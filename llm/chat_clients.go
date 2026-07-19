@@ -5,12 +5,6 @@ import (
 	"math/rand/v2"
 	"os"
 	"strings"
-	"sync"
-)
-
-var (
-	dynamicModelCache   = map[string]string{} // baseURL -> resolved model name
-	dynamicModelCacheMu sync.RWMutex
 )
 
 // LLMConfig holds configuration for LLM client initialization
@@ -222,27 +216,38 @@ func getDynamicChatGetter(model string, params *ChatParams) *ChatGetter {
 		panic(fmt.Sprintf("failed to parse dynamic model: %v", err))
 	}
 
-	// If model identifier is not specified, try to fetch it from the endpoint
-	if dynConfig.Model == "" {
-		dynamicModelCacheMu.RLock()
-		cached, ok := dynamicModelCache[dynConfig.BaseURL]
-		dynamicModelCacheMu.RUnlock()
-		if ok {
-			dynConfig.Model = cached
+	// Autodiscover each endpoint's effective base URL (appending /v1/ for a
+	// bare host:port that answers /v1/models) and, for the primary endpoint
+	// only, a model id if the spec didn't give one. resolveDynamicEndpoint
+	// memoizes per raw endpoint via sync.Once, so however many times this
+	// function runs for the same spec (it runs per-request on several
+	// benchmark paths), the actual network probe fires exactly once per
+	// distinct endpoint per process.
+	wantModel := dynConfig.Model == ""
+	resolvedURLs := make([]string, len(dynConfig.BaseURLs))
+	var primary resolvedEndpoint
+	for i, u := range dynConfig.BaseURLs {
+		res := resolveDynamicEndpoint(u, wantModel && i == 0)
+		resolvedURLs[i] = res.base
+		if i == 0 {
+			primary = res
+		}
+	}
+	dynConfig.BaseURLs = resolvedURLs
+	dynConfig.BaseURL = resolvedURLs[0]
+
+	if wantModel {
+		if primary.model != "" {
+			dynConfig.Model = primary.model
+		} else if dynConfig.Type == "anthropic" {
+			// Anthropic-compatible servers reject unknown/placeholder model
+			// ids outright, unlike some permissive single-model vLLM
+			// deployments — silently defaulting would just trade a clear
+			// startup error for a cryptic per-request one.
+			panic(errModelAutodiscoveryFailed(dynConfig.Type, dynConfig.BaseURL))
 		} else {
-			fetchedModel, err := fetchModelFromEndpoint(dynConfig.BaseURL)
-			var resolved string
-			if err != nil {
-				// Log warning but continue with a default model name
-				fmt.Fprintf(os.Stderr, "Warning: Failed to fetch model from endpoint: %v. Using 'default' as model identifier.\n", err)
-				resolved = "default"
-			} else {
-				resolved = fetchedModel
-			}
-			dynamicModelCacheMu.Lock()
-			dynamicModelCache[dynConfig.BaseURL] = resolved
-			dynamicModelCacheMu.Unlock()
-			dynConfig.Model = resolved
+			fmt.Fprintf(os.Stderr, "Warning: Failed to autodiscover model from endpoint %s. Using 'default' as model identifier.\n", dynConfig.BaseURL)
+			dynConfig.Model = "default"
 		}
 	}
 

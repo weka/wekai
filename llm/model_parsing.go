@@ -1,9 +1,7 @@
 package llm
 
 import (
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
 )
 
@@ -339,40 +337,4 @@ func ValidateModel(model string) error {
 	}
 
 	return nil
-}
-
-// fetchModelFromEndpoint attempts to fetch the first model from an OpenAI-compatible /models endpoint
-func fetchModelFromEndpoint(baseURL string) (string, error) {
-	// Ensure trailing slash
-	if !strings.HasSuffix(baseURL, "/") {
-		baseURL += "/"
-	}
-
-	modelsURL := baseURL + "models"
-
-	resp, err := sharedHTTPClient.Get(modelsURL)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch models from %s: %w", modelsURL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("models endpoint returned status %d", resp.StatusCode)
-	}
-
-	var result struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("failed to parse models response: %w", err)
-	}
-
-	if len(result.Data) == 0 {
-		return "", fmt.Errorf("no models found at endpoint")
-	}
-
-	return result.Data[0].ID, nil
 }
