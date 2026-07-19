@@ -6,6 +6,7 @@ vars:
   REPLAY_IMAGE: '{{.REPLAY_IMAGE | default "quay.io/weka.io/wekai-benchmark:replay-099a98c60fd7"}}'
   REGISTRY: '{{.REGISTRY | default "quay.io/weka.io/wekai-core"}}'
   REPLAY_REGISTRY: '{{.REPLAY_REGISTRY | default "quay.io/weka.io/wekai-benchmark"}}'
+  HELM_REGISTRY: '{{.HELM_REGISTRY | default "quay.io/weka.io/helm"}}'
 
 tasks:
   build:
@@ -37,7 +38,7 @@ tasks:
         --replay="{{.REPLAY}}"
         --registry="{{.REPLAY_REGISTRY}}"
 
-  publish:
+  app:push:
     desc: "Build (from this repo's Dockerfile) and publish the wekai-core image (dagger call publish). Override REGISTRY=... and REPLAY_IMAGE=... as needed."
     cmds:
       - >-
@@ -45,3 +46,15 @@ tasks:
         --source=.
         --registry="{{.REGISTRY}}"
         --replay-image="{{.REPLAY_IMAGE}}"
+
+  helm:push:
+    desc: "Publish the wekai-core image, then package+push chart/wekai-core pinned to it (dagger call push-helm). Override REGISTRY=..., HELM_REGISTRY=..., and REPLAY_IMAGE=... as needed."
+    cmds:
+      - >-
+        dagger call push-helm
+        --source=.
+        --registry="{{.REGISTRY}}"
+        --replay-image="{{.REPLAY_IMAGE}}"
+        --helm-registry="{{.HELM_REGISTRY}}"
+        --helm-username=env://QUAY_USERNAME
+        --helm-password=env://QUAY_PASSWORD

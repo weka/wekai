@@ -24,6 +24,9 @@ SOURCE_IGNORE = [
     "/results",
 ]
 
+CHART_DIR = "chart/wekai-core"
+CHART_NAME = "wekai-core"
+
 
 async def _calc_version(src: dagger.Directory) -> str:
     """Ported verbatim from wekai's .dagger/src/wekai_flows/main.py."""
@@ -31,6 +34,29 @@ async def _calc_version(src: dagger.Directory) -> str:
     sha = digest.split(":")[-1]
     version = f"v999.0.0-{sha[:12]}"
     return version
+
+
+async def _publish_image(
+    source: dagger.Directory,
+    registry: str,
+    replay_image: str,
+) -> tuple[str, str]:
+    """Builds and publishes the wekai-core image from this repo's own
+    Dockerfile. Shared by `publish` and `push_helm` so there is exactly one
+    build/tag/publish code path — `push_helm` awaits this to completion
+    before touching the chart, which is what makes "image pushed before
+    chart push" hold by construction rather than by convention.
+
+    Returns (image_name, version).
+    """
+    version = await _calc_version(source)
+    container = source.docker_build(
+        platform=LINUX_AMD64,
+        build_args=[BuildArg(name="REPLAY_IMAGE", value=replay_image)],
+    )
+    image_name = f"{registry}:{version}"
+    await container.publish(image_name)
+    return image_name, version
 
 
 @object_type
@@ -49,7 +75,7 @@ class WekaiCoreFlows:
         artifacts, regardless of which project publishes or consumes them.
         The image carries the replay JSONL at /replay.jsonl, so this repo's
         own Dockerfile embeds it via:
-        COPY --from=<registry>:replay-<sha12> /replay.jsonl /wekai/replay.jsonl
+        COPY --link --from=<registry>:replay-<sha12> /replay.jsonl /wekai/replay.jsonl
 
         Args:
             replay: The local replay JSONL file to publish (mandatory).
@@ -97,11 +123,68 @@ class WekaiCoreFlows:
                 build-arg, so a different embedded replay capture can be
                 selected without editing the Dockerfile.
         """
-        version = await _calc_version(source)
-        container = source.docker_build(
-            platform=LINUX_AMD64,
-            build_args=[BuildArg(name="REPLAY_IMAGE", value=replay_image)],
-        )
-        image_name = f"{registry}:{version}"
-        await container.publish(image_name)
+        image_name, _version = await _publish_image(source, registry, replay_image)
         return f"Published wekai-core image: {image_name}"
+
+    @function
+    async def push_helm(
+        self,
+        source: Annotated[dagger.Directory, Ignore(SOURCE_IGNORE)],
+        helm_username: dagger.Secret,
+        helm_password: dagger.Secret,
+        registry: str = "quay.io/weka.io/wekai-core",
+        helm_registry: str = "quay.io/weka.io/helm",
+        replay_image: str = "quay.io/weka.io/wekai-benchmark:replay-099a98c60fd7",
+    ) -> str:
+        """Publishes the wekai-core image, then packages and pushes
+        chart/wekai-core to an OCI Helm registry with the chart's image
+        reference pinned to that exact just-published image — a
+        `helm install` of the pushed chart with zero further --set flags
+        deploys exactly the image it was packaged with.
+
+        Reuses the same image-publish path as `publish` (via the shared
+        _publish_image helper — no duplicated build/tag/publish logic) and
+        awaits it to completion before packaging the chart, so "image
+        pushed before chart push" holds by construction.
+
+        Args:
+            helm_username: OCI Helm registry username.
+            helm_password: OCI Helm registry password.
+            registry: Image registry:repo the chart gets pinned to (same
+                target `publish` would use).
+            helm_registry: OCI Helm registry base, e.g. quay.io/weka.io/helm
+                (matches wekai's retired chart-push flow's default).
+            replay_image: Passed through to the Dockerfile's REPLAY_IMAGE
+                build-arg.
+        """
+        image_name, version = await _publish_image(source, registry, replay_image)
+
+        chart = source.directory(CHART_DIR)
+        registry_host = helm_registry.split("/")[0]  # e.g. "quay.io"
+
+        packaged = (
+            dag.container(platform=LINUX_AMD64)
+            .from_("alpine:latest")
+            .with_exec(["apk", "add", "--no-cache", "helm"])
+            .with_directory("/chart", chart)
+            .with_exec(["sed", "-i", f"s/^version:.*/version: {version}/", "/chart/Chart.yaml"])
+            .with_exec(["sed", "-i", f's/^appVersion:.*/appVersion: "{version}"/', "/chart/Chart.yaml"])
+            .with_exec(["sed", "-i", f"s|^imageRepository:.*|imageRepository: {registry}|", "/chart/values.yaml"])
+            .with_exec(["sed", "-i", f's|^imageTag:.*|imageTag: "{version}"|', "/chart/values.yaml"])
+            .with_exec(["helm", "package", "/chart", "--destination", "/out"])
+        )
+
+        await (
+            packaged
+            .with_secret_variable("HELM_USER", helm_username)
+            .with_secret_variable("HELM_PASS", helm_password)
+            .with_exec(["sh", "-c",
+                        f"echo $HELM_PASS | helm registry login {registry_host} -u $HELM_USER --password-stdin && "
+                        f"helm push /out/{CHART_NAME}-*.tgz oci://{helm_registry}"])
+        ).stdout()
+
+        return (
+            f"Published wekai-core image: {image_name}\n"
+            f"Published Helm chart: oci://{helm_registry}/{CHART_NAME}:{version} "
+            f"(pinned to image {image_name})"
+        )

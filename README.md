@@ -56,14 +56,19 @@ models — otherwise only dynamic/openrouter specs resolve.
 ## Deployment
 
 `Dockerfile` builds a self-contained replay image: a golang builder stage
-compiles the `wekai-core` binary, and a second `COPY --from=` stage embeds
-one router-replay JSONL artifact at `/wekai/replay.jsonl`, pulled from a
-separately-published scratch image (default
+compiles the `wekai-core` binary, and a second `COPY --link --from=` stage
+embeds one router-replay JSONL artifact at `/wekai/replay.jsonl`, pulled
+from a separately-published scratch image (default
 `quay.io/weka.io/wekai-benchmark:replay-<sha12>` — published by this repo's
 own `task replay:push`, see "CI / Publishing" below; the `wekai-benchmark`
 repo name there is historical, where replay artifacts have always lived —
-nothing built from this Dockerfile uses "benchmark" in its own name). Build
-locally with:
+nothing built from this Dockerfile uses "benchmark" in its own name). Both
+runtime-stage `COPY`s use BuildKit's `--link` — each becomes an
+independent, content-addressed layer, so a rebuild triggered by a Go source
+change (which busts the builder stage) does not recopy or reupload the
+replay layer, which can be several GB; its digest stays identical across
+rebuilds and registries can cross-mount the existing blob instead of
+re-uploading it. Build locally with:
 
 ```
 task docker:build   # override REPLAY_IMAGE=... to embed a different capture
@@ -96,7 +101,7 @@ Only its Go dependencies are needed to build the image, and they're all
 public, so unlike wekai's module this one needs no SSH socket forwarding
 for private-repo access.
 
-Two functions:
+Three functions:
 
 - `push-replay` — publishes a replay JSONL as a minimal scratch image,
   tagged `replay-<sha12>` (sha256 of the file), to
@@ -107,15 +112,30 @@ Two functions:
   source directory's content digest, same scheme wekai uses), and
   publishes to `quay.io/weka.io/wekai-core` by default. The Dockerfile's
   `REPLAY_IMAGE` build-arg is exposed as a `--replay-image` function param.
+- `push-helm` — first runs the exact same image build+publish as `publish`
+  (shared internal helper, not a separate code path), then packages
+  `chart/wekai-core` and pushes it to an OCI Helm registry
+  (`quay.io/weka.io/helm` by default), with the chart's `values.yaml`
+  `imageRepository`/`imageTag` and `Chart.yaml` `version`/`appVersion`
+  rewritten to point at the image that publish step just pushed. A
+  `helm install` of that chart with zero further `--set` flags always
+  deploys the exact image it was packaged with. Because the image publish
+  is `await`-ed before any chart packaging happens, "image pushed before
+  chart push" holds by construction, not by convention. Takes
+  `helm-username`/`helm-password` as Dagger secrets.
 
 ```
 task replay:push REPLAY=/path/to/replay.jsonl   # dagger call push-replay
-task publish                                     # dagger call publish
+task app:push                                    # dagger call publish (image only)
+task helm:push                                   # dagger call push-helm (image + chart, image first)
 ```
+
+`helm:push` reads Helm registry credentials from `QUAY_USERNAME`/`QUAY_PASSWORD`
+env vars (same convention wekai's retired chart-push flow used).
 
 `.dagger/sdk/` (the generated Dagger client bindings) is gitignored, same
 as wekai — run `dagger develop` once after a fresh clone (or the first
-`dagger call`/`task publish` will do it implicitly) to regenerate it
+`dagger call`/`task app:push` will do it implicitly) to regenerate it
 locally; nothing under `sdk/` is meant to be hand-edited or committed.
 
 ## Layout
