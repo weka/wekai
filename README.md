@@ -59,8 +59,8 @@ models — otherwise only dynamic/openrouter specs resolve.
 compiles the `wekai-core` binary, and a second `COPY --from=` stage embeds
 one router-replay JSONL artifact at `/wekai/replay.jsonl`, pulled from a
 separately-published scratch image (default
-`quay.io/weka.io/wekai-benchmark:replay-<sha12>` — published by wekai's
-`.dagger` `push_replay` / `task benchmark:push-replay`; the `wekai-benchmark`
+`quay.io/weka.io/wekai-benchmark:replay-<sha12>` — published by this repo's
+own `task replay:push`, see "CI / Publishing" below; the `wekai-benchmark`
 repo name there is historical, where replay artifacts have always lived —
 nothing built from this Dockerfile uses "benchmark" in its own name). Build
 locally with:
@@ -84,6 +84,39 @@ list, or `helm show values chart/wekai-core`.
 helm lint chart/wekai-core
 helm template test chart/wekai-core --values my-values.yaml
 ```
+
+## CI / Publishing
+
+Publishing is a self-contained Dagger module (Python SDK, engine pinned to
+`v0.18.6` to match wekai's own `.dagger` module) rooted at `dagger.json` /
+`.dagger/src/wekai_core_flows/`. It was ported from wekai's
+`.dagger/src/wekai_flows/main.py` (`push_replay`, `_calc_version`) — same
+tag scheme, same default registry, no reimplementation via crane/shell.
+Only its Go dependencies are needed to build the image, and they're all
+public, so unlike wekai's module this one needs no SSH socket forwarding
+for private-repo access.
+
+Two functions:
+
+- `push-replay` — publishes a replay JSONL as a minimal scratch image,
+  tagged `replay-<sha12>` (sha256 of the file), to
+  `quay.io/weka.io/wekai-benchmark` by default (registry overridable).
+- `publish` — builds this repo's own `Dockerfile` via `Directory.docker_build()`
+  (the Dockerfile is the single source of truth — the module does not
+  reimplement its steps), tags with `v999.0.0-<sha12>` (sha12 of the
+  source directory's content digest, same scheme wekai uses), and
+  publishes to `quay.io/weka.io/wekai-core` by default. The Dockerfile's
+  `REPLAY_IMAGE` build-arg is exposed as a `--replay-image` function param.
+
+```
+task replay:push REPLAY=/path/to/replay.jsonl   # dagger call push-replay
+task publish                                     # dagger call publish
+```
+
+`.dagger/sdk/` (the generated Dagger client bindings) is gitignored, same
+as wekai — run `dagger develop` once after a fresh clone (or the first
+`dagger call`/`task publish` will do it implicitly) to regenerate it
+locally; nothing under `sdk/` is meant to be hand-edited or committed.
 
 ## Layout
 

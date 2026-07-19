@@ -4,6 +4,8 @@ vars:
   IMAGE: wekai-core
   TAG: '{{.TAG | default "dev"}}'
   REPLAY_IMAGE: '{{.REPLAY_IMAGE | default "quay.io/weka.io/wekai-benchmark:replay-099a98c60fd7"}}'
+  REGISTRY: '{{.REGISTRY | default "quay.io/weka.io/wekai-core"}}'
+  REPLAY_REGISTRY: '{{.REPLAY_REGISTRY | default "quay.io/weka.io/wekai-benchmark"}}'
 
 tasks:
   build:
@@ -24,3 +26,22 @@ tasks:
         --build-arg REPLAY_IMAGE={{.REPLAY_IMAGE}}
         -t {{.IMAGE}}:{{.TAG}}
         .
+
+  replay:push:
+    desc: "Push a replay JSONL as a layer image (replay-<hash>) under the wekai-benchmark repo (dagger call push-replay). Override REPLAY_REGISTRY=... as needed."
+    requires:
+      vars: [REPLAY]
+    cmds:
+      - >-
+        dagger call push-replay
+        --replay="{{.REPLAY}}"
+        --registry="{{.REPLAY_REGISTRY}}"
+
+  publish:
+    desc: "Build (from this repo's Dockerfile) and publish the wekai-core image (dagger call publish). Override REGISTRY=... and REPLAY_IMAGE=... as needed."
+    cmds:
+      - >-
+        dagger call publish
+        --source=.
+        --registry="{{.REGISTRY}}"
+        --replay-image="{{.REPLAY_IMAGE}}"
