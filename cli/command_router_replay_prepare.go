@@ -254,7 +254,9 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 		Schema:      "replay-v3",
 		Name:        name,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-		Source:      src,
+		// Base name only: replay files get published as artifacts, and a full
+		// path would leak the producer's local filesystem layout.
+		Source:      filepath.Base(strings.TrimRight(src, "/")),
 		Summary: ReplaySummary{
 			Sessions:           rep.TotalSessions,
 			Instances:          rep.TotalInstances,
