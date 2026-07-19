@@ -1,13 +1,36 @@
 imageRepository: quay.io/weka.io/wekai-core
 imageTag: ""  # defaults to .Chart.AppVersion
+# Pull secrets for private registries, e.g.:
+#   imagePullSecrets:
+#     - name: quay-pull
+imagePullSecrets: []
 
 # The only supported run mode: replay the router-replay JSONL baked into the
-# image (at /wekai/replay.jsonl, see wekai-core's Dockerfile) against one or
-# more target model endpoints via `wekai-core benchmark auto
-# --router-replay-file`. There is no embed/docs-dir/model-list mode here —
-# for those, use wekai-core directly.
+# image (at /wekai/replay.jsonl, see wekai-core's Dockerfile) against a
+# target model endpoint via `wekai-core benchmark auto --router-replay-file`.
+# There is no embed/docs-dir/model-list mode here — for those, or for
+# multiple endpoints in one run, use wekai-core directly.
+
+# Target model endpoint — the only value most installs need to set, e.g.:
+#   --set endpoint=http://10.71.0.4:8000
+# Accepts a bare host:port (autodiscovers the /v1 path and, unless `model`
+# below is set, the model id too — see wekai-core's llm.NormalizeModelSpec /
+# ParseDynamicModel) or a full "dynamic/...,type=..." spec for anything
+# non-default (e.g. "http://10.71.0.4:8000,type=anthropic"). Required — the
+# chart renders without --models and the binary fails fast with a clear
+# error if this is left empty.
+endpoint: ""
+
+# Optional explicit model id. Appended to `endpoint` as ",model=<value>".
+# Leave empty to rely on autodiscovery.
+model: ""
+
+# Overall run duration, mapped to `benchmark auto --timeout`. Lower this for
+# smoke tests, e.g. --set duration=3m.
+duration: "8h"
+
+# Advanced/optional replay knobs — sane defaults, rarely need changing.
 replay:
-  models: []              # required: model endpoint(s) to replay against, e.g. ["dynamic/http://vllm.svc/v1,type=openai_vllm"]
   replayFile: /wekai/replay.jsonl  # path baked into the image by the Dockerfile
   replayRoles: ""          # comma-separated instance roles to replay (empty = all)
   replaySeries: 0          # cap on sessions replayed (0 = all in the file)
@@ -15,7 +38,6 @@ replay:
   maxOutputTokens: 0       # override max output tokens per request (0 = use replay-file's own budgets)
   concurrency: 0           # fixed concurrency (0 = auto hill-climber)
   maxConcurrency: 0        # hill-climber upper bound (0 = binary default)
-  timeout: ""              # overall run timeout, e.g. "30m"
   requestTimeout: ""       # per-request timeout, e.g. "5m"
   abortOnCollapse: false   # abort if windowed cache hit rate collapses
   replayStopAtLowConcurrency: false

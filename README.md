@@ -78,17 +78,96 @@ task docker:build   # override REPLAY_IMAGE=... to embed a different capture
 command, same pattern as wekai's retired `chart/benchmark`) that runs the
 embedded replay directly — no other run mode is supported. The container
 command is `wekai-core benchmark auto --router-replay-file
-/wekai/replay.jsonl ...`, with values for `replay.models`,
-`replay.replaySeries`, `replay.concurrency`, `replay.maxConcurrency`,
-`replay.dryRun` (+ dry-run TPS knobs), timeouts, and an optional
-`llmApiKeySecretName` envFrom secret. Results can optionally persist to a
-PVC via `storeResults`. See `chart/wekai-core/values.yaml` for the full
-list, or `helm show values chart/wekai-core`.
+/wekai/replay.jsonl ...`. The chart is deliberately minimal: the only value
+most installs need to set is `endpoint`, the target model server. Everything
+else (`replay.replaySeries`, `replay.concurrency`, `replay.maxConcurrency`,
+`replay.dryRun` + dry-run TPS knobs, per-request timeout, an optional
+`llmApiKeySecretName` envFrom secret, `storeResults` PVC persistence, ...)
+has a working default. See `chart/wekai-core/values.yaml` for the full list,
+or `helm show values chart/wekai-core`.
+
+Default install — runs for the default duration (8h):
+
+```
+helm install my-replay chart/wekai-core --set endpoint=http://10.71.0.4:8000
+```
+
+Smoke test — shorten `duration` (maps to `--timeout`), e.g. 3 minutes:
+
+```
+helm install my-replay chart/wekai-core \
+  --set endpoint=http://10.71.0.4:8000 \
+  --set duration=3m
+```
+
+Explicit model override — by default the model id is autodiscovered (see
+"Bare-URL model selector" below); set `model` to skip discovery:
+
+```
+helm install my-replay chart/wekai-core \
+  --set endpoint=http://10.71.0.4:8000 \
+  --set model=nvidia/Kimi-K2.6-NVFP4
+```
+
+`endpoint` accepts any dynamic model spec, not just a bare URL — e.g. to
+target an Anthropic-shaped server, append `,type=anthropic`. Because Helm's
+`--set` splits on unescaped commas, either escape it or use `--set-string`
+with a values file instead:
+
+```
+helm install my-replay chart/wekai-core \
+  --set-string endpoint='http://10.71.0.4:8000\,type=anthropic' \
+  --set duration=3m
+```
+
+Private registry — `quay.io/weka.io/wekai-core` requires auth to pull; create
+a `kubernetes.io/dockerconfigjson` secret once and reference it via
+`imagePullSecrets`:
+
+```
+kubectl create secret docker-registry quay-pull \
+  --docker-server=quay.io \
+  --docker-username=<user> --docker-password=<token>
+
+helm install my-replay chart/wekai-core \
+  --set endpoint=http://10.71.0.4:8000 \
+  --set 'imagePullSecrets[0].name=quay-pull'
+```
 
 ```
 helm lint chart/wekai-core
-helm template test chart/wekai-core --values my-values.yaml
+helm template test chart/wekai-core --set endpoint=http://10.71.0.4:8000
 ```
+
+### Bare-URL model selector
+
+A bare `http://` or `https://` URL passed as `--model`/`--models` (or, in the
+chart, `endpoint`) is promoted by `llm.NormalizeModelSpec` to a
+`dynamic/<url>,type=openai_vllm` spec — no need to spell out the dynamic
+model boilerplate for the common case. From there `ParseDynamicModel` /
+`GetChatGetter` autodiscover, against the endpoint itself, whatever the spec
+didn't already say:
+
+- **`/v1` path** — if the URL has no path (e.g. `http://host:8000`), a
+  `GET <url>/v1/models` probe checks whether the server answers there; on
+  success, `<url>/v1/` becomes the effective base for all requests. A URL
+  that already ends in `/v1` (or carries any other explicit path) is left
+  exactly as given — no probe.
+- **Model id** — if `model=` is absent from the spec, the first entry in
+  that same `/v1/models` response (`data[0].id`) is used as the model id.
+  For `type=anthropic` specifically, a model id is mandatory for the actual
+  request to succeed against a real Anthropic-compatible server, so failed
+  autodiscovery there is a hard error (specify `model=` explicitly) rather
+  than the softer `"default"` placeholder fallback used for other types.
+- **type=anthropic works the same way** — `http://host:8000,type=anthropic`
+  autodiscovers identically; only the request-shaping client differs.
+
+Discovery is memoized per distinct raw endpoint for the life of the process,
+not per request: `GetChatGetter` (and therefore this resolution) runs fresh
+on every request in several benchmark code paths, so without memoization a
+concurrent benchmark run would re-probe the endpoint on every single
+request. The underlying network probe(s) fire exactly once per endpoint no
+matter how many times or how concurrently the spec is resolved.
 
 ## CI / Publishing
 

@@ -17,6 +17,10 @@ spec:
         {{- include "wekai-core.selectorLabels" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           image: {{ .Values.imageRepository }}:{{ .Values.imageTag | default .Chart.AppVersion }}
@@ -28,8 +32,11 @@ spec:
               set -e
               wekai-core benchmark auto \
                 --router-replay-file={{ .Values.replay.replayFile }} \
-                {{- range .Values.replay.models }}
-                --models={{ . | quote }} \
+                {{- if .Values.endpoint }}
+                --models={{ if .Values.model }}{{ printf "%s,model=%s" .Values.endpoint .Values.model | quote }}{{ else }}{{ .Values.endpoint | quote }}{{ end }} \
+                {{- end }}
+                {{- if .Values.duration }}
+                --timeout={{ .Values.duration }} \
                 {{- end }}
                 {{- if .Values.replay.replayRoles }}
                 --router-replay-roles={{ .Values.replay.replayRoles }} \
@@ -48,9 +55,6 @@ spec:
                 {{- end }}
                 {{- if .Values.replay.maxConcurrency }}
                 --max-concurrency={{ .Values.replay.maxConcurrency | int64 }} \
-                {{- end }}
-                {{- if .Values.replay.timeout }}
-                --timeout={{ .Values.replay.timeout }} \
                 {{- end }}
                 {{- if .Values.replay.requestTimeout }}
                 --request-timeout={{ .Values.replay.requestTimeout }} \
