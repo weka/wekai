@@ -1,0 +1,10 @@
+bin/
+dist/
+wekai-core
+*.log
+.env
+.temp
+.idea/
+.DS_STORE
+results/
+*.out
