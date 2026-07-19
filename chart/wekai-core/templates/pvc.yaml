@@ -1,0 +1,17 @@
+{{- if .Values.storeResults }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "wekai-core.fullname" . }}-results
+  labels:
+    {{- include "wekai-core.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.storageClassName }}
+  storageClassName: {{ .Values.storageClassName }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.storageSize }}
+{{- end }}

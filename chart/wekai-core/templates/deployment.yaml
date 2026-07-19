@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "wekai-core.fullname" . }}
+  labels:
+    {{- include "wekai-core.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "wekai-core.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "wekai-core.selectorLabels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: {{ .Chart.Name }}
+          image: {{ .Values.imageRepository }}:{{ .Values.imageTag | default .Chart.AppVersion }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - "sh"
+            - "-c"
+            - |
+              set -e
+              wekai-core benchmark auto \
+                --router-replay-file={{ .Values.replay.replayFile }} \
+                {{- range .Values.replay.models }}
+                --models={{ . | quote }} \
+                {{- end }}
+                {{- if .Values.replay.replayRoles }}
+                --router-replay-roles={{ .Values.replay.replayRoles }} \
+                {{- end }}
+                {{- if .Values.replay.replaySeries }}
+                --replay-series={{ .Values.replay.replaySeries | int64 }} \
+                {{- end }}
+                {{- if .Values.replay.replayNoStamp }}
+                --replay-no-stamp \
+                {{- end }}
+                {{- if .Values.replay.maxOutputTokens }}
+                --max-output-tokens={{ .Values.replay.maxOutputTokens | int64 }} \
+                {{- end }}
+                {{- if .Values.replay.concurrency }}
+                --concurrency={{ .Values.replay.concurrency | int64 }} \
+                {{- end }}
+                {{- if .Values.replay.maxConcurrency }}
+                --max-concurrency={{ .Values.replay.maxConcurrency | int64 }} \
+                {{- end }}
+                {{- if .Values.replay.timeout }}
+                --timeout={{ .Values.replay.timeout }} \
+                {{- end }}
+                {{- if .Values.replay.requestTimeout }}
+                --request-timeout={{ .Values.replay.requestTimeout }} \
+                {{- end }}
+                {{- if .Values.replay.abortOnCollapse }}
+                --abort-on-collapse \
+                {{- end }}
+                {{- if .Values.replay.replayStopAtLowConcurrency }}
+                --replay-stop-at-low-concurrency \
+                {{- end }}
+                {{- if .Values.replay.stderrLogs }}
+                --stderr-logs \
+                {{- end }}
+                {{- if .Values.replay.dryRun }}
+                --dry-run \
+                {{- if .Values.replay.dryRunColdTPS }}
+                --dry-run-cold-tps={{ .Values.replay.dryRunColdTPS | int64 }} \
+                {{- end }}
+                {{- if .Values.replay.dryRunWarmTPS }}
+                --dry-run-warm-tps={{ .Values.replay.dryRunWarmTPS | int64 }} \
+                {{- end }}
+                {{- if .Values.replay.dryRunOutputTPS }}
+                --dry-run-output-tps={{ .Values.replay.dryRunOutputTPS | int64 }} \
+                {{- end }}
+                {{- end }}
+                {{- if .Values.storeResults }}
+                --save-request-data={{ .Values.resultsMountPath }} \
+                {{- end }}
+                ; sleep infinity
+          {{- if .Values.llmApiKeySecretName }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.llmApiKeySecretName }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.storeResults }}
+          volumeMounts:
+            - name: results
+              mountPath: {{ .Values.resultsMountPath }}
+          {{- end }}
+      {{- if .Values.storeResults }}
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: {{ include "wekai-core.fullname" . }}-results
+      {{- end }}

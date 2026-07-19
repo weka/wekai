@@ -1,0 +1,44 @@
+imageRepository: quay.io/weka.io/wekai-core
+imageTag: ""  # defaults to .Chart.AppVersion
+
+# The only supported run mode: replay the router-replay JSONL baked into the
+# image (at /wekai/replay.jsonl, see wekai-core's Dockerfile) against one or
+# more target model endpoints via `wekai-core benchmark auto
+# --router-replay-file`. There is no embed/docs-dir/model-list mode here —
+# for those, use wekai-core directly.
+replay:
+  models: []              # required: model endpoint(s) to replay against, e.g. ["dynamic/http://vllm.svc/v1,type=openai_vllm"]
+  replayFile: /wekai/replay.jsonl  # path baked into the image by the Dockerfile
+  replayRoles: ""          # comma-separated instance roles to replay (empty = all)
+  replaySeries: 0          # cap on sessions replayed (0 = all in the file)
+  replayNoStamp: false     # disable per-run cache-busting stamp (bitwise-faithful replay)
+  maxOutputTokens: 0       # override max output tokens per request (0 = use replay-file's own budgets)
+  concurrency: 0           # fixed concurrency (0 = auto hill-climber)
+  maxConcurrency: 0        # hill-climber upper bound (0 = binary default)
+  timeout: ""              # overall run timeout, e.g. "30m"
+  requestTimeout: ""       # per-request timeout, e.g. "5m"
+  abortOnCollapse: false   # abort if windowed cache hit rate collapses
+  replayStopAtLowConcurrency: false
+  stderrLogs: false
+
+  # Dry-run mode: simulate the replay's timing/rates offline (no real
+  # requests) using synthetic cold/warm/output token rates.
+  dryRun: false
+  dryRunColdTPS: 0
+  dryRunWarmTPS: 0
+  dryRunOutputTPS: 0
+
+llmApiKeySecretName: ""   # K8s secret with LLM API key env vars (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...)
+
+storeResults: false        # save per-request JSONL data (--save-request-data) to a PVC
+storageClassName: ""       # empty = cluster default
+storageSize: 10Gi          # PVC size for results storage
+resultsMountPath: /results
+
+resources:
+  requests:
+    memory: "256Mi"
+    cpu: "250m"
+  limits:
+    memory: "4Gi"
+    cpu: "4"

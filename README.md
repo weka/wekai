@@ -53,6 +53,38 @@ Either mechanism should also set `llm.ResolveModel` and
 `llm.LookupModelByIdentifier` (see above) if the embedder has its own named
 models — otherwise only dynamic/openrouter specs resolve.
 
+## Deployment
+
+`Dockerfile` builds a self-contained replay image: a golang builder stage
+compiles the `wekai-core` binary, and a second `COPY --from=` stage embeds
+one router-replay JSONL artifact at `/wekai/replay.jsonl`, pulled from a
+separately-published scratch image (default
+`quay.io/weka.io/wekai-benchmark:replay-<sha12>` — published by wekai's
+`.dagger` `push_replay` / `task benchmark:push-replay`; the `wekai-benchmark`
+repo name there is historical, where replay artifacts have always lived —
+nothing built from this Dockerfile uses "benchmark" in its own name). Build
+locally with:
+
+```
+task docker:build   # override REPLAY_IMAGE=... to embed a different capture
+```
+
+`chart/wekai-core/` is a run-once Helm chart (`; sleep infinity` after the
+command, same pattern as wekai's retired `chart/benchmark`) that runs the
+embedded replay directly — no other run mode is supported. The container
+command is `wekai-core benchmark auto --router-replay-file
+/wekai/replay.jsonl ...`, with values for `replay.models`,
+`replay.replaySeries`, `replay.concurrency`, `replay.maxConcurrency`,
+`replay.dryRun` (+ dry-run TPS knobs), timeouts, and an optional
+`llmApiKeySecretName` envFrom secret. Results can optionally persist to a
+PVC via `storeResults`. See `chart/wekai-core/values.yaml` for the full
+list, or `helm show values chart/wekai-core`.
+
+```
+helm lint chart/wekai-core
+helm template test chart/wekai-core --values my-values.yaml
+```
+
 ## Layout
 
 - `llm/` — raw LLM client layer (Anthropic, OpenAI, OpenAI Responses, Gemini
