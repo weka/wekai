@@ -107,7 +107,7 @@ class WekaiCoreFlows:
         self,
         source: Annotated[dagger.Directory, Ignore(SOURCE_IGNORE)],
         registry: str = "quay.io/weka.io/wekai-core",
-        replay_image: str = "quay.io/weka.io/wekai-benchmark:replay-099a98c60fd7",
+        replay_image: str = "quay.io/weka.io/wekai-benchmark:replay-24e7f15ba0ea",
     ) -> str:
         """Builds and publishes the wekai-core image from this repo's own Dockerfile.
 
@@ -134,7 +134,7 @@ class WekaiCoreFlows:
         helm_password: dagger.Secret,
         registry: str = "quay.io/weka.io/wekai-core",
         helm_registry: str = "quay.io/weka.io/helm",
-        replay_image: str = "quay.io/weka.io/wekai-benchmark:replay-099a98c60fd7",
+        replay_image: str = "quay.io/weka.io/wekai-benchmark:replay-24e7f15ba0ea",
     ) -> str:
         """Publishes the wekai-core image, then packages and pushes
         chart/wekai-core to an OCI Helm registry with the chart's image

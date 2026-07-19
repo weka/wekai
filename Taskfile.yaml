@@ -3,7 +3,7 @@ version: "3"
 vars:
   IMAGE: wekai-core
   TAG: '{{.TAG | default "dev"}}'
-  REPLAY_IMAGE: '{{.REPLAY_IMAGE | default "quay.io/weka.io/wekai-benchmark:replay-099a98c60fd7"}}'
+  REPLAY_IMAGE: '{{.REPLAY_IMAGE | default "quay.io/weka.io/wekai-benchmark:replay-24e7f15ba0ea"}}'
   REGISTRY: '{{.REGISTRY | default "quay.io/weka.io/wekai-core"}}'
   REPLAY_REGISTRY: '{{.REPLAY_REGISTRY | default "quay.io/weka.io/wekai-benchmark"}}'
   HELM_REGISTRY: '{{.HELM_REGISTRY | default "quay.io/weka.io/helm"}}'

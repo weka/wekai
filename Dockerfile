@@ -14,7 +14,7 @@
 
 # ARGs used in a FROM must be declared before the first FROM (global scope).
 # Override with --build-arg REPLAY_IMAGE=... to embed a different capture.
-ARG REPLAY_IMAGE=quay.io/weka.io/wekai-benchmark:replay-099a98c60fd7
+ARG REPLAY_IMAGE=quay.io/weka.io/wekai-benchmark:replay-24e7f15ba0ea
 
 # ---- Builder: compile the wekai-core binary ----
 FROM golang:1.25.7-alpine AS builder
