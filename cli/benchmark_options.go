@@ -1,24 +1,5 @@
 package cli
 
-// BenchmarkEmbedOptions contains options for the benchmark embed subcommand
-type BenchmarkEmbedOptions struct {
-	DocsDir      string   `long:"docs-dir" description:"Documentation directory to embed (default: use built-in benchmark doc)" env:"BENCHMARK_DOCS_DIR"`
-	Tokens       int      `long:"tokens" description:"Truncate embedded doc to this many tokens (max 305465; only used when --docs-dir is not set)" default:"100000" env:"BENCHMARK_TOKENS"`
-	Models       []string `long:"models" description:"Models to benchmark (can be specified multiple times)" required:"yes"`
-	NumRequests  int      `long:"num-requests" description:"Number of requests per series" default:"3" env:"BENCHMARK_NUM_REQUESTS"`
-	SleepBetween int      `long:"sleep-between" description:"Sleep duration between requests in seconds" default:"0" env:"BENCHMARK_SLEEP_BETWEEN"`
-	Series       int      `long:"series" description:"Number of series to run (each series gets unique GUID for cache invalidation)" default:"1" env:"BENCHMARK_SERIES"`
-	Cycles       int      `long:"cycles" description:"Number of times to repeat all series (tests long-term cache hits)" default:"1" env:"BENCHMARK_CYCLES"`
-	Concurrency  int      `long:"concurrency" description:"Number of series to run concurrently within each cycle (default: 1)" default:"1" env:"BENCHMARK_CONCURRENCY"`
-	Timeout      string   `long:"timeout" description:"Maximum duration for benchmark (e.g. 10m, 1h). Prints partial results on timeout." env:"BENCHMARK_TIMEOUT"`
-	Question     string   `long:"question" description:"Question to ask (default: summarize documentation)" env:"BENCHMARK_QUESTION"`
-
-	// Positional arguments
-	Args struct {
-		Question string `positional-arg-name:"question" description:"Question to ask (overrides --question flag)"`
-	} `positional-args:"yes"`
-}
-
 // BenchmarkThroughputOptions contains options for the benchmark throughput subcommand
 type BenchmarkThroughputOptions struct {
 	DocsDir                string   `long:"docs-dir" description:"Documentation directory (default: use built-in benchmark doc)" env:"BENCHMARK_DOCS_DIR"`

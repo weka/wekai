@@ -4,7 +4,6 @@ package cli
 // the full `wekai` binary and the slim `wekai-benchmark` binary so the
 // subcommand surface stays identical without duplicating the struct.
 type BenchmarkCommands struct {
-	Embed          BenchmarkEmbedCommand          `command:"embed" description:"Benchmark models with embedded documentation"`
 	Auto           BenchmarkAutoCommand           `command:"auto" description:"Auto-scaling benchmark to find max throughput"`
 	Throughput     BenchmarkThroughputCommand     `command:"throughput" description:"Three-phase throughput benchmark (cold prefill, warm prefill, decode)"`
 	Visualize      BenchmarkVisualizeCommand      `command:"visualize" description:"Generate HTML visualization from request data directory"`
@@ -12,7 +11,6 @@ type BenchmarkCommands struct {
 }
 
 func (b *BenchmarkCommands) Init() {
-	b.Embed.BenchmarkEmbedOptions = &BenchmarkEmbedOptions{}
 	b.Auto.BenchmarkAutoOptions = &BenchmarkAutoOptions{}
 	b.Throughput.BenchmarkThroughputOptions = &BenchmarkThroughputOptions{}
 	b.Visualize.BenchmarkVisualizeOptions = &BenchmarkVisualizeOptions{}

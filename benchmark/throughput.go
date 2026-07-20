@@ -991,3 +991,10 @@ func (r *ThroughputResult) FormatJSON() (string, error) {
 	}
 	return string(data), nil
 }
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}

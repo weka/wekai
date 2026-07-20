@@ -27,7 +27,7 @@ go build -o wekai .
 ## Usage
 
 ```
-wekai benchmark embed --help
+wekai benchmark auto --help
 wekai router serve --help
 wekai eval simple-tool --help
 ```
