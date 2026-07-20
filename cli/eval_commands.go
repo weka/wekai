@@ -7,9 +7,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/weka/wekai-core/benchmark"
-	"github.com/weka/wekai-core/config"
-	"github.com/weka/wekai-core/llm"
+	"github.com/weka/wekai/benchmark"
+	"github.com/weka/wekai/config"
+	"github.com/weka/wekai/llm"
 )
 
 // EvalSimpleToolCommand implements the eval simple-tool subcommand

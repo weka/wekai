@@ -3,7 +3,7 @@ package cli
 import (
 	"context"
 
-	"github.com/weka/wekai-core/config"
+	"github.com/weka/wekai/config"
 )
 
 // GlobalOptions contains global flags available to all wekai-core commands.

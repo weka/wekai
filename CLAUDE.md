@@ -1,4 +1,4 @@
-# wekai-core — AI-Assisted Development Guide
+# wekai — AI-Assisted Development Guide
 
 ## Commit Convention (MANDATORY)
 
@@ -33,7 +33,7 @@ Scope is optional but encouraged: `feat(llm): ...`, `fix(chart): ...`,
 ## Build & Test
 
 - Binary is named `wekai` (main package: `cmd/wekai/`); module stays
-  `github.com/weka/wekai-core`. `task build`, `task test`, `task docker:build`.
+  `github.com/weka/wekai`. `task build`, `task test`, `task docker:build`.
 - Publishing: `task replay:push` / `task app:push` / `task helm:push`
   (Dagger module in `.dagger/`; `helm:push` publishes the image first by
   construction).

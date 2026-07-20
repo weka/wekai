@@ -8,7 +8,7 @@ import (
 	"os"
 	"sort"
 
-	"github.com/weka/wekai-core/benchmark"
+	"github.com/weka/wekai/benchmark"
 )
 
 // RouterAnalyzeReplayCommand simulates a replay or source capture offline

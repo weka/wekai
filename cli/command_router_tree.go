@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/weka/wekai-core/llm"
+	"github.com/weka/wekai/llm"
 )
 
 // RouterTreeCommand reads redacted (or raw — auto-redacts in memory) capture

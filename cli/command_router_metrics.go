@@ -6,7 +6,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
-	"github.com/weka/wekai-core/llm"
+	"github.com/weka/wekai/llm"
 )
 
 // Prometheus metrics for the router. Counters are user/session/model-tagged so

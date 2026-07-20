@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/weka/wekai-core/llm"
+	"github.com/weka/wekai/llm"
 )
 
 // hotGateFanoutMultiplier scales the hot gate so router-replay sub-agent fan-out

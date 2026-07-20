@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/weka/wekai-core/benchmark"
-	"github.com/weka/wekai-core/config"
-	"github.com/weka/wekai-core/llm"
+	"github.com/weka/wekai/benchmark"
+	"github.com/weka/wekai/config"
+	"github.com/weka/wekai/llm"
 )
 
 const defaultBenchmarkQuestion = "summarize in three words first 3%, last 3%, and middle 20%, clearly separate this three parts in response"

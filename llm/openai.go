@@ -13,7 +13,7 @@ import (
 	"strings"
 
 	"github.com/weka/go-weka-observability/instrumentation"
-	"github.com/weka/wekai-core/tools"
+	"github.com/weka/wekai/tools"
 )
 
 type ChatMessage struct {

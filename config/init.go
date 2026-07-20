@@ -11,7 +11,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
 	"github.com/weka/go-weka-observability/instrumentation"
-	"github.com/weka/wekai-core/llm"
+	"github.com/weka/wekai/llm"
 )
 
 // LoadDotEnv loads a .env file from the working directory if present. Safe

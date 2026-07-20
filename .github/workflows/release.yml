@@ -101,5 +101,5 @@ jobs:
             CLI (binary is named `wekai`):
 
             ```
-            go install github.com/weka/wekai-core/cmd/wekai@${{ steps.semver.outputs.new_tag }}
+            go install github.com/weka/wekai/cmd/wekai@${{ steps.semver.outputs.new_tag }}
             ```

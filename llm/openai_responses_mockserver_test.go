@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/sashabaranov/go-openai/jsonschema"
-	"github.com/weka/wekai-core/llm/mockserver"
-	"github.com/weka/wekai-core/tools"
+	"github.com/weka/wekai/llm/mockserver"
+	"github.com/weka/wekai/tools"
 )
 
 func newOpenAIResponsesTestClient(baseURL string) *OpenAiResponsesChat {

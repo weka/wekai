@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/weka/wekai-core/tools"
+	"github.com/weka/wekai/tools"
 )
 
 // ---- helpers ----

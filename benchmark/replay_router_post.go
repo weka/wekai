@@ -23,8 +23,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/weka/wekai-core/llm"
-	"github.com/weka/wekai-core/tools"
+	"github.com/weka/wekai/llm"
+	"github.com/weka/wekai/tools"
 )
 
 // replayPoster owns the per-instance HTTP plumbing.

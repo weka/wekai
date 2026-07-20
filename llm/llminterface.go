@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/weka/wekai-core/tools"
+	"github.com/weka/wekai/tools"
 )
 
 // APIError represents an HTTP API error with status code, allowing retry

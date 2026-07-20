@@ -8,7 +8,7 @@ package config
 import (
 	"os"
 
-	"github.com/weka/wekai-core/llm"
+	"github.com/weka/wekai/llm"
 )
 
 // ConfigStruct holds the subset of global configuration read by moved

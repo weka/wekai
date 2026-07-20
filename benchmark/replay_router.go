@@ -32,7 +32,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/weka/wekai-core/config"
+	"github.com/weka/wekai/config"
 )
 
 // ---- File schema (mirrors wekai router replay-prepare output) ----

@@ -1,4 +1,4 @@
-module github.com/weka/wekai-core
+module github.com/weka/wekai
 
 go 1.25.7
 

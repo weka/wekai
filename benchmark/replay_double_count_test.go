@@ -23,7 +23,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/weka/wekai-core/llm"
+	"github.com/weka/wekai/llm"
 )
 
 // Known server response scenario used throughout.

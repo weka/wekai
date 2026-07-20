@@ -7,7 +7,7 @@ import (
 	"os"
 
 	"github.com/jessevdk/go-flags"
-	"github.com/weka/wekai-core/cli"
+	"github.com/weka/wekai/cli"
 )
 
 // Options defines the wekai-core command structure: benchmark, router, and

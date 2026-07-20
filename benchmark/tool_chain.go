@@ -7,9 +7,9 @@ import (
 	"strings"
 
 	"github.com/sashabaranov/go-openai/jsonschema"
-	"github.com/weka/wekai-core/config"
-	"github.com/weka/wekai-core/llm"
-	"github.com/weka/wekai-core/tools"
+	"github.com/weka/wekai/config"
+	"github.com/weka/wekai/llm"
+	"github.com/weka/wekai/tools"
 )
 
 // ToolChainResult represents the result of a tool chain evaluation

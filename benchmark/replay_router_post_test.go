@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/weka/wekai-core/llm"
+	"github.com/weka/wekai/llm"
 )
 
 func TestNewReplayPoster_OpenAI(t *testing.T) {

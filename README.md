@@ -1,9 +1,9 @@
-# wekai-core
+# wekai
 
 An LLM benchmarking, HTTP-proxy/router, and capture-replay toolkit for
 Anthropic, OpenAI (Chat Completions and Responses), and Gemini-native APIs.
 
-wekai-core ships three command groups:
+wekai ships three command groups:
 
 - **benchmark** — throughput/latency benchmarking against embedded documentation,
   auto-scaling load tests, and result visualization.
@@ -13,7 +13,7 @@ wekai-core ships three command groups:
 
 It works against any endpoint reachable via a dynamic model spec
 (`dynamic/<url>,type=anthropic|openai|openai_responses|gemini_native,...`) —
-no static model registry is required. Applications that embed wekai-core can
+no static model registry is required. Applications that embed wekai can
 inject their own named-model registry via the `llm.ResolveModel` and
 `llm.LookupModelByIdentifier` hooks.
 
@@ -21,7 +21,7 @@ inject their own named-model registry via the `llm.ResolveModel` and
 
 ```
 go build -o wekai ./cmd/wekai
-# or: go install github.com/weka/wekai-core/cmd/wekai@latest
+# or: go install github.com/weka/wekai/cmd/wekai@latest
 ```
 
 ## Usage
@@ -34,13 +34,13 @@ wekai eval simple-tool --help
 
 ## Embedding
 
-Applications that embed wekai-core's command groups directly (rather than
+Applications that embed wekai's command groups directly (rather than
 running the standalone binary) have two extension points, both in `cli/`:
 
 - `cli.SetGlobalOptions(*GlobalOptions)` — for binaries that parse their own
   `cli.GlobalOptions` before calling `flags.Parse` (this is what `main.go`
   above does). go-flags mutates that struct in place, so by the time any
-  command runs, wekai-core's internal `config.Config` is already in sync.
+  command runs, wekai's internal `config.Config` is already in sync.
 - `cli.PreExecute func(ctx context.Context) error` — for applications with
   their own richer global-options type that don't construct a
   `cli.GlobalOptions` at all. Set this once; it runs at the top of every
@@ -57,7 +57,7 @@ models — otherwise only dynamic/openrouter specs resolve.
 ## Deployment
 
 `Dockerfile` builds a self-contained replay image: a golang builder stage
-compiles the `wekai` binary (module github.com/weka/wekai-core), and a second `COPY --link --from=` stage
+compiles the `wekai` binary (module github.com/weka/wekai), and a second `COPY --link --from=` stage
 embeds one router-replay JSONL artifact at `/wekai/replay.jsonl`, pulled
 from a separately-published scratch image (default
 `quay.io/weka.io/wekai:replay-<sha12>` — published by this repo's own
@@ -118,7 +118,7 @@ hardcoded in the packaged values. `helm show chart` alone tells you exactly
 which image a chart version runs.
 
 Get the concrete `<vX>` for the snippets below from the
-[releases page](https://github.com/weka/wekai-core/releases) — every release
+[releases page](https://github.com/weka/wekai/releases) — every release
 description includes these commands pre-filled with its own version.
 
 Default install — runs for the default duration (8h):
@@ -212,7 +212,7 @@ matter how many times or how concurrently the spec is resolved.
 ## Releases
 
 **Install commands for every version live on the
-[releases page](https://github.com/weka/wekai-core/releases)** — each release
+[releases page](https://github.com/weka/wekai/releases)** — each release
 description carries copy-paste `helm install`, `docker pull`, and
 `go install` snippets pinned to that exact version. Pick a release there and
 substitute its version wherever this README says `<vX>`.

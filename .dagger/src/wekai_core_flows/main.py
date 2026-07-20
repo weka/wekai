@@ -43,7 +43,7 @@ async def _publish_image(
     replay_image: str,
     version: str = "",
 ) -> tuple[str, str]:
-    """Builds and publishes the wekai-core image from this repo's own
+    """Builds and publishes the wekai image from this repo's own
     Dockerfile. Shared by `publish` and `push_helm` so there is exactly one
     build/tag/publish code path — `push_helm` awaits this to completion
     before touching the chart, which is what makes "image pushed before
@@ -116,7 +116,7 @@ class WekaiCoreFlows:
         replay_image: str = "quay.io/weka.io/wekai:replay-24e7f15ba0ea",
         version: str = "",
     ) -> str:
-        """Builds and publishes the wekai-core image from this repo's own Dockerfile.
+        """Builds and publishes the wekai image from this repo's own Dockerfile.
 
         Uses Directory.docker_build() against the existing Dockerfile at the
         repo root — the Dockerfile is the single source of truth for the
@@ -134,7 +134,7 @@ class WekaiCoreFlows:
                 release workflow). Empty = content-hash scheme.
         """
         image_name, _version = await _publish_image(source, registry, replay_image, version)
-        return f"Published wekai-core image: {image_name}"
+        return f"Published wekai image: {image_name}"
 
     @function
     async def push_helm(
@@ -147,7 +147,7 @@ class WekaiCoreFlows:
         replay_image: str = "quay.io/weka.io/wekai:replay-24e7f15ba0ea",
         version: str = "",
     ) -> str:
-        """Publishes the wekai-core image, then packages and pushes
+        """Publishes the wekai image, then packages and pushes
         chart/wekai to an OCI Helm registry with the chart's image
         reference pinned to that exact just-published image — a
         `helm install` of the pushed chart with zero further --set flags
@@ -204,7 +204,7 @@ class WekaiCoreFlows:
         ).stdout()
 
         return (
-            f"Published wekai-core image: {image_name}\n"
+            f"Published wekai image: {image_name}\n"
             f"Published Helm chart: oci://{helm_registry}/{CHART_NAME}:{version} "
             f"(pinned to image {image_name})"
         )

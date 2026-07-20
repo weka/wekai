@@ -14,7 +14,7 @@ import (
 	"strings"
 
 	"github.com/weka/go-weka-observability/instrumentation"
-	"github.com/weka/wekai-core/tools"
+	"github.com/weka/wekai/tools"
 )
 
 // GeminiLLMClient implements a simple client for Google's Gemini API with streaming support

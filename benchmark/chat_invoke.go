@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/weka/wekai-core/llm"
-	"github.com/weka/wekai-core/tools"
+	"github.com/weka/wekai/llm"
+	"github.com/weka/wekai/tools"
 )
 
 // ChatInvokeResult is the outcome of InvokeChat: the final assistant text

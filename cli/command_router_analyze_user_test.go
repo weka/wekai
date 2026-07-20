@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/weka/wekai-core/llm"
+	"github.com/weka/wekai/llm"
 )
 
 // rec builds a minimal analyzeRecord with a server-reported usage for tests.

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# wekai-core replay image: the wekai-core binary (benchmark/router/eval
+# wekai replay image: the wekai binary (benchmark/router/eval
 # command trees) plus one embedded router-replay JSONL artifact, so a
 # deployment can run `wekai benchmark auto --router-replay-file
 # /wekai/replay.jsonl ...` with no external volume or fetch step.
@@ -16,7 +16,7 @@
 # Override with --build-arg REPLAY_IMAGE=... to embed a different capture.
 ARG REPLAY_IMAGE=quay.io/weka.io/wekai:replay-24e7f15ba0ea
 
-# ---- Builder: compile the wekai-core binary ----
+# ---- Builder: compile the wekai binary ----
 FROM golang:1.25.7-alpine AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -30,9 +30,9 @@ FROM ${REPLAY_IMAGE} AS replay
 
 # ---- Runtime ----
 FROM alpine:latest
-LABEL org.opencontainers.image.title="wekai-core" \
+LABEL org.opencontainers.image.title="wekai" \
       org.opencontainers.image.description="LLM benchmarking, router/proxy, and capture-replay toolkit" \
-      org.opencontainers.image.source="https://github.com/weka/wekai-core"
+      org.opencontainers.image.source="https://github.com/weka/wekai"
 RUN apk add --no-cache ca-certificates
 # --link: each COPY becomes an independent, content-addressed layer that
 # doesn't depend on prior layer state (both destinations are plain

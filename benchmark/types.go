@@ -3,7 +3,7 @@ package benchmark
 import (
 	"time"
 
-	"github.com/weka/wekai-core/tools"
+	"github.com/weka/wekai/tools"
 )
 
 // EmbedBenchmarkRequest represents a benchmark request for a single model

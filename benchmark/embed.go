@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/weka/go-weka-observability/instrumentation"
-	"github.com/weka/wekai-core/config"
-	"github.com/weka/wekai-core/llm"
-	"github.com/weka/wekai-core/tools"
+	"github.com/weka/wekai/config"
+	"github.com/weka/wekai/llm"
+	"github.com/weka/wekai/tools"
 	"golang.org/x/sync/errgroup"
 )
 
