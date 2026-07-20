@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"regexp"
@@ -131,6 +132,18 @@ type AutoBenchmarkConfig struct {
 	DryRunOutputTPS int
 
 	CacheSimChunkBytes int // chunk size for cacheEstimator (0 = default 1024)
+
+	// RandomGateOrder: when true, the concurrencyGate wakes normal (non-cold)
+	// waiters in uniformly random order instead of strict FIFO. In the
+	// oversubscribed regime, strict FIFO enforces exact round-robin over
+	// series (each series releases its slot then re-queues behind every
+	// other waiting series) -- the adversarial worst case for GPU
+	// prefix-cache LRU, since it guarantees maximum time-between-revisits
+	// for every series. Randomizing wake order lets some series get
+	// consecutive turns while others wait longer, trading strict fairness
+	// for cache-friendlier revisit patterns. Cold-start waiters are always
+	// served first, in FIFO order, regardless of this flag.
+	RandomGateOrder bool
 }
 
 // requestDataRecord holds per-request data written to JSONL output.
@@ -578,17 +591,44 @@ func (s *completionStream) MissTTFTStats(window int) (p50, p95 time.Duration) {
 }
 
 // concurrencyGate controls max parallel in-flight requests with a mutable limit.
-// Cold-start waiters are served before normal waiters.
+// Cold-start waiters are served before normal waiters. When randomOrder is
+// set, normal waiters are woken in uniformly random order instead of FIFO
+// (see AutoBenchmarkConfig.RandomGateOrder); coldWaiters are always FIFO.
 type concurrencyGate struct {
 	mu          sync.Mutex
 	limit       int
 	active      int
-	waiters     []chan struct{} // normal FIFO waiters
-	coldWaiters []chan struct{} // cold-start priority waiters (served first)
+	randomOrder bool
+	waiters     []chan struct{} // normal waiters; FIFO unless randomOrder
+	coldWaiters []chan struct{} // cold-start priority waiters (always FIFO, served first)
 }
 
-func newConcurrencyGate(limit int) *concurrencyGate {
-	return &concurrencyGate{limit: limit}
+func newConcurrencyGate(limit int, randomOrder bool) *concurrencyGate {
+	return &concurrencyGate{limit: limit, randomOrder: randomOrder}
+}
+
+// popNormalWaiter removes and returns the next normal waiter to serve, or nil
+// if g.waiters is empty. Caller must hold g.mu. FIFO (index 0) by default;
+// with randomOrder set, picks a uniformly random index and swap-removes it
+// (O(1), reorders the slice but every element is still served exactly once).
+// Uniform random selection is statistically starvation-free: every waiting
+// series has the same 1/n chance on each release regardless of queue
+// position or how long it has already waited.
+func (g *concurrencyGate) popNormalWaiter() chan struct{} {
+	n := len(g.waiters)
+	if n == 0 {
+		return nil
+	}
+	if !g.randomOrder {
+		w := g.waiters[0]
+		g.waiters = g.waiters[1:]
+		return w
+	}
+	i := rand.IntN(n)
+	w := g.waiters[i]
+	g.waiters[i] = g.waiters[n-1]
+	g.waiters = g.waiters[:n-1]
+	return w
 }
 
 // AcquireCold blocks until a slot is available, with priority over normal Acquire calls.
@@ -659,9 +699,7 @@ func (g *concurrencyGate) Release() {
 		w <- struct{}{}
 		return
 	}
-	if len(g.waiters) > 0 {
-		w := g.waiters[0]
-		g.waiters = g.waiters[1:]
+	if w := g.popNormalWaiter(); w != nil {
 		w <- struct{}{}
 		return
 	}
@@ -681,9 +719,7 @@ func (g *concurrencyGate) SetLimit(newLimit int) {
 			g.active++
 			continue
 		}
-		if len(g.waiters) > 0 {
-			w := g.waiters[0]
-			g.waiters = g.waiters[1:]
+		if w := g.popNormalWaiter(); w != nil {
 			w <- struct{}{}
 			g.active++
 			continue
@@ -1404,10 +1440,10 @@ func runSingleModelBenchmark(
 		seriesEvalAfter:   int64(cfg.MinEvalRequests),
 		lastEvalRPS:       0,
 		stream:            newCompletionStream(initMaxKeep),
-		gate:              newConcurrencyGate(initConc),
+		gate:              newConcurrencyGate(initConc, cfg.RandomGateOrder),
 	}
 	if cfg.HotSeriesConcurrency > 0 {
-		st.hotGate = newConcurrencyGate(cfg.HotSeriesConcurrency * hotGateFanoutMultiplier)
+		st.hotGate = newConcurrencyGate(cfg.HotSeriesConcurrency*hotGateFanoutMultiplier, cfg.RandomGateOrder)
 	}
 
 	// Single unconditional content-level estimator for all modes (synthetic/step/replay).

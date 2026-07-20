@@ -276,6 +276,7 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		DryRunWarmTPS:              c.DryRunWarmTPS,
 		DryRunOutputTPS:            c.DryRunOutputTPS,
 		CacheSimChunkBytes:         c.CacheSimChunkBytes,
+		RandomGateOrder:            c.RandomGateOrder,
 	}
 
 	if c.FromDataset != "" && c.RouterReplayFile != "" {
