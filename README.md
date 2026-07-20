@@ -184,6 +184,14 @@ concurrent benchmark run would re-probe the endpoint on every single
 request. The underlying network probe(s) fire exactly once per endpoint no
 matter how many times or how concurrently the spec is resolved.
 
+## Releases
+
+Pushes to `main` cut releases automatically (`.github/workflows/release.yml`):
+the next semver is derived from Conventional Commits (mandatory — see
+CLAUDE.md), the image and chart are published under that `vX.Y.Z` (overriding
+the local content-hash scheme below), and a GitHub Release is created with
+install instructions for that exact version.
+
 ## CI / Publishing
 
 Publishing is a self-contained Dagger module (Python SDK, engine pinned to

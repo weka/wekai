@@ -41,6 +41,7 @@ async def _publish_image(
     source: dagger.Directory,
     registry: str,
     replay_image: str,
+    version: str = "",
 ) -> tuple[str, str]:
     """Builds and publishes the wekai-core image from this repo's own
     Dockerfile. Shared by `publish` and `push_helm` so there is exactly one
@@ -49,8 +50,12 @@ async def _publish_image(
     chart push" hold by construction rather than by convention.
 
     Returns (image_name, version).
+
+    version: explicit version stamp (e.g. a semver tag from CI); when empty,
+    falls back to the content-hash scheme (_calc_version's v999.0.0-<sha12>).
     """
-    version = await _calc_version(source)
+    if not version:
+        version = await _calc_version(source)
     container = source.docker_build(
         platform=LINUX_AMD64,
         build_args=[BuildArg(name="REPLAY_IMAGE", value=replay_image)],
@@ -109,6 +114,7 @@ class WekaiCoreFlows:
         source: Annotated[dagger.Directory, Ignore(SOURCE_IGNORE)],
         registry: str = "quay.io/weka.io/wekai-core",
         replay_image: str = "quay.io/weka.io/wekai-benchmark:replay-24e7f15ba0ea",
+        version: str = "",
     ) -> str:
         """Builds and publishes the wekai-core image from this repo's own Dockerfile.
 
@@ -116,15 +122,18 @@ class WekaiCoreFlows:
         repo root — the Dockerfile is the single source of truth for the
         build; this function does not reimplement its steps. Tagged with
         the same version stamp scheme wekai uses (_calc_version:
-        v999.0.0-<sha12> of the source directory's digest).
+        v999.0.0-<sha12> of the source directory's digest) unless an
+        explicit version is given.
 
         Args:
             registry: Target image registry:repo (tag is appended).
             replay_image: Passed through to the Dockerfile's REPLAY_IMAGE
                 build-arg, so a different embedded replay capture can be
                 selected without editing the Dockerfile.
+            version: Explicit version stamp (e.g. a semver tag from the
+                release workflow). Empty = content-hash scheme.
         """
-        image_name, _version = await _publish_image(source, registry, replay_image)
+        image_name, _version = await _publish_image(source, registry, replay_image, version)
         return f"Published wekai-core image: {image_name}"
 
     @function
@@ -136,6 +145,7 @@ class WekaiCoreFlows:
         registry: str = "quay.io/weka.io/wekai-core",
         helm_registry: str = "quay.io/weka.io/helm",
         replay_image: str = "quay.io/weka.io/wekai-benchmark:replay-24e7f15ba0ea",
+        version: str = "",
     ) -> str:
         """Publishes the wekai-core image, then packages and pushes
         chart/wekai-core to an OCI Helm registry with the chart's image
@@ -157,8 +167,11 @@ class WekaiCoreFlows:
                 (matches wekai's retired chart-push flow's default).
             replay_image: Passed through to the Dockerfile's REPLAY_IMAGE
                 build-arg.
+            version: Explicit version stamp for BOTH the image tag and the
+                chart version/appVersion (e.g. a semver tag from the release
+                workflow). Empty = content-hash scheme (v999.0.0-<sha12>).
         """
-        image_name, version = await _publish_image(source, registry, replay_image)
+        image_name, version = await _publish_image(source, registry, replay_image, version)
 
         chart = source.directory(CHART_DIR)
         registry_host = helm_registry.split("/")[0]  # e.g. "quay.io"
