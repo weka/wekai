@@ -131,7 +131,7 @@ helm install my-replay oci://quay.io/weka.io/helm/wekai-core --version <vX> \
   --set duration=3m
 ```
 
-Private registry — `quay.io/weka.io/wekai-core` requires auth to pull; create
+Private registry — `quay.io/weka.io/wekai` requires auth to pull; create
 a `kubernetes.io/dockerconfigjson` secret once and reference it via
 `imagePullSecrets`:
 
@@ -212,7 +212,7 @@ Three functions:
   (the Dockerfile is the single source of truth — the module does not
   reimplement its steps), tags with `v999.0.0-<sha12>` (sha12 of the
   source directory's content digest, same scheme wekai uses), and
-  publishes to `quay.io/weka.io/wekai-core` by default. The Dockerfile's
+  publishes to `quay.io/weka.io/wekai` by default. The Dockerfile's
   `REPLAY_IMAGE` build-arg is exposed as a `--replay-image` function param.
 - `push-helm` — first runs the exact same image build+publish as `publish`
   (shared internal helper, not a separate code path), then packages

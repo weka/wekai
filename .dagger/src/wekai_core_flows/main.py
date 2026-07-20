@@ -112,7 +112,7 @@ class WekaiCoreFlows:
     async def publish(
         self,
         source: Annotated[dagger.Directory, Ignore(SOURCE_IGNORE)],
-        registry: str = "quay.io/weka.io/wekai-core",
+        registry: str = "quay.io/weka.io/wekai",
         replay_image: str = "quay.io/weka.io/wekai-benchmark:replay-24e7f15ba0ea",
         version: str = "",
     ) -> str:
@@ -142,7 +142,7 @@ class WekaiCoreFlows:
         source: Annotated[dagger.Directory, Ignore(SOURCE_IGNORE)],
         helm_username: dagger.Secret,
         helm_password: dagger.Secret,
-        registry: str = "quay.io/weka.io/wekai-core",
+        registry: str = "quay.io/weka.io/wekai",
         helm_registry: str = "quay.io/weka.io/helm",
         replay_image: str = "quay.io/weka.io/wekai-benchmark:replay-24e7f15ba0ea",
         version: str = "",

@@ -1,4 +1,4 @@
-imageRepository: quay.io/weka.io/wekai-core
+imageRepository: quay.io/weka.io/wekai
 imageTag: ""  # defaults to .Chart.AppVersion
 # Pull secrets for private registries, e.g.:
 #   imagePullSecrets:

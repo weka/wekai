@@ -91,7 +91,7 @@ jobs:
             Container image:
 
             ```
-            docker pull quay.io/weka.io/wekai-core:${{ steps.semver.outputs.new_tag }}
+            docker pull quay.io/weka.io/wekai:${{ steps.semver.outputs.new_tag }}
             ```
 
             CLI (binary is named `wekai`):
