@@ -43,6 +43,9 @@ spec:
                 {{- if .Values.replay.replaySeries }}
                 --replay-series={{ .Values.replay.replaySeries | int64 }} \
                 {{- end }}
+                {{- if .Values.replay.series }}
+                --series={{ .Values.replay.series | int64 }} \
+                {{- end }}
                 {{- if .Values.replay.replayNoStamp }}
                 --replay-no-stamp \
                 {{- end }}

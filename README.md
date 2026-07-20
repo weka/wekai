@@ -85,8 +85,8 @@ auto-generated `report.html` visualization are always written under
 `storeResults=true` to back that path with a PVC instead of a pod-local
 emptyDir. The chart is deliberately minimal: the only value most installs
 need to set is `endpoint`, the target model server; everything else has a
-working default (256 replayed sessions at fixed concurrency 28 with a
-4-worker hot pool).
+working default (all sessions replayed by 256 parallel series workers at
+fixed concurrency 28 with a 4-worker hot pool).
 
 | Value | Default | Purpose |
 |---|---|---|
@@ -95,7 +95,8 @@ working default (256 replayed sessions at fixed concurrency 28 with a
 | `duration` | `8h` | Benchmark run length (maps to `--timeout`); e.g. `3m` for smoke tests |
 | `imageRepository` / `imageTag` | `quay.io/weka.io/wekai` / `""` | Image; tag defaults to the chart's `appVersion` (see "Releases") |
 | `imagePullSecrets` | `[]` | Pull secrets for the private quay repo |
-| `replay.replaySeries` | `256` | Cap on replayed sessions (0 = all 5k+ in the embedded file) |
+| `replay.replaySeries` | `0` | Subset cap on which sessions get replayed (0 = all 5k+ in the embedded file) |
+| `replay.series` | `256` | Parallel series workers replaying sessions (`--series`) |
 | `replay.replayRoles` | `""` | Comma-separated instance roles to replay (empty = all) |
 | `replay.concurrency` | `28` | Fixed concurrency (0 = auto hill-climber) |
 | `replay.hotConcurrency` | `4` | Hot-pool workers with a dedicated gate (`--hot-series-concurrency`; 0 = off) |

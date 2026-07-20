@@ -33,7 +33,8 @@ duration: "8h"
 replay:
   replayFile: /wekai/replay.jsonl  # path baked into the image by the Dockerfile
   replayRoles: ""          # comma-separated instance roles to replay (empty = all)
-  replaySeries: 256        # cap on sessions replayed (0 = all in the file)
+  replaySeries: 0          # cap on sessions replayed — subset selection (0 = all in the file)
+  series: 256              # parallel series workers replaying sessions (--series; 0 = binary default ramp)
   replayNoStamp: false     # disable per-run cache-busting stamp (bitwise-faithful replay)
   maxOutputTokens: 0       # override max output tokens per request (0 = use replay-file's own budgets)
   concurrency: 28          # fixed concurrency (0 = auto hill-climber)
