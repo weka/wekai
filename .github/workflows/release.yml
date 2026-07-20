@@ -48,6 +48,17 @@ jobs:
         if: steps.semver.outputs.new_tag == ''
         run: echo "No feat/fix/BREAKING commits since ${{ steps.semver.outputs.previous_tag }} — skipping release."
 
+      - name: Free runner disk space
+        if: steps.semver.outputs.new_tag != ''
+        # The image embeds a ~9.5 GB (uncompressed) replay layer; assembling
+        # and exporting it inside the dagger engine exceeds the runner's
+        # default free disk. Dropping preinstalled toolchains frees ~25-30 GB.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null
+          df -h /
+
       - name: Log in to quay.io
         if: steps.semver.outputs.new_tag != ''
         run: echo "${{ secrets.QUAY_PASSWORD }}" | docker login quay.io -u "${{ secrets.QUAY_USERNAME }}" --password-stdin
