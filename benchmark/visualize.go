@@ -147,7 +147,8 @@ func readJSONLFile(path string) ([]requestDataRecord, error) {
 	defer f.Close()
 	var records []requestDataRecord
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	// 64 MiB cap: reqdata rows embed full prompts; 300k-token contexts exceed 1 MiB.
+	sc.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
 	for sc.Scan() {
 		var r requestDataRecord
 		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
