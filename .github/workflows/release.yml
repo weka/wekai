@@ -74,6 +74,21 @@ jobs:
           curl -fsSL https://dl.dagger.io/dagger/install.sh | DAGGER_VERSION=0.19.10 sh
           dagger version
 
+      - name: Build release binaries
+        if: steps.semver.outputs.new_tag != ''
+        # linux amd64+arm64, macOS arm64 (Apple Silicon) only.
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.semver.outputs.new_tag }}"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/arm64; do
+            export GOOS="${target%/*}" GOARCH="${target#*/}"
+            out="dist/wekai_${GOOS}_${GOARCH}"
+            CGO_ENABLED=0 go build -trimpath -o "${out}/wekai" .
+            tar -czf "dist/wekai_${VERSION}_${GOOS}_${GOARCH}.tar.gz" -C "${out}" wekai
+          done
+          ls -lh dist/*.tar.gz
+
       - name: Publish image + chart under semver (dagger push-helm)
         if: steps.semver.outputs.new_tag != ''
         env:
@@ -92,8 +107,16 @@ jobs:
         with:
           tag_name: ${{ steps.semver.outputs.new_tag }}
           generate_release_notes: true
+          files: dist/*.tar.gz
           body: |
             ## Install
+
+            Prebuilt binaries (linux amd64/arm64, macOS Apple Silicon) are
+            attached below, e.g.:
+
+            ```
+            curl -fsSL https://github.com/weka/wekai/releases/download/${{ steps.semver.outputs.new_tag }}/wekai_${{ steps.semver.outputs.new_tag }}_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz | tar -xz
+            ```
 
             Helm (replay benchmark against your endpoint — see README for all values):
 
