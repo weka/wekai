@@ -12,7 +12,7 @@ tasks:
   build:
     desc: "Build the wekai binary locally (module github.com/weka/wekai)"
     cmds:
-      - go build -o wekai ./cmd/wekai
+      - go build -o wekai .
 
   test:
     desc: "Run all tests"

@@ -20,8 +20,8 @@ inject their own named-model registry via the `llm.ResolveModel` and
 ## Build
 
 ```
-go build -o wekai ./cmd/wekai
-# or: go install github.com/weka/wekai/cmd/wekai@latest
+go build -o wekai .
+# or: go install github.com/weka/wekai@latest
 ```
 
 ## Usage

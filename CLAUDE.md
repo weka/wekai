@@ -32,7 +32,7 @@ Scope is optional but encouraged: `feat(llm): ...`, `fix(chart): ...`,
 
 ## Build & Test
 
-- Binary is named `wekai` (main package: `cmd/wekai/`); module stays
+- Binary is named `wekai` (main package at the repo root, so plain `go install github.com/weka/wekai@<vX>` works); module stays
   `github.com/weka/wekai`. `task build`, `task test`, `task docker:build`.
 - Publishing: `task replay:push` / `task app:push` / `task helm:push`
   (Dagger module in `.dagger/`; `helm:push` publishes the image first by
