@@ -32,6 +32,67 @@ wekai router serve --help
 wekai eval simple-tool --help
 ```
 
+## Cache coherency eval
+
+`wekai eval coherency` verifies that an inference server's prefix/KV cache
+returns *correct* bytes, not just *fast* ones. Each series gets a large
+garbage-padded system prompt (~213k characters by default) with a list of
+unique UUID stamps scattered through it; the model's only job is to echo
+back exactly its own comma-joined UUID list. Any deviation is evidence of
+cache corruption, not model weakness.
+
+Canonical run:
+
+```
+wekai eval coherency \
+  --model dynamic/http://YOUR-LLM-HOST:8000,type=openai_vllm \
+  --series 256 --shared-prefix-per-series 4 --abort-fraction 0.1
+```
+
+**Cycles: every series is sent twice.** With `--total` unset the default is
+`2 × series` requests — e.g. `--series 128` issues 256 requests total:
+cycle 1 sends each of the 128 unique prompts cold (full prefill), cycle 2
+re-sends the identical prompts so they should be served from cache. The
+report prints **mean cold TTFT (cycle 1)** vs **mean warm TTFT (cycle 2)**
+and an implicit cache hit rate (a cycle-2 request counts as a hit when its
+TTFT is ≤ 50% of the cycle-1 mean) — so you see in one run both that the
+cache *works* (warm ≪ cold) and that it's *coherent* (the checks below).
+
+**What the coherency report means.** Two pass/fail tests plus a failure
+breakdown:
+
+- `UUID_MISSING_FLAKY` — an expected UUID is absent from the response
+  ("missing"): the model never saw or lost part of its own prompt —
+  typically truncated/corrupted prefill or a cache block served from the
+  wrong content.
+- `CROSS_CONTAMINATION` — a UUID belonging to a *different* series appears
+  in the response: a KV/scheduling leak where one request was served
+  another request's cached blocks. This is the worst failure class.
+- `NOT_EXACT` — all UUIDs correct but extra prose/whitespace around them
+  (output conformity, per request).
+- `ERROR` — request failed outright.
+
+**Shared cache (`--shared-prefix-per-series 4`).** By default every series
+is fully unique, so series never touch each other's cache entries — which
+means cross-series reuse is never exercised. With cohorts of 4, each group
+of 4 series shares one byte-identical leading garbage prefix, so peers
+concurrently co-hit the same prefix-cache blocks — exactly the cross-series
+sharing a production cache does. Each series' unique UUID stamps still
+trail the shared prefix, so contamination detection remains valid and
+per-series.
+
+**Adversarial aborts (`--abort-fraction 0.1`).** 10% of requests are
+canceled mid-flight (connection closed while the server is mid-prefill or
+mid-KV-load), simulating client disconnects — the abort-during-load path
+where cache pinning bugs hide. Aborted requests create the corruption
+*opportunity* and are excluded from scoring; only their count is reported.
+
+Related knobs: `--concurrency` (max in-flight requests, default 1 — raise
+it to create real cache contention), `--garbage-characters`, `--seed` for
+reproducible prompts, `--reset-every-n` to inject vLLM dev-mode
+`reset_prefix_cache` calls mid-run, and `--total` to override the 2-cycle
+default. See `wekai eval coherency --help`.
+
 ## Embedding
 
 Applications that embed wekai's command groups directly (rather than
