@@ -87,16 +87,26 @@ else (`replay.replaySeries`, `replay.concurrency`, `replay.maxConcurrency`,
 has a working default. See `chart/wekai-core/values.yaml` for the full list,
 or `helm show values chart/wekai-core`.
 
+Charts are published to `oci://quay.io/weka.io/helm/wekai-core`. The chart
+`--version` is mandatory (versions are `v999.0.0-<sha12>` prerelease stamps,
+so Helm never auto-picks a "latest") and it pins the image purely by
+propagation: `push-helm` stamps `Chart.yaml`'s `version`/`appVersion` in
+lockstep with the image it just pushed, and the deployment template resolves
+the image tag via `imageTag | default .Chart.AppVersion` — no version is
+hardcoded in the packaged values. `helm show chart` alone tells you exactly
+which image a chart version runs.
+
 Default install — runs for the default duration (8h):
 
 ```
-helm install my-replay chart/wekai-core --set endpoint=http://10.71.0.4:8000
+helm install my-replay oci://quay.io/weka.io/helm/wekai-core \
+  --version <vX> --set endpoint=http://10.71.0.4:8000
 ```
 
 Smoke test — shorten `duration` (maps to `--timeout`), e.g. 3 minutes:
 
 ```
-helm install my-replay chart/wekai-core \
+helm install my-replay oci://quay.io/weka.io/helm/wekai-core --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
   --set duration=3m
 ```
@@ -105,7 +115,7 @@ Explicit model override — by default the model id is autodiscovered (see
 "Bare-URL model selector" below); set `model` to skip discovery:
 
 ```
-helm install my-replay chart/wekai-core \
+helm install my-replay oci://quay.io/weka.io/helm/wekai-core --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
   --set model=nvidia/Kimi-K2.6-NVFP4
 ```
@@ -116,7 +126,7 @@ target an Anthropic-shaped server, append `,type=anthropic`. Because Helm's
 with a values file instead:
 
 ```
-helm install my-replay chart/wekai-core \
+helm install my-replay oci://quay.io/weka.io/helm/wekai-core --version <vX> \
   --set-string endpoint='http://10.71.0.4:8000\,type=anthropic' \
   --set duration=3m
 ```
@@ -130,10 +140,14 @@ kubectl create secret docker-registry quay-pull \
   --docker-server=quay.io \
   --docker-username=<user> --docker-password=<token>
 
-helm install my-replay chart/wekai-core \
+helm install my-replay oci://quay.io/weka.io/helm/wekai-core --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
   --set 'imagePullSecrets[0].name=quay-pull'
 ```
+
+For local development installs from the chart directory, pass the image tag
+explicitly (the in-tree `Chart.yaml` carries a placeholder `appVersion`):
+`helm install my-replay chart/wekai-core --set imageTag=<vX> --set endpoint=...`
 
 ```
 helm lint chart/wekai-core
@@ -195,11 +209,15 @@ Three functions:
 - `push-helm` — first runs the exact same image build+publish as `publish`
   (shared internal helper, not a separate code path), then packages
   `chart/wekai-core` and pushes it to an OCI Helm registry
-  (`quay.io/weka.io/helm` by default), with the chart's `values.yaml`
-  `imageRepository`/`imageTag` and `Chart.yaml` `version`/`appVersion`
-  rewritten to point at the image that publish step just pushed. A
-  `helm install` of that chart with zero further `--set` flags always
-  deploys the exact image it was packaged with. Because the image publish
+  (`quay.io/weka.io/helm` by default). Version pinning is pure propagation
+  (same pattern as wekai's `push_restricted` charts): only `Chart.yaml`'s
+  `version`/`appVersion` are stamped — in lockstep with the image the
+  publish step just pushed — and the deployment template resolves the image
+  tag via `imageTag | default .Chart.AppVersion`; the packaged `values.yaml`
+  carries no hardcoded version (`imageTag` stays `""`, and only
+  `imageRepository` is synced to the actual push registry). A `helm install`
+  of a chart version with zero further `--set` flags always deploys the
+  exact image published under that same version. Because the image publish
   is `await`-ed before any chart packaging happens, "image pushed before
   chart push" holds by construction, not by convention. Takes
   `helm-username`/`helm-password` as Dagger secrets.

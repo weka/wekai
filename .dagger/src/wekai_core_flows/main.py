@@ -168,10 +168,16 @@ class WekaiCoreFlows:
             .from_("alpine:latest")
             .with_exec(["apk", "add", "--no-cache", "helm"])
             .with_directory("/chart", chart)
+            # Version pinning is pure propagation (same pattern as wekai's
+            # push_restricted): only Chart.yaml is stamped, and the deployment
+            # template resolves the image tag via `imageTag | default
+            # .Chart.AppVersion`. values.yaml imageTag stays "" — no hardcoded
+            # version in the packaged chart. imageRepository IS synced to the
+            # actual push destination so a custom registry never yields a
+            # chart pointing at the default repo.
             .with_exec(["sed", "-i", f"s/^version:.*/version: {version}/", "/chart/Chart.yaml"])
             .with_exec(["sed", "-i", f's/^appVersion:.*/appVersion: "{version}"/', "/chart/Chart.yaml"])
             .with_exec(["sed", "-i", f"s|^imageRepository:.*|imageRepository: {registry}|", "/chart/values.yaml"])
-            .with_exec(["sed", "-i", f's|^imageTag:.*|imageTag: "{version}"|', "/chart/values.yaml"])
             .with_exec(["helm", "package", "/chart", "--destination", "/out"])
         )
 
