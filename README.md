@@ -32,6 +32,66 @@ wekai router serve --help
 wekai eval simple-tool --help
 ```
 
+## Replay benchmark
+
+`wekai benchmark auto --router-replay-file` replays previously captured
+agentic traffic against a target endpoint — the same run mode the Helm
+chart below wraps. Canonical run (the chart's exact defaults, expressed as
+flags):
+
+```
+wekai benchmark auto \
+  --router-replay-file replay.jsonl \
+  --models http://YOUR-LLM-HOST:8000 \
+  --series 256 --concurrency 28 --hot-series-concurrency 4 \
+  --timeout 8h \
+  --save-request-data ./results
+```
+
+**Where the replay file comes from.** `wekai router serve` proxies live
+LLM traffic and captures it (redacted); `wekai router replay-prepare`
+compiles those captures into a single replay-v3 JSONL file — one header
+line plus one session per line, so the replayer streams it with a bounded
+queue regardless of file size. Each request embeds the original structured
+spec (system blocks, tools, messages) with content regenerated
+deterministically from each block's hash: same hash → same bytes → the
+server's prefix cache hits exactly the way the original traffic did,
+without shipping any real captured text.
+
+**What "replay" preserves.** This is not a request firehose — it re-enacts
+each captured session as a tree: per-session series boundaries, sequential
+turn order per agent instance, parent→child sequencing (a sub-agent starts
+only after its parent's spawning request completes), sibling fan-out
+concurrency (K spawned agents run in parallel), and per-request
+input/output token budgets. Prefix growth and sub-agent bursts therefore
+hit the endpoint's KV/prefix cache with the same shape as real agentic
+load.
+
+**The knobs, and how they differ:**
+
+- `--series 256` — how many parallel workers replay sessions; each worker
+  pulls the next session from the stream and runs its full tree to
+  completion. Not to be confused with…
+- `--replay-series N` — a *subset cap* on which sessions get replayed at
+  all (0/omitted = every session in the file).
+- `--concurrency 28` — the gate on simultaneously in-flight HTTP requests.
+  During fan-out moments a session tree can want more slots than its one
+  worker; the gate queues the surplus, absorbing bursts.
+- `--hot-series-concurrency 4` — carves 4 of the workers into a "hot" pool
+  with its own dedicated gate, so a few sessions issue back-to-back
+  requests at full speed while the rest share the main gate — a
+  foreground-agents-plus-background-fleet traffic mix.
+- By default each run injects a per-run `<ignore>RUN_GUID</ignore>` stamp
+  ahead of every prompt, so a rerun starts against a pristine prefix cache
+  while within-run cross-session cache hits still occur;
+  `--replay-no-stamp` disables it for bitwise-faithful replay.
+
+**Results.** `--save-request-data` writes per-request JSONL under
+`./results/<run-timestamp>/` and auto-generates an interactive
+`report.html` scatter-plot (TTFT / response time / cache hits over time)
+there at the end of the run. Regenerate or combine runs later with
+`wekai benchmark visualize <dir>` and `wekai benchmark visualize-merge`.
+
 ## Cache coherency eval
 
 `wekai eval coherency` verifies that an inference server's prefix/KV cache
