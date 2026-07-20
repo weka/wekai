@@ -410,7 +410,17 @@ func (c *BenchmarkVisualizeMergeCommand) Execute(args []string) error {
 		}
 	}
 
-	htmlPath, err := benchmark.GenerateVisualizationMerged(dirs, c.Output, c.Concurrency)
+	var labels []string
+	if c.Labels != "" {
+		for _, l := range strings.Split(c.Labels, ",") {
+			labels = append(labels, strings.TrimSpace(l))
+		}
+		if len(labels) != len(dirs) {
+			return fmt.Errorf("--labels count (%d) does not match directory count (%d)", len(labels), len(dirs))
+		}
+	}
+
+	htmlPath, err := benchmark.GenerateVisualizationMerged(dirs, labels, c.Output, c.Concurrency)
 	if err != nil {
 		return fmt.Errorf("generate merged visualization: %w", err)
 	}

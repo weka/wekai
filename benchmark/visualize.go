@@ -46,6 +46,12 @@ func GenerateVisualization(dir string, concurrency int) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("read %s: %w", f, err)
 		}
+		// Prefer the clean model alias (e.g. "DS3H_weka-64r8w") over the raw
+		// sanitized filename (e.g. "dynamic_http___..._alias_DS3H_weka-64r8w")
+		// when the file's records unambiguously identify one model.
+		if alias := resolveRecordsAlias(records); alias != "" {
+			name = alias
+		}
 		var vr []vizRecord
 		for _, r := range records {
 			vr = append(vr, vizRecord{
@@ -85,6 +91,25 @@ func GenerateVisualization(dir string, concurrency int) (string, error) {
 		return "", fmt.Errorf("execute template: %w", err)
 	}
 	return htmlPath, nil
+}
+
+// resolveRecordsAlias returns the single distinct model display alias found
+// across records (via GetModelDisplayName, which parses "alias=..." out of a
+// dynamic model spec), or "" when records is empty or spans more than one
+// distinct alias (ambiguous — caller should fall back to another label).
+func resolveRecordsAlias(records []requestDataRecord) string {
+	aliases := map[string]bool{}
+	for _, r := range records {
+		if a := GetModelDisplayName(r.Model); a != "" {
+			aliases[a] = true
+		}
+	}
+	if len(aliases) == 1 {
+		for a := range aliases {
+			return a
+		}
+	}
+	return ""
 }
 
 func readJSONLFile(path string) ([]requestDataRecord, error) {

@@ -93,6 +93,7 @@ type BenchmarkVisualizeMergeOptions struct {
 	All         bool   `long:"all" description:"Treat the first argument as a parent directory and include all subdirectories"`
 	Output      string `long:"output" short:"o" description:"Output directory for merged results (default: auto-generated next to input)"`
 	Concurrency int    `long:"concurrency" description:"Concurrency used during benchmark (for moving average window size = concurrency*3)" default:"0"`
+	Labels      string `long:"labels" description:"Comma-separated labels for each input directory, in positional order (overrides auto-detected model aliases / directory names). Count must exactly match the number of directories (post --all expansion)."`
 	Args        struct {
 		Dirs []string `positional-arg-name:"directories" description:"Directories containing .jsonl request data files"`
 	} `positional-args:"yes"`
