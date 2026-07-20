@@ -3,9 +3,9 @@ version: "3"
 vars:
   IMAGE: wekai-core
   TAG: '{{.TAG | default "dev"}}'
-  REPLAY_IMAGE: '{{.REPLAY_IMAGE | default "quay.io/weka.io/wekai-benchmark:replay-24e7f15ba0ea"}}'
+  REPLAY_IMAGE: '{{.REPLAY_IMAGE | default "quay.io/weka.io/wekai:replay-24e7f15ba0ea"}}'
   REGISTRY: '{{.REGISTRY | default "quay.io/weka.io/wekai"}}'
-  REPLAY_REGISTRY: '{{.REPLAY_REGISTRY | default "quay.io/weka.io/wekai-benchmark"}}'
+  REPLAY_REGISTRY: '{{.REPLAY_REGISTRY | default "quay.io/weka.io/wekai"}}'
   HELM_REGISTRY: '{{.HELM_REGISTRY | default "quay.io/weka.io/helm"}}'
 
 tasks:
@@ -29,7 +29,7 @@ tasks:
         .
 
   replay:push:
-    desc: "Push a replay JSONL as a layer image (replay-<hash>) under the wekai-benchmark repo (dagger call push-replay). Override REPLAY_REGISTRY=... as needed."
+    desc: "Push a replay JSONL as a layer image (tag replay-<hash>) into the wekai quay repo (dagger call push-replay). Override REPLAY_REGISTRY=... as needed."
     requires:
       vars: [REPLAY]
     cmds:
@@ -48,7 +48,7 @@ tasks:
         --replay-image="{{.REPLAY_IMAGE}}"
 
   helm:push:
-    desc: "Publish the wekai-core image, then package+push chart/wekai-core pinned to it (dagger call push-helm). Override REGISTRY=..., HELM_REGISTRY=..., and REPLAY_IMAGE=... as needed."
+    desc: "Publish the wekai image, then package+push chart/wekai pinned to it (dagger call push-helm). Override REGISTRY=..., HELM_REGISTRY=..., and REPLAY_IMAGE=... as needed."
     cmds:
       - >-
         dagger call push-helm

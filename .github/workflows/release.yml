@@ -83,7 +83,7 @@ jobs:
             Helm (replay benchmark against your endpoint — see README for all values):
 
             ```
-            helm install my-replay oci://quay.io/weka.io/helm/wekai-core \
+            helm install my-replay oci://quay.io/weka.io/helm/wekai \
               --version ${{ steps.semver.outputs.new_tag }} \
               --set endpoint=http://YOUR-LLM-HOST:8000
             ```

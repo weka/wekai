@@ -60,10 +60,9 @@ models — otherwise only dynamic/openrouter specs resolve.
 compiles the `wekai` binary (module github.com/weka/wekai-core), and a second `COPY --link --from=` stage
 embeds one router-replay JSONL artifact at `/wekai/replay.jsonl`, pulled
 from a separately-published scratch image (default
-`quay.io/weka.io/wekai-benchmark:replay-<sha12>` — published by this repo's
-own `task replay:push`, see "CI / Publishing" below; the `wekai-benchmark`
-repo name there is historical, where replay artifacts have always lived —
-nothing built from this Dockerfile uses "benchmark" in its own name). Both
+`quay.io/weka.io/wekai:replay-<sha12>` — published by this repo's own
+`task replay:push`, see "CI / Publishing" below; replay artifacts and the
+app image share the wekai quay repo, distinguished by the replay- tag prefix). Both
 runtime-stage `COPY`s use BuildKit's `--link` — each becomes an
 independent, content-addressed layer, so a rebuild triggered by a Go source
 change (which busts the builder stage) does not recopy or reupload the
@@ -75,7 +74,7 @@ re-uploading it. Build locally with:
 task docker:build   # override REPLAY_IMAGE=... to embed a different capture
 ```
 
-`chart/wekai-core/` is a run-once Helm chart (`; sleep infinity` after the
+`chart/wekai/` is a run-once Helm chart (`; sleep infinity` after the
 command, same pattern as wekai's retired `chart/benchmark`) that runs the
 embedded replay directly — no other run mode is supported. The container
 command is `wekai benchmark auto --router-replay-file
@@ -84,10 +83,10 @@ most installs need to set is `endpoint`, the target model server. Everything
 else (`replay.replaySeries`, `replay.concurrency`, `replay.maxConcurrency`,
 `replay.dryRun` + dry-run TPS knobs, per-request timeout, an optional
 `llmApiKeySecretName` envFrom secret, `storeResults` PVC persistence, ...)
-has a working default. See `chart/wekai-core/values.yaml` for the full list,
-or `helm show values chart/wekai-core`.
+has a working default. See `chart/wekai/values.yaml` for the full list,
+or `helm show values chart/wekai`.
 
-Charts are published to `oci://quay.io/weka.io/helm/wekai-core`. The chart
+Charts are published to `oci://quay.io/weka.io/helm/wekai`. The chart
 `--version` is mandatory (versions are `v999.0.0-<sha12>` prerelease stamps,
 so Helm never auto-picks a "latest") and it pins the image purely by
 propagation: `push-helm` stamps `Chart.yaml`'s `version`/`appVersion` in
@@ -99,14 +98,14 @@ which image a chart version runs.
 Default install — runs for the default duration (8h):
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai-core \
+helm install my-replay oci://quay.io/weka.io/helm/wekai \
   --version <vX> --set endpoint=http://10.71.0.4:8000
 ```
 
 Smoke test — shorten `duration` (maps to `--timeout`), e.g. 3 minutes:
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai-core --version <vX> \
+helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
   --set duration=3m
 ```
@@ -115,7 +114,7 @@ Explicit model override — by default the model id is autodiscovered (see
 "Bare-URL model selector" below); set `model` to skip discovery:
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai-core --version <vX> \
+helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
   --set model=nvidia/Kimi-K2.6-NVFP4
 ```
@@ -126,7 +125,7 @@ target an Anthropic-shaped server, append `,type=anthropic`. Because Helm's
 with a values file instead:
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai-core --version <vX> \
+helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set-string endpoint='http://10.71.0.4:8000\,type=anthropic' \
   --set duration=3m
 ```
@@ -140,18 +139,18 @@ kubectl create secret docker-registry quay-pull \
   --docker-server=quay.io \
   --docker-username=<user> --docker-password=<token>
 
-helm install my-replay oci://quay.io/weka.io/helm/wekai-core --version <vX> \
+helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
   --set 'imagePullSecrets[0].name=quay-pull'
 ```
 
 For local development installs from the chart directory, pass the image tag
 explicitly (the in-tree `Chart.yaml` carries a placeholder `appVersion`):
-`helm install my-replay chart/wekai-core --set imageTag=<vX> --set endpoint=...`
+`helm install my-replay chart/wekai --set imageTag=<vX> --set endpoint=...`
 
 ```
-helm lint chart/wekai-core
-helm template test chart/wekai-core --set endpoint=http://10.71.0.4:8000
+helm lint chart/wekai
+helm template test chart/wekai --set endpoint=http://10.71.0.4:8000
 ```
 
 ### Bare-URL model selector
@@ -207,7 +206,9 @@ Three functions:
 
 - `push-replay` — publishes a replay JSONL as a minimal scratch image,
   tagged `replay-<sha12>` (sha256 of the file), to
-  `quay.io/weka.io/wekai-benchmark` by default (registry overridable).
+  `quay.io/weka.io/wekai` by default, alongside the app image — replay
+  artifacts are distinguished by the `replay-` tag prefix (registry
+  overridable).
 - `publish` — builds this repo's own `Dockerfile` via `Directory.docker_build()`
   (the Dockerfile is the single source of truth — the module does not
   reimplement its steps), tags with `v999.0.0-<sha12>` (sha12 of the
@@ -216,7 +217,7 @@ Three functions:
   `REPLAY_IMAGE` build-arg is exposed as a `--replay-image` function param.
 - `push-helm` — first runs the exact same image build+publish as `publish`
   (shared internal helper, not a separate code path), then packages
-  `chart/wekai-core` and pushes it to an OCI Helm registry
+  `chart/wekai` and pushes it to an OCI Helm registry
   (`quay.io/weka.io/helm` by default). Version pinning is pure propagation
   (same pattern as wekai's `push_restricted` charts): only `Chart.yaml`'s
   `version`/`appVersion` are stamped — in lockstep with the image the

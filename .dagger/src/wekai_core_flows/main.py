@@ -7,8 +7,8 @@ LINUX_AMD64 = dagger.Platform("linux/amd64")
 
 # Mirrors wekai's own .gitignore so a publish digest isn't polluted by
 # local build artifacts, IDE state, or the dagger module's own generated
-# sdk/. Leading "/" anchors to the repo root — an unanchored "wekai-core"
-# would also match chart/wekai-core (see wekai-core/.gitignore history).
+# sdk/. Leading "/" anchors to the repo root — an unanchored "wekai"
+# would also match chart/wekai (see .gitignore history).
 SOURCE_IGNORE = [
     "*/.git",
     "*/.DS_Store",
@@ -25,8 +25,8 @@ SOURCE_IGNORE = [
     "/results",
 ]
 
-CHART_DIR = "chart/wekai-core"
-CHART_NAME = "wekai-core"
+CHART_DIR = "chart/wekai"
+CHART_NAME = "wekai"
 
 
 async def _calc_version(src: dagger.Directory) -> str:
@@ -71,14 +71,14 @@ class WekaiCoreFlows:
     async def push_replay(
         self,
         replay: dagger.File,
-        registry: str = "quay.io/weka.io/wekai-benchmark",
+        registry: str = "quay.io/weka.io/wekai",
     ) -> str:
         """Publishes a router replay file as a minimal scratch image.
 
-        Ported verbatim from wekai's .dagger push_replay: identical tag
-        scheme (replay-<sha12 of content>) and default registry — the
-        wekai-benchmark quay repo stays the historical home of replay
-        artifacts, regardless of which project publishes or consumes them.
+        Ported from wekai's .dagger push_replay: identical tag scheme
+        (replay-<sha12 of content>). Replay artifacts live in the same
+        wekai quay repo as the app image, distinguished by the replay-
+        tag prefix.
         The image carries the replay JSONL at /replay.jsonl, so this repo's
         own Dockerfile embeds it via:
         COPY --link --from=<registry>:replay-<sha12> /replay.jsonl /wekai/replay.jsonl
@@ -113,7 +113,7 @@ class WekaiCoreFlows:
         self,
         source: Annotated[dagger.Directory, Ignore(SOURCE_IGNORE)],
         registry: str = "quay.io/weka.io/wekai",
-        replay_image: str = "quay.io/weka.io/wekai-benchmark:replay-24e7f15ba0ea",
+        replay_image: str = "quay.io/weka.io/wekai:replay-24e7f15ba0ea",
         version: str = "",
     ) -> str:
         """Builds and publishes the wekai-core image from this repo's own Dockerfile.
@@ -144,11 +144,11 @@ class WekaiCoreFlows:
         helm_password: dagger.Secret,
         registry: str = "quay.io/weka.io/wekai",
         helm_registry: str = "quay.io/weka.io/helm",
-        replay_image: str = "quay.io/weka.io/wekai-benchmark:replay-24e7f15ba0ea",
+        replay_image: str = "quay.io/weka.io/wekai:replay-24e7f15ba0ea",
         version: str = "",
     ) -> str:
         """Publishes the wekai-core image, then packages and pushes
-        chart/wekai-core to an OCI Helm registry with the chart's image
+        chart/wekai to an OCI Helm registry with the chart's image
         reference pinned to that exact just-published image — a
         `helm install` of the pushed chart with zero further --set flags
         deploys exactly the image it was packaged with.

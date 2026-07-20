@@ -7,14 +7,14 @@
 #
 # The replay artifact is published separately (see this repo's own
 # `task replay:push` / `dagger call push-replay`) as a minimal scratch
-# image under the historical `wekai-benchmark` quay repo — that repo name is
+# image in the same wekai quay repo (tag prefix replay-) — that repo also
 # where replay artifacts have always lived and is kept for that source
 # reference only; nothing built or tagged from *this* Dockerfile uses
 # "benchmark" in its name.
 
 # ARGs used in a FROM must be declared before the first FROM (global scope).
 # Override with --build-arg REPLAY_IMAGE=... to embed a different capture.
-ARG REPLAY_IMAGE=quay.io/weka.io/wekai-benchmark:replay-24e7f15ba0ea
+ARG REPLAY_IMAGE=quay.io/weka.io/wekai:replay-24e7f15ba0ea
 
 # ---- Builder: compile the wekai-core binary ----
 FROM golang:1.25.7-alpine AS builder

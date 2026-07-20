@@ -1,20 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "wekai-core.fullname" . }}
+  name: {{ include "wekai.fullname" . }}
   labels:
-    {{- include "wekai-core.labels" . | nindent 4 }}
+    {{- include "wekai.labels" . | nindent 4 }}
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      {{- include "wekai-core.selectorLabels" . | nindent 6 }}
+      {{- include "wekai.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "wekai-core.selectorLabels" . | nindent 8 }}
+        {{- include "wekai.selectorLabels" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
       {{- with .Values.imagePullSecrets }}
@@ -100,5 +100,5 @@ spec:
       volumes:
         - name: results
           persistentVolumeClaim:
-            claimName: {{ include "wekai-core.fullname" . }}-results
+            claimName: {{ include "wekai.fullname" . }}-results
       {{- end }}

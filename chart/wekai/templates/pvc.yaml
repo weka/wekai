@@ -2,9 +2,9 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "wekai-core.fullname" . }}-results
+  name: {{ include "wekai.fullname" . }}-results
   labels:
-    {{- include "wekai-core.labels" . | nindent 4 }}
+    {{- include "wekai.labels" . | nindent 4 }}
 spec:
   accessModes:
     - ReadWriteOnce

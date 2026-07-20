@@ -1,5 +1,5 @@
 apiVersion: v2
-name: wekai-core
+name: wekai
 description: Runs an embedded LLM traffic replay (wekai benchmark auto --router-replay-file) against a target model endpoint
 type: application
 version: 0.1.0
