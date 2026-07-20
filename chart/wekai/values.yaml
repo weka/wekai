@@ -33,11 +33,12 @@ duration: "8h"
 replay:
   replayFile: /wekai/replay.jsonl  # path baked into the image by the Dockerfile
   replayRoles: ""          # comma-separated instance roles to replay (empty = all)
-  replaySeries: 0          # cap on sessions replayed (0 = all in the file)
+  replaySeries: 256        # cap on sessions replayed (0 = all in the file)
   replayNoStamp: false     # disable per-run cache-busting stamp (bitwise-faithful replay)
   maxOutputTokens: 0       # override max output tokens per request (0 = use replay-file's own budgets)
-  concurrency: 0           # fixed concurrency (0 = auto hill-climber)
-  maxConcurrency: 0        # hill-climber upper bound (0 = binary default)
+  concurrency: 28          # fixed concurrency (0 = auto hill-climber)
+  hotConcurrency: 4        # H workers form a 'hot' pool with a dedicated gate (--hot-series-concurrency; 0 = off)
+  maxConcurrency: 0        # hill-climber upper bound, only relevant when concurrency=0 (0 = binary default)
   requestTimeout: ""       # per-request timeout, e.g. "5m"
   abortOnCollapse: false   # abort if windowed cache hit rate collapses
   replayStopAtLowConcurrency: false
@@ -52,7 +53,12 @@ replay:
 
 llmApiKeySecretName: ""   # K8s secret with LLM API key env vars (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...)
 
-storeResults: false        # save per-request JSONL data (--save-request-data) to a PVC
+# Per-request JSONL data + the auto-generated report.html are ALWAYS saved
+# (--save-request-data) under resultsMountPath/<run-timestamp>/. After the
+# benchmark finishes (or fails) the pod sleeps so you can explore/extract
+# results (kubectl exec / kubectl cp); delete the pod to have the Deployment
+# restart the benchmark.
+storeResults: false        # true = persist results on a PVC; false = pod-local emptyDir (lost when the pod is deleted)
 storageClassName: ""       # empty = cluster default
 storageSize: 10Gi          # PVC size for results storage
 resultsMountPath: /results

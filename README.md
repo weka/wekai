@@ -74,16 +74,19 @@ re-uploading it. Build locally with:
 task docker:build   # override REPLAY_IMAGE=... to embed a different capture
 ```
 
-`chart/wekai/` is a run-once Helm chart (`; sleep infinity` after the
-command, same pattern as wekai's retired `chart/benchmark`) that runs the
-embedded replay directly — no other run mode is supported. The container
-command is `wekai benchmark auto --router-replay-file
-/wekai/replay.jsonl ...`. The chart is deliberately minimal: the only value
-most installs need to set is `endpoint`, the target model server. Everything
-else (`replay.replaySeries`, `replay.concurrency`, `replay.maxConcurrency`,
-`replay.dryRun` + dry-run TPS knobs, per-request timeout, an optional
-`llmApiKeySecretName` envFrom secret, `storeResults` PVC persistence, ...)
-has a working default.
+`chart/wekai/` is a run-once Helm chart that runs the embedded replay
+directly — no other run mode is supported. The container command is
+`wekai benchmark auto --router-replay-file /wekai/replay.jsonl ...`. After
+the benchmark completes (or fails) the pod sleeps forever so results stay
+explorable via `kubectl exec`/`kubectl cp`; delete the pod and the
+Deployment restarts the benchmark. Per-request JSONL data plus an
+auto-generated `report.html` visualization are always written under
+`resultsMountPath/<run-timestamp>/` (`--save-request-data`) — set
+`storeResults=true` to back that path with a PVC instead of a pod-local
+emptyDir. The chart is deliberately minimal: the only value most installs
+need to set is `endpoint`, the target model server; everything else has a
+working default (256 replayed sessions at fixed concurrency 28 with a
+4-worker hot pool).
 
 | Value | Default | Purpose |
 |---|---|---|
@@ -92,9 +95,11 @@ has a working default.
 | `duration` | `8h` | Benchmark run length (maps to `--timeout`); e.g. `3m` for smoke tests |
 | `imageRepository` / `imageTag` | `quay.io/weka.io/wekai` / `""` | Image; tag defaults to the chart's `appVersion` (see "Releases") |
 | `imagePullSecrets` | `[]` | Pull secrets for the private quay repo |
-| `replay.replaySeries` | `0` | Cap on replayed sessions (0 = all 5k+ in the embedded file) |
+| `replay.replaySeries` | `256` | Cap on replayed sessions (0 = all 5k+ in the embedded file) |
 | `replay.replayRoles` | `""` | Comma-separated instance roles to replay (empty = all) |
-| `replay.concurrency` / `replay.maxConcurrency` | `0` / `0` | Fixed concurrency / hill-climber upper bound (0 = auto) |
+| `replay.concurrency` | `28` | Fixed concurrency (0 = auto hill-climber) |
+| `replay.hotConcurrency` | `4` | Hot-pool workers with a dedicated gate (`--hot-series-concurrency`; 0 = off) |
+| `replay.maxConcurrency` | `0` | Hill-climber upper bound, only relevant when `concurrency=0` |
 | `replay.maxOutputTokens` | `0` | Override per-request output budget (0 = replay-file budgets) |
 | `replay.requestTimeout` | `""` | Per-request timeout, e.g. `5m` |
 | `replay.replayNoStamp` | `false` | Disable per-run cache-busting stamp (bitwise-faithful replay) |
@@ -102,7 +107,7 @@ has a working default.
 | `replay.dryRun` + `replay.dryRun{Cold,Warm,Output}TPS` | `false` / `0` | Synthetic timing mode, no real LLM calls |
 | `replay.stderrLogs` | `false` | Log to stderr |
 | `llmApiKeySecretName` | `""` | K8s secret with LLM API-key env vars (for endpoints that need auth) |
-| `storeResults` / `storageSize` / `storageClassName` / `resultsMountPath` | `false` / `10Gi` / `""` / `/results` | Persist per-request JSONL to a PVC |
+| `storeResults` / `storageSize` / `storageClassName` / `resultsMountPath` | `false` / `10Gi` / `""` / `/results` | Results (JSONL + `report.html`) are always saved under `resultsMountPath`; `storeResults=true` backs it with a PVC, otherwise emptyDir |
 | `resources` | 256Mi/250m → 4Gi/4 | Pod resources |
 
 Authoritative list with inline docs: `chart/wekai/values.yaml`

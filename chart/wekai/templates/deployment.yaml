@@ -29,7 +29,6 @@ spec:
             - "sh"
             - "-c"
             - |
-              set -e
               wekai benchmark auto \
                 --router-replay-file={{ .Values.replay.replayFile }} \
                 {{- if .Values.endpoint }}
@@ -52,6 +51,9 @@ spec:
                 {{- end }}
                 {{- if .Values.replay.concurrency }}
                 --concurrency={{ .Values.replay.concurrency | int64 }} \
+                {{- end }}
+                {{- if .Values.replay.hotConcurrency }}
+                --hot-series-concurrency={{ .Values.replay.hotConcurrency | int64 }} \
                 {{- end }}
                 {{- if .Values.replay.maxConcurrency }}
                 --max-concurrency={{ .Values.replay.maxConcurrency | int64 }} \
@@ -80,10 +82,10 @@ spec:
                 --dry-run-output-tps={{ .Values.replay.dryRunOutputTPS | int64 }} \
                 {{- end }}
                 {{- end }}
-                {{- if .Values.storeResults }}
                 --save-request-data={{ .Values.resultsMountPath }} \
-                {{- end }}
-                ; sleep infinity
+                || echo "wekai benchmark auto exited with status $?"
+              echo "Benchmark finished. Sleeping so results under {{ .Values.resultsMountPath }} stay explorable (kubectl exec/cp); delete the pod to rerun."
+              sleep infinity
           {{- if .Values.llmApiKeySecretName }}
           envFrom:
             - secretRef:
@@ -91,14 +93,14 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if .Values.storeResults }}
           volumeMounts:
             - name: results
               mountPath: {{ .Values.resultsMountPath }}
-          {{- end }}
-      {{- if .Values.storeResults }}
       volumes:
         - name: results
+          {{- if .Values.storeResults }}
           persistentVolumeClaim:
             claimName: {{ include "wekai.fullname" . }}-results
-      {{- end }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
