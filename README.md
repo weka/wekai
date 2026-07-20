@@ -83,8 +83,30 @@ most installs need to set is `endpoint`, the target model server. Everything
 else (`replay.replaySeries`, `replay.concurrency`, `replay.maxConcurrency`,
 `replay.dryRun` + dry-run TPS knobs, per-request timeout, an optional
 `llmApiKeySecretName` envFrom secret, `storeResults` PVC persistence, ...)
-has a working default. See `chart/wekai/values.yaml` for the full list,
-or `helm show values chart/wekai`.
+has a working default.
+
+| Value | Default | Purpose |
+|---|---|---|
+| `endpoint` | `""` | Target model server — the one value most installs set. Bare URL (`http://host:8000`, autodiscovers `/v1` + model id) or a full `dynamic/...,type=...` spec |
+| `model` | `""` | Optional explicit model id (skips autodiscovery); appended as `,model=<v>` |
+| `duration` | `8h` | Benchmark run length (maps to `--timeout`); e.g. `3m` for smoke tests |
+| `imageRepository` / `imageTag` | `quay.io/weka.io/wekai` / `""` | Image; tag defaults to the chart's `appVersion` (see "Releases") |
+| `imagePullSecrets` | `[]` | Pull secrets for the private quay repo |
+| `replay.replaySeries` | `0` | Cap on replayed sessions (0 = all 5k+ in the embedded file) |
+| `replay.replayRoles` | `""` | Comma-separated instance roles to replay (empty = all) |
+| `replay.concurrency` / `replay.maxConcurrency` | `0` / `0` | Fixed concurrency / hill-climber upper bound (0 = auto) |
+| `replay.maxOutputTokens` | `0` | Override per-request output budget (0 = replay-file budgets) |
+| `replay.requestTimeout` | `""` | Per-request timeout, e.g. `5m` |
+| `replay.replayNoStamp` | `false` | Disable per-run cache-busting stamp (bitwise-faithful replay) |
+| `replay.abortOnCollapse` / `replay.replayStopAtLowConcurrency` | `false` | Early-stop behaviors |
+| `replay.dryRun` + `replay.dryRun{Cold,Warm,Output}TPS` | `false` / `0` | Synthetic timing mode, no real LLM calls |
+| `replay.stderrLogs` | `false` | Log to stderr |
+| `llmApiKeySecretName` | `""` | K8s secret with LLM API-key env vars (for endpoints that need auth) |
+| `storeResults` / `storageSize` / `storageClassName` / `resultsMountPath` | `false` / `10Gi` / `""` / `/results` | Persist per-request JSONL to a PVC |
+| `resources` | 256Mi/250m → 4Gi/4 | Pod resources |
+
+Authoritative list with inline docs: `chart/wekai/values.yaml`
+(or `helm show values oci://quay.io/weka.io/helm/wekai --version <vX>`).
 
 Charts are published to `oci://quay.io/weka.io/helm/wekai`. The chart
 `--version` is mandatory (versions are `v999.0.0-<sha12>` prerelease stamps,
@@ -94,6 +116,10 @@ lockstep with the image it just pushed, and the deployment template resolves
 the image tag via `imageTag | default .Chart.AppVersion` — no version is
 hardcoded in the packaged values. `helm show chart` alone tells you exactly
 which image a chart version runs.
+
+Get the concrete `<vX>` for the snippets below from the
+[releases page](https://github.com/weka/wekai-core/releases) — every release
+description includes these commands pre-filled with its own version.
 
 Default install — runs for the default duration (8h):
 
@@ -185,11 +211,17 @@ matter how many times or how concurrently the spec is resolved.
 
 ## Releases
 
+**Install commands for every version live on the
+[releases page](https://github.com/weka/wekai-core/releases)** — each release
+description carries copy-paste `helm install`, `docker pull`, and
+`go install` snippets pinned to that exact version. Pick a release there and
+substitute its version wherever this README says `<vX>`.
+
 Pushes to `main` cut releases automatically (`.github/workflows/release.yml`):
 the next semver is derived from Conventional Commits (mandatory — see
 CLAUDE.md), the image and chart are published under that `vX.Y.Z` (overriding
-the local content-hash scheme below), and a GitHub Release is created with
-install instructions for that exact version.
+the local content-hash scheme below), and the GitHub Release is created with
+those per-version install instructions.
 
 ## CI / Publishing
 
