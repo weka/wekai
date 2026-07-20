@@ -22,14 +22,24 @@ import (
 var autoRunDirRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z$`)
 
 // deriveSourceLabel picks a human-readable label for a merged source
-// directory. Preference order:
+// directory when no explicit --labels override was given. Preference order
+// (a timestamp is NEVER an acceptable label on its own — it's the fallback
+// of last resort only when neither of the first two yield anything):
 //  1. The single distinct model alias found across the directory's records
-//     (parsed from each record's "model" field via GetModelDisplayName) —
-//     e.g. two dirs with alias=DS3H_weka-64r8w / alias=DS3H_hbm resolve to
-//     those aliases even though they share the same model id.
+//     (parsed from each record's "model" field via extractAlias — a real
+//     alias=... parameter, not a display-name fallback) — e.g. two dirs with
+//     alias=DS3H_weka-64r8w / alias=DS3H_hbm resolve to those aliases even
+//     though they share the same underlying model id.
 //  2. The parent directory's basename, when the directory's own basename is
-//     an opaque auto-generated timestamp subdirectory (see autoRunDirRe).
-//  3. The directory's own basename (previous, pre-fix behavior).
+//     an opaque auto-generated timestamp subdirectory (see autoRunDirRe) —
+//     e.g. ".../DS3H_weka-64r8w_reqdata/2026-07-19T12-00-00Z" -> the parent
+//     "DS3H_weka-64r8w_reqdata", not the timestamp leaf.
+//  3. The directory's own basename — either a genuinely meaningful
+//     non-timestamp dir name (pre-fix behavior, unchanged), or, only when
+//     nothing else is available, the timestamp itself as a last resort.
+//
+// The overall priority actually applied by GenerateVisualizationMerged is:
+// --labels override > alias > parent run-dir name > timestamp (last resort).
 func deriveSourceLabel(dir string, records []requestDataRecord) string {
 	if alias := resolveRecordsAlias(records); alias != "" {
 		return alias
@@ -50,7 +60,8 @@ func deriveSourceLabel(dir string, records []requestDataRecord) string {
 // and merged CSVs, and produces a single HTML report.
 //
 // labels, if non-empty, overrides auto-detected labels; it must have exactly
-// one entry per entry in dirs, matched positionally.
+// one entry per entry in dirs, matched positionally. When absent, labels are
+// auto-derived per deriveSourceLabel.
 func GenerateVisualizationMerged(dirs []string, labels []string, outputDir string, concurrency int) (string, error) {
 	if len(dirs) == 0 {
 		return "", fmt.Errorf("no directories provided")

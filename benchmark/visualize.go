@@ -7,9 +7,36 @@ import (
 	"html/template"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/weka/wekai/llm"
 )
+
+// aliasParamRe matches an "alias=<value>" parameter embedded in a raw model
+// spec string (e.g. "dynamic/http://host:port/v1,type=openai_vllm,alias=DS3H_weka-64r8w").
+// Used as a permissive fallback when llm.ParseDynamicModel doesn't recognize
+// the spec format, so a real alias is never lost to a strict-parser mismatch.
+var aliasParamRe = regexp.MustCompile(`alias=([a-zA-Z0-9._-]+)`)
+
+// extractAlias returns the alias embedded in a raw (unsanitized) model spec
+// string, or "" if none is present. Unlike GetModelDisplayName (which falls
+// back to returning the full model string for display purposes, so it never
+// signals "no alias"), this distinguishes "has a real alias" from "doesn't" —
+// required so callers can fall through to a different label source instead
+// of using the full raw spec string as a label.
+func extractAlias(modelStr string) string {
+	if llm.IsDynamicModel(modelStr) {
+		if cfg, err := llm.ParseDynamicModel(modelStr); err == nil && cfg.Alias != "" {
+			return cfg.Alias
+		}
+	}
+	if m := aliasParamRe.FindStringSubmatch(modelStr); len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
 
 // GenerateVisualization reads all .jsonl files from dir and produces an
 // interactive HTML scatter-plot in the same directory. Returns the path
@@ -93,14 +120,14 @@ func GenerateVisualization(dir string, concurrency int) (string, error) {
 	return htmlPath, nil
 }
 
-// resolveRecordsAlias returns the single distinct model display alias found
-// across records (via GetModelDisplayName, which parses "alias=..." out of a
-// dynamic model spec), or "" when records is empty or spans more than one
-// distinct alias (ambiguous — caller should fall back to another label).
+// resolveRecordsAlias returns the single distinct model alias found across
+// records (via extractAlias), or "" when records is empty, no record carries
+// a real alias, or records span more than one distinct alias (ambiguous) —
+// in all "" cases the caller should fall back to another label source.
 func resolveRecordsAlias(records []requestDataRecord) string {
 	aliases := map[string]bool{}
 	for _, r := range records {
-		if a := GetModelDisplayName(r.Model); a != "" {
+		if a := extractAlias(r.Model); a != "" {
 			aliases[a] = true
 		}
 	}
