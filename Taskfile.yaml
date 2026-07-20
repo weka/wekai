@@ -10,9 +10,9 @@ vars:
 
 tasks:
   build:
-    desc: "Build the wekai-core binary locally"
+    desc: "Build the wekai binary locally (module github.com/weka/wekai-core)"
     cmds:
-      - go build -o wekai-core .
+      - go build -o wekai ./cmd/wekai
 
   test:
     desc: "Run all tests"

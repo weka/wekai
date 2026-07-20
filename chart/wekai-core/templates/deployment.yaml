@@ -30,7 +30,7 @@ spec:
             - "-c"
             - |
               set -e
-              wekai-core benchmark auto \
+              wekai benchmark auto \
                 --router-replay-file={{ .Values.replay.replayFile }} \
                 {{- if .Values.endpoint }}
                 --models={{ if .Values.model }}{{ printf "%s,model=%s" .Values.endpoint .Values.model | quote }}{{ else }}{{ .Values.endpoint | quote }}{{ end }} \

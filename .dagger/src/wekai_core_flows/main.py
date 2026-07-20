@@ -18,6 +18,7 @@ SOURCE_IGNORE = [
     ".temp",
     "/bin",
     "/dist",
+    "/wekai",
     "/wekai-core",
     "*.log",
     "*.out",

@@ -1,5 +1,6 @@
 bin/
 dist/
+/wekai
 /wekai-core
 *.log
 .env

@@ -7,7 +7,7 @@ imagePullSecrets: []
 
 # The only supported run mode: replay the router-replay JSONL baked into the
 # image (at /wekai/replay.jsonl, see wekai-core's Dockerfile) against a
-# target model endpoint via `wekai-core benchmark auto --router-replay-file`.
+# target model endpoint via `wekai benchmark auto --router-replay-file`.
 # There is no embed/docs-dir/model-list mode here — for those, or for
 # multiple endpoints in one run, use wekai-core directly.
 

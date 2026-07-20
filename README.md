@@ -20,15 +20,16 @@ inject their own named-model registry via the `llm.ResolveModel` and
 ## Build
 
 ```
-go build -o wekai-core .
+go build -o wekai ./cmd/wekai
+# or: go install github.com/weka/wekai-core/cmd/wekai@latest
 ```
 
 ## Usage
 
 ```
-wekai-core benchmark embed --help
-wekai-core router serve --help
-wekai-core eval simple-tool --help
+wekai benchmark embed --help
+wekai router serve --help
+wekai eval simple-tool --help
 ```
 
 ## Embedding
@@ -56,7 +57,7 @@ models — otherwise only dynamic/openrouter specs resolve.
 ## Deployment
 
 `Dockerfile` builds a self-contained replay image: a golang builder stage
-compiles the `wekai-core` binary, and a second `COPY --link --from=` stage
+compiles the `wekai` binary (module github.com/weka/wekai-core), and a second `COPY --link --from=` stage
 embeds one router-replay JSONL artifact at `/wekai/replay.jsonl`, pulled
 from a separately-published scratch image (default
 `quay.io/weka.io/wekai-benchmark:replay-<sha12>` — published by this repo's
@@ -77,7 +78,7 @@ task docker:build   # override REPLAY_IMAGE=... to embed a different capture
 `chart/wekai-core/` is a run-once Helm chart (`; sleep infinity` after the
 command, same pattern as wekai's retired `chart/benchmark`) that runs the
 embedded replay directly — no other run mode is supported. The container
-command is `wekai-core benchmark auto --router-replay-file
+command is `wekai benchmark auto --router-replay-file
 /wekai/replay.jsonl ...`. The chart is deliberately minimal: the only value
 most installs need to set is `endpoint`, the target model server. Everything
 else (`replay.replaySeries`, `replay.concurrency`, `replay.maxConcurrency`,

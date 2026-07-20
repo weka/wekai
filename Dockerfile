@@ -2,7 +2,7 @@
 #
 # wekai-core replay image: the wekai-core binary (benchmark/router/eval
 # command trees) plus one embedded router-replay JSONL artifact, so a
-# deployment can run `wekai-core benchmark auto --router-replay-file
+# deployment can run `wekai benchmark auto --router-replay-file
 # /wekai/replay.jsonl ...` with no external volume or fetch step.
 #
 # The replay artifact is published separately (see this repo's own
@@ -23,7 +23,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
-RUN go build -o /out/wekai-core .
+RUN go build -o /out/wekai ./cmd/wekai
 
 # ---- Replay artifact source ----
 FROM ${REPLAY_IMAGE} AS replay
@@ -42,6 +42,6 @@ RUN apk add --no-cache ca-certificates
 # source change) does not invalidate or recopy the replay layer — its
 # digest is stable across rebuilds, so registries can reuse/cross-mount the
 # existing blob instead of re-uploading it.
-COPY --link --from=builder /out/wekai-core /usr/local/bin/wekai-core
+COPY --link --from=builder /out/wekai /usr/local/bin/wekai
 COPY --link --from=replay /replay.jsonl /wekai/replay.jsonl
-ENTRYPOINT ["/usr/local/bin/wekai-core"]
+ENTRYPOINT ["/usr/local/bin/wekai"]
