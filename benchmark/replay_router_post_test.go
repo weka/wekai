@@ -46,6 +46,20 @@ func TestNewReplayPoster_OpenAI(t *testing.T) {
 			wantPath:  "/v1/chat/completions",
 		},
 		{
+			// Base WITHOUT the /v1 suffix must build the same endpoint as
+			// the /v1 style above — both URL conventions work for replay.
+			name:      "openai_vllm, base without /v1",
+			modelSpec: "dynamic/http://127.0.0.1:8000,type=openai_vllm,model=my-model",
+			wantType:  "openai_vllm",
+			wantPath:  "/v1/chat/completions",
+		},
+		{
+			name:      "anthropic, base without /v1",
+			modelSpec: "dynamic/http://127.0.0.1:8000,type=anthropic,model=claude",
+			wantType:  "anthropic",
+			wantPath:  "/v1/messages",
+		},
+		{
 			name:      "unsupported type (rejected)",
 			modelSpec: "dynamic/http://127.0.0.1:8000/v1,type=gemini_native,model=gemini",
 			wantErr:   true,
@@ -69,8 +83,10 @@ func TestNewReplayPoster_OpenAI(t *testing.T) {
 			if p.apiType != tt.wantType {
 				t.Errorf("apiType = %q, want %q", p.apiType, tt.wantType)
 			}
-			if p.endpoint != "http://127.0.0.1:8000/v1"+tt.wantPath {
-				t.Errorf("endpoint = %q, want suffix %q", p.endpoint, tt.wantPath)
+			// Exact full-URL assertion: a /v1-suffixed base must NOT double
+			// into /v1/v1/... (the pre-fix suffix-only check let that slip).
+			if want := "http://127.0.0.1:8000" + tt.wantPath; p.endpoint != want {
+				t.Errorf("endpoint = %q, want %q", p.endpoint, want)
 			}
 		})
 	}

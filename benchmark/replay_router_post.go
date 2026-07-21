@@ -76,6 +76,12 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 		return nil, fmt.Errorf("no base URL in model spec")
 	}
 	base = strings.TrimRight(base, "/")
+	// Tolerate base URLs that already carry the /v1 API suffix — the
+	// convention every other wekai path uses (eval coherency, synthetic
+	// auto, OpenAI SDK style). Without this, ".../v1" bases produced a
+	// doubled /v1/v1 endpoint and a 100%-404 storm. Mirrors the same
+	// defensive strip in vllm_metrics.go's endpoint derivation.
+	base = strings.TrimSuffix(base, "/v1")
 
 	// API key selection: Anthropic targets use x-api-key (or dummy-key for
 	// local endpoints); OpenAI targets use Bearer auth with the OpenAI key
