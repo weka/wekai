@@ -638,11 +638,11 @@ const ADT_LINE_COLOR = "#f5f5f5";
 const MIX_BAND_H = 64;
 
 // DOM-free helpers (fmtTokens/mixAt/adtAt/mixTotalMax/mixStackHeight/
-// mixRate): unit-tested under node by TestCacheMixLookupHelpersJS, which
-// slices the emitted script from "function fmtTokens(" to "function
-// cacheMixEnabled(" — keep them contiguous and ahead of cacheMixEnabled
-// (html/template strips these comments from the output, so the test can't
-// anchor on markers).
+// mixRate/placeTooltip): unit-tested under node by
+// TestCacheMixLookupHelpersJS, which slices the emitted script from
+// "function fmtTokens(" to "function cacheMixEnabled(" — keep them
+// contiguous and ahead of cacheMixEnabled (html/template strips these
+// comments from the output, so the test can't anchor on markers).
 function fmtTokens(v) {
   if (v >= 1e9) return (v / 1e9).toFixed(1) + "B";
   if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
@@ -702,6 +702,21 @@ function mixRate(seg) {
   const secs = (seg.t1 - seg.t0) / 1000;
   if (secs <= 0) return 0;
   return (seg.c + seg.lc + seg.ec) / secs;
+}
+
+// placeTooltip: viewport-aware tooltip position for a cursor at (cx,cy).
+// Default is right-of/below-ish the cursor (+12,-10); when the tip would
+// cross the right or bottom viewport edge it flips to the other side of the
+// cursor, then clamps into [pad, viewport-pad-size] on both axes.
+function placeTooltip(cx, cy, tipW, tipH, vw, vh) {
+  const off = 12, pad = 4;
+  let x = cx + off;
+  if (x + tipW > vw - pad) x = cx - off - tipW;
+  x = Math.min(Math.max(x, pad), Math.max(pad, vw - pad - tipW));
+  let y = cy - 10;
+  if (y + tipH > vh - pad) y = cy - off - tipH;
+  y = Math.min(Math.max(y, pad), Math.max(pad, vh - pad - tipH));
+  return { x: x, y: y };
 }
 
 
@@ -1086,6 +1101,21 @@ function mixTooltipHTML(s, t) {
   return lines.join("<br>");
 }
 
+// showTooltip: single positioning path for every tooltip (dot, line,
+// overlay, tick hover). Content is set FIRST, measured at a neutral
+// position (so the right viewport edge can't squeeze the measured width),
+// then placed viewport-aware via placeTooltip.
+function showTooltip(e, html) {
+  tooltip.innerHTML = html;
+  tooltip.style.display = "block";
+  tooltip.style.left = "0px";
+  tooltip.style.top = "0px";
+  const r = tooltip.getBoundingClientRect();
+  const pos = placeTooltip(e.clientX, e.clientY, r.width, r.height, window.innerWidth, window.innerHeight);
+  tooltip.style.left = pos.x + "px";
+  tooltip.style.top = pos.y + "px";
+}
+
 // --- Drag-to-zoom ---
 canvas.addEventListener("mousedown", e => {
   const rect = canvas.getBoundingClientRect();
@@ -1182,9 +1212,6 @@ canvas.addEventListener("mousemove", e => {
   }
 
   if (best) {
-    tooltip.style.display = "block";
-    tooltip.style.left = (e.clientX + 12) + "px";
-    tooltip.style.top = (e.clientY - 10) + "px";
     if (best.isLine) {
       const win = best.win;
       const vals = best.type === "ttft" ? win.map(r => r.ttft).filter(v => v > 0) : win.map(r => r.resp);
@@ -1195,7 +1222,7 @@ canvas.addEventListener("mousemove", e => {
       let totalUpTo = 0, errUpTo = 0, maxSnSeen = 0;
       best.s.records.forEach(r => { if (r.t <= best.t) { totalUpTo++; if (r.err) errUpTo++; if (r.sn > maxSnSeen) maxSnSeen = r.sn; } });
       const mixInfo = mixTooltipHTML(best.s, best.t);
-      tooltip.innerHTML =
+      showTooltip(e,
         "<b>" + best.s.name + "</b> \u2014 " + (best.type === "ttft" ? "TTFT" : "Response") + " avg<br>" +
         "Window: " + win.length + " requests<br>" +
         "Avg: " + fmt(best.avgVal) + "<br>" +
@@ -1203,41 +1230,35 @@ canvas.addEventListener("mousemove", e => {
         "p95: " + fmt(p95) + "<br>" +
         "Series: " + maxSnSeen + "<br>" +
         "Total: " + totalUpTo + (errUpTo > 0 ? ", <span style='color:#ff4444'>errors: " + errUpTo + "</span>" : "") +
-        (mixInfo ? "<br>" + mixInfo : "");
+        (mixInfo ? "<br>" + mixInfo : ""));
     } else {
       const r = best.r;
       const mixInfo = mixTooltipHTML(best.s, r.t);
-      tooltip.innerHTML =
+      showTooltip(e,
         "<b>" + best.s.name + "</b> (series " + r.sn + ", req " + r.rn + ")<br>" +
         "TTFT: " + r.ttft.toFixed(1) + " ms<br>" +
         "Response: " + r.resp.toFixed(1) + " ms<br>" +
         (r.ch ? "Cache hit<br>" : "") +
         (r.err ? "<span style='color:#ff4444'>ERROR</span>" : "") +
-        (mixInfo ? "<br>" + mixInfo : "");
+        (mixInfo ? "<br>" + mixInfo : ""));
     }
   } else if (mixHover) {
-    tooltip.style.display = "block";
-    tooltip.style.left = (e.clientX + 12) + "px";
-    tooltip.style.top = (e.clientY - 10) + "px";
     const seg = mixAt(mixHover.band.s.mix, mixHover.t);
     let win = "";
     if (seg) {
       win = "window: " + formatTickLabel(Math.round(seg.t0 / 1000)) + " \u2192 " +
         formatTickLabel(Math.round(seg.t1 / 1000)) + "<br>";
     }
-    tooltip.innerHTML = "<b>" + mixHover.band.s.name + "</b> \u2014 cache mix<br>" +
-      win + mixTooltipHTML(mixHover.band.s, mixHover.t);
+    showTooltip(e, "<b>" + mixHover.band.s.name + "</b> \u2014 cache mix<br>" +
+      win + mixTooltipHTML(mixHover.band.s, mixHover.t));
   } else if (tickHover) {
-    tooltip.style.display = "block";
-    tooltip.style.left = (e.clientX + 12) + "px";
-    tooltip.style.top = (e.clientY - 10) + "px";
     const elapsedSec = Math.round((tickHover.tickTime - globalTMin) / 1000);
     const rows = tickStats(tickHover.tickTime).map(({ si, cumReqs, cumErrs, maxSn }) => {
       const errPart = cumErrs > 0 ? ", <span style='color:#ff4444'>errors: " + cumErrs + "</span>" : "";
       return "<span style='color:" + seriesColors[si] + "'>" + DATA[si].name + "</span>: " +
         cumReqs + " reqs" + errPart + ", series @" + maxSn;
     });
-    tooltip.innerHTML = "<b>t = " + formatTickLabel(elapsedSec) + "</b><br>" + rows.join("<br>");
+    showTooltip(e, "<b>t = " + formatTickLabel(elapsedSec) + "</b><br>" + rows.join("<br>"));
   } else {
     tooltip.style.display = "none";
   }

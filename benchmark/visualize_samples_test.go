@@ -201,6 +201,25 @@ assert(mixRate(weak.mix[0]) === 50000 / 60, "60s interval rate");
 const wide = {t0:0, t1:120000, c:60000, lc:0, ec:0}; // missed tick: 120s interval
 assert(mixRate(wide) === 500, "120s interval => total/120, got " + mixRate(wide));
 assert(mixRate({t0:5, t1:5, c:9, lc:0, ec:0}) === 0, "zero-width interval => 0");
+
+// Viewport-aware tooltip placement (vw=1000, vh=800; tip 200x150).
+let p = placeTooltip(100, 100, 200, 150, 1000, 800);
+assert(p.x === 112 && p.y === 90, "fits => right of cursor (+12,-10), got " + JSON.stringify(p));
+// Right edge: flips to the left of the cursor.
+p = placeTooltip(950, 100, 200, 150, 1000, 800);
+assert(p.x === 950 - 12 - 200 && p.y === 90, "right edge => flip left, got " + JSON.stringify(p));
+// Bottom edge (the reported bug): flips above the cursor.
+p = placeTooltip(100, 780, 200, 150, 1000, 800);
+assert(p.y === 780 - 12 - 150 && p.x === 112, "bottom edge => flip above, got " + JSON.stringify(p));
+// Corner: flips on both axes.
+p = placeTooltip(980, 790, 200, 150, 1000, 800);
+assert(p.x === 980 - 12 - 200 && p.y === 790 - 12 - 150, "corner => flip both, got " + JSON.stringify(p));
+// Clamps: cursor at origin with a flip that would go negative stays >= pad,
+// and an oversized tip is pinned inside the viewport.
+p = placeTooltip(2, 2, 200, 900, 1000, 800);
+assert(p.x === 14 && p.y === 4, "oversized tip clamps to pad, got " + JSON.stringify(p));
+p = placeTooltip(500, 500, 2000, 150, 1000, 800);
+assert(p.x === 4, "tip wider than viewport pins to left pad, got " + JSON.stringify(p));
 console.log("ALL_OK");
 `
 	jsPath := filepath.Join(dir, "helpers_test.js")
