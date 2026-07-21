@@ -491,6 +491,8 @@ func runRouterReplaySeriesLoop(
 		seriesNum := idx + 1
 		runRouterReplaySession(benchCtx, cfg, st, rdw,
 			sess, seriesNum, endpointOverride, reqTimeout, docs, gate)
+		// Session slot retired — drop its active-dataset snapshot.
+		st.datasetTracker.Reset(seriesNum)
 		st.seriesReplayCompleted.Add(1)
 		updateSnap(st)
 	}

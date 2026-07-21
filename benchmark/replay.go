@@ -102,6 +102,9 @@ func runReplaySeriesLoop(
 		seriesGUID := conv.ID
 
 		fullyWalked := runReplayConversation(benchCtx, cfg, st, rdw, conv, seriesNum, seriesGUID, endpointOverride, reqTimeout, gate)
+		// The conversation's slot is retired — its context no longer counts
+		// toward the active dataset.
+		st.datasetTracker.Reset(seriesNum)
 		if fullyWalked {
 			st.seriesReplayCompleted.Add(1)
 		}
@@ -423,6 +426,11 @@ func recordReplayRequest(
 		cachedTokens:         metrics.UsageData.CachedTokens.Count,
 		localCacheRatio:      metrics.LocalCacheRatio,
 	})
+
+	if !isErr {
+		st.datasetTracker.Update(metrics.SeriesNum,
+			int64(metrics.UsageData.InputTokens.Count+metrics.UsageData.CachedTokens.Count))
+	}
 
 	st.totalCompleted.Add(1)
 	if isErr {

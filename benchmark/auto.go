@@ -215,6 +215,14 @@ func (w *requestDataWriter) write(rec requestDataRecord) error {
 	return w.enc.Encode(rec)
 }
 
+// writeAny encodes a non-request record (e.g. vllmMetricsSample) into the
+// same JSONL stream. Safe for concurrent use with write().
+func (w *requestDataWriter) writeAny(v any) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.enc.Encode(v)
+}
+
 func (w *requestDataWriter) close() error {
 	return w.f.Close()
 }
@@ -839,6 +847,12 @@ type autoState struct {
 	// in replay, and misses partial reuse in --step growth).
 	estimator *cacheEstimator
 
+	// Per-series latest-prompt-token snapshots for the active-dataset metric
+	// sampled by the vLLM metrics collector (see vllm_metrics.go). Always
+	// non-nil; series loops Update on each successful response and Reset on
+	// slot recycle.
+	datasetTracker *activeDatasetTracker
+
 	// Global cold-start TTFT tracking for implicit cache detection
 	coldStartTTFTCount atomic.Int64 // count of cold-start samples (used for series-scaling gate)
 	ttftDegradedCount  atomic.Int64 // requests disqualified from cache-hit by TTFT degradation
@@ -1441,6 +1455,12 @@ func runSingleModelBenchmark(
 		lastEvalRPS:       0,
 		stream:            newCompletionStream(initMaxKeep),
 		gate:              newConcurrencyGate(initConc, cfg.RandomGateOrder),
+		datasetTracker:    newActiveDatasetTracker(),
+	}
+	if sampler := startVLLMMetricsSampler(benchCtx, cfg.Model, st.datasetTracker, rdw); sampler != nil {
+		// stop() is deferred after rdw's close, so it runs first (LIFO) and
+		// waits for the goroutine — no sample write can race the file close.
+		defer sampler.stop()
 	}
 	if cfg.HotSeriesConcurrency > 0 {
 		st.hotGate = newConcurrencyGate(cfg.HotSeriesConcurrency*hotGateFanoutMultiplier, cfg.RandomGateOrder)
@@ -1622,6 +1642,14 @@ func runSingleModelBenchmark(
 
 				workerGate.Release()
 
+				// Active-dataset snapshot: latest full prompt tokens for this
+				// slot, BEFORE any recycle below so the retiring session's last
+				// response can't repopulate the reset slot.
+				if metrics.Error == nil {
+					st.datasetTracker.Update(seriesNum,
+						int64(metrics.UsageData.InputTokens.Count+metrics.UsageData.CachedTokens.Count))
+				}
+
 				if !stepDone {
 					maxDocTokens := len(fullDocs) / 4
 					if cfg.Tokens > 0 && cfg.Tokens < maxDocTokens {
@@ -1637,6 +1665,7 @@ func runSingleModelBenchmark(
 							}
 							isFirstRequest = true
 							coldStartTTFT = 0
+							st.datasetTracker.Reset(seriesNum)
 						} else {
 							cachedPrompt = buildSeriesPrompt(fullDocs, seriesGUID, groupGUID, maxDocTokens, useShared)
 							stepDone = true

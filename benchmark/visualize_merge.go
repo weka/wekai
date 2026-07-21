@@ -105,12 +105,14 @@ func GenerateVisualizationMerged(dirs []string, labels []string, outputDir strin
 		}
 
 		var dirRecords []requestDataRecord
+		var dirSamples []vllmMetricsSample
 		for _, f := range files {
-			records, err := readJSONLFile(f)
+			records, samples, err := readJSONLFile(f)
 			if err != nil {
 				return "", fmt.Errorf("read %s: %w", f, err)
 			}
 			dirRecords = append(dirRecords, records...)
+			dirSamples = append(dirSamples, samples...)
 		}
 
 		var alias string
@@ -147,6 +149,15 @@ func GenerateVisualizationMerged(dirs []string, labels []string, outputDir strin
 			tr := taggedRecord{source: alias, record: r}
 			seriesRecords = append(seriesRecords, tr)
 			allRecords = append(allRecords, tr)
+		}
+		// Carry metrics samples into the merged JSONL so the merged report
+		// renders the cache-mix overlay too (they route by record_type; CSVs
+		// stay request-only).
+		for _, s := range dirSamples {
+			if err := enc.Encode(s); err != nil {
+				out.Close()
+				return "", fmt.Errorf("write metrics sample to %s: %w", outFile, err)
+			}
 		}
 		out.Close()
 

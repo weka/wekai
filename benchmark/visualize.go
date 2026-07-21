@@ -62,14 +62,16 @@ func GenerateVisualization(dir string, concurrency int) (string, error) {
 	}
 
 	type seriesData struct {
-		Name    string      `json:"name"`
-		Records []vizRecord `json:"records"`
+		Name    string             `json:"name"`
+		Records []vizRecord        `json:"records"`
+		Mix     []vizSampleSegment `json:"mix,omitempty"`
+		Adt     []vizAdtPoint      `json:"adt,omitempty"`
 	}
 
 	var allSeries []seriesData
 	for _, f := range files {
 		name := strings.TrimSuffix(filepath.Base(f), ".jsonl")
-		records, err := readJSONLFile(f)
+		records, samples, err := readJSONLFile(f)
 		if err != nil {
 			return "", fmt.Errorf("read %s: %w", f, err)
 		}
@@ -91,7 +93,8 @@ func GenerateVisualization(dir string, concurrency int) (string, error) {
 				CacheHit:      r.CacheHit,
 			})
 		}
-		allSeries = append(allSeries, seriesData{Name: name, Records: vr})
+		mix, adt := buildSampleViz(samples)
+		allSeries = append(allSeries, seriesData{Name: name, Records: vr, Mix: mix, Adt: adt})
 	}
 
 	seriesJSON, err := json.Marshal(allSeries)
@@ -139,24 +142,46 @@ func resolveRecordsAlias(records []requestDataRecord) string {
 	return ""
 }
 
-func readJSONLFile(path string) ([]requestDataRecord, error) {
+// readJSONLFile reads a request-data JSONL file, routing lines by their
+// record_type: absent/empty = a request row (legacy files predate the field),
+// "vllm_metrics_sample" = a metrics sample. Unknown record types and
+// malformed lines are skipped — a new record type must never corrupt request
+// parsing (unmarshalling a sample into requestDataRecord would otherwise
+// "succeed" as an all-zero phantom request).
+func readJSONLFile(path string) ([]requestDataRecord, []vllmMetricsSample, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer f.Close()
 	var records []requestDataRecord
+	var samples []vllmMetricsSample
 	sc := bufio.NewScanner(f)
 	// 64 MiB cap: reqdata rows embed full prompts; 300k-token contexts exceed 1 MiB.
 	sc.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
 	for sc.Scan() {
-		var r requestDataRecord
-		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
+		var probe struct {
+			RecordType string `json:"record_type"`
+		}
+		if err := json.Unmarshal(sc.Bytes(), &probe); err != nil {
 			continue // skip malformed lines
 		}
-		records = append(records, r)
+		switch probe.RecordType {
+		case "":
+			var r requestDataRecord
+			if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
+				continue
+			}
+			records = append(records, r)
+		case recordTypeVLLMMetricsSample:
+			var s vllmMetricsSample
+			if err := json.Unmarshal(sc.Bytes(), &s); err != nil {
+				continue
+			}
+			samples = append(samples, s)
+		}
 	}
-	return records, sc.Err()
+	return records, samples, sc.Err()
 }
 
 // nextVersionedPath returns a path like dir/report.html, dir/report_v2.html, etc.
@@ -246,13 +271,23 @@ const sortedIndices = RAW_DATA.map((_, i) => i);
 sortedIndices.sort((a, b) => sortKey(RAW_DATA[a].name).localeCompare(sortKey(RAW_DATA[b].name)));
 const DATA = sortedIndices.map(i => RAW_DATA[i]);
 
-// Normalize timestamps: align each series to start at t=0
+// Normalize timestamps: align each series to start at t=0. Metrics-sample
+// overlays (mix segments / active-dataset points) shift by the same offset so
+// they stay aligned with the series' requests.
 DATA.forEach(s => {
-  if (s.records.length === 0) return;
   let tMin = Infinity;
   s.records.forEach(r => { if (r.t < tMin) tMin = r.t; });
+  if (!isFinite(tMin)) {
+    (s.mix || []).forEach(m => { if (m.t0 < tMin) tMin = m.t0; });
+    (s.adt || []).forEach(p => { if (p.t < tMin) tMin = p.t; });
+  }
+  if (!isFinite(tMin)) return;
   s.records.forEach(r => { r.t -= tMin; });
+  (s.mix || []).forEach(m => { m.t0 -= tMin; m.t1 -= tMin; });
+  (s.adt || []).forEach(p => { p.t -= tMin; });
 });
+
+const HAS_CACHE_MIX = DATA.some(s => (s.mix && s.mix.length) || (s.adt && s.adt.length));
 
 // Precompute moving averages and error bars per series
 DATA.forEach(s => {
@@ -388,6 +423,16 @@ DATA.forEach(s => {
     if (r.resp > globalYMax) globalYMax = r.resp;
     if (r.ttft > globalYMax) globalYMax = r.ttft;
     totalRequests++;
+  });
+  // Cache-mix samples extend the time range (a final sample can land after
+  // the last request completes) but never the latency axis.
+  (s.mix || []).forEach(m => {
+    if (m.t0 < globalTMin) globalTMin = m.t0;
+    if (m.t1 > globalTMax) globalTMax = m.t1;
+  });
+  (s.adt || []).forEach(p => {
+    if (p.t < globalTMin) globalTMin = p.t;
+    if (p.t > globalTMax) globalTMax = p.t;
   });
 });
 if (globalTMax === globalTMin) globalTMax = globalTMin + 1000;
@@ -571,6 +616,104 @@ function tickStats(tickTime) {
   return out;
 }
 
+// --- Cache-mix overlay (vLLM prompt-source metrics samples) ---
+// Per-minute source mix rendered as one horizontal band per sampled series,
+// stacked from the top of the plot area at 30% opacity. Colors are constant:
+// compute=red, local prefix cache=green, external KV transfer=purple. The
+// active-dataset token line is drawn inside each band against a shared scale.
+const MIX_COMPUTE_COLOR = "#e74c3c";
+const MIX_LOCAL_COLOR = "#2ecc71";
+const MIX_EXTERNAL_COLOR = "#9b59b6";
+const ADT_LINE_COLOR = "#f5f5f5";
+const MIX_BAND_H = 64;
+
+function fmtTokens(v) {
+  if (v >= 1e9) return (v / 1e9).toFixed(1) + "B";
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + "k";
+  return "" + Math.round(v);
+}
+
+function cacheMixEnabled() {
+  const cb = document.getElementById("showCacheMix");
+  return HAS_CACHE_MIX && cb && cb.checked;
+}
+
+function drawCacheMix() {
+  if (!cacheMixEnabled()) return;
+  const sampled = [];
+  DATA.forEach((s, si) => {
+    if (hiddenSeries.has(si)) return;
+    if ((s.mix && s.mix.length) || (s.adt && s.adt.length)) sampled.push({ s, si });
+  });
+  if (!sampled.length) return;
+
+  let bandH = MIX_BAND_H;
+  if (sampled.length * bandH > plotH * 0.6) {
+    bandH = Math.max(24, Math.floor(plotH * 0.6 / sampled.length));
+  }
+  let adtMax = 0;
+  sampled.forEach(({ s }) => (s.adt || []).forEach(p => { if (p.v > adtMax) adtMax = p.v; }));
+
+  sampled.forEach(({ s }, bi) => {
+    const yTop = margin.top + bi * bandH;
+
+    // Source-mix band: each inter-sample interval split vertically by the
+    // per-source token-delta share; 100% compute fills the whole band red.
+    ctx.globalAlpha = 0.3;
+    (s.mix || []).forEach(seg => {
+      if (seg.t1 < viewTMin || seg.t0 > viewTMax) return;
+      const total = seg.c + seg.lc + seg.ec;
+      if (total <= 0) return;
+      const x1 = mapX(seg.t0), x2 = mapX(seg.t1);
+      let y = yTop;
+      [[seg.c, MIX_COMPUTE_COLOR], [seg.lc, MIX_LOCAL_COLOR], [seg.ec, MIX_EXTERNAL_COLOR]].forEach(([v, col]) => {
+        if (v <= 0) return;
+        const h = bandH * (v / total);
+        ctx.fillStyle = col;
+        ctx.fillRect(x1, y, x2 - x1, h);
+        y += h;
+      });
+    });
+    ctx.globalAlpha = 1;
+
+    // Active-dataset line: 0 at band bottom, shared adtMax at band top.
+    if (adtMax > 0 && s.adt && s.adt.length > 1) {
+      ctx.strokeStyle = ADT_LINE_COLOR;
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      let started = false;
+      s.adt.forEach(p => {
+        const x = mapX(p.t);
+        const y = yTop + bandH - (p.v / adtMax) * bandH;
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // Band border + labels.
+    ctx.strokeStyle = "#444";
+    ctx.lineWidth = 0.5;
+    ctx.strokeRect(margin.left, yTop, plotW, bandH);
+    ctx.font = "10px monospace";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = "#ddd";
+    ctx.fillText(s.name + " cache mix", margin.left + 4, yTop + 3);
+    if (s.adt && s.adt.length) {
+      const last = s.adt[s.adt.length - 1];
+      ctx.fillStyle = ADT_LINE_COLOR;
+      ctx.textAlign = "right";
+      ctx.fillText("active dataset (tokens): " + fmtTokens(last.v) +
+        " | " + last.s + " series | scale 0-" + fmtTokens(adtMax),
+        margin.left + plotW - 4, yTop + 3);
+      ctx.textAlign = "left";
+    }
+  });
+}
+
 function draw() {
   // Recalc bottom margin for visible series count
   const newBottom = calcBottomMargin();
@@ -683,6 +826,9 @@ function draw() {
   ctx.beginPath();
   ctx.rect(margin.left, margin.top, plotW, plotH);
   ctx.clip();
+
+  // Cache-mix overlay renders first so latency lines stay on top of it.
+  drawCacheMix();
 
   // Moving average lines
   DATA.forEach((s, si) => {
@@ -986,6 +1132,19 @@ document.getElementById("resetZoom").addEventListener("click", () => {
 ["showTTFT","showResp","showDots","showErrors"].forEach(id => {
   document.getElementById(id).addEventListener("change", draw);
 });
+
+// Cache-mix toggle only exists when the dataset actually carries metrics
+// samples; old datasets render exactly as before.
+if (HAS_CACHE_MIX) {
+  const lbl = document.createElement("label");
+  lbl.innerHTML = '<input type="checkbox" id="showCacheMix" checked> Show Cache Mix ' +
+    '<span style="color:' + MIX_COMPUTE_COLOR + '">&#9632;</span>compute ' +
+    '<span style="color:' + MIX_LOCAL_COLOR + '">&#9632;</span>local cache ' +
+    '<span style="color:' + MIX_EXTERNAL_COLOR + '">&#9632;</span>external KV ' +
+    '<span style="color:' + ADT_LINE_COLOR + '">&#8213;</span>active dataset (tokens)';
+  document.querySelector(".controls").appendChild(lbl);
+  document.getElementById("showCacheMix").addEventListener("change", draw);
+}
 
 window.addEventListener("resize", () => { resize(); draw(); });
 resize();
