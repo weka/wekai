@@ -246,7 +246,7 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 <div class="controls">
   <label><input type="checkbox" id="showTTFT" checked> Show TTFT</label>
   <label><input type="checkbox" id="showResp" checked> Show Response Time</label>
-  <label><input type="checkbox" id="showDots"> Show Dots</label>
+  <label><input type="checkbox" id="showDots"> Show Requests</label>
   <label><input type="checkbox" id="showErrors" checked> Show Errors</label>
   <button id="resetZoom" disabled>Reset Zoom</button>
   <span id="zoomInfo" style="font-size:0.8em;color:#7563A5;"></span>
