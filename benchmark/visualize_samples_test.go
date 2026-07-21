@@ -41,13 +41,16 @@ func benchFixtureData(alias string, base time.Time) ([]requestDataRecord, []vllm
 	for i := 0; i < 5; i++ {
 		st := base.Add(time.Duration(i) * 20 * time.Second)
 		records = append(records, requestDataRecord{
-			StartTime:  st,
-			EndTime:    st.Add(2 * time.Second),
-			TTFT:       150,
-			ResponseMs: 2000,
-			Model:      model,
-			SeriesNum:  1,
-			RequestNum: i + 1,
+			StartTime:    st,
+			EndTime:      st.Add(2 * time.Second),
+			TTFT:         150,
+			ResponseMs:   2000,
+			Model:        model,
+			SeriesNum:    1,
+			RequestNum:   i + 1,
+			InputTokens:  100,
+			CachedTokens: 400,
+			OutputTokens: 50,
 		})
 	}
 	var samples []vllmMetricsSample
@@ -87,6 +90,7 @@ func TestGenerateVisualizationWithCacheMixSamples(t *testing.T) {
 		"MIX_COMPUTE_COLOR", "active dataset (tokens)",
 		"MIX_TOTAL_MAX", "mixStackHeight", "mixRate", // absolute band scaling
 		"drawTotals", "totalsStack", "showTotals", "showXAxisValues", // totals volume layer + axis toggle
+		"volumeGeometry", "volumeHoverAt", "windowRates", "Show Totals (ingest)", // ingest volume + hover
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("generated HTML missing %q", want)
@@ -203,26 +207,58 @@ const wide = {t0:0, t1:120000, c:60000, lc:0, ec:0}; // missed tick: 120s interv
 assert(mixRate(wide) === 500, "120s interval => total/120, got " + mixRate(wide));
 assert(mixRate({t0:5, t1:5, c:9, lc:0, ec:0}) === 0, "zero-width interval => 0");
 
-// Totals volume layer math.
-const ta = [0, 10, 20, 30];    // 4 requests
-const tb = [5, 15];            // 2 requests
+// Totals volume layer math — INGEST TOKENS (input+cached), not requests.
+const ta = [0, 10, 20, 30];          // series A completion times
+const ca = [500, 1500, 1600, 2000];  // A cumulative ingest (incl cached)
+const tb = [5, 15];                  // series B
+const cb2 = [700, 1000];             // B cumulative ingest
+const A = { times: ta, cum: ca }, B = { times: tb, cum: cb2 };
 assert(cumCountAt(ta, -1) === 0, "before first completion => 0");
 assert(cumCountAt(ta, 10) === 2, "boundary timestamp inclusive");
 assert(cumCountAt(ta, 1e9) === 4, "after last => all");
 assert(cumCountAt([], 5) === 0 && cumCountAt(null, 5) === 0, "empty/missing => 0");
+assert(cumTokensAt(ta, ca, -1) === 0, "tokens before first => 0");
+assert(cumTokensAt(ta, ca, 10) === 1500, "cumulative tokens at boundary (cached included in cum)");
+assert(cumTokensAt(ta, ca, 1e9) === 2000, "tokens after last => final total");
 // Normalization: at end-of-run the stack top is exactly 1.0 = full height.
-let st = totalsStack([ta, tb], 1e9, ta.length + tb.length);
-assert(Math.abs(st[st.length - 1] - 1.0) < 1e-12, "final combined total => full height, got " + st);
+const FINAL = 2000 + 1000;
+let st = totalsStack([A, B], 1e9, FINAL);
+assert(Math.abs(st[st.length - 1] - 1.0) < 1e-12, "final combined ingest => full height, got " + st);
 // Stacking order stable (input = legend order): layer tops are cumulative.
-st = totalsStack([ta, tb], 15, 6);
-assert(Math.abs(st[0] - 2 / 6) < 1e-12 && Math.abs(st[1] - 4 / 6) < 1e-12, "stack order/cumulation, got " + st);
-// Zero-request series contributes nothing (zero-thickness layer).
-st = totalsStack([ta, [], tb], 1e9, 6);
-assert(st[1] === st[0], "zero-request series adds no thickness");
+st = totalsStack([A, B], 15, FINAL);
+assert(Math.abs(st[0] - 1500 / FINAL) < 1e-12 && Math.abs(st[1] - 2500 / FINAL) < 1e-12,
+  "stack order/token cumulation, got " + st);
+// Zero-ingest series contributes nothing (zero-thickness layer).
+st = totalsStack([A, { times: [], cum: [] }, B], 1e9, FINAL);
+assert(st[1] === st[0], "zero-ingest series adds no thickness");
 // Hide/show: caller drops hidden series and renormalizes => remaining stack
 // still tops out at 1.0.
-st = totalsStack([tb], 1e9, tb.length);
+st = totalsStack([B], 1e9, 1000);
 assert(Math.abs(st[0] - 1.0) < 1e-12, "renormalized visible-only stack fills fully");
+
+// Closest-point lookup for the volume hover.
+assert(closestIndex(null, 5) === -1 && closestIndex([], 5) === -1, "empty => -1");
+assert(closestIndex(ta, -100) === 0, "before first => first");
+assert(closestIndex(ta, 1e9) === 3, "after last => last");
+assert(closestIndex(ta, 14) === 1, "nearest below wins");
+assert(closestIndex(ta, 16) === 2, "nearest above wins");
+assert(closestIndex(ta, 15) === 1, "tie goes to the earlier point");
+
+// Trailing-window rates (requests/s, ingest tok/s, output tok/s).
+const byT = [
+  { t: 0,     in: 100, ca: 400, out: 10 },
+  { t: 30000, in: 100, ca: 400, out: 20 },
+  { t: 60000, in: 200, ca: 300, out: 30 },
+];
+let wr = windowRates(byT, 60000, 60000);
+assert(wr.n === 3, "window includes boundary records, got n=" + wr.n);
+assert(Math.abs(wr.rps - 3 / 60) < 1e-12, "requests/s over 60s");
+assert(Math.abs(wr.inPerSec - 1500 / 60) < 1e-12, "ingest tok/s includes cached, got " + wr.inPerSec);
+assert(Math.abs(wr.outPerSec - 60 / 60) < 1e-12, "output tok/s");
+// Early-run clamp: window start clamps to the first record.
+wr = windowRates(byT, 30000, 60000);
+assert(Math.abs(wr.spanS - 30) < 1e-12 && wr.n === 2, "span clamps to run start");
+assert(windowRates([], 5, 60000) === null && windowRates(null, 5, 60000) === null, "empty => null");
 
 // Volume ceiling: with cache-mix bands on, fraction 1.0 lands EXACTLY on
 // the band strip's lower edge (no overlap); with bands off, on the plot
@@ -380,6 +416,20 @@ assert(s0._respP50.length > 1, "fixture has plotted percentile points");
 const p = s0._respP50[Math.floor(s0._respP50.length / 2)];
 hoverAt(mapX(p.t), mapY(p.v), "line-hover");
 hoverAt(margin.left + plotW / 2, margin.top + 10, "band-hover");
+// Priority chain: line hover wins over the volume layer even where the
+// volume is underneath...
+{
+  const tip = document.getElementById("tooltip");
+  assert(!(tip.innerHTML || "").includes("ingest volume"), "band hover must not be a volume tooltip");
+  hoverAt(mapX(p.t), mapY(p.v), "line-over-volume");
+  assert(!(tip.innerHTML || "").includes("ingest volume"), "line hover wins over volume");
+  // ...and pointing at empty plot area over the stack yields the volume
+  // tooltip with cumulative tokens + window rates.
+  hoverAt(mapX(p.t) + 40, margin.top + plotH - 5, "volume-hover");
+  assert((tip.innerHTML || "").includes("ingest volume"), "volume hover fires in the stack area: " + (tip.innerHTML || "").slice(0, 80));
+  assert((tip.innerHTML || "").includes("% of stack"), "volume tooltip carries stack share");
+  assert((tip.innerHTML || "").includes("tok/s"), "volume tooltip carries window rates");
+}
 // Toggle independence: every combination of the two TTFT checkboxes must
 // render without throwing (p95 stays available with p50 off and vice versa).
 const t50 = document.getElementById("showTTFT"), t95 = document.getElementById("showTTFTP95");

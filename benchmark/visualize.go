@@ -69,6 +69,10 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool) (str
 		SeriesNum     int     `json:"sn"`
 		RequestNum    int     `json:"rn"`
 		CacheHit      bool    `json:"ch"`
+		// Token counts for the ingest volume layer and its hover rates.
+		InputTokens  int `json:"in"`  // net-of-cache input tokens
+		CachedTokens int `json:"ca"`  // server-cached prompt tokens
+		OutputTokens int `json:"out"` // completion tokens
 	}
 
 	type seriesData struct {
@@ -104,6 +108,9 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool) (str
 				SeriesNum:     r.SeriesNum,
 				RequestNum:    r.RequestNum,
 				CacheHit:      r.CacheHit,
+				InputTokens:   r.InputTokens,
+				CachedTokens:  r.CachedTokens,
+				OutputTokens:  r.OutputTokens,
 			})
 		}
 		mix, adt := buildSampleViz(samples)
@@ -257,7 +264,7 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   <label><input type="checkbox" id="showResp" checked> Show Response Time</label>
   <label><input type="checkbox" id="showDots"> Show Requests</label>
   <label><input type="checkbox" id="showErrors" checked> Show Errors</label>
-  <label><input type="checkbox" id="showTotals" checked> Show Totals</label>
+  <label><input type="checkbox" id="showTotals" checked> Show Totals (ingest)</label>
   <label><input type="checkbox" id="showXAxisValues"> Show X-axis values</label>
   <button id="resetZoom" disabled>Reset Zoom</button>
   <span id="zoomInfo" style="font-size:0.8em;color:#8a9096;"></span>
@@ -323,8 +330,15 @@ const MIX_TOTAL_MAX = mixTotalMax(DATA);
 
 // Precompute moving averages and error bars per series
 DATA.forEach(s => {
-  // Sorted completion times for the cumulative totals volume layer.
-  s._cumTimes = s.records.map(r => r.t).sort((a, b) => a - b);
+  // Time-ordered records with cumulative INGEST tokens (input + cached —
+  // the full context volume, same quantity as wekai's in= counter) for the
+  // totals volume layer and its hover rates.
+  const byT = s.records.slice().sort((a, b) => a.t - b.t);
+  s._byT = byT;
+  s._cumTimes = byT.map(r => r.t);
+  s._cumTokens = [];
+  let ingestAcc = 0;
+  byT.forEach(r => { ingestAcc += (r.in || 0) + (r.ca || 0); s._cumTokens.push(ingestAcc); });
   const sorted = s.records.filter(r => !r.err).slice().sort((a, b) => a.t - b.t);
   s._sorted = sorted;
   const maxSn = sorted.reduce((mx, r) => Math.max(mx, r.sn), 1);
@@ -376,7 +390,7 @@ const OTHER_PALETTE = [
   "#ab9a64","#8a95a3","#a678e8","#5f987d","#b98f83","#c2b078",
   "#8d5fd6","#707c8a","#75b094","#d0b3f5","#9aa5b1","#c9b8e8",
 ];
-const GPU_VARIANTS = ["#8a95a3","#707c8a","#a3aeba","#5c6875","#b8c2cc"];
+const GPU_VARIANTS = ["#8094b5","#68809f","#9cb0cb","#54687f","#aec3da"]; // muted slate-BLUE (perceptible cool lean, restraint kept)
 const DRAM_VARIANTS = ["#5f987d","#4d8069","#75b094","#3f6a57","#8cc4a9"];
 const WEKA_VARIANTS = [
   "#a678e8","#C79FF1","#8d5fd6","#b58ff0","#7745c0","#d0b3f5",
@@ -753,20 +767,57 @@ function totalsY(frac, plotTop, plotHeight, ceilingY) {
   return bottom - frac * (bottom - ceilingY);
 }
 
-// totalsStack: stacked cumulative fractions at time t for series given in
-// stacking (legend) order, normalized against finalTotal — the combined
-// FINAL count, so the stack reaches exactly 1.0 (full available height) at
-// the end of the run and the shape is stable under zoom. Callers pass only
-// visible series (and their recomputed finalTotal) so hidden series
-// contribute nothing.
-function totalsStack(timesArr, t, finalTotal) {
+// cumTokensAt: cumulative ingest tokens of a series at time t, from the
+// sorted times and the aligned cumulative-token array (cached tokens
+// included by construction).
+function cumTokensAt(times, cumTokens, t) {
+  const idx = cumCountAt(times, t);
+  return idx > 0 ? cumTokens[idx - 1] : 0;
+}
+
+// totalsStack: stacked cumulative ingest-token fractions at time t for
+// series given in stacking (legend) order — each entry {times, cum} — and
+// normalized against finalTotal (the combined FINAL ingest), so the stack
+// reaches exactly 1.0 (full available height) at the end of the run and the
+// shape is stable under zoom. Callers pass only visible series (and their
+// recomputed finalTotal) so hidden series contribute nothing.
+function totalsStack(seriesCums, t, finalTotal) {
   const out = [];
   let acc = 0;
-  (timesArr || []).forEach(times => {
-    if (finalTotal > 0) acc += cumCountAt(times, t) / finalTotal;
+  (seriesCums || []).forEach(sc => {
+    if (finalTotal > 0) acc += cumTokensAt(sc.times, sc.cum, t) / finalTotal;
     out.push(acc);
   });
   return out;
+}
+
+// closestIndex: index of the timestamp nearest to t (ties to the earlier
+// one); -1 for empty input.
+function closestIndex(times, t) {
+  if (!times || !times.length) return -1;
+  const idx = cumCountAt(times, t);
+  if (idx <= 0) return 0;
+  if (idx >= times.length) return times.length - 1;
+  return (t - times[idx - 1]) <= (times[idx] - t) ? idx - 1 : idx;
+}
+
+// windowRates: requests/s, ingest tokens/s (input+cached) and output
+// tokens/s over the trailing windowMs ending at t, from time-ordered
+// records; the span clamps to the run start so early-run rates stay honest.
+function windowRates(byT, t, windowMs) {
+  if (!byT || !byT.length) return null;
+  const t0 = Math.max(t - windowMs, byT[0].t);
+  let n = 0, inTok = 0, outTok = 0;
+  for (let i = byT.length - 1; i >= 0; i--) {
+    const r = byT[i];
+    if (r.t > t) continue;
+    if (r.t < t0) break;
+    n++;
+    inTok += (r.in || 0) + (r.ca || 0);
+    outTok += (r.out || 0);
+  }
+  const spanS = Math.max((t - t0) / 1000, 1e-9);
+  return { n: n, rps: n / spanS, inPerSec: inTok / spanS, outPerSec: outTok / spanS, spanS: spanS };
 }
 
 // adtAt returns the latest active-dataset observation at or before t, or
@@ -835,43 +886,50 @@ function xAxisValuesEnabled() {
   return cb ? cb.checked : true;
 }
 
-// drawTotals renders the cumulative completed-request "volume" layer:
-// stacked translucent areas (one per visible series, legend order, series
-// colors, alpha 0.3) behind the latency lines. Normalized to the combined
-// FINAL total of the visible series = full plot height, so the stack fills
-// the chart exactly at the end of the run and the biggest contributor
-// visibly owns the top of the right edge.
-function drawTotals() {
+// volumeGeometry: shared state for the ingest volume layer — the visible
+// contributing series, the combined final ingest-token total, and the
+// stack's ceiling (the cache-mix strip's lower edge when the overlay is on,
+// else the plot top). Used by drawTotals and the volume hover so they can't
+// disagree. null when the layer is off or empty.
+function volumeGeometry() {
   const cb = document.getElementById("showTotals");
-  if (!cb || !cb.checked) return;
+  if (!cb || !cb.checked) return null;
   const visible = [];
   DATA.forEach((s, si) => {
     if (!hiddenSeries.has(si) && s._cumTimes && s._cumTimes.length) visible.push({ s, si });
   });
-  if (!visible.length) return;
+  if (!visible.length) return null;
   let finalTotal = 0;
-  visible.forEach(({ s }) => { finalTotal += s._cumTimes.length; });
-  if (finalTotal <= 0) return;
-
-  // Ceiling: with the cache-mix overlay on, the stack tops out exactly at
-  // the band strip's lower edge — the layers tile, never overlap. With the
-  // overlay off it fills to the literal plot top. Recomputed every draw, so
-  // toggling Show Cache Mix re-targets the normalization instantly.
+  visible.forEach(({ s }) => { finalTotal += s._cumTokens[s._cumTokens.length - 1]; });
+  if (finalTotal <= 0) return null;
   const layout = cacheMixLayout();
   let ceilingY = margin.top;
   if (layout && layout.bands.length) {
     const last = layout.bands[layout.bands.length - 1];
     ceilingY = last.yTop + last.bandH;
   }
+  return { visible: visible, finalTotal: finalTotal, ceilingY: ceilingY };
+}
+
+// drawTotals renders the cumulative INGEST-TOKEN "volume" layer: stacked
+// translucent areas (one per visible series, legend order, series colors,
+// alpha 0.3) behind the latency lines. Normalized to the combined FINAL
+// ingest of the visible series = full available height, so the stack fills
+// the chart exactly at the end of the run and the biggest contributor
+// visibly owns the top of the right edge.
+function drawTotals() {
+  const geo = volumeGeometry();
+  if (!geo) return;
+  const { visible, finalTotal, ceilingY } = geo;
 
   const stepPx = 2;
   const n = Math.max(2, Math.floor(plotW / stepPx) + 1);
   const xs = new Array(n), stacks = new Array(n);
-  const timesArr = visible.map(({ s }) => s._cumTimes);
+  const seriesCums = visible.map(({ s }) => ({ times: s._cumTimes, cum: s._cumTokens }));
   for (let k = 0; k < n; k++) {
     const px = Math.min(k * stepPx, plotW);
     xs[k] = margin.left + px;
-    stacks[k] = totalsStack(timesArr, unmapX(margin.left + px), finalTotal);
+    stacks[k] = totalsStack(seriesCums, unmapX(margin.left + px), finalTotal);
   }
 
   ctx.globalAlpha = 0.3;
@@ -1266,6 +1324,33 @@ function draw() {
   updateInfo();
 }
 
+// volumeHoverAt: the ingest-volume layer under the cursor, or null. Finds
+// the layer whose stacked band contains the pointer's vertical fraction,
+// then snaps to that series' closest data point in time. Lowest hover
+// priority: dot/line > cache-mix band > volume.
+function volumeHoverAt(mx, my) {
+  const geo = volumeGeometry();
+  if (!geo) return null;
+  const bottom = margin.top + plotH;
+  if (my > bottom || my < geo.ceilingY) return null;
+  const t = unmapX(mx);
+  const fracY = (bottom - my) / Math.max(bottom - geo.ceilingY, 1e-9);
+  let acc = 0, hit = null;
+  for (const vs of geo.visible) {
+    const frac = cumTokensAt(vs.s._cumTimes, vs.s._cumTokens, t) / geo.finalTotal;
+    if (fracY <= acc + frac) { hit = vs; break; }
+    acc += frac;
+  }
+  if (!hit) return null;
+  const ci = closestIndex(hit.s._cumTimes, t);
+  if (ci < 0) return null;
+  const tc = hit.s._cumTimes[ci];
+  const cumTok = hit.s._cumTokens[ci];
+  let stackAll = 0;
+  geo.visible.forEach(({ s }) => { stackAll += cumTokensAt(s._cumTimes, s._cumTokens, tc); });
+  return { s: hit.s, si: hit.si, tc: tc, cumTok: cumTok, share: stackAll > 0 ? cumTok / stackAll : 0 };
+}
+
 // mixTooltipHTML renders the cache-mix breakdown lines for series s at time
 // t: the covering (or latest preceding) per-minute source deltas plus the
 // active dataset size/series count. "" when no sample data exists at t.
@@ -1391,8 +1476,15 @@ canvas.addEventListener("mousemove", e => {
   // ANNOTATION_ROWS_MAX_DURATION) to avoid an overlapping label band --
   // hovering near any x-axis gridline surfaces the same per-series
   // cumulative breakdown via tooltip instead.
+  // Ingest-volume hover: lowest priority of the shaped hovers — never
+  // steals from dot/line or band tooltips.
+  let volHover = null;
+  if (!best && !mixHover && mx >= margin.left && mx <= margin.left + plotW) {
+    volHover = volumeHoverAt(mx, my);
+  }
+
   let tickHover = null;
-  if (!best && !mixHover && (viewTMax - viewTMin) / 1000 > ANNOTATION_ROWS_MAX_DURATION && my >= margin.top) {
+  if (!best && !mixHover && !volHover && (viewTMax - viewTMin) / 1000 > ANNOTATION_ROWS_MAX_DURATION && my >= margin.top) {
     let bestTickDist = 10;
     currentTicks.forEach(tk => {
       const d = Math.abs(mx - tk.x);
@@ -1443,6 +1535,15 @@ canvas.addEventListener("mousemove", e => {
     }
     showTooltip(e, "<b>" + mixHover.band.s.name + "</b> \u2014 cache mix<br>" +
       win + mixTooltipHTML(mixHover.band.s, mixHover.t));
+  } else if (volHover) {
+    const rates = windowRates(volHover.s._byT, volHover.tc, 60000);
+    showTooltip(e,
+      "<b>" + volHover.s.name + "</b> \u2014 ingest volume<br>" +
+      "at " + formatTickLabel(Math.round(volHover.tc / 1000)) + ": " +
+      fmtTokens(volHover.cumTok) + " tok cumulative (" + (100 * volHover.share).toFixed(0) + "% of stack)<br>" +
+      (rates ? "<span style='color:#8a9096'>last " + Math.round(rates.spanS) + "s: " +
+        rates.n + " req (" + rates.rps.toFixed(1) + "/s), in " + fmtTokens(rates.inPerSec) + " tok/s, out " +
+        fmtTokens(rates.outPerSec) + " tok/s</span>" : ""));
   } else if (tickHover) {
     const elapsedSec = Math.round((tickHover.tickTime - globalTMin) / 1000);
     const rows = tickStats(tickHover.tickTime).map(({ si, cumReqs, cumErrs, maxSn }) => {
