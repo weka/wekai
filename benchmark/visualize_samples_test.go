@@ -260,6 +260,16 @@ wr = windowRates(byT, 30000, 60000);
 assert(Math.abs(wr.spanS - 30) < 1e-12 && wr.n === 2, "span clamps to run start");
 assert(windowRates([], 5, 60000) === null && windowRates(null, 5, 60000) === null, "empty => null");
 
+// Volume hover share is vs the BEST series at the same time point, not the
+// stack total (cross-implementation totals are meaningless).
+// At t=1e9: A=2000 (largest), B=1000.
+assert(Math.abs(shareOfBest([A, B], 1e9, 2000) - 1.0) < 1e-12, "hovered==largest => 100%");
+assert(Math.abs(shareOfBest([A, B], 1e9, 1000) - 0.5) < 1e-12, "smaller => ratio of best");
+// Tie: both series at the same cumulative => both read 100%.
+const T1 = { times: [0], cum: [500] }, T2 = { times: [0], cum: [500] };
+assert(shareOfBest([T1, T2], 10, 500) === 1.0, "ties => 100% for both");
+assert(shareOfBest([], 10, 5) === 0 && shareOfBest([T1], -1, 0) === 0, "no data / zero best => 0");
+
 // Volume ceiling: with cache-mix bands on, fraction 1.0 lands EXACTLY on
 // the band strip's lower edge (no overlap); with bands off, on the plot
 // top. plotTop=30, plotH=600 => bottom=630; strip bottom e.g. 30+2*64=158.
@@ -346,7 +356,7 @@ function __el(id, extra) {
   return __elements[id];
 }
 __el("chart"); __el("tooltip", { _w: 220, _h: 180 });
-__el("showTTFT", { checked: true }); __el("showTTFTP95", { checked: true });
+__el("showTTFT", { checked: true }); __el("showTTFTP95", { checked: false });
 __el("showResp", { checked: true });
 __el("showDots", { checked: false }); __el("showErrors", { checked: true });
 __el("showCacheMix", { checked: true });
@@ -427,7 +437,7 @@ hoverAt(margin.left + plotW / 2, margin.top + 10, "band-hover");
   // tooltip with cumulative tokens + window rates.
   hoverAt(mapX(p.t) + 40, margin.top + plotH - 5, "volume-hover");
   assert((tip.innerHTML || "").includes("ingest volume"), "volume hover fires in the stack area: " + (tip.innerHTML || "").slice(0, 80));
-  assert((tip.innerHTML || "").includes("% of stack"), "volume tooltip carries stack share");
+  assert((tip.innerHTML || "").includes("% of best"), "volume tooltip carries share-of-best");
   assert((tip.innerHTML || "").includes("tok/s"), "volume tooltip carries window rates");
 }
 // Toggle independence: every combination of the two TTFT checkboxes must

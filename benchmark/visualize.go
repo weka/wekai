@@ -259,8 +259,8 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 <h1>Benchmark Request Timeline</h1>
 <div class="info" id="info"></div>
 <div class="controls">
-  <label><input type="checkbox" id="showTTFT" checked> Show TTFT</label>
-  <label><input type="checkbox" id="showTTFTP95" checked> TTFT p95</label>
+  <label><input type="checkbox" id="showTTFT" checked> TTFT p50</label>
+  <label><input type="checkbox" id="showTTFTP95"> TTFT p95</label>
   <label><input type="checkbox" id="showResp" checked> Show Response Time</label>
   <label><input type="checkbox" id="showDots"> Show Requests</label>
   <label><input type="checkbox" id="showErrors" checked> Show Errors</label>
@@ -799,6 +799,20 @@ function closestIndex(times, t) {
   if (idx <= 0) return 0;
   if (idx >= times.length) return times.length - 1;
   return (t - times[idx - 1]) <= (times[idx] - t) ? idx - 1 : idx;
+}
+
+// shareOfBest: the hovered series' cumulative ingest as a fraction of the
+// LARGEST series' cumulative at the same time point — cross-implementation
+// totals have no combined meaning, so shares are expressed against the
+// best: the biggest series reads 100%, others their fraction of it (ties
+// all read 100%).
+function shareOfBest(seriesCums, t, hoveredTok) {
+  let best = 0;
+  (seriesCums || []).forEach(sc => {
+    const v = cumTokensAt(sc.times, sc.cum, t);
+    if (v > best) best = v;
+  });
+  return best > 0 ? hoveredTok / best : 0;
 }
 
 // windowRates: requests/s, ingest tokens/s (input+cached) and output
@@ -1346,9 +1360,8 @@ function volumeHoverAt(mx, my) {
   if (ci < 0) return null;
   const tc = hit.s._cumTimes[ci];
   const cumTok = hit.s._cumTokens[ci];
-  let stackAll = 0;
-  geo.visible.forEach(({ s }) => { stackAll += cumTokensAt(s._cumTimes, s._cumTokens, tc); });
-  return { s: hit.s, si: hit.si, tc: tc, cumTok: cumTok, share: stackAll > 0 ? cumTok / stackAll : 0 };
+  const cums = geo.visible.map(({ s }) => ({ times: s._cumTimes, cum: s._cumTokens }));
+  return { s: hit.s, si: hit.si, tc: tc, cumTok: cumTok, share: shareOfBest(cums, tc, cumTok) };
 }
 
 // mixTooltipHTML renders the cache-mix breakdown lines for series s at time
@@ -1540,7 +1553,7 @@ canvas.addEventListener("mousemove", e => {
     showTooltip(e,
       "<b>" + volHover.s.name + "</b> \u2014 ingest volume<br>" +
       "at " + formatTickLabel(Math.round(volHover.tc / 1000)) + ": " +
-      fmtTokens(volHover.cumTok) + " tok cumulative (" + (100 * volHover.share).toFixed(0) + "% of stack)<br>" +
+      fmtTokens(volHover.cumTok) + " tok cumulative (" + (100 * volHover.share).toFixed(0) + "% of best)<br>" +
       (rates ? "<span style='color:#8a9096'>last " + Math.round(rates.spanS) + "s: " +
         rates.n + " req (" + rates.rps.toFixed(1) + "/s), in " + fmtTokens(rates.inPerSec) + " tok/s, out " +
         fmtTokens(rates.outPerSec) + " tok/s</span>" : ""));
