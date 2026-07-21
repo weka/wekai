@@ -218,26 +218,27 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Benchmark Results</title>
 <style>
-  /* WEKA brand scheme (weka.io custom.css): violet #773DBE, fuchsia #EB00C0,
-     deep indigo #180D36, near-black #05030B, panel #241b30, muted text
-     #D1CFD7, secondary text #7563A5. */
+  /* WEKA brand scheme, neutral-first: near-black surfaces (#05030B, weka.io)
+     with a faint indigo-tinted chart panel, calm off-white/gray typography,
+     and vivid brand color reserved for a single accent class (external-KV).
+     Color is jewelry, not paint. */
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #05030B; color: #D1CFD7; padding: 16px; }
-  h1 { font-size: 1.4em; margin-bottom: 8px; color: #D1CFD7; }
-  .info { font-size: 0.85em; color: #7563A5; margin-bottom: 12px; }
+  h1 { font-size: 1.4em; margin-bottom: 8px; color: #e8e7eb; }
+  .info { font-size: 0.85em; color: #61656C; margin-bottom: 12px; }
   .controls { margin-bottom: 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   .controls label { font-size: 0.85em; cursor: pointer; }
   .controls input[type=checkbox] { margin-right: 4px; }
-  .controls button { font-size: 0.8em; padding: 3px 10px; background: #241b30; color: #D1CFD7; border: 1px solid #7563A5; border-radius: 4px; cursor: pointer; }
-  .controls button:hover { background: #35255c; }
+  .controls button { font-size: 0.8em; padding: 3px 10px; background: #15121f; color: #D1CFD7; border: 1px solid #3a3547; border-radius: 4px; cursor: pointer; }
+  .controls button:hover { background: #201a30; }
   .controls button:disabled { opacity: 0.3; cursor: default; }
   #legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 12px; font-size: 0.8em; }
   .legend-item { display: flex; align-items: center; gap: 4px; cursor: pointer; opacity: 1; }
   .legend-item.hidden { opacity: 0.35; }
   .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
-  .legend-count { color: #7563A5; font-size: 0.9em; }
-  canvas { background: #180D36; border-radius: 8px; display: block; cursor: crosshair; }
-  #tooltip { position: fixed; background: #241b30; border: 1px solid #7563A5; border-radius: 6px; padding: 8px 10px; font-size: 0.8em; pointer-events: none; display: none; z-index: 100; max-width: 300px; line-height: 1.5; }
+  .legend-count { color: #61656C; font-size: 0.9em; }
+  canvas { background: #0d0a1a; border-radius: 8px; display: block; cursor: crosshair; }
+  #tooltip { position: fixed; background: #15121f; border: 1px solid #3a3547; border-radius: 6px; padding: 8px 10px; font-size: 0.8em; pointer-events: none; display: none; z-index: 100; max-width: 300px; line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -249,12 +250,12 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   <label><input type="checkbox" id="showDots"> Show Requests</label>
   <label><input type="checkbox" id="showErrors" checked> Show Errors</label>
   <button id="resetZoom" disabled>Reset Zoom</button>
-  <span id="zoomInfo" style="font-size:0.8em;color:#7563A5;"></span>
+  <span id="zoomInfo" style="font-size:0.8em;color:#61656C;"></span>
 </div>
 <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-  <button id="selectAll" style="font-size:0.8em;padding:3px 10px;background:#241b30;color:#D1CFD7;border:1px solid #7563A5;border-radius:4px;cursor:pointer;">Select All</button>
-  <button id="deselectAll" style="font-size:0.8em;padding:3px 10px;background:#241b30;color:#D1CFD7;border:1px solid #7563A5;border-radius:4px;cursor:pointer;">Deselect All</button>
-  <input id="seriesFilter" type="text" placeholder="Filter series..." style="font-size:0.8em;padding:3px 8px;background:#241b30;color:#D1CFD7;border:1px solid #7563A5;border-radius:4px;width:200px;">
+  <button id="selectAll" style="font-size:0.8em;padding:3px 10px;background:#15121f;color:#D1CFD7;border:1px solid #3a3547;border-radius:4px;cursor:pointer;">Select All</button>
+  <button id="deselectAll" style="font-size:0.8em;padding:3px 10px;background:#15121f;color:#D1CFD7;border:1px solid #3a3547;border-radius:4px;cursor:pointer;">Deselect All</button>
+  <input id="seriesFilter" type="text" placeholder="Filter series..." style="font-size:0.8em;padding:3px 8px;background:#15121f;color:#D1CFD7;border:1px solid #3a3547;border-radius:4px;width:200px;">
 </div>
 <div id="legend"></div>
 <canvas id="chart"></canvas>
@@ -271,6 +272,7 @@ function getAlias(name) {
 }
 function classifyAlias(a) {
   if (a === "gpu") return "gpu";
+  if (/(?:^|[-_])hbm(?:$|[-_])/.test(a) || /^hbm/.test(a)) return "gpu"; // no-offload arms are named "hbm"
   if (/(?:^|[-_])gds(?:$|[-_])/.test(a)) return "weka";
   if (/^weka/.test(a)) return "weka";
   if (/(?:^|[-_])dram(?:$|[-_])/.test(a)) return "dram";
@@ -352,19 +354,20 @@ function percentile(arr, p) {
   return s[Math.max(0, idx)];
 }
 
-// --- Color assignment (WEKA brand families) ---
-// Pure red stays reserved for errors. weka arms wear the brand
-// fuchsia/violet family; hbm/gpu arms cool blue; dram teal; the fixed-order
-// fallback mixes the families. Head of each list validated (lightness band,
-// chroma floor, CVD separation, contrast) against the #180D36 surface.
+// --- Color assignment (WEKA brand, neutral-first) ---
+// Series lines are deliberately desaturated — position and the legend carry
+// identity; full-saturation brand fuchsia is reserved for the external-KV
+// accent alone. Pure red stays reserved for errors. weka arms wear muted
+// violet, hbm/gpu muted slate-blue, dram muted gray-teal, the fallback
+// neutral grays and soft tints.
 const OTHER_PALETTE = [
-  "#e2685b","#3b93e8","#EB00C0","#9259d8","#2aa0ba","#D1CFD7",
-  "#773DBE","#e85d50","#57a5ee","#c79ff1","#6B00DD","#43b5cf",
+  "#9d7be0","#6f8fb5","#b7897f","#6fa0a5","#c9b8e8","#a9a7b3",
+  "#7e5fc4","#8aa6c8","#b79aec","#587f83","#9a9ba5","#7d8590",
 ];
-const GPU_VARIANTS = ["#3b93e8","#2f89dd","#57a5ee","#1f78c8","#7fc0f5"];
-const DRAM_VARIANTS = ["#2aa0ba","#1f8ba3","#43b5cf","#177a90","#5cc3da"];
+const GPU_VARIANTS = ["#6f8fb5","#5a7a9f","#8aa6c8","#4d6a8c","#93aecb"];
+const DRAM_VARIANTS = ["#6fa0a5","#587f83","#8ab8bd","#4a6d71","#a0c8cc"];
 const WEKA_VARIANTS = [
-  "#EB00C0","#773DBE","#9259d8","#6B00DD","#c79ff1","#a34fe8",
+  "#9d7be0","#7e5fc4","#b79aec","#6a4fa8","#c9b8e8","#8f79cf",
 ];
 
 const seriesColors = [];
@@ -649,22 +652,20 @@ function tickStats(tickTime) {
 // stacked from the top of the plot area at 30% opacity. Colors are constant:
 // compute=red, local prefix cache=green, external KV transfer=purple. The
 // active-dataset token line is drawn inside each band against a shared scale.
-// Brand-coherent source triad, validated against the black band backdrop
-// (lightness band / chroma / CVD separation / contrast all pass): the
-// external-KV hero wears the official Weka Fuchsia, the dominant local-cache
-// mass a calm mid violet, and compute — the cost — a deep coral accent (the
-// official palette carries no warm accent; coral is the one off-palette
-// color, per the design spec).
-const MIX_COMPUTE_COLOR = "#e85d50";
-const MIX_LOCAL_COLOR = "#9259d8";
-const MIX_EXTERNAL_COLOR = "#EB00C0"; // official Weka Fuchsia (weka.io)
-const ADT_LINE_COLOR = "#FFFFFF";
-const ADT_LINE_UNDERLAY = "rgba(5, 3, 11, 0.9)"; // dark casing keeps the line legible over every fill
+// Neutral-first source triad on the black band backdrop: the dominant
+// local-cache mass is a dim violet-gray, compute a muted clay, and the
+// external-KV hero is the ONE vivid element in the whole report — official
+// Weka Fuchsia. It is the smallest area and the story that should pop;
+// everything else stays under a strict saturation budget.
+const MIX_COMPUTE_COLOR = "#8a6f63";
+const MIX_LOCAL_COLOR = "#6b5e91";
+const MIX_EXTERNAL_COLOR = "#EB00C0"; // official Weka Fuchsia — the single high-chroma accent
+const ADT_LINE_COLOR = "#e8e7eb";
 const MIX_BAND_H = 64;
-// Band fills sit on a solid-black backdrop, so they no longer need
-// transparency against the chart background — near-opaque pops on black
-// while latency lines (drawn after) still overpaint the bands.
-const MIX_FILL_ALPHA = 0.85;
+// Band fills sit on a solid-black backdrop; slightly translucent so the
+// (muted) band mass sits visually behind the latency lines — the plot reads
+// first, the band second.
+const MIX_FILL_ALPHA = 0.78;
 
 // DOM-free helpers (fmtTokens/mixAt/adtAt/mixTotalMax/mixStackHeight/
 // mixRate/placeTooltip): unit-tested under node by
@@ -808,31 +809,24 @@ function drawCacheMix() {
     ctx.globalAlpha = 1;
 
     // Active-dataset line: 0 at band bottom, shared adtMax at band top.
-    // Drawn twice — dark casing then white core — so it stays legible over
-    // the light and dark fills alike.
+    // Thin off-white — the muted fills leave it plenty of contrast.
     if (adtMax > 0 && s.adt && s.adt.length > 1) {
-      const traceAdt = () => {
-        ctx.beginPath();
-        let started = false;
-        s.adt.forEach(p => {
-          const x = mapX(p.t);
-          const y = yTop + bandH - (p.v / adtMax) * bandH;
-          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-        });
-        ctx.stroke();
-      };
-      ctx.strokeStyle = ADT_LINE_UNDERLAY;
-      ctx.lineWidth = 3.5;
-      traceAdt();
       ctx.strokeStyle = ADT_LINE_COLOR;
-      ctx.lineWidth = 1.5;
-      ctx.globalAlpha = 0.95;
-      traceAdt();
+      ctx.lineWidth = 1;
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      let started = false;
+      s.adt.forEach(p => {
+        const x = mapX(p.t);
+        const y = yTop + bandH - (p.v / adtMax) * bandH;
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
       ctx.globalAlpha = 1;
     }
 
     // Band border + labels.
-    ctx.strokeStyle = "#3d2e66";
+    ctx.strokeStyle = "#232038";
     ctx.lineWidth = 0.5;
     ctx.strokeRect(margin.left, yTop, plotW, bandH);
     ctx.font = "10px monospace";
@@ -865,9 +859,9 @@ function draw() {
   ctx.clearRect(0, 0, W, H);
 
   // Grid and axes
-  ctx.strokeStyle = "#2a1d52";
+  ctx.strokeStyle = "#151024";
   ctx.lineWidth = 0.5;
-  ctx.fillStyle = "#7563A5";
+  ctx.fillStyle = "#8f8ba0";
   ctx.font = "11px monospace";
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
@@ -912,29 +906,30 @@ function draw() {
         const p3 = ")";
         const fullW = ctx.measureText(p1 + p2 + p3 + snPart).width;
         cx = x - fullW / 2;
-        ctx.fillStyle = seriesColors[si];
+        ctx.fillStyle = "#D1CFD7";
         ctx.fillText(p1, cx, yBase);
         cx += ctx.measureText(p1).width;
         ctx.fillStyle = "#ff4444";
         ctx.fillText(p2, cx, yBase);
         cx += ctx.measureText(p2).width;
-        ctx.fillStyle = seriesColors[si];
+        ctx.fillStyle = "#D1CFD7";
         ctx.fillText(p3, cx, yBase);
         cx += ctx.measureText(p3).width;
       } else {
         const fullW = ctx.measureText("" + cumReqs + snPart).width;
         cx = x - fullW / 2;
-        ctx.fillStyle = seriesColors[si];
+        ctx.fillStyle = "#D1CFD7";
         ctx.fillText("" + cumReqs, cx, yBase);
         cx += ctx.measureText("" + cumReqs).width;
       }
-      ctx.fillStyle = "#7563A5";
+      ctx.fillStyle = "#8f8ba0";
       ctx.fillText(snPart, cx, yBase);
       ctx.textAlign = "center";
       row++;
     });
     // Dataset-size rows: active-dataset tokens as of each tick, one row per
     // visible sampled series, sharing the sparse adaptive tick columns.
+    // Text stays neutral; the row's left-edge chip names the series.
     if (cacheMixEnabled()) {
       DATA.forEach((ds, si) => {
         if (hiddenSeries.has(si) || !ds.adt || !ds.adt.length) return;
@@ -942,14 +937,32 @@ function draw() {
         const label = "ds:" + (p ? fmtTokens(p.v) : "-");
         const yBase = margin.top + plotH + 20 + row * 14;
         ctx.textAlign = "left";
-        ctx.fillStyle = seriesColors[si];
+        ctx.fillStyle = "#D1CFD7";
         ctx.fillText(label, x - ctx.measureText(label).width / 2, yBase);
         ctx.textAlign = "center";
         row++;
       });
     }
     ctx.font = "11px monospace";
-    ctx.fillStyle = "#7563A5";
+    ctx.fillStyle = "#8f8ba0";
+  }
+
+  // Row-identity chips: annotation text is neutral, so a small colored chip
+  // at the left edge of each row names its series (request rows first, then
+  // ds: rows, matching the per-tick row order).
+  {
+    let row = 0;
+    const chip = si => {
+      ctx.fillStyle = seriesColors[si];
+      ctx.fillRect(margin.left - 13, margin.top + plotH + 20 + row * 14 + 1, 7, 7);
+      row++;
+    };
+    DATA.forEach((ds, si) => { if (!hiddenSeries.has(si)) chip(si); });
+    if (cacheMixEnabled()) {
+      DATA.forEach((ds, si) => {
+        if (!hiddenSeries.has(si) && ds.adt && ds.adt.length) chip(si);
+      });
+    }
   }
 
   // Y axis label
@@ -970,7 +983,7 @@ function draw() {
   ctx.textBaseline = "top";
 
   // Plot border
-  ctx.strokeStyle = "#3d2e66";
+  ctx.strokeStyle = "#232038";
   ctx.lineWidth = 1;
   ctx.strokeRect(margin.left, margin.top, plotW, plotH);
 
@@ -1107,9 +1120,9 @@ function draw() {
   if (dragStart !== null && dragCurrent !== null) {
     const x1 = Math.max(margin.left, Math.min(dragStart, dragCurrent));
     const x2 = Math.min(margin.left + plotW, Math.max(dragStart, dragCurrent));
-    ctx.fillStyle = "rgba(119, 61, 190, 0.2)";
+    ctx.fillStyle = "rgba(157, 123, 224, 0.12)";
     ctx.fillRect(x1, margin.top, x2 - x1, plotH);
-    ctx.strokeStyle = "#EB00C0";
+    ctx.strokeStyle = "#9d7be0";
     ctx.lineWidth = 1;
     ctx.setLineDash([4, 4]);
     ctx.strokeRect(x1, margin.top, x2 - x1, plotH);
