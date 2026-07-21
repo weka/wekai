@@ -186,9 +186,10 @@ type requestDataRecord struct {
 
 // requestDataWriter writes requestDataRecord entries as JSONL, safe for concurrent use.
 type requestDataWriter struct {
-	mu  sync.Mutex
-	f   *os.File
-	enc *json.Encoder
+	mu     sync.Mutex
+	f      *os.File
+	enc    *json.Encoder
+	closed bool
 }
 
 var sanitizeModelRe = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
@@ -209,21 +210,38 @@ func newRequestDataWriter(outputDir, model string, _ time.Time) (*requestDataWri
 	}, nil
 }
 
+// write encodes a request record. Writes after close() are silent no-ops:
+// during abnormal shutdown (error storm + early kill) in-flight workers can
+// race the deferred close, and a warning-per-row "file already closed"
+// storm helps nobody.
 func (w *requestDataWriter) write(rec requestDataRecord) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
 	return w.enc.Encode(rec)
 }
 
 // writeAny encodes a non-request record (e.g. vllmMetricsSample) into the
-// same JSONL stream. Safe for concurrent use with write().
+// same JSONL stream. Safe for concurrent use with write(); same silent
+// no-op after close.
 func (w *requestDataWriter) writeAny(v any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
 	return w.enc.Encode(v)
 }
 
 func (w *requestDataWriter) close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.closed = true
 	return w.f.Close()
 }
 

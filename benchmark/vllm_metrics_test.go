@@ -202,6 +202,39 @@ func TestReadJSONLFileMixedRecordTypes(t *testing.T) {
 	}
 }
 
+// TestRequestDataWriterWriteAfterCloseIsSilent: during abnormal shutdown
+// (error storm + early kill) in-flight workers race the deferred close; a
+// write after close must be a silent no-op, not a warning-per-row storm.
+func TestRequestDataWriterWriteAfterCloseIsSilent(t *testing.T) {
+	dir := t.TempDir()
+	rdw, err := newRequestDataWriter(dir, "close_test", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rdw.write(requestDataRecord{RequestNum: 1}); err != nil {
+		t.Fatalf("pre-close write: %v", err)
+	}
+	if err := rdw.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdw.write(requestDataRecord{RequestNum: 2}); err != nil {
+		t.Fatalf("write after close must be a silent no-op, got: %v", err)
+	}
+	if err := rdw.writeAny(map[string]int{"x": 1}); err != nil {
+		t.Fatalf("writeAny after close must be a silent no-op, got: %v", err)
+	}
+	if err := rdw.close(); err != nil {
+		t.Fatalf("double close must be a no-op, got: %v", err)
+	}
+	records, samples, err := readJSONLFile(filepath.Join(dir, "close_test.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || len(samples) != 0 {
+		t.Fatalf("post-close writes must not land: got %d records / %d samples", len(records), len(samples))
+	}
+}
+
 func TestSamplerSampleOnceWritesRecord(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/metrics" {
