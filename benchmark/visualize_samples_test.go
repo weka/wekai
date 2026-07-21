@@ -232,6 +232,116 @@ console.log("ALL_OK");
 	}
 }
 
+// reportDOMStub is a minimal DOM/window stub that lets the emitted report
+// script run to completion under node and lets tests capture and invoke the
+// canvas event listeners. Canvas 2D calls are absorbed by a Proxy.
+const reportDOMStub = `
+const __listeners = {};
+function __makeCtx() {
+  return new Proxy({}, {
+    get(t, prop) {
+      if (prop === "measureText") return () => ({ width: 10 });
+      if (typeof prop === "string") return () => undefined;
+      return undefined;
+    },
+    set() { return true; }
+  });
+}
+const __elements = {};
+function __el(id, extra) {
+  if (!__elements[id]) {
+    __elements[id] = Object.assign({
+      id, style: {}, innerHTML: "", textContent: "", value: "", checked: false,
+      disabled: false, className: "", dataset: {},
+      appendChild() {}, addEventListener(type, fn) { (__listeners[id + ":" + type] = __listeners[id + ":" + type] || []).push(fn); },
+      getBoundingClientRect() { return { left: 0, top: 0, width: this._w || 0, height: this._h || 0 }; },
+      classList: { toggle() {}, add() {}, remove() {} },
+      getContext: __makeCtx,
+    }, extra || {});
+  }
+  return __elements[id];
+}
+__el("chart"); __el("tooltip", { _w: 220, _h: 180 });
+__el("showTTFT", { checked: true }); __el("showResp", { checked: true });
+__el("showDots", { checked: false }); __el("showErrors", { checked: true });
+__el("showCacheMix", { checked: true });
+__el("resetZoom"); __el("zoomInfo"); __el("info"); __el("legend");
+__el("selectAll"); __el("deselectAll"); __el("seriesFilter");
+const document = {
+  getElementById: id => __el(id),
+  createElement: () => __el("dyn" + Math.random()),
+  querySelector: () => __el("controls"),
+};
+const window = {
+  innerWidth: 1600, innerHeight: 900, devicePixelRatio: 1,
+  addEventListener() {},
+};
+`
+
+// TestTooltipShowsOnHoverJS is an end-to-end hover regression test: it runs
+// the FULL emitted report script under node with a DOM stub, simulates a
+// mousemove over the response moving-average line and over a cache-mix band,
+// and asserts the tooltip element ends up displayed, with content, at
+// in-viewport coordinates. Guards against a refactor of the tooltip show
+// path silently killing hover (positioning-only unit tests can't catch
+// that). Skipped when node isn't installed.
+func TestTooltipShowsOnHoverJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS hover test skipped")
+	}
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	rec, smp := benchFixtureData("hover", base)
+	writeMixedJSONL(t, dir, "a", rec, smp)
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+function hoverAt(px, py, label) {
+  const tip = document.getElementById("tooltip");
+  tip.style.display = "none"; tip.innerHTML = "";
+  const mm = (__listeners["chart:mousemove"] || [])[0];
+  assert(mm, "mousemove listener registered");
+  mm({ clientX: px, clientY: py });
+  assert(tip.style.display === "block", label + ": tooltip displayed (got " + JSON.stringify(tip.style.display) + ")");
+  assert((tip.innerHTML || "").length > 0, label + ": tooltip has content");
+  const x = parseFloat(tip.style.left), y = parseFloat(tip.style.top);
+  assert(isFinite(x) && isFinite(y), label + ": numeric coords (" + tip.style.left + "," + tip.style.top + ")");
+  assert(x >= 0 && x <= 1600 && y >= 0 && y <= 900, label + ": in viewport (" + x + "," + y + ")");
+}
+const s0 = DATA[0];
+assert(s0._avgResp.length > 1, "fixture has avg points");
+const p = s0._avgResp[Math.floor(s0._avgResp.length / 2)];
+hoverAt(mapX(p.t), mapY(p.v), "line-hover");
+hoverAt(margin.left + plotW / 2, margin.top + 10, "band-hover");
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "hover_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node hover test failed: %v\n%s", err, out)
+	}
+}
+
 // TestMergedLabelsWinDisplayNames: two source dirs whose records share the
 // SAME embedded alias, merged with distinct explicit --labels, must show
 // distinct display names. seriesData.Name is the single source for the

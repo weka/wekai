@@ -646,9 +646,13 @@ function tickStats(tickTime) {
 // active-dataset token line is drawn inside each band against a shared scale.
 const MIX_COMPUTE_COLOR = "#e74c3c";
 const MIX_LOCAL_COLOR = "#2ecc71";
-const MIX_EXTERNAL_COLOR = "#9b59b6";
+const MIX_EXTERNAL_COLOR = "#7C03EC"; // WEKA brand violet (weka.io primary)
 const ADT_LINE_COLOR = "#f5f5f5";
 const MIX_BAND_H = 64;
+// Band fills sit on a solid-black backdrop, so they no longer need
+// transparency against the chart background — near-opaque pops on black
+// while latency lines (drawn after) still overpaint the bands.
+const MIX_FILL_ALPHA = 0.85;
 
 // DOM-free helpers (fmtTokens/mixAt/adtAt/mixTotalMax/mixStackHeight/
 // mixRate/placeTooltip): unit-tested under node by
@@ -764,12 +768,16 @@ function drawCacheMix() {
   const adtMax = layout.adtMax;
 
   layout.bands.forEach(({ s, yTop, bandH }) => {
+    // Solid-black backdrop, band-area only: fills pop against it, and
+    // unfilled (black) band space still reads as "low ingest".
+    ctx.fillStyle = "#000";
+    ctx.fillRect(margin.left, yTop, plotW, bandH);
 
     // Source-mix band: stack height is ABSOLUTE — this interval's total
     // ingested delta against the report-wide MIX_TOTAL_MAX (shared across
     // all series), anchored at the band bottom so quiet minutes render
     // mostly empty. Within the stack the split stays proportional by source.
-    ctx.globalAlpha = 0.3;
+    ctx.globalAlpha = MIX_FILL_ALPHA;
     (s.mix || []).forEach(seg => {
       if (seg.t1 < viewTMin || seg.t0 > viewTMax) return;
       const total = seg.c + seg.lc + seg.ec;
@@ -1298,6 +1306,13 @@ canvas.addEventListener("mouseup", e => {
 canvas.addEventListener("mouseleave", () => {
   if (dragStart !== null) { dragStart = null; dragCurrent = null; draw(); }
   tooltip.style.display = "none";
+});
+
+// Defensive: a drag released OUTSIDE the browser window never delivers
+// mouseup to the canvas; a stuck dragStart would then suppress every
+// tooltip until the next canvas interaction. Window-level mouseup clears it.
+window.addEventListener("mouseup", () => {
+  if (dragStart !== null) { dragStart = null; dragCurrent = null; draw(); }
 });
 
 // Double-click to reset zoom
