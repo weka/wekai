@@ -253,6 +253,7 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 <div class="info" id="info"></div>
 <div class="controls">
   <label><input type="checkbox" id="showTTFT" checked> Show TTFT</label>
+  <label><input type="checkbox" id="showTTFTP95" checked> TTFT p95</label>
   <label><input type="checkbox" id="showResp" checked> Show Response Time</label>
   <label><input type="checkbox" id="showDots"> Show Requests</label>
   <label><input type="checkbox" id="showErrors" checked> Show Errors</label>
@@ -329,18 +330,23 @@ DATA.forEach(s => {
   const maxSn = sorted.reduce((mx, r) => Math.max(mx, r.sn), 1);
   const winSize = CONCURRENCY > 0 ? CONCURRENCY * 3 : Math.max(maxSn * 3, 10);
   s._winSize = winSize;
-  s._avgTTFT = [];
-  s._avgResp = [];
+  // Plotted lines: rolling-window percentiles. Response = p50 only; TTFT =
+  // p50 and p95 (dash pattern encodes the percentile, color the series).
+  s._respP50 = [];
+  s._ttftP50 = [];
+  s._ttftP95 = [];
   for (let i = 0; i < sorted.length; i++) {
     const start = Math.max(0, i - winSize + 1);
     const win = sorted.slice(start, i + 1);
     const ttfts = win.map(r => r.ttft).filter(v => v > 0);
     const resps = win.map(r => r.resp);
-    s._avgTTFT.push({ t: sorted[i].t, v: ttfts.length ? ttfts.reduce((a,b)=>a+b,0)/ttfts.length : 0 });
-    s._avgResp.push({ t: sorted[i].t, v: resps.reduce((a,b)=>a+b,0)/resps.length });
+    const t = sorted[i].t;
+    s._respP50.push({ t: t, v: percentile(resps, 0.5) });
+    s._ttftP50.push({ t: t, v: ttfts.length ? percentile(ttfts, 0.5) : 0 });
+    s._ttftP95.push({ t: t, v: ttfts.length ? percentile(ttfts, 0.95) : 0 });
   }
   // Precompute error bars: sample every winSize points from ALL records (including errors)
-  // Each bar is anchored at the response avg line at that time
+  // Each bar is anchored at the response p50 line at that time
   const allSorted = s.records.slice().sort((a, b) => a.t - b.t);
   s._errBars = [];
   let avgIdx = 0;
@@ -349,21 +355,14 @@ DATA.forEach(s => {
     let errs = 0, total = 0;
     for (let j = start; j <= i; j++) { total++; if (allSorted[j].err) errs++; }
     if (errs > 0) {
-      // Find nearest avgResp value for this timestamp
+      // Find nearest response-p50 value for this timestamp
       const t = allSorted[i].t;
-      while (avgIdx < s._avgResp.length - 1 && s._avgResp[avgIdx].t < t) avgIdx++;
-      const respAvg = s._avgResp.length > 0 ? s._avgResp[Math.min(avgIdx, s._avgResp.length - 1)].v : 0;
+      while (avgIdx < s._respP50.length - 1 && s._respP50[avgIdx].t < t) avgIdx++;
+      const respAvg = s._respP50.length > 0 ? s._respP50[Math.min(avgIdx, s._respP50.length - 1)].v : 0;
       s._errBars.push({ t: t, errRate: errs / total, errs: errs, total: total, respAvg: respAvg });
     }
   }
 });
-
-function percentile(arr, p) {
-  if (arr.length === 0) return 0;
-  const s = arr.slice().sort((a, b) => a - b);
-  const idx = Math.ceil(s.length * p) - 1;
-  return s[Math.max(0, idx)];
-}
 
 // --- Color assignment (official WEKA brand, neutral-first) ---
 // Multi-series palettes are restrained tints DERIVED from the brand set so
@@ -500,7 +499,7 @@ function countRecords(records) {
 
 function formatCount(ok, err) {
   if (err === 0) return '<span style="color:#C9C9C9">' + ok + '</span>';
-  return '<span style="color:#C9C9C9">' + ok + '</span>, <span style="color:#ff4444">' + err + '</span>';
+  return '<span style="color:#C9C9C9">' + ok + '</span>, <span style="color:#FF6B6B">' + err + '</span>';
 }
 
 function updateInfo() {
@@ -711,6 +710,26 @@ function mixAt(mix, t) {
     if (m.t1 <= t) found = m; else break;
   }
   return found;
+}
+
+// percentile of an unsorted array (nearest-rank); 0 for empty input.
+// (Declared here, in the DOM-free helper block, so node tests cover it;
+// hoisting makes it available to the precompute pass above.)
+function percentile(arr, p) {
+  if (!arr || arr.length === 0) return 0;
+  const s = arr.slice().sort((a, b) => a - b);
+  const idx = Math.ceil(s.length * p) - 1;
+  return s[Math.max(0, idx)];
+}
+
+// percentileDash: canvas dash pattern per plotted line kind — the pattern
+// encodes the percentile, the color encodes the series; the two channels
+// never mix. Response p50 solid; TTFT p50 dense dots (primary); TTFT p95
+// long sparse dashes (secondary).
+function percentileDash(kind) {
+  if (kind === "ttft50") return [2, 3];
+  if (kind === "ttft95") return [10, 7];
+  return []; // resp50: solid
 }
 
 // cumCountAt returns how many sorted timestamps are <= t (the cumulative
@@ -1123,45 +1142,33 @@ function draw() {
   drawTotals();
   drawCacheMix();
 
-  // Moving average lines
+  // Rolling-percentile lines: pattern encodes the percentile, color the
+  // series. Response p50 solid; TTFT p50 dense dots; TTFT p95 sparse
+  // lighter dashes (independently togglable).
+  const showTTFTP95 = document.getElementById("showTTFTP95").checked;
+  const plotLine = (pts, kind, color, alpha, width, skipZero) => {
+    if (!pts || pts.length < 2) return;
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = width;
+    ctx.setLineDash(percentileDash(kind));
+    ctx.beginPath();
+    let started = false;
+    pts.forEach(p => {
+      if (p.t < viewTMin || p.t > viewTMax || (skipZero && p.v <= 0)) return;
+      const x = mapX(p.t), y = mapY(p.v);
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  };
   DATA.forEach((s, si) => {
     if (hiddenSeries.has(si)) return;
     const color = seriesColors[si];
-
-    // Response time average line (solid)
-    if (showResp && s._avgResp.length > 1) {
-      ctx.strokeStyle = color;
-      ctx.globalAlpha = 0.8;
-      ctx.lineWidth = 2;
-      ctx.setLineDash([]);
-      ctx.beginPath();
-      let started = false;
-      s._avgResp.forEach(p => {
-        if (p.t < viewTMin || p.t > viewTMax) return;
-        const x = mapX(p.t), y = mapY(p.v);
-        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-      });
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-    }
-
-    // TTFT average line (dashed)
-    if (showTTFT && s._avgTTFT.length > 1) {
-      ctx.strokeStyle = color;
-      ctx.globalAlpha = 0.8;
-      ctx.lineWidth = 2;
-      ctx.setLineDash([6, 4]);
-      ctx.beginPath();
-      let started = false;
-      s._avgTTFT.forEach(p => {
-        if (p.t < viewTMin || p.t > viewTMax || p.v <= 0) return;
-        const x = mapX(p.t), y = mapY(p.v);
-        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-      });
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.globalAlpha = 1;
-    }
+    if (showResp) plotLine(s._respP50, "resp50", color, 0.8, 2, false);
+    if (showTTFT) plotLine(s._ttftP50, "ttft50", color, 0.8, 2, true);
+    if (showTTFTP95) plotLine(s._ttftP95, "ttft95", color, 0.55, 1.5, true);
   });
 
   // Error rate bars
@@ -1360,8 +1367,9 @@ canvas.addEventListener("mousemove", e => {
           }
         }
       };
-      if (document.getElementById("showResp").checked) checkLine(s._avgResp, "resp");
-      if (document.getElementById("showTTFT").checked) checkLine(s._avgTTFT, "ttft");
+      if (document.getElementById("showResp").checked) checkLine(s._respP50, "resp50");
+      if (document.getElementById("showTTFT").checked) checkLine(s._ttftP50, "ttft50");
+      if (document.getElementById("showTTFTP95").checked) checkLine(s._ttftP95, "ttft95");
     });
   }
 
@@ -1395,22 +1403,25 @@ canvas.addEventListener("mousemove", e => {
   if (best) {
     if (best.isLine) {
       const win = best.win;
-      const vals = best.type === "ttft" ? win.map(r => r.ttft).filter(v => v > 0) : win.map(r => r.resp);
+      const isTTFT = best.type === "ttft50" || best.type === "ttft95";
+      const vals = isTTFT ? win.map(r => r.ttft).filter(v => v > 0) : win.map(r => r.resp);
+      const avg = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
       const p50 = percentile(vals, 0.5);
       const p95 = percentile(vals, 0.95);
       const fmt = v => v >= 1000 ? (v/1000).toFixed(2) + "s" : v.toFixed(0) + "ms";
+      const lineLabel = { resp50: "Response p50", ttft50: "TTFT p50", ttft95: "TTFT p95" }[best.type] || best.type;
       // Count total requests, errors, and max series index up to this point
       let totalUpTo = 0, errUpTo = 0, maxSnSeen = 0;
       best.s.records.forEach(r => { if (r.t <= best.t) { totalUpTo++; if (r.err) errUpTo++; if (r.sn > maxSnSeen) maxSnSeen = r.sn; } });
       const mixInfo = mixTooltipHTML(best.s, best.t);
       showTooltip(e,
-        "<b>" + best.s.name + "</b> \u2014 " + (best.type === "ttft" ? "TTFT" : "Response") + " avg<br>" +
+        "<b>" + best.s.name + "</b> \u2014 " + lineLabel + "<br>" +
         "Window: " + win.length + " requests<br>" +
-        "Avg: " + fmt(best.avgVal) + "<br>" +
+        "Avg: " + fmt(avg) + "<br>" +
         "p50: " + fmt(p50) + "<br>" +
         "p95: " + fmt(p95) + "<br>" +
         "Series: " + maxSnSeen + "<br>" +
-        "Total: " + totalUpTo + (errUpTo > 0 ? ", <span style='color:#ff4444'>errors: " + errUpTo + "</span>" : "") +
+        "Total: " + totalUpTo + (errUpTo > 0 ? ", <span style='color:#FF6B6B'>errors: " + errUpTo + "</span>" : "") +
         (mixInfo ? "<br>" + mixInfo : ""));
     } else {
       const r = best.r;
@@ -1420,7 +1431,7 @@ canvas.addEventListener("mousemove", e => {
         "TTFT: " + r.ttft.toFixed(1) + " ms<br>" +
         "Response: " + r.resp.toFixed(1) + " ms<br>" +
         (r.ch ? "Cache hit<br>" : "") +
-        (r.err ? "<span style='color:#ff4444'>ERROR</span>" : "") +
+        (r.err ? "<span style='color:#FF6B6B'>ERROR</span>" : "") +
         (mixInfo ? "<br>" + mixInfo : ""));
     }
   } else if (mixHover) {
@@ -1435,7 +1446,7 @@ canvas.addEventListener("mousemove", e => {
   } else if (tickHover) {
     const elapsedSec = Math.round((tickHover.tickTime - globalTMin) / 1000);
     const rows = tickStats(tickHover.tickTime).map(({ si, cumReqs, cumErrs, maxSn }) => {
-      const errPart = cumErrs > 0 ? ", <span style='color:#ff4444'>errors: " + cumErrs + "</span>" : "";
+      const errPart = cumErrs > 0 ? ", <span style='color:#FF6B6B'>errors: " + cumErrs + "</span>" : "";
       return "<span style='color:" + seriesColors[si] + "'>" + DATA[si].name + "</span>: " +
         cumReqs + " reqs" + errPart + ", series @" + maxSn;
     });
@@ -1488,7 +1499,7 @@ document.getElementById("resetZoom").addEventListener("click", () => {
 });
 
 // Wire up controls
-["showTTFT","showResp","showDots","showErrors","showTotals","showXAxisValues"].forEach(id => {
+["showTTFT","showTTFTP95","showResp","showDots","showErrors","showTotals","showXAxisValues"].forEach(id => {
   document.getElementById(id).addEventListener("change", draw);
 });
 

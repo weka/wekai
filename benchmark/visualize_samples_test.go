@@ -234,6 +234,22 @@ assert(totalsY(0.5, 30, 600, 158) === 630 - 0.5 * (630 - 158), "linear in betwee
 // Toggling re-targets: same fraction, different ceiling => different y.
 assert(totalsY(0.8, 30, 600, 158) !== totalsY(0.8, 30, 600, 30), "ceiling change moves the stack");
 
+// Rolling-window percentile math (nearest-rank).
+assert(percentile([], 0.5) === 0 && percentile(null, 0.5) === 0, "empty => 0");
+assert(percentile([7], 0.5) === 7 && percentile([7], 0.95) === 7, "singleton");
+assert(percentile([4, 1, 3, 2], 0.5) === 2, "p50 of 1..4 = 2 (nearest-rank)");
+assert(percentile([4, 1, 3, 2], 0.95) === 4, "p95 of 1..4 = 4");
+const hundred = Array.from({length: 100}, (_, i) => i + 1);
+assert(percentile(hundred, 0.5) === 50 && percentile(hundred, 0.95) === 95, "p50/p95 of 1..100");
+
+// Line-style mapping: pattern encodes percentile; the three kinds must be
+// mutually distinct, and resp50 must be solid.
+const d50 = JSON.stringify(percentileDash("ttft50"));
+const d95 = JSON.stringify(percentileDash("ttft95"));
+const dresp = JSON.stringify(percentileDash("resp50"));
+assert(dresp === "[]", "response p50 is solid");
+assert(d50 !== d95 && d50 !== dresp && d95 !== dresp, "three distinct patterns: " + d50 + " " + d95 + " " + dresp);
+
 // Viewport-aware tooltip placement (vw=1000, vh=800; tip 200x150).
 let p = placeTooltip(100, 100, 200, 150, 1000, 800);
 assert(p.x === 112 && p.y === 90, "fits => right of cursor (+12,-10), got " + JSON.stringify(p));
@@ -294,7 +310,8 @@ function __el(id, extra) {
   return __elements[id];
 }
 __el("chart"); __el("tooltip", { _w: 220, _h: 180 });
-__el("showTTFT", { checked: true }); __el("showResp", { checked: true });
+__el("showTTFT", { checked: true }); __el("showTTFTP95", { checked: true });
+__el("showResp", { checked: true });
 __el("showDots", { checked: false }); __el("showErrors", { checked: true });
 __el("showCacheMix", { checked: true });
 __el("showTotals", { checked: true }); __el("showXAxisValues", { checked: false });
@@ -359,10 +376,18 @@ function hoverAt(px, py, label) {
   assert(x >= 0 && x <= 1600 && y >= 0 && y <= 900, label + ": in viewport (" + x + "," + y + ")");
 }
 const s0 = DATA[0];
-assert(s0._avgResp.length > 1, "fixture has avg points");
-const p = s0._avgResp[Math.floor(s0._avgResp.length / 2)];
+assert(s0._respP50.length > 1, "fixture has plotted percentile points");
+const p = s0._respP50[Math.floor(s0._respP50.length / 2)];
 hoverAt(mapX(p.t), mapY(p.v), "line-hover");
 hoverAt(margin.left + plotW / 2, margin.top + 10, "band-hover");
+// Toggle independence: every combination of the two TTFT checkboxes must
+// render without throwing (p95 stays available with p50 off and vice versa).
+const t50 = document.getElementById("showTTFT"), t95 = document.getElementById("showTTFTP95");
+[[true, true], [true, false], [false, true], [false, false]].forEach(([a, b]) => {
+  t50.checked = a; t95.checked = b;
+  draw();
+});
+t50.checked = true; t95.checked = true;
 console.log("ALL_OK");
 `
 	jsPath := filepath.Join(dir, "hover_test.js")
