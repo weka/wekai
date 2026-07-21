@@ -181,7 +181,10 @@ func GenerateVisualizationMerged(dirs []string, labels []string, outputDir strin
 	}
 	fmt.Fprintf(os.Stderr, "CSVs saved to: %s and %s\n", fullDir, chunkedDir)
 
-	return GenerateVisualization(outputDir, concurrency)
+	// Explicit --labels must win as the DISPLAYED series names too, not just
+	// the merged filenames: pin display names to the label-derived basenames
+	// so a record alias shared by both arms can't collapse them into one name.
+	return generateVisualization(outputDir, concurrency, len(labels) > 0)
 }
 
 type taggedRecord struct {

@@ -232,6 +232,59 @@ console.log("ALL_OK");
 	}
 }
 
+// TestMergedLabelsWinDisplayNames: two source dirs whose records share the
+// SAME embedded alias, merged with distinct explicit --labels, must show
+// distinct display names. seriesData.Name is the single source for the
+// legend, the cache-mix band label, the tooltip headers, and the ds: axis
+// rows, so asserting the embedded names covers "everywhere".
+func TestMergedLabelsWinDisplayNames(t *testing.T) {
+	root := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	dirA := filepath.Join(root, "armA")
+	dirB := filepath.Join(root, "armB")
+	// benchFixtureData embeds alias=<arg> in every record's model spec; use
+	// the same alias for both dirs to reproduce the same-alias collision.
+	recA, smpA := benchFixtureData("SHARED_alias", base)
+	recB, smpB := benchFixtureData("SHARED_alias", base)
+	writeMixedJSONL(t, dirA, "reqs", recA, smpA)
+	writeMixedJSONL(t, dirB, "reqs", recB, smpB)
+
+	outDir := filepath.Join(root, "merged")
+	htmlPath, err := GenerateVisualizationMerged([]string{dirA, dirB}, []string{"label-arm-a", "label-arm-b"}, outDir, 4)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	for _, want := range []string{`"name":"label-arm-a"`, `"name":"label-arm-b"`} {
+		if !strings.Contains(html, want) {
+			t.Errorf("merged HTML missing display name %s", want)
+		}
+	}
+	if strings.Contains(html, `"name":"SHARED_alias"`) {
+		t.Errorf("record alias overrode explicit --labels as a display name")
+	}
+
+	// Without labels the alias still wins (fallback chain unchanged): both
+	// dirs derive the same alias and collide into SHARED_alias/_2 filenames,
+	// but display names come from the records' alias.
+	outDir2 := filepath.Join(root, "merged-nolabels")
+	htmlPath2, err := GenerateVisualizationMerged([]string{dirA, dirB}, nil, outDir2, 4)
+	if err != nil {
+		t.Fatalf("merge without labels: %v", err)
+	}
+	b2, err := os.ReadFile(htmlPath2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b2), `"name":"SHARED_alias"`) {
+		t.Errorf("alias fallback broken when no labels are given")
+	}
+}
+
 func TestGenerateVisualizationMergedCarriesSamples(t *testing.T) {
 	root := t.TempDir()
 	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)

@@ -42,6 +42,16 @@ func extractAlias(modelStr string) string {
 // interactive HTML scatter-plot in the same directory. Returns the path
 // to the generated HTML file.
 func GenerateVisualization(dir string, concurrency int) (string, error) {
+	return generateVisualization(dir, concurrency, false)
+}
+
+// generateVisualization is the implementation behind GenerateVisualization.
+// keepFileNames pins each series' DISPLAYED name (legend, cache-mix band
+// label, tooltips, ds: axis rows — all render seriesData.Name) to the .jsonl
+// basename instead of re-resolving the record alias. The merged path sets it
+// when explicit --labels were given, so labels win end-to-end: two arms
+// sharing one alias would otherwise render indistinguishably.
+func generateVisualization(dir string, concurrency int, keepFileNames bool) (string, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 	if err != nil {
 		return "", fmt.Errorf("glob jsonl files: %w", err)
@@ -77,9 +87,12 @@ func GenerateVisualization(dir string, concurrency int) (string, error) {
 		}
 		// Prefer the clean model alias (e.g. "DS3H_weka-64r8w") over the raw
 		// sanitized filename (e.g. "dynamic_http___..._alias_DS3H_weka-64r8w")
-		// when the file's records unambiguously identify one model.
-		if alias := resolveRecordsAlias(records); alias != "" {
-			name = alias
+		// when the file's records unambiguously identify one model — unless
+		// the caller pinned names to the (label-derived) filenames.
+		if !keepFileNames {
+			if alias := resolveRecordsAlias(records); alias != "" {
+				name = alias
+			}
 		}
 		var vr []vizRecord
 		for _, r := range records {
