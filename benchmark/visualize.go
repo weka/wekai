@@ -288,6 +288,10 @@ DATA.forEach(s => {
 });
 
 const HAS_CACHE_MIX = DATA.some(s => (s.mix && s.mix.length) || (s.adt && s.adt.length));
+// Report-wide band scale: max total delta over ALL series and the whole
+// period (function declarations hoist). Independent of series visibility so
+// toggling a series never rescales the others.
+const MIX_TOTAL_MAX = mixTotalMax(DATA);
 
 // Precompute moving averages and error bars per series
 DATA.forEach(s => {
@@ -633,11 +637,12 @@ const MIX_EXTERNAL_COLOR = "#9b59b6";
 const ADT_LINE_COLOR = "#f5f5f5";
 const MIX_BAND_H = 64;
 
-// DOM-free helpers (fmtTokens/mixAt/adtAt): unit-tested under node by
-// TestCacheMixLookupHelpersJS, which slices the emitted script from
-// "function fmtTokens(" to "function cacheMixEnabled(" — keep these three
-// contiguous and ahead of cacheMixEnabled (html/template strips these
-// comments from the output, so the test can't anchor on markers).
+// DOM-free helpers (fmtTokens/mixAt/adtAt/mixTotalMax/mixStackHeight/
+// mixRate): unit-tested under node by TestCacheMixLookupHelpersJS, which
+// slices the emitted script from "function fmtTokens(" to "function
+// cacheMixEnabled(" — keep them contiguous and ahead of cacheMixEnabled
+// (html/template strips these comments from the output, so the test can't
+// anchor on markers).
 function fmtTokens(v) {
   if (v >= 1e9) return (v / 1e9).toFixed(1) + "B";
   if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
@@ -668,6 +673,35 @@ function adtAt(adt, t) {
     if (adt[i].t <= t) found = adt[i]; else break;
   }
   return found;
+}
+
+// mixTotalMax returns the maximum per-interval TOTAL ingested delta
+// (compute+local+external) across every series in the report — the single
+// shared scale for all bands, deliberately NOT per-series: a series peaking
+// at 50k tok/min next to one peaking at 1M renders mostly unfilled.
+function mixTotalMax(seriesArr) {
+  let mx = 0;
+  (seriesArr || []).forEach(s => (s.mix || []).forEach(m => {
+    const t = m.c + m.lc + m.ec;
+    if (t > mx) mx = t;
+  }));
+  return mx;
+}
+
+// mixStackHeight: absolute stack height for one interval — this interval's
+// total delta as a fraction of the global max, of the band height.
+function mixStackHeight(seg, globalMax, bandH) {
+  const total = seg.c + seg.lc + seg.ec;
+  if (total <= 0 || globalMax <= 0) return 0;
+  return bandH * (total / globalMax);
+}
+
+// mixRate: the interval's ingest rate in input tokens/s, over the ACTUAL
+// sample interval (missed ticks widen it; never assume 60s).
+function mixRate(seg) {
+  const secs = (seg.t1 - seg.t0) / 1000;
+  if (secs <= 0) return 0;
+  return (seg.c + seg.lc + seg.ec) / secs;
 }
 
 
@@ -703,18 +737,21 @@ function drawCacheMix() {
 
   layout.bands.forEach(({ s, yTop, bandH }) => {
 
-    // Source-mix band: each inter-sample interval split vertically by the
-    // per-source token-delta share; 100% compute fills the whole band red.
+    // Source-mix band: stack height is ABSOLUTE — this interval's total
+    // ingested delta against the report-wide MIX_TOTAL_MAX (shared across
+    // all series), anchored at the band bottom so quiet minutes render
+    // mostly empty. Within the stack the split stays proportional by source.
     ctx.globalAlpha = 0.3;
     (s.mix || []).forEach(seg => {
       if (seg.t1 < viewTMin || seg.t0 > viewTMax) return;
       const total = seg.c + seg.lc + seg.ec;
-      if (total <= 0) return;
+      const stackH = mixStackHeight(seg, MIX_TOTAL_MAX, bandH);
+      if (stackH <= 0) return;
       const x1 = mapX(seg.t0), x2 = mapX(seg.t1);
-      let y = yTop;
+      let y = yTop + bandH - stackH;
       [[seg.c, MIX_COMPUTE_COLOR], [seg.lc, MIX_LOCAL_COLOR], [seg.ec, MIX_EXTERNAL_COLOR]].forEach(([v, col]) => {
         if (v <= 0) return;
-        const h = bandH * (v / total);
+        const h = stackH * (v / total);
         ctx.fillStyle = col;
         ctx.fillRect(x1, y, x2 - x1, h);
         y += h;
@@ -746,7 +783,7 @@ function drawCacheMix() {
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
     ctx.fillStyle = "#ddd";
-    ctx.fillText(s.name + " cache mix", margin.left + 4, yTop + 3);
+    ctx.fillText(s.name + " cache mix (peak " + fmtTokens(MIX_TOTAL_MAX) + " tok/min)", margin.left + 4, yTop + 3);
     if (s.adt && s.adt.length) {
       const last = s.adt[s.adt.length - 1];
       ctx.fillStyle = ADT_LINE_COLOR;
@@ -1040,6 +1077,8 @@ function mixTooltipHTML(s, t) {
     lines.push("<span style='color:" + MIX_COMPUTE_COLOR + "'>compute: " + fmtTokens(seg.c) + pct(seg.c) + "</span>");
     lines.push("<span style='color:" + MIX_LOCAL_COLOR + "'>local cache: " + fmtTokens(seg.lc) + pct(seg.lc) + "</span>");
     lines.push("<span style='color:" + MIX_EXTERNAL_COLOR + "'>external KV: " + fmtTokens(seg.ec) + pct(seg.ec) + "</span>");
+    lines.push("<span style='color:#aaa'>ingest: " + fmtTokens(mixRate(seg)) + " tok/s (" +
+      fmtTokens(total) + " tok / " + Math.round((seg.t1 - seg.t0) / 1000) + "s)</span>");
   }
   if (p) {
     lines.push("<span style='color:" + ADT_LINE_COLOR + "'>active dataset: " + fmtTokens(p.v) + " tok, " + p.s + " series</span>");

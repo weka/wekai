@@ -85,6 +85,7 @@ func TestGenerateVisualizationWithCacheMixSamples(t *testing.T) {
 		`"mix":`, `"adt":`, // per-series overlay data embedded
 		"drawCacheMix", "showCacheMix", "HAS_CACHE_MIX", // overlay code paths
 		"MIX_COMPUTE_COLOR", "active dataset (tokens)",
+		"MIX_TOTAL_MAX", "mixStackHeight", "mixRate", // absolute band scaling
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("generated HTML missing %q", want)
@@ -178,6 +179,28 @@ assert(adtAt(adt, 59999).v === 100, "holds until next sample");
 assert(adtAt(adt, 60001).v === 200 && adtAt(adt, 60001).s === 2, "latest at-or-before");
 assert(adtAt(adt, 1e12).v === 300, "after last => last");
 assert(fmtTokens(1234567) === "1.2M" && fmtTokens(999) === "999", "fmtTokens");
+
+// Absolute band scaling: the max is shared ACROSS series in a report (a
+// 50k-peak series next to a 1M-peak series must NOT be per-series
+// normalized).
+const strong = { mix: [ {t0:0, t1:60000, c:900000, lc:80000, ec:20000} ] };  // total 1M
+const weak   = { mix: [ {t0:0, t1:60000, c:10000,  lc:30000, ec:10000} ] };  // total 50k
+const gm = mixTotalMax([strong, weak]);
+assert(gm === 1000000, "cross-series shared max = 1M, got " + gm);
+assert(mixTotalMax([weak]) === 50000, "single-series max");
+assert(mixTotalMax([]) === 0 && mixTotalMax(null) === 0, "empty/missing series => 0");
+// Partial-fill math: 50k total against the 1M shared max => 5% of the band.
+const h = mixStackHeight(weak.mix[0], gm, 64);
+assert(Math.abs(h - 3.2) < 1e-9, "50k vs 1M => 5% of 64px = 3.2, got " + h);
+assert(mixStackHeight(strong.mix[0], gm, 64) === 64, "max interval fills the band");
+assert(mixStackHeight({t0:0,t1:60000,c:0,lc:0,ec:0}, gm, 64) === 0, "zero total => empty");
+assert(mixStackHeight(weak.mix[0], 0, 64) === 0, "zero global max => empty");
+
+// Ingest rate uses the ACTUAL interval, not a hardcoded 60s.
+assert(mixRate(weak.mix[0]) === 50000 / 60, "60s interval rate");
+const wide = {t0:0, t1:120000, c:60000, lc:0, ec:0}; // missed tick: 120s interval
+assert(mixRate(wide) === 500, "120s interval => total/120, got " + mixRate(wide));
+assert(mixRate({t0:5, t1:5, c:9, lc:0, ec:0}) === 0, "zero-width interval => 0");
 console.log("ALL_OK");
 `
 	jsPath := filepath.Join(dir, "helpers_test.js")
