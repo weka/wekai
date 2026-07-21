@@ -3,6 +3,7 @@ package benchmark
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -114,6 +115,78 @@ func TestGenerateVisualizationWithoutSamplesUnchanged(t *testing.T) {
 	// runtime HAS_CACHE_MIX gate keeps the checkbox absent.
 	if strings.Contains(html, `"mix":`) || strings.Contains(html, `"adt":`) {
 		t.Errorf("sample-less dataset must not embed overlay data")
+	}
+}
+
+// TestCacheMixLookupHelpersJS executes the DOM-free tooltip-lookup helpers
+// (mixAt / adtAt, between the __CACHEMIX_PURE_HELPERS__ markers in the
+// report template) under node, covering interval containment and the
+// before-first / after-last edges. Skipped when node isn't installed.
+func TestCacheMixLookupHelpersJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS helper test skipped")
+	}
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	rec, smp := benchFixtureData("helpers", base)
+	writeMixedJSONL(t, dir, "a", rec, smp)
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// html/template strips JS comments from the emitted script, so marker
+	// comments don't survive — slice on the function boundaries instead:
+	// fmtTokens/mixAt/adtAt are contiguous, followed by cacheMixEnabled.
+	html := string(b)
+	start := strings.Index(html, "function fmtTokens(")
+	end := strings.Index(html, "function cacheMixEnabled(")
+	if start < 0 || end < 0 || end <= start {
+		t.Fatalf("pure helper functions not found in generated HTML (start=%d end=%d)", start, end)
+	}
+	helpers := html[start:end]
+
+	script := helpers + `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+const mix = [
+  {t0: 0,     t1: 60000,  c: 10, lc: 20, ec: 30},
+  {t0: 60000, t1: 120000, c: 1,  lc: 2,  ec: 3},
+];
+const adt = [
+  {t: 0,      v: 100, s: 1},
+  {t: 60000,  v: 200, s: 2},
+  {t: 120000, v: 300, s: 3},
+];
+assert(mixAt(mix, -1) === null, "before first interval => null");
+assert(mixAt([], 5) === null, "empty mix => null");
+assert(mixAt(null, 5) === null, "missing mix => null");
+assert(mixAt(mix, 0).c === 10, "start boundary covered");
+assert(mixAt(mix, 59999).c === 10, "interior covered");
+assert(mixAt(mix, 60000).c === 10, "shared boundary belongs to earlier interval");
+assert(mixAt(mix, 90000).c === 1, "second interval covered");
+assert(mixAt(mix, 120000).c === 1, "end boundary covered");
+assert(mixAt(mix, 999999).c === 1, "after last => latest at-or-before");
+assert(adtAt(adt, -5) === null, "before first sample => null");
+assert(adtAt(null, 5) === null, "missing adt => null");
+assert(adtAt(adt, 0).v === 100, "exact first sample");
+assert(adtAt(adt, 59999).v === 100, "holds until next sample");
+assert(adtAt(adt, 60001).v === 200 && adtAt(adt, 60001).s === 2, "latest at-or-before");
+assert(adtAt(adt, 1e12).v === 300, "after last => last");
+assert(fmtTokens(1234567) === "1.2M" && fmtTokens(999) === "999", "fmtTokens");
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "helpers_test.js")
+	if err := os.WriteFile(jsPath, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node helper test failed: %v\n%s", err, out)
 	}
 }
 

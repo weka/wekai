@@ -396,9 +396,15 @@ let dragCurrent = null;
 function calcBottomMargin() {
   const visibleCount = DATA.filter((_, i) => !hiddenSeries.has(i)).length;
   const duration = (viewTMax - viewTMin) / 1000;
+  // Dataset-size rows: one extra row per visible sampled series when the
+  // cache-mix overlay is enabled.
+  let dsRows = 0;
+  if (typeof cacheMixEnabled === "function" && cacheMixEnabled()) {
+    dsRows = DATA.filter((s, i) => !hiddenSeries.has(i) && s.adt && s.adt.length).length;
+  }
   // Rows are always printed: adaptive ticks (11-17 columns) leave ample width.
   // 20px for time label + 14px per visible series (single line each)
-  return 20 + visibleCount * 14;
+  return 20 + (visibleCount + dsRows) * 14;
 }
 
 function resize() {
@@ -627,6 +633,11 @@ const MIX_EXTERNAL_COLOR = "#9b59b6";
 const ADT_LINE_COLOR = "#f5f5f5";
 const MIX_BAND_H = 64;
 
+// DOM-free helpers (fmtTokens/mixAt/adtAt): unit-tested under node by
+// TestCacheMixLookupHelpersJS, which slices the emitted script from
+// "function fmtTokens(" to "function cacheMixEnabled(" — keep these three
+// contiguous and ahead of cacheMixEnabled (html/template strips these
+// comments from the output, so the test can't anchor on markers).
 function fmtTokens(v) {
   if (v >= 1e9) return (v / 1e9).toFixed(1) + "B";
   if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
@@ -634,29 +645,63 @@ function fmtTokens(v) {
   return "" + Math.round(v);
 }
 
+// mixAt returns the sample interval covering t, or — when t is past the last
+// interval — the latest interval at or before t. null when t precedes the
+// first interval (no data yet at that point in the run).
+function mixAt(mix, t) {
+  if (!mix || !mix.length || t < mix[0].t0) return null;
+  let found = null;
+  for (let i = 0; i < mix.length; i++) {
+    const m = mix[i];
+    if (m.t0 <= t && t <= m.t1) return m;
+    if (m.t1 <= t) found = m; else break;
+  }
+  return found;
+}
+
+// adtAt returns the latest active-dataset observation at or before t, or
+// null when t precedes the first sample.
+function adtAt(adt, t) {
+  if (!adt || !adt.length || t < adt[0].t) return null;
+  let found = adt[0];
+  for (let i = 1; i < adt.length; i++) {
+    if (adt[i].t <= t) found = adt[i]; else break;
+  }
+  return found;
+}
+
+
 function cacheMixEnabled() {
   const cb = document.getElementById("showCacheMix");
   return HAS_CACHE_MIX && cb && cb.checked;
 }
 
-function drawCacheMix() {
-  if (!cacheMixEnabled()) return;
-  const sampled = [];
+// cacheMixLayout computes the band geometry shared by drawCacheMix and the
+// overlay hover lookup in mousemove. null when the overlay is off/empty.
+function cacheMixLayout() {
+  if (!cacheMixEnabled()) return null;
+  const bands = [];
   DATA.forEach((s, si) => {
     if (hiddenSeries.has(si)) return;
-    if ((s.mix && s.mix.length) || (s.adt && s.adt.length)) sampled.push({ s, si });
+    if ((s.mix && s.mix.length) || (s.adt && s.adt.length)) bands.push({ s, si });
   });
-  if (!sampled.length) return;
-
+  if (!bands.length) return null;
   let bandH = MIX_BAND_H;
-  if (sampled.length * bandH > plotH * 0.6) {
-    bandH = Math.max(24, Math.floor(plotH * 0.6 / sampled.length));
+  if (bands.length * bandH > plotH * 0.6) {
+    bandH = Math.max(24, Math.floor(plotH * 0.6 / bands.length));
   }
+  bands.forEach((b, bi) => { b.yTop = margin.top + bi * bandH; b.bandH = bandH; });
   let adtMax = 0;
-  sampled.forEach(({ s }) => (s.adt || []).forEach(p => { if (p.v > adtMax) adtMax = p.v; }));
+  bands.forEach(b => (b.s.adt || []).forEach(p => { if (p.v > adtMax) adtMax = p.v; }));
+  return { bands, adtMax };
+}
 
-  sampled.forEach(({ s }, bi) => {
-    const yTop = margin.top + bi * bandH;
+function drawCacheMix() {
+  const layout = cacheMixLayout();
+  if (!layout) return;
+  const adtMax = layout.adtMax;
+
+  layout.bands.forEach(({ s, yTop, bandH }) => {
 
     // Source-mix band: each inter-sample interval split vertically by the
     // per-source token-delta share; 100% compute fills the whole band red.
@@ -795,6 +840,21 @@ function draw() {
       ctx.textAlign = "center";
       row++;
     });
+    // Dataset-size rows: active-dataset tokens as of each tick, one row per
+    // visible sampled series, sharing the sparse adaptive tick columns.
+    if (cacheMixEnabled()) {
+      DATA.forEach((ds, si) => {
+        if (hiddenSeries.has(si) || !ds.adt || !ds.adt.length) return;
+        const p = adtAt(ds.adt, tickTime);
+        const label = "ds:" + (p ? fmtTokens(p.v) : "-");
+        const yBase = margin.top + plotH + 20 + row * 14;
+        ctx.textAlign = "left";
+        ctx.fillStyle = seriesColors[si];
+        ctx.fillText(label, x - ctx.measureText(label).width / 2, yBase);
+        ctx.textAlign = "center";
+        row++;
+      });
+    }
     ctx.font = "11px monospace";
     ctx.fillStyle = "#888";
   }
@@ -966,6 +1026,27 @@ function draw() {
   updateInfo();
 }
 
+// mixTooltipHTML renders the cache-mix breakdown lines for series s at time
+// t: the covering (or latest preceding) per-minute source deltas plus the
+// active dataset size/series count. "" when no sample data exists at t.
+function mixTooltipHTML(s, t) {
+  const seg = mixAt(s.mix, t);
+  const p = adtAt(s.adt, t);
+  if (!seg && !p) return "";
+  const lines = [];
+  if (seg) {
+    const total = seg.c + seg.lc + seg.ec;
+    const pct = v => total > 0 ? " (" + (100 * v / total).toFixed(0) + "%)" : "";
+    lines.push("<span style='color:" + MIX_COMPUTE_COLOR + "'>compute: " + fmtTokens(seg.c) + pct(seg.c) + "</span>");
+    lines.push("<span style='color:" + MIX_LOCAL_COLOR + "'>local cache: " + fmtTokens(seg.lc) + pct(seg.lc) + "</span>");
+    lines.push("<span style='color:" + MIX_EXTERNAL_COLOR + "'>external KV: " + fmtTokens(seg.ec) + pct(seg.ec) + "</span>");
+  }
+  if (p) {
+    lines.push("<span style='color:" + ADT_LINE_COLOR + "'>active dataset: " + fmtTokens(p.v) + " tok, " + p.s + " series</span>");
+  }
+  return lines.join("<br>");
+}
+
 // --- Drag-to-zoom ---
 canvas.addEventListener("mousedown", e => {
   const rect = canvas.getBoundingClientRect();
@@ -1034,12 +1115,26 @@ canvas.addEventListener("mousemove", e => {
     });
   }
 
+  // Cache-mix overlay hover: pointer inside a band (and not on a dot/line)
+  // surfaces that minute's source breakdown + active dataset size.
+  let mixHover = null;
+  if (!best && mx >= margin.left && mx <= margin.left + plotW) {
+    const layout = cacheMixLayout();
+    if (layout) {
+      const band = layout.bands.find(b => my >= b.yTop && my <= b.yTop + b.bandH);
+      if (band) {
+        const t = unmapX(mx);
+        if (mixAt(band.s.mix, t) || adtAt(band.s.adt, t)) mixHover = { band, t };
+      }
+    }
+  }
+
   // On long views the per-tick annotation rows aren't printed (see
   // ANNOTATION_ROWS_MAX_DURATION) to avoid an overlapping label band --
   // hovering near any x-axis gridline surfaces the same per-series
   // cumulative breakdown via tooltip instead.
   let tickHover = null;
-  if (!best && (viewTMax - viewTMin) / 1000 > ANNOTATION_ROWS_MAX_DURATION && my >= margin.top) {
+  if (!best && !mixHover && (viewTMax - viewTMin) / 1000 > ANNOTATION_ROWS_MAX_DURATION && my >= margin.top) {
     let bestTickDist = 10;
     currentTicks.forEach(tk => {
       const d = Math.abs(mx - tk.x);
@@ -1060,6 +1155,7 @@ canvas.addEventListener("mousemove", e => {
       // Count total requests, errors, and max series index up to this point
       let totalUpTo = 0, errUpTo = 0, maxSnSeen = 0;
       best.s.records.forEach(r => { if (r.t <= best.t) { totalUpTo++; if (r.err) errUpTo++; if (r.sn > maxSnSeen) maxSnSeen = r.sn; } });
+      const mixInfo = mixTooltipHTML(best.s, best.t);
       tooltip.innerHTML =
         "<b>" + best.s.name + "</b> \u2014 " + (best.type === "ttft" ? "TTFT" : "Response") + " avg<br>" +
         "Window: " + win.length + " requests<br>" +
@@ -1067,16 +1163,31 @@ canvas.addEventListener("mousemove", e => {
         "p50: " + fmt(p50) + "<br>" +
         "p95: " + fmt(p95) + "<br>" +
         "Series: " + maxSnSeen + "<br>" +
-        "Total: " + totalUpTo + (errUpTo > 0 ? ", <span style='color:#ff4444'>errors: " + errUpTo + "</span>" : "");
+        "Total: " + totalUpTo + (errUpTo > 0 ? ", <span style='color:#ff4444'>errors: " + errUpTo + "</span>" : "") +
+        (mixInfo ? "<br>" + mixInfo : "");
     } else {
       const r = best.r;
+      const mixInfo = mixTooltipHTML(best.s, r.t);
       tooltip.innerHTML =
         "<b>" + best.s.name + "</b> (series " + r.sn + ", req " + r.rn + ")<br>" +
         "TTFT: " + r.ttft.toFixed(1) + " ms<br>" +
         "Response: " + r.resp.toFixed(1) + " ms<br>" +
         (r.ch ? "Cache hit<br>" : "") +
-        (r.err ? "<span style='color:#ff4444'>ERROR</span>" : "");
+        (r.err ? "<span style='color:#ff4444'>ERROR</span>" : "") +
+        (mixInfo ? "<br>" + mixInfo : "");
     }
+  } else if (mixHover) {
+    tooltip.style.display = "block";
+    tooltip.style.left = (e.clientX + 12) + "px";
+    tooltip.style.top = (e.clientY - 10) + "px";
+    const seg = mixAt(mixHover.band.s.mix, mixHover.t);
+    let win = "";
+    if (seg) {
+      win = "window: " + formatTickLabel(Math.round(seg.t0 / 1000)) + " \u2192 " +
+        formatTickLabel(Math.round(seg.t1 / 1000)) + "<br>";
+    }
+    tooltip.innerHTML = "<b>" + mixHover.band.s.name + "</b> \u2014 cache mix<br>" +
+      win + mixTooltipHTML(mixHover.band.s, mixHover.t);
   } else if (tickHover) {
     tooltip.style.display = "block";
     tooltip.style.left = (e.clientX + 12) + "px";
