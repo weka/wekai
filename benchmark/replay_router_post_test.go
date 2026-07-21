@@ -219,6 +219,16 @@ func TestNewReplayPoster_OpenAI(t *testing.T) {
 			wantFallback: "http://127.0.0.1:8000/v1/messages",
 		},
 		{
+			// A /v2 base is honored verbatim — the old TrimSuffix design
+			// would have mangled only /v1; the fallback still inserts /v1
+			// after the prefix (and only fires on 404).
+			name:         "openai_vllm, /v2 base",
+			modelSpec:    "dynamic/http://127.0.0.1:8000/v2,type=openai_vllm,model=my-model",
+			wantType:     "openai_vllm",
+			wantPrimary:  "http://127.0.0.1:8000/v2/chat/completions",
+			wantFallback: "http://127.0.0.1:8000/v2/v1/chat/completions",
+		},
+		{
 			// Arbitrary path prefixes (proxies) are honored on the first try.
 			name:         "openai_vllm, proxy prefix base",
 			modelSpec:    "dynamic/http://127.0.0.1:8000/proxy/llm,type=openai_vllm,model=my-model",
