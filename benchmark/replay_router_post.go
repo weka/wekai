@@ -5,9 +5,9 @@ package benchmark
 // can't accept a pre-built multi-turn conversation with mixed text /
 // tool_use / tool_result blocks (which is what the replay needs to send).
 //
-// Endpoint: <base>/v1/messages (Anthropic-style). Body construction is in
-// replay_router_wire.go. This file handles HTTP transport, headers,
-// streaming SSE parsing, and metric extraction.
+// Endpoint: attempt-then-fallback — <base>+leaf verbatim first, /v1 inserted
+// on 404 (see replayPoster). Body construction is in replay_router_wire.go;
+// this file handles HTTP transport, headers, SSE parsing, and metrics.
 
 import (
 	"bufio"
@@ -29,15 +29,28 @@ import (
 
 // replayPoster owns the per-instance HTTP plumbing.
 type replayPoster struct {
-	model     string
-	endpoint  string
-	apiKey    string
-	apiType   string // "anthropic", "openai", or "openai_vllm"
-	client    *http.Client
-	runID     string
-	dryRun    bool
-	estimator *cacheEstimator
-	dryRates  struct {
+	model  string
+	apiKey string
+	// Attempt-then-fallback endpoint resolution: the FIRST attempt honors
+	// the spec's base URL exactly (base + endpoint leaf — whatever path
+	// prefix the operator gave: /v1, /v2, a proxy prefix, anything). If it
+	// 404s, the same request retries once with "/v1" inserted (so bare-root
+	// specs work against real vLLM without the operator knowing the API
+	// path). The first 2xx latches its form for the rest of the run; only
+	// 404 ever triggers the fallback — other 4xx/5xx are real request
+	// errors on a valid path.
+	epPrimary  string
+	epFallback string
+	epMu       sync.Mutex
+	epResolved string // latched endpoint; "" until the first success
+	epFellBack bool
+	epLogOnce  sync.Once
+	apiType    string // "anthropic", "openai", or "openai_vllm"
+	client     *http.Client
+	runID      string
+	dryRun     bool
+	estimator  *cacheEstimator
+	dryRates   struct {
 		coldTPS   int
 		warmTPS   int
 		outputTPS int
@@ -76,12 +89,6 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 		return nil, fmt.Errorf("no base URL in model spec")
 	}
 	base = strings.TrimRight(base, "/")
-	// Tolerate base URLs that already carry the /v1 API suffix — the
-	// convention every other wekai path uses (eval coherency, synthetic
-	// auto, OpenAI SDK style). Without this, ".../v1" bases produced a
-	// doubled /v1/v1 endpoint and a 100%-404 storm. Mirrors the same
-	// defensive strip in vllm_metrics.go's endpoint derivation.
-	base = strings.TrimSuffix(base, "/v1")
 
 	// API key selection: Anthropic targets use x-api-key (or dummy-key for
 	// local endpoints); OpenAI targets use Bearer auth with the OpenAI key
@@ -94,17 +101,21 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 		apiKey = "dummy-key"
 	}
 
-	// Endpoint path: /v1/messages for Anthropic, /v1/chat/completions for OpenAI.
-	endpoint := base + "/v1/messages"
+	// Endpoint leaf: /messages for Anthropic, /chat/completions for OpenAI.
+	// The primary attempt appends it to the operator's base verbatim; the
+	// fallback inserts /v1 (see the struct comment for the contract).
+	leaf := "/messages"
 	if dyn.Type == "openai" || dyn.Type == "openai_vllm" {
-		endpoint = base + "/v1/chat/completions"
+		leaf = "/chat/completions"
 	}
+	epPrimary := base + leaf
+	epFallback := base + "/v1" + leaf
 
 	model := dyn.Model
 	if model == "" && !dryRun {
 		discovered, derr := discoverModelName(base)
 		if derr != nil {
-			return nil, fmt.Errorf("model=... not set in %q and discovery from %s/v1/models failed: %w", modelSpec, base, derr)
+			return nil, fmt.Errorf("model=... not set in %q and model discovery from %s failed: %w", modelSpec, base, derr)
 		}
 		model = discovered
 		logDiscoveredModelOnce(base, model)
@@ -113,13 +124,14 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 		model = "dry-run"
 	}
 	return &replayPoster{
-		model:     model,
-		endpoint:  endpoint,
-		apiKey:    apiKey,
-		apiType:   dyn.Type,
-		runID:     runID,
-		dryRun:    dryRun,
-		estimator: estimator,
+		model:      model,
+		epPrimary:  epPrimary,
+		epFallback: epFallback,
+		apiKey:     apiKey,
+		apiType:    dyn.Type,
+		runID:      runID,
+		dryRun:     dryRun,
+		estimator:  estimator,
 		dryRates: struct {
 			coldTPS   int
 			warmTPS   int
@@ -144,27 +156,38 @@ func logDiscoveredModelOnce(base, model string) {
 		return
 	}
 	discoveredOnce[base] = true
-	fmt.Fprintf(os.Stderr, "[router-replay] %s: discovered model %q from /v1/models\n", base, model)
+	fmt.Fprintf(os.Stderr, "[router-replay] %s: discovered model %q from the models listing\n", base, model)
 }
 
-// discoverModelName fetches <base>/v1/models and returns the first model
-// id. Used when --model 'http://...,type=anthropic' omits model=... so the
-// operator doesn't have to remember the exact id served by each port.
+// discoverModelName returns the first model id from the endpoint's models
+// listing. Used when --model 'http://...,type=anthropic' omits model=... so
+// the operator doesn't have to remember the exact id served by each port.
+// Same attempt-then-fallback contract as the replay endpoint itself: honor
+// the operator's path first (<base>/models), insert /v1 only on 404.
 func discoverModelName(base string) (string, error) {
-	url := base + "/v1/models"
+	id, status, err := fetchFirstModelID(base + "/models")
+	if err != nil && status == http.StatusNotFound {
+		id, _, err = fetchFirstModelID(base + "/v1/models")
+	}
+	return id, err
+}
+
+// fetchFirstModelID GETs an OpenAI-style models listing and returns the
+// first id, the HTTP status (0 on transport error), and any error.
+func fetchFirstModelID(url string) (string, int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return "", fmt.Errorf("status %d", resp.StatusCode)
+		return "", resp.StatusCode, fmt.Errorf("status %d from %s", resp.StatusCode, url)
 	}
 	var body struct {
 		Data []struct {
@@ -172,12 +195,70 @@ func discoverModelName(base string) (string, error) {
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return "", err
+		return "", resp.StatusCode, err
 	}
 	if len(body.Data) == 0 {
-		return "", fmt.Errorf("no models returned by %s", url)
+		return "", resp.StatusCode, fmt.Errorf("no models returned by %s", url)
 	}
-	return body.Data[0].ID, nil
+	return body.Data[0].ID, resp.StatusCode, nil
+}
+
+// endpointAttempts returns the URL(s) to try for a request: the latched
+// endpoint once resolved, else primary then /v1 fallback.
+func (p *replayPoster) endpointAttempts() []string {
+	p.epMu.Lock()
+	defer p.epMu.Unlock()
+	if p.epResolved != "" {
+		return []string{p.epResolved}
+	}
+	return []string{p.epPrimary, p.epFallback}
+}
+
+// latchEndpoint records the first endpoint form that returned 2xx and logs
+// the resolution once. Concurrent first requests may each probe both forms
+// in parallel — benign duplicate probes by design (no single-flight, so a
+// high-concurrency launch is never serialized behind one resolver); the
+// first success wins and later latches are no-ops.
+func (p *replayPoster) latchEndpoint(url string) {
+	p.epMu.Lock()
+	if p.epResolved == "" {
+		p.epResolved = url
+		p.epFellBack = url == p.epFallback && p.epFallback != p.epPrimary
+	}
+	resolved, fellBack := p.epResolved, p.epFellBack
+	p.epMu.Unlock()
+	p.epLogOnce.Do(func() {
+		note := ""
+		if fellBack {
+			note = " (fallback /v1 applied)"
+		}
+		fmt.Fprintf(os.Stderr, "[router-replay] endpoint resolved: %s%s\n", resolved, note)
+	})
+}
+
+// sendOnce POSTs bodyBytes to url with the poster's auth/accept headers.
+func (p *replayPoster) sendOnce(ctx context.Context, url string, bodyBytes []byte, stream bool) (*http.Response, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if p.apiType == "anthropic" {
+		httpReq.Header.Set("Accept", "application/json")
+		httpReq.Header.Set("X-Api-Key", p.apiKey)
+		httpReq.Header.Set("Anthropic-Version", "2023-06-01")
+		if stream {
+			httpReq.Header.Set("Accept", "text/event-stream")
+		}
+	} else {
+		// OpenAI-compatible: Bearer auth, no Anthropic-Version header.
+		httpReq.Header.Set("Accept", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+		if stream {
+			httpReq.Header.Set("Accept", "text/event-stream")
+		}
+	}
+	return p.client.Do(httpReq)
 }
 
 // do issues one request and returns its metrics. Honors ctx for
@@ -220,44 +301,31 @@ func (p *replayPoster) do(
 		localCacheRatio = p.estimator.Observe(canonical)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.endpoint, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return RequestMetrics{
-			RequestNum:        int(st.totalCompleted.Load()) + 1,
-			SeriesNum:         seriesNum,
-			CycleNum:          turnIdx,
-			SeriesGUID:        sessionID + ":" + instanceID,
-			Error:             err,
-			TotalResponseTime: time.Since(startTime),
+	// Attempt-then-fallback: try the operator's path verbatim; ONLY a 404
+	// (path-level error) triggers one retry of the same request with /v1
+	// inserted. Transport errors and non-404 statuses return as-is.
+	var resp *http.Response
+	var attemptURL string
+	attempts := p.endpointAttempts()
+	for i, u := range attempts {
+		resp, err = p.sendOnce(ctx, u, bodyBytes, req.Stream)
+		if err != nil {
+			return RequestMetrics{
+				RequestNum:        int(st.totalCompleted.Load()) + 1,
+				SeriesNum:         seriesNum,
+				CycleNum:          turnIdx,
+				SeriesGUID:        sessionID + ":" + instanceID,
+				Error:             err,
+				TotalResponseTime: time.Since(startTime),
+			}
 		}
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if p.apiType == "anthropic" {
-		httpReq.Header.Set("Accept", "application/json")
-		httpReq.Header.Set("X-Api-Key", p.apiKey)
-		httpReq.Header.Set("Anthropic-Version", "2023-06-01")
-		if req.Stream {
-			httpReq.Header.Set("Accept", "text/event-stream")
+		attemptURL = u
+		if resp.StatusCode == http.StatusNotFound && i+1 < len(attempts) {
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			continue
 		}
-	} else {
-		// OpenAI-compatible: Bearer auth, no Anthropic-Version header.
-		httpReq.Header.Set("Accept", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
-		if req.Stream {
-			httpReq.Header.Set("Accept", "text/event-stream")
-		}
-	}
-
-	resp, err := p.client.Do(httpReq)
-	if err != nil {
-		return RequestMetrics{
-			RequestNum:        int(st.totalCompleted.Load()) + 1,
-			SeriesNum:         seriesNum,
-			CycleNum:          turnIdx,
-			SeriesGUID:        sessionID + ":" + instanceID,
-			Error:             err,
-			TotalResponseTime: time.Since(startTime),
-		}
+		break
 	}
 	defer resp.Body.Close()
 
@@ -274,6 +342,7 @@ func (p *replayPoster) do(
 		m.TotalResponseTime = time.Since(startTime)
 		return m
 	}
+	p.latchEndpoint(attemptURL)
 
 	if p.apiType == "openai" || p.apiType == "openai_vllm" {
 		if req.Stream {

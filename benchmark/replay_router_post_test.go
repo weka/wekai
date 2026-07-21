@@ -7,57 +7,224 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/weka/wekai/llm"
 )
 
+// TestReplayEndpointResolution covers the attempt-then-fallback contract:
+// bare-root bases fall back to /v1 on 404 and latch that form; /v1 bases
+// work on the first attempt with no doubled probe; non-404 errors never
+// trigger the fallback; concurrent first requests race the latch benignly
+// (duplicate probes allowed, single winner).
+func TestReplayEndpointResolution(t *testing.T) {
+	newVLLMStyleServer := func() (*httptest.Server, func() []string) {
+		var mu sync.Mutex
+		var paths []string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			paths = append(paths, r.URL.Path)
+			mu.Unlock()
+			if r.URL.Path != "/v1/chat/completions" {
+				w.WriteHeader(404)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}`)
+		}))
+		return ts, func() []string {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]string{}, paths...)
+		}
+	}
+	minimalReq := RouterReplayRequest{
+		RequestID:    1,
+		Stream:       false,
+		OutputTokens: 10,
+		Messages: []RouterReplayMessage{
+			{Role: "user", Hash: "h1", Bytes: 40, BlockTypes: []string{"text"}},
+		},
+	}
+	docs := strings.Repeat("x", 400)
+	keys := llm.APIKeys{OpenAI: "sk-test"}
+	newState := func() *autoState { return &autoState{stream: newCompletionStream(200)} }
+	mustPoster := func(t *testing.T, spec string) *replayPoster {
+		t.Helper()
+		p, err := newReplayPoster(spec, keys, "", "", false, 0, 0, 0, nil)
+		if err != nil {
+			t.Fatalf("newReplayPoster: %v", err)
+		}
+		return p
+	}
+
+	t.Run("bare root falls back to /v1 and latches", func(t *testing.T) {
+		ts, seen := newVLLMStyleServer()
+		defer ts.Close()
+		p := mustPoster(t, fmt.Sprintf("dynamic/%s,type=openai_vllm,model=m", ts.URL))
+		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState()); m.Error != nil {
+			t.Fatalf("first request: %v", m.Error)
+		}
+		got := seen()
+		if len(got) != 2 || got[0] != "/chat/completions" || got[1] != "/v1/chat/completions" {
+			t.Fatalf("probe sequence = %v, want [/chat/completions /v1/chat/completions]", got)
+		}
+		if p.epResolved != ts.URL+"/v1/chat/completions" || !p.epFellBack {
+			t.Errorf("latch = %q fellBack=%v, want fallback latched", p.epResolved, p.epFellBack)
+		}
+		// Latched: the second request goes straight to /v1, one wire call.
+		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState()); m.Error != nil {
+			t.Fatalf("second request: %v", m.Error)
+		}
+		if got = seen(); len(got) != 3 || got[2] != "/v1/chat/completions" {
+			t.Fatalf("post-latch paths = %v, want exactly one /v1 request appended", got)
+		}
+	})
+
+	t.Run("/v1 base works first try, no doubled probe", func(t *testing.T) {
+		ts, seen := newVLLMStyleServer()
+		defer ts.Close()
+		p := mustPoster(t, fmt.Sprintf("dynamic/%s/v1,type=openai_vllm,model=m", ts.URL))
+		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState()); m.Error != nil {
+			t.Fatalf("request: %v", m.Error)
+		}
+		got := seen()
+		if len(got) != 1 || got[0] != "/v1/chat/completions" {
+			t.Fatalf("paths = %v, want exactly [/v1/chat/completions] (no /v1/v1 probe)", got)
+		}
+		if p.epResolved != ts.URL+"/v1/chat/completions" || p.epFellBack {
+			t.Errorf("latch = %q fellBack=%v, want primary latched without fallback", p.epResolved, p.epFellBack)
+		}
+	})
+
+	t.Run("non-404 does not trigger fallback", func(t *testing.T) {
+		var mu sync.Mutex
+		hits := 0
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			hits++
+			mu.Unlock()
+			w.WriteHeader(500)
+		}))
+		defer ts.Close()
+		p := mustPoster(t, fmt.Sprintf("dynamic/%s,type=openai_vllm,model=m", ts.URL))
+		m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState())
+		if m.Error == nil || !strings.Contains(m.Error.Error(), "status 500") {
+			t.Fatalf("expected status-500 error, got %v", m.Error)
+		}
+		mu.Lock()
+		n := hits
+		mu.Unlock()
+		if n != 1 {
+			t.Errorf("server saw %d requests, want 1 (500 must not trigger the /v1 fallback)", n)
+		}
+		if got := p.endpointAttempts(); len(got) != 2 {
+			t.Errorf("endpoint latched on a failed request: %v", got)
+		}
+	})
+
+	t.Run("concurrent first requests latch benignly", func(t *testing.T) {
+		ts, seen := newVLLMStyleServer()
+		defer ts.Close()
+		p := mustPoster(t, fmt.Sprintf("dynamic/%s,type=openai_vllm,model=m", ts.URL))
+		const n = 8
+		errs := make([]error, n)
+		var wg sync.WaitGroup
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				m := p.do(context.Background(), minimalReq, docs, 1, "s", fmt.Sprintf("i%d", i), 1, newState())
+				errs[i] = m.Error
+			}(i)
+		}
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("concurrent request %d: %v", i, err)
+			}
+		}
+		if p.epResolved != ts.URL+"/v1/chat/completions" || !p.epFellBack {
+			t.Fatalf("latch after concurrent start = %q fellBack=%v", p.epResolved, p.epFellBack)
+		}
+		// Duplicate probes during the race are allowed; once latched, a new
+		// request adds exactly one wire call.
+		before := len(seen())
+		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState()); m.Error != nil {
+			t.Fatalf("post-latch request: %v", m.Error)
+		}
+		after := seen()
+		if len(after) != before+1 || after[len(after)-1] != "/v1/chat/completions" {
+			t.Fatalf("post-latch added %d calls (last %q), want exactly one /v1 call",
+				len(after)-before, after[len(after)-1])
+		}
+	})
+}
+
 func TestNewReplayPoster_OpenAI(t *testing.T) {
 	tests := []struct {
-		name      string
-		modelSpec string
-		wantType  string
-		wantPath  string
-		wantErr   bool
+		name         string
+		modelSpec    string
+		wantType     string
+		wantPrimary  string
+		wantFallback string
+		wantErr      bool
 	}{
 		{
-			name:      "openai type",
-			modelSpec: "dynamic/http://127.0.0.1:8000/v1,type=openai,model=gpt-4",
-			wantType:  "openai",
-			wantPath:  "/v1/chat/completions",
+			// The primary attempt honors the operator's /v1 base verbatim;
+			// the fallback candidate exists but only fires on 404.
+			name:         "openai type, /v1 base",
+			modelSpec:    "dynamic/http://127.0.0.1:8000/v1,type=openai,model=gpt-4",
+			wantType:     "openai",
+			wantPrimary:  "http://127.0.0.1:8000/v1/chat/completions",
+			wantFallback: "http://127.0.0.1:8000/v1/v1/chat/completions",
 		},
 		{
-			name:      "openai_vllm type",
-			modelSpec: "dynamic/http://127.0.0.1:8000/v1,type=openai_vllm,model=my-model",
-			wantType:  "openai_vllm",
-			wantPath:  "/v1/chat/completions",
+			name:         "openai_vllm type, /v1 base",
+			modelSpec:    "dynamic/http://127.0.0.1:8000/v1,type=openai_vllm,model=my-model",
+			wantType:     "openai_vllm",
+			wantPrimary:  "http://127.0.0.1:8000/v1/chat/completions",
+			wantFallback: "http://127.0.0.1:8000/v1/v1/chat/completions",
 		},
 		{
-			name:      "anthropic type (existing)",
-			modelSpec: "dynamic/http://127.0.0.1:8000/v1,type=anthropic,model=claude",
-			wantType:  "anthropic",
-			wantPath:  "/v1/messages",
+			name:         "anthropic type, /v1 base",
+			modelSpec:    "dynamic/http://127.0.0.1:8000/v1,type=anthropic,model=claude",
+			wantType:     "anthropic",
+			wantPrimary:  "http://127.0.0.1:8000/v1/messages",
+			wantFallback: "http://127.0.0.1:8000/v1/v1/messages",
 		},
 		{
-			name:      "bare URL defaults to openai_vllm via NormalizeModelSpec",
-			modelSpec: llm.NormalizeModelSpec("http://127.0.0.1:8000/v1") + ",model=test-model", // add explicit model to avoid discovery
-			wantType:  "openai_vllm",
-			wantPath:  "/v1/chat/completions",
+			name:         "bare URL defaults to openai_vllm via NormalizeModelSpec",
+			modelSpec:    llm.NormalizeModelSpec("http://127.0.0.1:8000/v1") + ",model=test-model", // add explicit model to avoid discovery
+			wantType:     "openai_vllm",
+			wantPrimary:  "http://127.0.0.1:8000/v1/chat/completions",
+			wantFallback: "http://127.0.0.1:8000/v1/v1/chat/completions",
 		},
 		{
-			// Base WITHOUT the /v1 suffix must build the same endpoint as
-			// the /v1 style above — both URL conventions work for replay.
-			name:      "openai_vllm, base without /v1",
-			modelSpec: "dynamic/http://127.0.0.1:8000,type=openai_vllm,model=my-model",
-			wantType:  "openai_vllm",
-			wantPath:  "/v1/chat/completions",
+			// Bare-root base: the primary honors it verbatim (would 404 on
+			// real vLLM), the fallback inserts the /v1 that vLLM serves.
+			name:         "openai_vllm, bare-root base",
+			modelSpec:    "dynamic/http://127.0.0.1:8000,type=openai_vllm,model=my-model",
+			wantType:     "openai_vllm",
+			wantPrimary:  "http://127.0.0.1:8000/chat/completions",
+			wantFallback: "http://127.0.0.1:8000/v1/chat/completions",
 		},
 		{
-			name:      "anthropic, base without /v1",
-			modelSpec: "dynamic/http://127.0.0.1:8000,type=anthropic,model=claude",
-			wantType:  "anthropic",
-			wantPath:  "/v1/messages",
+			name:         "anthropic, bare-root base",
+			modelSpec:    "dynamic/http://127.0.0.1:8000,type=anthropic,model=claude",
+			wantType:     "anthropic",
+			wantPrimary:  "http://127.0.0.1:8000/messages",
+			wantFallback: "http://127.0.0.1:8000/v1/messages",
+		},
+		{
+			// Arbitrary path prefixes (proxies) are honored on the first try.
+			name:         "openai_vllm, proxy prefix base",
+			modelSpec:    "dynamic/http://127.0.0.1:8000/proxy/llm,type=openai_vllm,model=my-model",
+			wantType:     "openai_vllm",
+			wantPrimary:  "http://127.0.0.1:8000/proxy/llm/chat/completions",
+			wantFallback: "http://127.0.0.1:8000/proxy/llm/v1/chat/completions",
 		},
 		{
 			name:      "unsupported type (rejected)",
@@ -83,10 +250,14 @@ func TestNewReplayPoster_OpenAI(t *testing.T) {
 			if p.apiType != tt.wantType {
 				t.Errorf("apiType = %q, want %q", p.apiType, tt.wantType)
 			}
-			// Exact full-URL assertion: a /v1-suffixed base must NOT double
-			// into /v1/v1/... (the pre-fix suffix-only check let that slip).
-			if want := "http://127.0.0.1:8000" + tt.wantPath; p.endpoint != want {
-				t.Errorf("endpoint = %q, want %q", p.endpoint, want)
+			if p.epPrimary != tt.wantPrimary {
+				t.Errorf("epPrimary = %q, want %q", p.epPrimary, tt.wantPrimary)
+			}
+			if p.epFallback != tt.wantFallback {
+				t.Errorf("epFallback = %q, want %q", p.epFallback, tt.wantFallback)
+			}
+			if got := p.endpointAttempts(); len(got) != 2 || got[0] != tt.wantPrimary || got[1] != tt.wantFallback {
+				t.Errorf("endpointAttempts pre-latch = %v, want [primary fallback]", got)
 			}
 		})
 	}
@@ -109,6 +280,14 @@ func TestOpenAIReplayEndToEnd(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedPath = r.URL.Path
 		receivedAuth = r.Header.Get("Authorization")
+
+		// vLLM-shaped: only /v1/chat/completions exists. With a bare-root
+		// base the poster's first attempt (/chat/completions) 404s here and
+		// the /v1 fallback carries the request — this e2e exercises that.
+		if r.URL.Path != "/v1/chat/completions" {
+			w.WriteHeader(404)
+			return
+		}
 
 		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
 			t.Errorf("failed to decode request body: %v", err)
