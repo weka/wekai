@@ -256,6 +256,8 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   <label><input type="checkbox" id="showResp" checked> Show Response Time</label>
   <label><input type="checkbox" id="showDots"> Show Requests</label>
   <label><input type="checkbox" id="showErrors" checked> Show Errors</label>
+  <label><input type="checkbox" id="showTotals" checked> Show Totals</label>
+  <label><input type="checkbox" id="showXAxisValues"> Show X-axis values</label>
   <button id="resetZoom" disabled>Reset Zoom</button>
   <span id="zoomInfo" style="font-size:0.8em;color:#8a9096;"></span>
 </div>
@@ -320,6 +322,8 @@ const MIX_TOTAL_MAX = mixTotalMax(DATA);
 
 // Precompute moving averages and error bars per series
 DATA.forEach(s => {
+  // Sorted completion times for the cumulative totals volume layer.
+  s._cumTimes = s.records.map(r => r.t).sort((a, b) => a - b);
   const sorted = s.records.filter(r => !r.err).slice().sort((a, b) => a.t - b.t);
   s._sorted = sorted;
   const maxSn = sorted.reduce((mx, r) => Math.max(mx, r.sn), 1);
@@ -428,17 +432,22 @@ let dragStart = null; // pixel X where drag began
 let dragCurrent = null;
 
 function calcBottomMargin() {
-  const visibleCount = DATA.filter((_, i) => !hiddenSeries.has(i)).length;
   const duration = (viewTMax - viewTMin) / 1000;
+  // Per-tick request-count rows only when "Show X-axis values" is on (the
+  // totals volume layer carries the same story by default).
+  let reqRows = 0;
+  if (typeof xAxisValuesEnabled === "function" && xAxisValuesEnabled()) {
+    reqRows = DATA.filter((_, i) => !hiddenSeries.has(i)).length;
+  }
   // Dataset-size rows: one extra row per visible sampled series when the
   // cache-mix overlay is enabled.
   let dsRows = 0;
   if (typeof cacheMixEnabled === "function" && cacheMixEnabled()) {
     dsRows = DATA.filter((s, i) => !hiddenSeries.has(i) && s.adt && s.adt.length).length;
   }
-  // Rows are always printed: adaptive ticks (11-17 columns) leave ample width.
-  // 20px for time label + 14px per visible series (single line each)
-  return 20 + (visibleCount + dsRows) * 14;
+  // 20px for the time label + 14px per printed row (single line each);
+  // adaptive ticks (11-17 columns) leave ample width.
+  return 20 + (reqRows + dsRows) * 14;
 }
 
 function resize() {
@@ -704,6 +713,34 @@ function mixAt(mix, t) {
   return found;
 }
 
+// cumCountAt returns how many sorted timestamps are <= t (the cumulative
+// completed-request count of a series at time t).
+function cumCountAt(times, t) {
+  if (!times || !times.length) return 0;
+  let lo = 0, hi = times.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (times[mid] <= t) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+// totalsStack: stacked cumulative fractions at time t for series given in
+// stacking (legend) order, normalized against finalTotal — the combined
+// FINAL count, so the stack reaches exactly 1.0 (full plot height) at the
+// end of the run and the shape is stable under zoom. Callers pass only
+// visible series (and their recomputed finalTotal) so hidden series
+// contribute nothing.
+function totalsStack(timesArr, t, finalTotal) {
+  const out = [];
+  let acc = 0;
+  (timesArr || []).forEach(times => {
+    if (finalTotal > 0) acc += cumCountAt(times, t) / finalTotal;
+    out.push(acc);
+  });
+  return out;
+}
+
 // adtAt returns the latest active-dataset observation at or before t, or
 // null when t precedes the first sample.
 function adtAt(adt, t) {
@@ -763,6 +800,57 @@ function placeTooltip(cx, cy, tipW, tipH, vw, vh) {
 function cacheMixEnabled() {
   const cb = document.getElementById("showCacheMix");
   return HAS_CACHE_MIX && cb && cb.checked;
+}
+
+function xAxisValuesEnabled() {
+  const cb = document.getElementById("showXAxisValues");
+  return cb ? cb.checked : true;
+}
+
+// drawTotals renders the cumulative completed-request "volume" layer:
+// stacked translucent areas (one per visible series, legend order, series
+// colors, alpha 0.3) behind the latency lines. Normalized to the combined
+// FINAL total of the visible series = full plot height, so the stack fills
+// the chart exactly at the end of the run and the biggest contributor
+// visibly owns the top of the right edge.
+function drawTotals() {
+  const cb = document.getElementById("showTotals");
+  if (!cb || !cb.checked) return;
+  const visible = [];
+  DATA.forEach((s, si) => {
+    if (!hiddenSeries.has(si) && s._cumTimes && s._cumTimes.length) visible.push({ s, si });
+  });
+  if (!visible.length) return;
+  let finalTotal = 0;
+  visible.forEach(({ s }) => { finalTotal += s._cumTimes.length; });
+  if (finalTotal <= 0) return;
+
+  const stepPx = 2;
+  const n = Math.max(2, Math.floor(plotW / stepPx) + 1);
+  const xs = new Array(n), stacks = new Array(n);
+  const timesArr = visible.map(({ s }) => s._cumTimes);
+  for (let k = 0; k < n; k++) {
+    const px = Math.min(k * stepPx, plotW);
+    xs[k] = margin.left + px;
+    stacks[k] = totalsStack(timesArr, unmapX(margin.left + px), finalTotal);
+  }
+
+  ctx.globalAlpha = 0.3;
+  visible.forEach(({ si }, li) => {
+    ctx.fillStyle = seriesColors[si];
+    ctx.beginPath();
+    for (let k = 0; k < n; k++) {
+      const y = margin.top + plotH * (1 - stacks[k][li]);
+      if (k === 0) ctx.moveTo(xs[k], y); else ctx.lineTo(xs[k], y);
+    }
+    for (let k = n - 1; k >= 0; k--) {
+      const below = li === 0 ? 0 : stacks[k][li - 1];
+      ctx.lineTo(xs[k], margin.top + plotH * (1 - below));
+    }
+    ctx.closePath();
+    ctx.fill();
+  });
+  ctx.globalAlpha = 1;
 }
 
 // cacheMixLayout computes the band geometry shared by drawCacheMix and the
@@ -909,7 +997,7 @@ function draw() {
     if (!showAnnotationRows) continue;
     ctx.font = "9px monospace";
     let row = 0;
-    tickStats(tickTime).forEach(({ si, cumReqs, cumErrs, maxSn }) => {
+    if (xAxisValuesEnabled()) tickStats(tickTime).forEach(({ si, cumReqs, cumErrs, maxSn }) => {
       const yBase = margin.top + plotH + 20 + row * 14;
       const snPart = "@" + maxSn;
       ctx.textAlign = "left";
@@ -971,7 +1059,9 @@ function draw() {
       ctx.fillRect(margin.left - 13, margin.top + plotH + 20 + row * 14 + 1, 7, 7);
       row++;
     };
-    DATA.forEach((ds, si) => { if (!hiddenSeries.has(si)) chip(si); });
+    if (xAxisValuesEnabled()) {
+      DATA.forEach((ds, si) => { if (!hiddenSeries.has(si)) chip(si); });
+    }
     if (cacheMixEnabled()) {
       DATA.forEach((ds, si) => {
         if (!hiddenSeries.has(si) && ds.adt && ds.adt.length) chip(si);
@@ -1007,7 +1097,10 @@ function draw() {
   ctx.rect(margin.left, margin.top, plotW, plotH);
   ctx.clip();
 
-  // Cache-mix overlay renders first so latency lines stay on top of it.
+  // Totals volume layer first (bottom of the z-order), then the cache-mix
+  // overlay (its black backdrop deliberately sits over the volume in the
+  // band region), then latency lines on top of both.
+  drawTotals();
   drawCacheMix();
 
   // Moving average lines
@@ -1375,7 +1468,7 @@ document.getElementById("resetZoom").addEventListener("click", () => {
 });
 
 // Wire up controls
-["showTTFT","showResp","showDots","showErrors"].forEach(id => {
+["showTTFT","showResp","showDots","showErrors","showTotals","showXAxisValues"].forEach(id => {
   document.getElementById(id).addEventListener("change", draw);
 });
 

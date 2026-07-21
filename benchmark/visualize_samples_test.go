@@ -86,6 +86,7 @@ func TestGenerateVisualizationWithCacheMixSamples(t *testing.T) {
 		"drawCacheMix", "showCacheMix", "HAS_CACHE_MIX", // overlay code paths
 		"MIX_COMPUTE_COLOR", "active dataset (tokens)",
 		"MIX_TOTAL_MAX", "mixStackHeight", "mixRate", // absolute band scaling
+		"drawTotals", "totalsStack", "showTotals", "showXAxisValues", // totals volume layer + axis toggle
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("generated HTML missing %q", want)
@@ -202,6 +203,27 @@ const wide = {t0:0, t1:120000, c:60000, lc:0, ec:0}; // missed tick: 120s interv
 assert(mixRate(wide) === 500, "120s interval => total/120, got " + mixRate(wide));
 assert(mixRate({t0:5, t1:5, c:9, lc:0, ec:0}) === 0, "zero-width interval => 0");
 
+// Totals volume layer math.
+const ta = [0, 10, 20, 30];    // 4 requests
+const tb = [5, 15];            // 2 requests
+assert(cumCountAt(ta, -1) === 0, "before first completion => 0");
+assert(cumCountAt(ta, 10) === 2, "boundary timestamp inclusive");
+assert(cumCountAt(ta, 1e9) === 4, "after last => all");
+assert(cumCountAt([], 5) === 0 && cumCountAt(null, 5) === 0, "empty/missing => 0");
+// Normalization: at end-of-run the stack top is exactly 1.0 = full height.
+let st = totalsStack([ta, tb], 1e9, ta.length + tb.length);
+assert(Math.abs(st[st.length - 1] - 1.0) < 1e-12, "final combined total => full height, got " + st);
+// Stacking order stable (input = legend order): layer tops are cumulative.
+st = totalsStack([ta, tb], 15, 6);
+assert(Math.abs(st[0] - 2 / 6) < 1e-12 && Math.abs(st[1] - 4 / 6) < 1e-12, "stack order/cumulation, got " + st);
+// Zero-request series contributes nothing (zero-thickness layer).
+st = totalsStack([ta, [], tb], 1e9, 6);
+assert(st[1] === st[0], "zero-request series adds no thickness");
+// Hide/show: caller drops hidden series and renormalizes => remaining stack
+// still tops out at 1.0.
+st = totalsStack([tb], 1e9, tb.length);
+assert(Math.abs(st[0] - 1.0) < 1e-12, "renormalized visible-only stack fills fully");
+
 // Viewport-aware tooltip placement (vw=1000, vh=800; tip 200x150).
 let p = placeTooltip(100, 100, 200, 150, 1000, 800);
 assert(p.x === 112 && p.y === 90, "fits => right of cursor (+12,-10), got " + JSON.stringify(p));
@@ -265,6 +287,7 @@ __el("chart"); __el("tooltip", { _w: 220, _h: 180 });
 __el("showTTFT", { checked: true }); __el("showResp", { checked: true });
 __el("showDots", { checked: false }); __el("showErrors", { checked: true });
 __el("showCacheMix", { checked: true });
+__el("showTotals", { checked: true }); __el("showXAxisValues", { checked: false });
 __el("resetZoom"); __el("zoomInfo"); __el("info"); __el("legend");
 __el("selectAll"); __el("deselectAll"); __el("seriesFilter");
 const document = {
