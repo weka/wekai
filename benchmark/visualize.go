@@ -338,14 +338,12 @@ const dpr = window.devicePixelRatio || 1;
 
 const margin = { top: 30, right: 20, bottom: 50, left: 70 };
 
-// Beyond this view duration, the per-tick annotation rows (cumulative
-// request/error counts per series) are no longer always-printed under the
-// axis -- at a flat 5m tick step a multi-hour run crammed dozens of
-// overlapping label columns into an illegible band. Long views instead show
-// ticks/time-labels only, with per-tick details available on hover (see
-// computeXStepSec/mousemove below). Zooming into a <=1h window (drag-zoom)
-// brings the printed rows back automatically since this is checked against
-// the current view span, not the full run.
+// Annotation rows (cumulative request/error counts per series) are always
+// printed under the axis: computeXStepSec keeps tick count at ~11-17 for any
+// span, so the columns no longer overlap (the old flat 5m step crammed dozens
+// of columns on multi-hour runs). Hover on a gridline still shows the same
+// per-tick breakdown as a tooltip. Constant retained for the hover fallback
+// threshold only.
 const ANNOTATION_ROWS_MAX_DURATION = 3600;
 let W, H, plotW, plotH;
 let hiddenSeries = new Set();
@@ -363,7 +361,7 @@ let dragCurrent = null;
 function calcBottomMargin() {
   const visibleCount = DATA.filter((_, i) => !hiddenSeries.has(i)).length;
   const duration = (viewTMax - viewTMin) / 1000;
-  if (duration > ANNOTATION_ROWS_MAX_DURATION) return 20; // rows replaced by hover tooltip
+  // Rows are always printed: adaptive ticks (11-17 columns) leave ample width.
   // 20px for time label + 14px per visible series (single line each)
   return 20 + visibleCount * 14;
 }
@@ -609,7 +607,7 @@ function draw() {
   ctx.textBaseline = "top";
   const duration = (viewTMax - viewTMin) / 1000;
   const xStepSec = computeXStepSec(duration);
-  const showAnnotationRows = duration <= ANNOTATION_ROWS_MAX_DURATION;
+  const showAnnotationRows = true; // adaptive tick density keeps columns readable at any span
   const startSec = Math.ceil(((viewTMin - globalTMin) / 1000) / xStepSec) * xStepSec;
   currentTicks = []; // rebuilt every draw; consumed by mousemove hover lookup
   for (let s = startSec; s <= (viewTMax - globalTMin) / 1000; s += xStepSec) {
