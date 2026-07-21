@@ -337,8 +337,22 @@ const tooltip = document.getElementById("tooltip");
 const dpr = window.devicePixelRatio || 1;
 
 const margin = { top: 30, right: 20, bottom: 50, left: 70 };
+
+// Beyond this view duration, the per-tick annotation rows (cumulative
+// request/error counts per series) are no longer always-printed under the
+// axis -- at a flat 5m tick step a multi-hour run crammed dozens of
+// overlapping label columns into an illegible band. Long views instead show
+// ticks/time-labels only, with per-tick details available on hover (see
+// computeXStepSec/mousemove below). Zooming into a <=1h window (drag-zoom)
+// brings the printed rows back automatically since this is checked against
+// the current view span, not the full run.
+const ANNOTATION_ROWS_MAX_DURATION = 3600;
 let W, H, plotW, plotH;
 let hiddenSeries = new Set();
+// Positions of the x-axis ticks drawn in the most recent draw() call, so
+// mousemove can hover-match a tick even when its annotation row isn't
+// printed (long views -- see ANNOTATION_ROWS_MAX_DURATION).
+let currentTicks = [];
 
 // Zoom state
 let globalTMin = Infinity, globalTMax = -Infinity, globalYMax = 0;
@@ -348,6 +362,8 @@ let dragCurrent = null;
 
 function calcBottomMargin() {
   const visibleCount = DATA.filter((_, i) => !hiddenSeries.has(i)).length;
+  const duration = (viewTMax - viewTMin) / 1000;
+  if (duration > ANNOTATION_ROWS_MAX_DURATION) return 20; // rows replaced by hover tooltip
   // 20px for time label + 14px per visible series (single line each)
   return 20 + visibleCount * 14;
 }
@@ -515,6 +531,48 @@ function recalcYMax() {
   viewYMax = Math.max(viewYMax * 1.1, 1);
 }
 
+// computeXStepSec picks the x-axis tick interval (seconds) for a given view
+// duration, targeting ~12-20 visible ticks regardless of run length. A flat
+// step beyond 10 minutes used to emit a tick every 5m no matter how long the
+// run was (48 mashed-together labels on a 4h/14400s span) -- this scales the
+// step with the span instead.
+function computeXStepSec(duration) {
+  if (duration <= 10) return 1;
+  if (duration <= 30) return 2;
+  if (duration <= 60) return 5;
+  if (duration <= 300) return 30;
+  if (duration <= 600) return 60;
+  if (duration <= 1800) return 120;   // <=30m: 2m ticks
+  if (duration <= 3600) return 300;   // <=1h: 5m ticks
+  if (duration <= 7200) return 600;   // <=2h: 10m ticks
+  if (duration <= 14400) return 900;  // <=4h: 15m ticks
+  if (duration <= 28800) return 1800; // <=8h: 30m ticks
+  return 3600;                        // beyond 8h: 1h ticks
+}
+
+// formatTickLabel renders a compact label for a tick offset of s seconds
+// (e.g. "45m", "1h15m", "2h" -- never a redundant "1h0m").
+function formatTickLabel(s) {
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m" + (s % 60 ? (s % 60) + "s" : "");
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h + "h" + (m ? m + "m" : "");
+}
+
+// tickStats computes, for each visible series, the cumulative request/error
+// count and max series-num as of tickTime. Shared by the always-printed
+// annotation rows (short/zoomed views) and the hover tooltip (long views).
+function tickStats(tickTime) {
+  const out = [];
+  DATA.forEach((ds, si) => {
+    if (hiddenSeries.has(si)) return;
+    let cumReqs = 0, cumErrs = 0, maxSn = 0;
+    ds.records.forEach(r => { if (r.t <= tickTime) { cumReqs++; if (r.err) cumErrs++; if (r.sn > maxSn) maxSn = r.sn; } });
+    out.push({ si, cumReqs, cumErrs, maxSn });
+  });
+  return out;
+}
+
 function draw() {
   // Recalc bottom margin for visible series count
   const newBottom = calcBottomMargin();
@@ -550,30 +608,21 @@ function draw() {
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
   const duration = (viewTMax - viewTMin) / 1000;
-  let xStepSec;
-  if (duration <= 10) xStepSec = 1;
-  else if (duration <= 30) xStepSec = 2;
-  else if (duration <= 60) xStepSec = 5;
-  else if (duration <= 300) xStepSec = 30;
-  else if (duration <= 600) xStepSec = 60;
-  else xStepSec = 300;
+  const xStepSec = computeXStepSec(duration);
+  const showAnnotationRows = duration <= ANNOTATION_ROWS_MAX_DURATION;
   const startSec = Math.ceil(((viewTMin - globalTMin) / 1000) / xStepSec) * xStepSec;
+  currentTicks = []; // rebuilt every draw; consumed by mousemove hover lookup
   for (let s = startSec; s <= (viewTMax - globalTMin) / 1000; s += xStepSec) {
     const x = mapX(globalTMin + s * 1000);
     if (x < margin.left || x > margin.left + plotW) continue;
-    ctx.beginPath(); ctx.moveTo(x, margin.top); ctx.lineTo(x, margin.top + plotH); ctx.stroke();
-    let label;
-    if (s < 60) label = s + "s";
-    else if (s < 3600) label = Math.floor(s/60) + "m" + (s%60 ? (s%60) + "s" : "");
-    else label = Math.floor(s/3600) + "h" + Math.floor((s%3600)/60) + "m";
-    ctx.fillText(label, x, margin.top + plotH + 6);
     const tickTime = globalTMin + s * 1000;
+    currentTicks.push({ x, tickTime });
+    ctx.beginPath(); ctx.moveTo(x, margin.top); ctx.lineTo(x, margin.top + plotH); ctx.stroke();
+    ctx.fillText(formatTickLabel(s), x, margin.top + plotH + 6);
+    if (!showAnnotationRows) continue;
     ctx.font = "9px monospace";
     let row = 0;
-    DATA.forEach((ds, si) => {
-      if (hiddenSeries.has(si)) return;
-      let cumReqs = 0, cumErrs = 0, maxSn = 0;
-      ds.records.forEach(r => { if (r.t <= tickTime) { cumReqs++; if (r.err) cumErrs++; if (r.sn > maxSn) maxSn = r.sn; } });
+    tickStats(tickTime).forEach(({ si, cumReqs, cumErrs, maxSn }) => {
       const yBase = margin.top + plotH + 20 + row * 14;
       const snPart = "@" + maxSn;
       ctx.textAlign = "left";
@@ -841,6 +890,19 @@ canvas.addEventListener("mousemove", e => {
     });
   }
 
+  // On long views the per-tick annotation rows aren't printed (see
+  // ANNOTATION_ROWS_MAX_DURATION) to avoid an overlapping label band --
+  // hovering near any x-axis gridline surfaces the same per-series
+  // cumulative breakdown via tooltip instead.
+  let tickHover = null;
+  if (!best && (viewTMax - viewTMin) / 1000 > ANNOTATION_ROWS_MAX_DURATION && my >= margin.top) {
+    let bestTickDist = 10;
+    currentTicks.forEach(tk => {
+      const d = Math.abs(mx - tk.x);
+      if (d < bestTickDist) { bestTickDist = d; tickHover = tk; }
+    });
+  }
+
   if (best) {
     tooltip.style.display = "block";
     tooltip.style.left = (e.clientX + 12) + "px";
@@ -871,6 +933,17 @@ canvas.addEventListener("mousemove", e => {
         (r.ch ? "Cache hit<br>" : "") +
         (r.err ? "<span style='color:#ff4444'>ERROR</span>" : "");
     }
+  } else if (tickHover) {
+    tooltip.style.display = "block";
+    tooltip.style.left = (e.clientX + 12) + "px";
+    tooltip.style.top = (e.clientY - 10) + "px";
+    const elapsedSec = Math.round((tickHover.tickTime - globalTMin) / 1000);
+    const rows = tickStats(tickHover.tickTime).map(({ si, cumReqs, cumErrs, maxSn }) => {
+      const errPart = cumErrs > 0 ? ", <span style='color:#ff4444'>errors: " + cumErrs + "</span>" : "";
+      return "<span style='color:" + seriesColors[si] + "'>" + DATA[si].name + "</span>: " +
+        cumReqs + " reqs" + errPart + ", series @" + maxSn;
+    });
+    tooltip.innerHTML = "<b>t = " + formatTickLabel(elapsedSec) + "</b><br>" + rows.join("<br>");
   } else {
     tooltip.style.display = "none";
   }
