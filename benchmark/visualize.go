@@ -725,10 +725,19 @@ function cumCountAt(times, t) {
   return lo;
 }
 
+// totalsY maps a stacked cumulative fraction onto the canvas: the stack
+// grows from the plot bottom and fraction 1.0 lands EXACTLY on ceilingY —
+// the cache-mix strip's lower edge when the overlay is on (the two layers
+// tile the vertical space, never overlap), else the plot top.
+function totalsY(frac, plotTop, plotHeight, ceilingY) {
+  const bottom = plotTop + plotHeight;
+  return bottom - frac * (bottom - ceilingY);
+}
+
 // totalsStack: stacked cumulative fractions at time t for series given in
 // stacking (legend) order, normalized against finalTotal — the combined
-// FINAL count, so the stack reaches exactly 1.0 (full plot height) at the
-// end of the run and the shape is stable under zoom. Callers pass only
+// FINAL count, so the stack reaches exactly 1.0 (full available height) at
+// the end of the run and the shape is stable under zoom. Callers pass only
 // visible series (and their recomputed finalTotal) so hidden series
 // contribute nothing.
 function totalsStack(timesArr, t, finalTotal) {
@@ -825,6 +834,17 @@ function drawTotals() {
   visible.forEach(({ s }) => { finalTotal += s._cumTimes.length; });
   if (finalTotal <= 0) return;
 
+  // Ceiling: with the cache-mix overlay on, the stack tops out exactly at
+  // the band strip's lower edge — the layers tile, never overlap. With the
+  // overlay off it fills to the literal plot top. Recomputed every draw, so
+  // toggling Show Cache Mix re-targets the normalization instantly.
+  const layout = cacheMixLayout();
+  let ceilingY = margin.top;
+  if (layout && layout.bands.length) {
+    const last = layout.bands[layout.bands.length - 1];
+    ceilingY = last.yTop + last.bandH;
+  }
+
   const stepPx = 2;
   const n = Math.max(2, Math.floor(plotW / stepPx) + 1);
   const xs = new Array(n), stacks = new Array(n);
@@ -840,12 +860,12 @@ function drawTotals() {
     ctx.fillStyle = seriesColors[si];
     ctx.beginPath();
     for (let k = 0; k < n; k++) {
-      const y = margin.top + plotH * (1 - stacks[k][li]);
+      const y = totalsY(stacks[k][li], margin.top, plotH, ceilingY);
       if (k === 0) ctx.moveTo(xs[k], y); else ctx.lineTo(xs[k], y);
     }
     for (let k = n - 1; k >= 0; k--) {
       const below = li === 0 ? 0 : stacks[k][li - 1];
-      ctx.lineTo(xs[k], margin.top + plotH * (1 - below));
+      ctx.lineTo(xs[k], totalsY(below, margin.top, plotH, ceilingY));
     }
     ctx.closePath();
     ctx.fill();

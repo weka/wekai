@@ -224,6 +224,16 @@ assert(st[1] === st[0], "zero-request series adds no thickness");
 st = totalsStack([tb], 1e9, tb.length);
 assert(Math.abs(st[0] - 1.0) < 1e-12, "renormalized visible-only stack fills fully");
 
+// Volume ceiling: with cache-mix bands on, fraction 1.0 lands EXACTLY on
+// the band strip's lower edge (no overlap); with bands off, on the plot
+// top. plotTop=30, plotH=600 => bottom=630; strip bottom e.g. 30+2*64=158.
+assert(totalsY(1.0, 30, 600, 158) === 158, "full stack tops at band strip bottom edge");
+assert(totalsY(0, 30, 600, 158) === 630, "empty stack sits on the plot bottom");
+assert(totalsY(1.0, 30, 600, 30) === 30, "bands off => full stack reaches plot top");
+assert(totalsY(0.5, 30, 600, 158) === 630 - 0.5 * (630 - 158), "linear in between");
+// Toggling re-targets: same fraction, different ceiling => different y.
+assert(totalsY(0.8, 30, 600, 158) !== totalsY(0.8, 30, 600, 30), "ceiling change moves the stack");
+
 // Viewport-aware tooltip placement (vw=1000, vh=800; tip 200x150).
 let p = placeTooltip(100, 100, 200, 150, 1000, 800);
 assert(p.x === 112 && p.y === 90, "fits => right of cursor (+12,-10), got " + JSON.stringify(p));
