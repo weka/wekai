@@ -5,12 +5,9 @@
 # deployment can run `wekai benchmark auto --router-replay-file
 # /wekai/replay.jsonl ...` with no external volume or fetch step.
 #
-# The replay artifact is published separately (see this repo's own
-# `task replay:push` / `dagger call push-replay`) as a minimal scratch
-# image in the same wekai quay repo (tag prefix replay-) — that repo also
-# where replay artifacts have always lived and is kept for that source
-# reference only; nothing built or tagged from *this* Dockerfile uses
-# "benchmark" in its name.
+# The replay artifact is published separately (`task replay:push` /
+# `dagger call push-replay`) as a minimal scratch image in the same wekai
+# quay repo, distinguished by the replay- tag prefix.
 
 # ARGs used in a FROM must be declared before the first FROM (global scope).
 # Override with --build-arg REPLAY_IMAGE=... to embed a different capture.

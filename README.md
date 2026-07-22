@@ -65,6 +65,21 @@ deterministically from each block's hash: same hash → same bytes → the
 server's prefix cache hits exactly the way the original traffic did,
 without shipping any real captured text.
 
+**Downloading it.** The capture embedded in the image and run by the Helm
+chart is published as a scratch image holding just `/replay.jsonl`, pulled
+anonymously with `curl` — no Docker engine, no registry client (~1.3 GB
+download, ~9 GB on disk). `Dockerfile`'s `REPLAY_IMAGE` ARG is the source
+of truth for the tag:
+
+```
+REPO=weka.io/wekai; TAG=replay-24e7f15ba0ea
+TOKEN=$(curl -s "https://quay.io/v2/auth?service=quay.io&scope=repository:$REPO:pull" | jq -r .token)
+LAYER=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+  "https://quay.io/v2/$REPO/manifests/$TAG" | jq -r '.layers[0].digest')
+curl -L -H "Authorization: Bearer $TOKEN" "https://quay.io/v2/$REPO/blobs/$LAYER" | tar -xz replay.jsonl
+```
+
 **What "replay" preserves.** This is not a request firehose — it re-enacts
 each captured session as a tree: per-session series boundaries, sequential
 turn order per agent instance, parent→child sequencing (a sub-agent starts
@@ -188,9 +203,10 @@ models — otherwise only dynamic/openrouter specs resolve.
 compiles the `wekai` binary (module github.com/weka/wekai), and a second `COPY --link --from=` stage
 embeds one router-replay JSONL artifact at `/wekai/replay.jsonl`, pulled
 from a separately-published scratch image (default
-`quay.io/weka.io/wekai:replay-<sha12>` — published by this repo's own
-`task replay:push`, see "CI / Publishing" below; replay artifacts and the
-app image share the wekai quay repo, distinguished by the replay- tag prefix). Both
+`quay.io/weka.io/wekai:replay-<sha12>` — published by `task replay:push`,
+see "CI / Publishing" below; replay artifacts and the app image share the
+wekai quay repo, distinguished by the `replay-` tag prefix; to fetch that
+artifact standalone see "Downloading it" above). Both
 runtime-stage `COPY`s use BuildKit's `--link` — each becomes an
 independent, content-addressed layer, so a rebuild triggered by a Go source
 change (which busts the builder stage) does not recopy or reupload the
@@ -357,13 +373,10 @@ those per-version install instructions.
 ## CI / Publishing
 
 Publishing is a self-contained Dagger module (Python SDK, engine pinned to
-`v0.18.6` to match wekai's own `.dagger` module) rooted at `dagger.json` /
-`.dagger/src/wekai_core_flows/`. It was ported from wekai's
-`.dagger/src/wekai_flows/main.py` (`push_replay`, `_calc_version`) — same
-tag scheme, same default registry, no reimplementation via crane/shell.
-Only its Go dependencies are needed to build the image, and they're all
-public, so unlike wekai's module this one needs no SSH socket forwarding
-for private-repo access.
+`v0.18.6`) rooted at `dagger.json` / `.dagger/src/wekai_core_flows/`. All
+Go dependencies needed to build the image are public, so no SSH socket
+forwarding or registry credentials are required for the image build
+itself.
 
 Three functions:
 
@@ -372,18 +385,17 @@ Three functions:
   `quay.io/weka.io/wekai` by default, alongside the app image — replay
   artifacts are distinguished by the `replay-` tag prefix (registry
   overridable).
-- `publish` — builds this repo's own `Dockerfile` via `Directory.docker_build()`
+- `publish` — builds the repo's `Dockerfile` via `Directory.docker_build()`
   (the Dockerfile is the single source of truth — the module does not
   reimplement its steps), tags with `v999.0.0-<sha12>` (sha12 of the
-  source directory's content digest, same scheme wekai uses), and
+  source directory's content digest), and
   publishes to `quay.io/weka.io/wekai` by default. The Dockerfile's
   `REPLAY_IMAGE` build-arg is exposed as a `--replay-image` function param.
 - `push-helm` — first runs the exact same image build+publish as `publish`
   (shared internal helper, not a separate code path), then packages
   `chart/wekai` and pushes it to an OCI Helm registry
-  (`quay.io/weka.io/helm` by default). Version pinning is pure propagation
-  (same pattern as wekai's `push_restricted` charts): only `Chart.yaml`'s
-  `version`/`appVersion` are stamped — in lockstep with the image the
+  (`quay.io/weka.io/helm` by default). Version pinning is pure propagation:
+  only `Chart.yaml`'s `version`/`appVersion` are stamped — in lockstep with the image the
   publish step just pushed — and the deployment template resolves the image
   tag via `imageTag | default .Chart.AppVersion`; the packaged `values.yaml`
   carries no hardcoded version (`imageTag` stays `""`, and only
@@ -401,12 +413,12 @@ task helm:push                                   # dagger call push-helm (image 
 ```
 
 `helm:push` reads Helm registry credentials from `QUAY_USERNAME`/`QUAY_PASSWORD`
-env vars (same convention wekai's retired chart-push flow used).
+env vars.
 
-`.dagger/sdk/` (the generated Dagger client bindings) is gitignored, same
-as wekai — run `dagger develop` once after a fresh clone (or the first
-`dagger call`/`task app:push` will do it implicitly) to regenerate it
-locally; nothing under `sdk/` is meant to be hand-edited or committed.
+`.dagger/sdk/` (the generated Dagger client bindings) is gitignored — run
+`dagger develop` once after a fresh clone (or let the first
+`dagger call`/`task app:push` do it implicitly) to regenerate it locally;
+nothing under `sdk/` is meant to be hand-edited or committed.
 
 ## Layout
 
