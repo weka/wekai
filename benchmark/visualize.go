@@ -338,14 +338,14 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   <button id="ctxFilterBtn" style="font-size:0.8em;padding:3px 10px;background:#1E2429;color:#F2F2EB;border:1px solid #7C03EC;border-radius:4px;cursor:pointer;">Context Filter</button>
   <button id="selectAll" style="font-size:0.8em;padding:3px 10px;background:#1E2429;color:#F2F2EB;border:1px solid #42464A;border-radius:4px;cursor:pointer;">Select All</button>
   <button id="deselectAll" style="font-size:0.8em;padding:3px 10px;background:#1E2429;color:#F2F2EB;border:1px solid #42464A;border-radius:4px;cursor:pointer;">Deselect All</button>
-  <input id="seriesFilter" type="text" placeholder="Filter series..." style="font-size:0.8em;padding:3px 8px;background:#1E2429;color:#F2F2EB;border:1px solid #42464A;border-radius:4px;width:200px;">
+  <input id="variantFilter" type="text" placeholder="Filter variants..." style="font-size:0.8em;padding:3px 8px;background:#1E2429;color:#F2F2EB;border:1px solid #42464A;border-radius:4px;width:200px;">
 </div>
 <div id="legend"></div>
 <canvas id="chart"></canvas>
 <div id="tooltip"></div>
 <div id="ctxModal" class="modal-backdrop">
   <div class="modal">
-    <h2>Series &amp; context filter</h2>
+    <h2>Variants &amp; context filter</h2>
     <div id="ctxModalSeries"></div>
     <div class="modal-band">
       <span>Show requests with context</span>
@@ -662,7 +662,7 @@ function updateInfo() {
   const span = ((viewTMax - viewTMin) / 1000).toFixed(1);
   const totalStr = formatCount(totalOk, totalErr);
   document.getElementById("info").innerHTML =
-    DATA.length + " series, " + totalStr + " requests" +
+    DATA.length + " variants, " + totalStr + " requests" +
     (isZoomed() ? " (of " + totalRequests + " total)" : "") +
     ", time span: " + span + "s";
 
@@ -705,7 +705,7 @@ function syncLegendVisuals() {
 }
 
 document.getElementById("selectAll").addEventListener("click", () => {
-  const filter = document.getElementById("seriesFilter").value.toLowerCase();
+  const filter = document.getElementById("variantFilter").value.toLowerCase();
   DATA.forEach((s, i) => {
     if (!filter || s.name.toLowerCase().includes(filter)) hiddenSeries.delete(i);
   });
@@ -714,7 +714,7 @@ document.getElementById("selectAll").addEventListener("click", () => {
 });
 
 document.getElementById("deselectAll").addEventListener("click", () => {
-  const filter = document.getElementById("seriesFilter").value.toLowerCase();
+  const filter = document.getElementById("variantFilter").value.toLowerCase();
   DATA.forEach((s, i) => {
     if (!filter || s.name.toLowerCase().includes(filter)) hiddenSeries.add(i);
   });
@@ -722,7 +722,7 @@ document.getElementById("deselectAll").addEventListener("click", () => {
   draw();
 });
 
-document.getElementById("seriesFilter").addEventListener("input", (e) => {
+document.getElementById("variantFilter").addEventListener("input", (e) => {
   const filter = e.target.value.toLowerCase();
   legendItems.forEach((item, i) => {
     const matches = !filter || DATA[i].name.toLowerCase().includes(filter);
