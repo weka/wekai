@@ -91,6 +91,7 @@ func TestGenerateVisualizationWithCacheMixSamples(t *testing.T) {
 		"MIX_TOTAL_MAX", "mixStackHeight", "mixRate", // absolute band scaling
 		"drawTotals", "totalsStack", "showTotals", "showXAxisValues", // totals volume layer + axis toggle
 		"volumeGeometry", "volumeHoverAt", "windowRates", "Show Totals (ingest)", // ingest volume + hover
+		"ctxModal", "ctxInBand", "applyCtxFilter", "Context Filter", "max ctx", // context-size filter modal
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("generated HTML missing %q", want)
@@ -267,6 +268,15 @@ assert(Math.abs(wr.outPerSec - 60 / 60) < 1e-12, "output tok/s");
 wr = windowRates(byT, 30000, 60000);
 assert(Math.abs(wr.spanS - 30) < 1e-12 && wr.n === 2, "span clamps to run start");
 assert(windowRates([], 5, 60000) === null && windowRates(null, 5, 60000) === null, "empty => null");
+
+// Context-band membership (input+cached, inclusive bounds, 0 = unbounded).
+const rec500 = { in: 100, ca: 400 };
+assert(ctxInBand(rec500, 0, 0), "unbounded band keeps everything");
+assert(ctxInBand(rec500, 500, 0) && ctxInBand(rec500, 0, 500), "band boundaries are inclusive");
+assert(!ctxInBand(rec500, 501, 0), "below min drops");
+assert(!ctxInBand(rec500, 0, 499), "above max drops");
+assert(ctxInBand({ in: 500 }, 500, 500), "rows without cached tokens still counted");
+assert(!ctxInBand({}, 1, 0) && ctxInBand({}, 0, 0), "empty record = ctx 0");
 
 // Volume hover share is vs the BEST series at the same time point, not the
 // stack total (cross-implementation totals are meaningless).
@@ -457,6 +467,18 @@ const t50 = document.getElementById("showTTFT"), t95 = document.getElementById("
   draw();
 });
 t50.checked = true; t95.checked = true;
+// Context-band filter end-to-end: fixture rows all have ctx=500 (in=100 +
+// ca=400). Inclusive boundary keeps them at max=500; min=501 empties every
+// view and the chart still renders; reset restores the full view.
+applyCtxFilter(0, 500);
+assert(DATA[0]._view.length === DATA[0].records.length, "ctx<=500 keeps all rows (inclusive boundary)");
+draw();
+applyCtxFilter(501, 0);
+assert(DATA[0]._view.length === 0, "min 501 filters out all ctx=500 rows");
+draw();
+applyCtxFilter(0, 0);
+assert(DATA[0]._view === DATA[0].records, "reset restores the unfiltered view");
+draw();
 console.log("ALL_OK");
 `
 	jsPath := filepath.Join(dir, "hover_test.js")

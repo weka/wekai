@@ -306,6 +306,17 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   .legend-ctx { color: #C79FF1; font-size: 0.85em; }
   canvas { background: #171C20; border-radius: 8px; display: block; cursor: crosshair; }
   #tooltip { position: fixed; background: #1E2429; border: 1px solid #42464A; border-radius: 6px; padding: 8px 10px; font-size: 0.8em; pointer-events: none; display: none; z-index: 100; max-width: 300px; line-height: 1.5; }
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 200; display: none; }
+  .modal { background: #1E2429; border: 1px solid #42464A; border-radius: 8px; padding: 16px; width: 440px; max-height: 72vh; overflow-y: auto; margin: 10vh auto 0; }
+  .modal h2 { font-size: 1em; font-weight: 500; color: #F2F2EB; margin-bottom: 10px; }
+  .modal-series-row { display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 0.85em; }
+  .modal-series-row .legend-ctx { margin-left: auto; }
+  .modal-band { margin: 12px 0; font-size: 0.85em; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .modal-band input { width: 130px; font-size: 0.9em; padding: 3px 6px; background: #171C20; color: #F2F2EB; border: 1px solid #42464A; border-radius: 4px; }
+  .modal-actions { display: flex; gap: 8px; margin-top: 8px; }
+  .modal-actions button { font-size: 0.8em; padding: 4px 12px; background: #171C20; color: #F2F2EB; border: 1px solid #42464A; border-radius: 4px; cursor: pointer; }
+  .modal-actions button:hover { background: #2A3038; }
+  #ctxApply { border-color: #7C03EC; }
 </style>
 </head>
 <body>
@@ -324,6 +335,7 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   <span id="zoomInfo" style="font-size:0.8em;color:#8a9096;"></span>
 </div>
 <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+  <button id="ctxFilterBtn" style="font-size:0.8em;padding:3px 10px;background:#1E2429;color:#F2F2EB;border:1px solid #7C03EC;border-radius:4px;cursor:pointer;">Context Filter</button>
   <button id="selectAll" style="font-size:0.8em;padding:3px 10px;background:#1E2429;color:#F2F2EB;border:1px solid #42464A;border-radius:4px;cursor:pointer;">Select All</button>
   <button id="deselectAll" style="font-size:0.8em;padding:3px 10px;background:#1E2429;color:#F2F2EB;border:1px solid #42464A;border-radius:4px;cursor:pointer;">Deselect All</button>
   <input id="seriesFilter" type="text" placeholder="Filter series..." style="font-size:0.8em;padding:3px 8px;background:#1E2429;color:#F2F2EB;border:1px solid #42464A;border-radius:4px;width:200px;">
@@ -331,6 +343,23 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 <div id="legend"></div>
 <canvas id="chart"></canvas>
 <div id="tooltip"></div>
+<div id="ctxModal" class="modal-backdrop">
+  <div class="modal">
+    <h2>Series &amp; context filter</h2>
+    <div id="ctxModalSeries"></div>
+    <div class="modal-band">
+      <span>Show requests with context</span>
+      <input id="ctxMin" type="number" min="0" step="1000" placeholder="&ge; tokens (min)">
+      <span>&mdash;</span>
+      <input id="ctxMax" type="number" min="0" step="1000" placeholder="&le; tokens (max)">
+    </div>
+    <div class="modal-actions">
+      <button id="ctxApply">Apply</button>
+      <button id="ctxReset">Reset</button>
+      <button id="ctxClose">Close</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const RAW_DATA = {{.Data}};
@@ -382,27 +411,33 @@ const HAS_CACHE_MIX = DATA.some(s => (s.mix && s.mix.length) || (s.adt && s.adt.
 // toggling a series never rescales the others.
 const MIX_TOTAL_MAX = mixTotalMax(DATA);
 
-// Precompute moving averages and error bars per series
-DATA.forEach(s => {
-  // Time-ordered records with cumulative INGEST tokens (input + cached —
-  // the full context volume, same quantity as wekai's in= counter) for the
-  // totals volume layer and its hover rates.
-  const byT = s.records.slice().sort((a, b) => a.t - b.t);
+// Context-band filter state: when active, every latency/volume computation
+// reads the per-series filtered view (s._view) instead of the full record
+// set. min/max of 0 mean unbounded. The time axis and the cache-mix
+// overlay (server-side aggregates) stay unfiltered by design.
+let ctxFilter = { min: 0, max: 0 };
+function ctxFilterActive() { return ctxFilter.min > 0 || ctxFilter.max > 0; }
+
+// computeDerived rebuilds every derived structure of a series from its
+// current view: cumulative ingest/output (volume layer + hover rates),
+// rolling-percentile lines, and error bars. Called once per series at load
+// and again on every context-filter change — never per frame, so 90k-row
+// datasets stay responsive.
+function computeDerived(s) {
+  const view = s._view;
+  const byT = view.slice().sort((a, b) => a.t - b.t);
   s._byT = byT;
   s._cumTimes = byT.map(r => r.t);
   s._cumTokens = [];
   s._cumOutTokens = []; // cumulative OUTPUT tokens, aligned with _cumTimes
   let ingestAcc = 0, outAcc = 0;
-  s._maxCtx = 0; // largest single-request context (input+cached) this session
   byT.forEach(r => {
-    const ctx = (r.in || 0) + (r.ca || 0);
-    if (ctx > s._maxCtx) s._maxCtx = ctx;
-    ingestAcc += ctx;
+    ingestAcc += (r.in || 0) + (r.ca || 0);
     outAcc += (r.out || 0);
     s._cumTokens.push(ingestAcc);
     s._cumOutTokens.push(outAcc);
   });
-  const sorted = s.records.filter(r => !r.err).slice().sort((a, b) => a.t - b.t);
+  const sorted = view.filter(r => !r.err).slice().sort((a, b) => a.t - b.t);
   s._sorted = sorted;
   const maxSn = sorted.reduce((mx, r) => Math.max(mx, r.sn), 1);
   const winSize = CONCURRENCY > 0 ? CONCURRENCY * 3 : Math.max(maxSn * 3, 10);
@@ -422,24 +457,59 @@ DATA.forEach(s => {
     s._ttftP50.push({ t: t, v: ttfts.length ? percentile(ttfts, 0.5) : 0 });
     s._ttftP95.push({ t: t, v: ttfts.length ? percentile(ttfts, 0.95) : 0 });
   }
-  // Precompute error bars: sample every winSize points from ALL records (including errors)
-  // Each bar is anchored at the response p50 line at that time
-  const allSorted = s.records.slice().sort((a, b) => a.t - b.t);
+  // Error bars: sample every winSize points from the view (including
+  // errors), each bar anchored at the response p50 line at that time.
   s._errBars = [];
   let avgIdx = 0;
-  for (let i = winSize - 1; i < allSorted.length; i += winSize) {
+  for (let i = winSize - 1; i < byT.length; i += winSize) {
     const start = Math.max(0, i - winSize + 1);
     let errs = 0, total = 0;
-    for (let j = start; j <= i; j++) { total++; if (allSorted[j].err) errs++; }
+    for (let j = start; j <= i; j++) { total++; if (byT[j].err) errs++; }
     if (errs > 0) {
-      // Find nearest response-p50 value for this timestamp
-      const t = allSorted[i].t;
+      const t = byT[i].t;
       while (avgIdx < s._respP50.length - 1 && s._respP50[avgIdx].t < t) avgIdx++;
       const respAvg = s._respP50.length > 0 ? s._respP50[Math.min(avgIdx, s._respP50.length - 1)].v : 0;
       s._errBars.push({ t: t, errRate: errs / total, errs: errs, total: total, respAvg: respAvg });
     }
   }
+}
+
+DATA.forEach(s => {
+  // Largest single-request context (input+cached) over the FULL session —
+  // the legend/chooser hint; deliberately not filter-dependent.
+  s._maxCtx = 0;
+  s.records.forEach(r => {
+    const ctx = (r.in || 0) + (r.ca || 0);
+    if (ctx > s._maxCtx) s._maxCtx = ctx;
+  });
+  s._view = s.records;
+  computeDerived(s);
 });
+
+// applyCtxFilter re-derives every series against a context band (input+
+// cached tokens per request) and redraws. 0 = unbounded on either side.
+function applyCtxFilter(minTok, maxTok) {
+  ctxFilter = { min: minTok > 0 ? minTok : 0, max: maxTok > 0 ? maxTok : 0 };
+  DATA.forEach(s => {
+    s._view = ctxFilterActive()
+      ? s.records.filter(r => ctxInBand(r, ctxFilter.min, ctxFilter.max))
+      : s.records;
+    computeDerived(s);
+  });
+  const btn = document.getElementById("ctxFilterBtn");
+  if (btn) {
+    let label = "Context Filter";
+    if (ctxFilterActive()) {
+      const parts = [];
+      if (ctxFilter.min > 0) parts.push(">=" + fmtTokens(ctxFilter.min));
+      if (ctxFilter.max > 0) parts.push("<=" + fmtTokens(ctxFilter.max));
+      label += " (" + parts.join(", ") + ")";
+    }
+    btn.textContent = label;
+  }
+  recalcYMax();
+  draw();
+}
 
 // --- Color assignment (official WEKA brand, neutral-first) ---
 // Multi-series palettes are restrained tints DERIVED from the brand set so
@@ -583,7 +653,7 @@ function updateInfo() {
   let totalOk = 0, totalErr = 0;
   const perSeries = [];
   DATA.forEach((s, i) => {
-    const c = countRecords(s.records);
+    const c = countRecords(s._view);
     perSeries.push(c);
     totalOk += c.ok;
     totalErr += c.err;
@@ -691,7 +761,7 @@ function recalcYMax() {
   viewYMax = 0;
   DATA.forEach((s, si) => {
     if (hiddenSeries.has(si)) return;
-    s.records.forEach(r => {
+    s._view.forEach(r => {
       if (r.t < viewTMin || r.t > viewTMax) return;
       if (r.resp > viewYMax) viewYMax = r.resp;
       if (r.ttft > viewYMax) viewYMax = r.ttft;
@@ -736,7 +806,7 @@ function tickStats(tickTime) {
   DATA.forEach((ds, si) => {
     if (hiddenSeries.has(si)) return;
     let cumReqs = 0, cumErrs = 0, maxSn = 0;
-    ds.records.forEach(r => { if (r.t <= tickTime) { cumReqs++; if (r.err) cumErrs++; if (r.sn > maxSn) maxSn = r.sn; } });
+    ds._view.forEach(r => { if (r.t <= tickTime) { cumReqs++; if (r.err) cumErrs++; if (r.sn > maxSn) maxSn = r.sn; } });
     out.push({ si, cumReqs, cumErrs, maxSn });
   });
   return out;
@@ -808,6 +878,16 @@ function percentileDash(kind) {
   if (kind === "ttft50") return [2, 3];
   if (kind === "ttft95") return [10, 7];
   return []; // resp50: solid
+}
+
+// ctxInBand: whether a request row's context size (input+cached tokens)
+// falls inside the [minTok, maxTok] band; 0 means unbounded on that side,
+// and both bounds are inclusive.
+function ctxInBand(rec, minTok, maxTok) {
+  const c = ((rec && rec.in) || 0) + ((rec && rec.ca) || 0);
+  if (minTok > 0 && c < minTok) return false;
+  if (maxTok > 0 && c > maxTok) return false;
+  return true;
 }
 
 // cumCountAt returns how many sorted timestamps are <= t (the cumulative
@@ -1339,7 +1419,7 @@ function draw() {
       if (hiddenSeries.has(si)) return;
       const color = seriesColors[si];
 
-      s.records.forEach(r => {
+      s._view.forEach(r => {
         if (r.t < viewTMin || r.t > viewTMax) return;
         if (r.err && !showErrors) return;
         const x = mapX(r.t);
@@ -1496,7 +1576,7 @@ canvas.addEventListener("mousemove", e => {
   if (document.getElementById("showDots").checked) {
     DATA.forEach((s, si) => {
       if (hiddenSeries.has(si)) return;
-      s.records.forEach(r => {
+      s._view.forEach(r => {
         if (r.t < viewTMin || r.t > viewTMax) return;
         const x = mapX(r.t);
         const yr = mapY(r.resp);
@@ -1582,7 +1662,7 @@ canvas.addEventListener("mousemove", e => {
       const lineLabel = { resp50: "Response p50", ttft50: "TTFT p50", ttft95: "TTFT p95" }[best.type] || best.type;
       // Count total requests, errors, and max series index up to this point
       let totalUpTo = 0, errUpTo = 0, maxSnSeen = 0;
-      best.s.records.forEach(r => { if (r.t <= best.t) { totalUpTo++; if (r.err) errUpTo++; if (r.sn > maxSnSeen) maxSnSeen = r.sn; } });
+      best.s._view.forEach(r => { if (r.t <= best.t) { totalUpTo++; if (r.err) errUpTo++; if (r.sn > maxSnSeen) maxSnSeen = r.sn; } });
       const mixInfo = mixTooltipHTML(best.s, best.t);
       showTooltip(e,
         "<b>" + best.s.name + "</b> \u2014 " + lineLabel + "<br>" +
@@ -1694,6 +1774,60 @@ if (HAS_CACHE_MIX) {
     '<span style="color:' + ADT_LINE_COLOR + '">&#8213;</span>active dataset (tokens)';
   document.querySelector(".controls").appendChild(lbl);
   document.getElementById("showCacheMix").addEventListener("change", draw);
+}
+
+// Context-filter modal: the series selector — per-series rows with color
+// dot, visibility checkbox, and max-context hint — plus the numeric
+// context band (>= min / <= max tokens) that re-derives all curves,
+// volume, and rates from the filtered requests on Apply. Dismissable
+// (Close / backdrop / Esc) and resettable.
+{
+  const modal = document.getElementById("ctxModal");
+  const openBtn = document.getElementById("ctxFilterBtn");
+  const listEl = document.getElementById("ctxModalSeries");
+  const rebuildList = () => {
+    listEl.innerHTML = "";
+    DATA.forEach((s, i) => {
+      const row = document.createElement("div");
+      row.className = "modal-series-row";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = !hiddenSeries.has(i);
+      cb.addEventListener("change", () => {
+        if (cb.checked) hiddenSeries.delete(i); else hiddenSeries.add(i);
+        syncLegendVisuals();
+        draw();
+      });
+      row.appendChild(cb);
+      const dot = document.createElement("div");
+      dot.className = "legend-dot";
+      dot.style.background = seriesColors[i];
+      row.appendChild(dot);
+      const name = document.createElement("span");
+      name.textContent = s.name;
+      row.appendChild(name);
+      const ctxHintEl = document.createElement("span");
+      ctxHintEl.className = "legend-ctx";
+      ctxHintEl.textContent = s._maxCtx > 0 ? "max ctx " + fmtTokens(s._maxCtx) : "";
+      row.appendChild(ctxHintEl);
+      listEl.appendChild(row);
+    });
+  };
+  const closeModal = () => { modal.style.display = "none"; };
+  openBtn.addEventListener("click", () => { rebuildList(); modal.style.display = "block"; });
+  document.getElementById("ctxClose").addEventListener("click", closeModal);
+  modal.addEventListener("click", e => { if (e.target === modal) closeModal(); });
+  window.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+  document.getElementById("ctxApply").addEventListener("click", () => {
+    const min = parseFloat(document.getElementById("ctxMin").value) || 0;
+    const max = parseFloat(document.getElementById("ctxMax").value) || 0;
+    applyCtxFilter(min, max);
+  });
+  document.getElementById("ctxReset").addEventListener("click", () => {
+    document.getElementById("ctxMin").value = "";
+    document.getElementById("ctxMax").value = "";
+    applyCtxFilter(0, 0);
+  });
 }
 
 window.addEventListener("resize", () => { resize(); draw(); });
