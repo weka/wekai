@@ -303,6 +303,7 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   .legend-item.hidden { opacity: 0.35; }
   .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
   .legend-count { color: #8a9096; font-size: 0.9em; }
+  .legend-ctx { color: #C79FF1; font-size: 0.85em; }
   canvas { background: #171C20; border-radius: 8px; display: block; cursor: crosshair; }
   #tooltip { position: fixed; background: #1E2429; border: 1px solid #42464A; border-radius: 6px; padding: 8px 10px; font-size: 0.8em; pointer-events: none; display: none; z-index: 100; max-width: 300px; line-height: 1.5; }
 </style>
@@ -392,8 +393,11 @@ DATA.forEach(s => {
   s._cumTokens = [];
   s._cumOutTokens = []; // cumulative OUTPUT tokens, aligned with _cumTimes
   let ingestAcc = 0, outAcc = 0;
+  s._maxCtx = 0; // largest single-request context (input+cached) this session
   byT.forEach(r => {
-    ingestAcc += (r.in || 0) + (r.ca || 0);
+    const ctx = (r.in || 0) + (r.ca || 0);
+    if (ctx > s._maxCtx) s._maxCtx = ctx;
+    ingestAcc += ctx;
     outAcc += (r.out || 0);
     s._cumTokens.push(ingestAcc);
     s._cumOutTokens.push(outAcc);
@@ -612,8 +616,9 @@ DATA.forEach((s, i) => {
   item.className = "legend-item";
   item.dataset.index = i;
   item.dataset.name = s.name.toLowerCase();
+  const ctxHint = s._maxCtx > 0 ? ' <span class="legend-ctx">max ctx ' + fmtTokens(s._maxCtx) + '</span>' : '';
   item.innerHTML = '<div class="legend-dot" style="background:' + seriesColors[i] + '"></div>' +
-    s.name + ' <span class="legend-count" id="legend-count-' + i + '">(' + formatCount(ok, err) + ')</span>';
+    s.name + ' <span class="legend-count" id="legend-count-' + i + '">(' + formatCount(ok, err) + ')</span>' + ctxHint;
   item.onclick = () => {
     if (hiddenSeries.has(i)) hiddenSeries.delete(i); else hiddenSeries.add(i);
     item.classList.toggle("hidden");
