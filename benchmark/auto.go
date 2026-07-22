@@ -133,17 +133,20 @@ type AutoBenchmarkConfig struct {
 
 	CacheSimChunkBytes int // chunk size for cacheEstimator (0 = default 1024)
 
-	// RandomGateOrder: when true, the concurrencyGate wakes normal (non-cold)
-	// waiters in uniformly random order instead of strict FIFO. In the
-	// oversubscribed regime, strict FIFO enforces exact round-robin over
-	// series (each series releases its slot then re-queues behind every
-	// other waiting series) -- the adversarial worst case for GPU
-	// prefix-cache LRU, since it guarantees maximum time-between-revisits
-	// for every series. Randomizing wake order lets some series get
-	// consecutive turns while others wait longer, trading strict fairness
-	// for cache-friendlier revisit patterns. Cold-start waiters are always
-	// served first, in FIFO order, regardless of this flag.
-	RandomGateOrder bool
+	// FIFOGateOrder: when true, the concurrencyGate wakes normal (non-cold)
+	// waiters in strict FIFO order — the LEGACY behavior, kept reachable via
+	// --random-gate-order=false. The DEFAULT (zero value) is uniformly
+	// random wake order: in the oversubscribed regime strict FIFO enforces
+	// exact round-robin over series (each series releases its slot then
+	// re-queues behind every other waiting series) — the adversarial worst
+	// case for GPU prefix-cache LRU, since it guarantees maximum
+	// time-between-revisits for every series. Random order lets some series
+	// get consecutive turns, trading strict fairness for cache-friendlier
+	// revisit patterns. Default flipped to random on 2026-07-22: historical
+	// FIFO runs compare only against explicit --random-gate-order=false runs
+	// from here on. Cold-start waiters are always served first, in FIFO
+	// order, regardless of this setting.
+	FIFOGateOrder bool
 }
 
 // requestDataRecord holds per-request data written to JSONL output.
@@ -619,7 +622,7 @@ func (s *completionStream) MissTTFTStats(window int) (p50, p95 time.Duration) {
 // concurrencyGate controls max parallel in-flight requests with a mutable limit.
 // Cold-start waiters are served before normal waiters. When randomOrder is
 // set, normal waiters are woken in uniformly random order instead of FIFO
-// (see AutoBenchmarkConfig.RandomGateOrder); coldWaiters are always FIFO.
+// (see AutoBenchmarkConfig.FIFOGateOrder — random is the default); coldWaiters are always FIFO.
 type concurrencyGate struct {
 	mu          sync.Mutex
 	limit       int
@@ -1472,7 +1475,7 @@ func runSingleModelBenchmark(
 		seriesEvalAfter:   int64(cfg.MinEvalRequests),
 		lastEvalRPS:       0,
 		stream:            newCompletionStream(initMaxKeep),
-		gate:              newConcurrencyGate(initConc, cfg.RandomGateOrder),
+		gate:              newConcurrencyGate(initConc, !cfg.FIFOGateOrder),
 		datasetTracker:    newActiveDatasetTracker(),
 	}
 	if sampler := startVLLMMetricsSampler(benchCtx, cfg.Model, st.datasetTracker, rdw); sampler != nil {
@@ -1481,7 +1484,7 @@ func runSingleModelBenchmark(
 		defer sampler.stop()
 	}
 	if cfg.HotSeriesConcurrency > 0 {
-		st.hotGate = newConcurrencyGate(cfg.HotSeriesConcurrency*hotGateFanoutMultiplier, cfg.RandomGateOrder)
+		st.hotGate = newConcurrencyGate(cfg.HotSeriesConcurrency*hotGateFanoutMultiplier, !cfg.FIFOGateOrder)
 	}
 
 	// Single unconditional content-level estimator for all modes (synthetic/step/replay).

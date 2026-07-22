@@ -72,7 +72,7 @@ type BenchmarkAutoOptions struct {
 	DryRunWarmTPS              int      `long:"dry-run-warm-tps" default:"10000000" description:"Dry-run: warm (cached) input tokens processed per second." env:"BENCHMARK_DRY_RUN_WARM_TPS"`
 	DryRunOutputTPS            int      `long:"dry-run-output-tps" default:"100000" description:"Dry-run: output tokens generated per second." env:"BENCHMARK_DRY_RUN_OUTPUT_TPS"`
 	CacheSimChunkBytes         int      `long:"cache-sim-chunk-bytes" description:"Chunk size in bytes for the content-level cache estimator (0 = default 1024)." default:"0" env:"BENCHMARK_CACHE_SIM_CHUNK_BYTES"`
-	RandomGateOrder            bool     `long:"random-gate-order" description:"Wake the concurrency gate's waiting series in uniformly random order instead of strict FIFO round-robin when oversubscribed. Strict FIFO forces every series to wait behind all other waiting series before its next turn -- the adversarial worst case for GPU prefix-cache LRU. Cold-start waiters are unaffected (always served first, FIFO). Off by default (exact FIFO)." env:"BENCHMARK_RANDOM_GATE_ORDER"`
+	RandomGateOrder            string   `long:"random-gate-order" choice:"true" choice:"false" default:"true" optional:"yes" optional-value:"true" description:"Wake the concurrency gate's waiting series in uniformly random order when oversubscribed (the DEFAULT). Strict FIFO forces every series to wait behind all other waiting series before its next turn -- the adversarial worst case for GPU prefix-cache LRU. Pass --random-gate-order=false for the legacy exact-FIFO order. Cold-start waiters are unaffected (always served first, FIFO)." env:"BENCHMARK_RANDOM_GATE_ORDER"`
 
 	// Positional arguments
 	Args struct {

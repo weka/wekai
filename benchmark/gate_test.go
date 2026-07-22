@@ -286,3 +286,17 @@ func spinUntil(t *testing.T, cond func() bool) {
 	}
 	t.Fatalf("condition not met within deadline")
 }
+
+// TestGateOrderDefaultIsRandom locks the 2026-07-22 default flip at the
+// config level: a default-constructed AutoBenchmarkConfig produces a
+// random-order gate; explicit FIFOGateOrder restores the legacy FIFO.
+func TestGateOrderDefaultIsRandom(t *testing.T) {
+	var cfg AutoBenchmarkConfig
+	if g := newConcurrencyGate(1, !cfg.FIFOGateOrder); !g.randomOrder {
+		t.Fatal("default-constructed config must yield a random-order gate")
+	}
+	cfg.FIFOGateOrder = true
+	if g := newConcurrencyGate(1, !cfg.FIFOGateOrder); g.randomOrder {
+		t.Fatal("explicit FIFOGateOrder must yield a FIFO gate")
+	}
+}
