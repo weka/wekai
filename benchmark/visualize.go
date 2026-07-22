@@ -311,8 +311,18 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   .modal h2 { font-size: 1em; font-weight: 500; color: #F2F2EB; margin-bottom: 10px; }
   .modal-series-row { display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 0.85em; }
   .modal-series-row .legend-ctx { margin-left: auto; }
-  .modal-band { margin: 12px 0; font-size: 0.85em; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .modal-band input { width: 130px; font-size: 0.9em; padding: 3px 6px; background: #171C20; color: #F2F2EB; border: 1px solid #42464A; border-radius: 4px; }
+  .modal-band { margin: 12px 0; font-size: 0.85em; }
+  .modal-band-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; flex-wrap: nowrap; }
+  .modal-band input[type=number] { width: 110px; font-size: 0.9em; padding: 3px 6px; background: #171C20; color: #F2F2EB; border: 1px solid #42464A; border-radius: 4px; }
+  .modal-band-sep { color: #8a9096; }
+  .modal-section-title { font-size: 0.85em; color: #F2F2EB; margin: 12px 0 4px; }
+  .modal-sn-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; flex-wrap: nowrap; font-size: 0.85em; }
+  .modal-sn-row input[type=text] { flex: 1; font-size: 0.9em; padding: 3px 6px; background: #171C20; color: #F2F2EB; border: 1px solid #42464A; border-radius: 4px; }
+  .modal-sn-row button { font-size: 0.8em; padding: 3px 10px; background: #171C20; color: #F2F2EB; border: 1px solid #42464A; border-radius: 4px; cursor: pointer; }
+  .modal-sn-list { max-height: 180px; overflow-y: auto; border: 1px solid #42464A; border-radius: 4px; margin-top: 6px; padding: 4px 6px; }
+  .modal-sn-item { display: flex; gap: 6px; align-items: center; padding: 2px 0; font-size: 0.8em; }
+  .modal-sn-item .legend-ctx { margin-left: auto; }
+  .modal-sn-note { font-size: 0.75em; color: #8a9096; margin-top: 4px; }
   .modal-actions { display: flex; gap: 8px; margin-top: 8px; }
   .modal-actions button { font-size: 0.8em; padding: 4px 12px; background: #171C20; color: #F2F2EB; border: 1px solid #42464A; border-radius: 4px; cursor: pointer; }
   .modal-actions button:hover { background: #2A3038; }
@@ -347,11 +357,25 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   <div class="modal">
     <h2>Variants &amp; context filter</h2>
     <div id="ctxModalSeries"></div>
+    <div class="modal-section-title">In-dataset series (empty selection = all)</div>
+    <div class="modal-sn-row">
+      <input id="snInput" type="text" placeholder="series indices, e.g. 3,7,12-15">
+      <button id="snAdd">Add</button>
+      <button id="snClear">Clear</button>
+      <span id="snCount"></span>
+    </div>
+    <div id="snList" class="modal-sn-list"></div>
+    <div class="modal-sn-note" id="snNote"></div>
     <div class="modal-band">
-      <span>Show requests with context</span>
-      <input id="ctxMin" type="number" min="0" step="1000" placeholder="&ge; tokens (min)">
-      <span>&mdash;</span>
-      <input id="ctxMax" type="number" min="0" step="1000" placeholder="&le; tokens (max)">
+      <span>Context band (k tokens, inclusive)</span>
+      <div class="modal-band-row">
+        <span>&ge;</span>
+        <input id="ctxMin" type="number" min="0" step="10" placeholder="min">
+        <span class="modal-band-sep">&ndash;</span>
+        <span>&le;</span>
+        <input id="ctxMax" type="number" min="0" step="10" placeholder="max">
+        <span>k tok</span>
+      </div>
     </div>
     <div class="modal-actions">
       <button id="ctxApply">Apply</button>
@@ -417,6 +441,11 @@ const MIX_TOTAL_MAX = mixTotalMax(DATA);
 // overlay (server-side aggregates) stay unfiltered by design.
 let ctxFilter = { min: 0, max: 0 };
 function ctxFilterActive() { return ctxFilter.min > 0 || ctxFilter.max > 0; }
+// In-dataset series selection (by series index r.sn, global across
+// variants so arm A's session N compares against arm B's session N).
+// Empty set = all series. Composes with the context band: kept rows must
+// satisfy BOTH.
+let snFilter = new Set();
 
 // computeDerived rebuilds every derived structure of a series from its
 // current view: cumulative ingest/output (volume layer + hover rates),
@@ -490,21 +519,22 @@ DATA.forEach(s => {
 // cached tokens per request) and redraws. 0 = unbounded on either side.
 function applyCtxFilter(minTok, maxTok) {
   ctxFilter = { min: minTok > 0 ? minTok : 0, max: maxTok > 0 ? maxTok : 0 };
+  const anyFilter = ctxFilterActive() || snFilter.size > 0;
   DATA.forEach(s => {
-    s._view = ctxFilterActive()
-      ? s.records.filter(r => ctxInBand(r, ctxFilter.min, ctxFilter.max))
+    s._view = anyFilter
+      ? s.records.filter(r => ctxInBand(r, ctxFilter.min, ctxFilter.max) &&
+          (snFilter.size === 0 || snFilter.has(r.sn)))
       : s.records;
     computeDerived(s);
   });
   const btn = document.getElementById("ctxFilterBtn");
   if (btn) {
     let label = "Context Filter";
-    if (ctxFilterActive()) {
-      const parts = [];
-      if (ctxFilter.min > 0) parts.push(">=" + fmtTokens(ctxFilter.min));
-      if (ctxFilter.max > 0) parts.push("<=" + fmtTokens(ctxFilter.max));
-      label += " (" + parts.join(", ") + ")";
-    }
+    const parts = [];
+    if (ctxFilter.min > 0) parts.push(">=" + fmtTokens(ctxFilter.min));
+    if (ctxFilter.max > 0) parts.push("<=" + fmtTokens(ctxFilter.max));
+    if (snFilter.size > 0) parts.push(snFilter.size + " series");
+    if (parts.length) label += " (" + parts.join(", ") + ")";
     btn.textContent = label;
   }
   recalcYMax();
@@ -888,6 +918,26 @@ function ctxInBand(rec, minTok, maxTok) {
   if (minTok > 0 && c < minTok) return false;
   if (maxTok > 0 && c > maxTok) return false;
   return true;
+}
+
+// parseSnList parses a series-index list like "3, 7, 12-15" into sorted
+// unique indices; malformed tokens are ignored, ranges are inclusive.
+function parseSnList(text) {
+  const out = new Set();
+  String(text || "").split(",").forEach(tok => {
+    tok = tok.trim();
+    if (!tok) return;
+    const m = tok.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (m) {
+      let a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+      if (a > b) { const t = a; a = b; b = t; }
+      if (b - a > 100000) return; // reject absurd ranges
+      for (let i = a; i <= b; i++) out.add(i);
+      return;
+    }
+    if (/^\d+$/.test(tok)) out.add(parseInt(tok, 10));
+  });
+  return Array.from(out).sort((a, b) => a - b);
 }
 
 // cumCountAt returns how many sorted timestamps are <= t (the cumulative
@@ -1785,6 +1835,66 @@ if (HAS_CACHE_MIX) {
   const modal = document.getElementById("ctxModal");
   const openBtn = document.getElementById("ctxFilterBtn");
   const listEl = document.getElementById("ctxModalSeries");
+
+  // Global per-series-index stats for the in-dataset selector: max context
+  // and request count across all variants, sorted heaviest-context first.
+  // Computed once; the rendered list is capped so replay runs with
+  // thousands of sessions never lag the modal.
+  const SN_LIST_CAP = 300;
+  const SN_INFO = (() => {
+    const m = new Map();
+    DATA.forEach(s => s.records.forEach(r => {
+      const ctx = (r.in || 0) + (r.ca || 0);
+      let e = m.get(r.sn);
+      if (!e) { e = { sn: r.sn, maxCtx: 0, reqs: 0 }; m.set(r.sn, e); }
+      if (ctx > e.maxCtx) e.maxCtx = ctx;
+      e.reqs++;
+    }));
+    return Array.from(m.values()).sort((a, b) => b.maxCtx - a.maxCtx);
+  })();
+
+  const snCountEl = document.getElementById("snCount");
+  const snListEl = document.getElementById("snList");
+  const snNoteEl = document.getElementById("snNote");
+  const refreshSnCount = () => {
+    snCountEl.textContent = snFilter.size > 0 ? snFilter.size + " selected" : "all";
+  };
+  const rebuildSnList = () => {
+    snListEl.innerHTML = "";
+    SN_INFO.slice(0, SN_LIST_CAP).forEach(info => {
+      const row = document.createElement("div");
+      row.className = "modal-sn-item";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = snFilter.has(info.sn);
+      cb.addEventListener("change", () => {
+        if (cb.checked) snFilter.add(info.sn); else snFilter.delete(info.sn);
+        refreshSnCount();
+      });
+      row.appendChild(cb);
+      const name = document.createElement("span");
+      name.textContent = "#" + info.sn + " (" + info.reqs + " reqs)";
+      row.appendChild(name);
+      const ctxEl = document.createElement("span");
+      ctxEl.className = "legend-ctx";
+      ctxEl.textContent = "max ctx " + fmtTokens(info.maxCtx);
+      row.appendChild(ctxEl);
+      snListEl.appendChild(row);
+    });
+    snNoteEl.textContent = SN_INFO.length > SN_LIST_CAP
+      ? "showing top " + SN_LIST_CAP + " of " + SN_INFO.length + " series by max context — use the index field for the rest"
+      : SN_INFO.length + " series, heaviest context first";
+    refreshSnCount();
+  };
+  document.getElementById("snAdd").addEventListener("click", () => {
+    parseSnList(document.getElementById("snInput").value).forEach(sn => snFilter.add(sn));
+    document.getElementById("snInput").value = "";
+    rebuildSnList();
+  });
+  document.getElementById("snClear").addEventListener("click", () => {
+    snFilter.clear();
+    rebuildSnList();
+  });
   const rebuildList = () => {
     listEl.innerHTML = "";
     DATA.forEach((s, i) => {
@@ -1814,18 +1924,21 @@ if (HAS_CACHE_MIX) {
     });
   };
   const closeModal = () => { modal.style.display = "none"; };
-  openBtn.addEventListener("click", () => { rebuildList(); modal.style.display = "block"; });
+  openBtn.addEventListener("click", () => { rebuildList(); rebuildSnList(); modal.style.display = "block"; });
   document.getElementById("ctxClose").addEventListener("click", closeModal);
   modal.addEventListener("click", e => { if (e.target === modal) closeModal(); });
   window.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+  // Band inputs are in K TOKENS: "300" means 300,000 tokens.
   document.getElementById("ctxApply").addEventListener("click", () => {
-    const min = parseFloat(document.getElementById("ctxMin").value) || 0;
-    const max = parseFloat(document.getElementById("ctxMax").value) || 0;
-    applyCtxFilter(min, max);
+    const minK = parseFloat(document.getElementById("ctxMin").value) || 0;
+    const maxK = parseFloat(document.getElementById("ctxMax").value) || 0;
+    applyCtxFilter(minK * 1000, maxK * 1000);
   });
   document.getElementById("ctxReset").addEventListener("click", () => {
     document.getElementById("ctxMin").value = "";
     document.getElementById("ctxMax").value = "";
+    snFilter.clear();
+    rebuildSnList();
     applyCtxFilter(0, 0);
   });
 }
