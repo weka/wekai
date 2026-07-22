@@ -1,5 +1,12 @@
 # wekai
 
+> **Active development — no API stability guarantees.** CLI flags, Helm
+> values, and Go APIs are all subject to change between releases. Getting
+> the defaults and the functionality right is a higher priority here than
+> keeping a stable interface, and defaults do change. **Compare runs only
+> head to head on the same version** — numbers from different versions are
+> not comparable, since a defaults change can move them on its own.
+
 An LLM benchmarking, HTTP-proxy/router, and capture-replay toolkit for
 Anthropic, OpenAI (Chat Completions and Responses), and Gemini-native APIs.
 
