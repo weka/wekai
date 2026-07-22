@@ -215,7 +215,7 @@ fixed concurrency 28 with a 4-worker hot pool).
 | `model` | `""` | Optional explicit model id (skips autodiscovery); appended as `,model=<v>` |
 | `duration` | `8h` | Benchmark run length (maps to `--timeout`); e.g. `3m` for smoke tests |
 | `imageRepository` / `imageTag` | `quay.io/weka.io/wekai` / `""` | Image; tag defaults to the chart's `appVersion` (see "Releases") |
-| `imagePullSecrets` | `[]` | Pull secrets for the private quay repo |
+| `imagePullSecrets` | `[]` | Optional pull secrets — the quay repo is public, only needed behind an authenticated mirror |
 | `replay.replaySeries` | `0` | Subset cap on which sessions get replayed (0 = all 5k+ in the embedded file) |
 | `replay.series` | `256` | Parallel series workers replaying sessions (`--series`) |
 | `replay.replayRoles` | `""` | Comma-separated instance roles to replay (empty = all) |
@@ -283,18 +283,15 @@ helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set duration=3m
 ```
 
-Private registry — `quay.io/weka.io/wekai` requires auth to pull; create
-a `kubernetes.io/dockerconfigjson` secret once and reference it via
+Pull secrets — `quay.io/weka.io/wekai` is public, so no credentials are
+needed. If your cluster still pulls through an authenticated mirror or
+proxy, reference an existing `kubernetes.io/dockerconfigjson` secret via
 `imagePullSecrets`:
 
 ```
-kubectl create secret docker-registry quay-pull \
-  --docker-server=quay.io \
-  --docker-username=<user> --docker-password=<token>
-
 helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
-  --set 'imagePullSecrets[0].name=quay-pull'
+  --set 'imagePullSecrets[0].name=my-pull-secret'
 ```
 
 For local development installs from the chart directory, pass the image tag

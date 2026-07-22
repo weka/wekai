@@ -1,8 +1,9 @@
 imageRepository: quay.io/weka.io/wekai
 imageTag: ""  # defaults to .Chart.AppVersion
-# Pull secrets for private registries, e.g.:
+# Optional — the image repo above is public. Only needed if you pull through
+# an authenticated mirror/proxy or host your own copy, e.g.:
 #   imagePullSecrets:
-#     - name: quay-pull
+#     - name: my-pull-secret
 imagePullSecrets: []
 
 # The only supported run mode: replay the router-replay JSONL baked into the
