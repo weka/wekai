@@ -220,6 +220,14 @@ assert(cumCountAt([], 5) === 0 && cumCountAt(null, 5) === 0, "empty/missing => 0
 assert(cumTokensAt(ta, ca, -1) === 0, "tokens before first => 0");
 assert(cumTokensAt(ta, ca, 10) === 1500, "cumulative tokens at boundary (cached included in cum)");
 assert(cumTokensAt(ta, ca, 1e9) === 2000, "tokens after last => final total");
+// Cumulative OUTPUT tokens use the same lookup against the same timestamps,
+// so ingest and output totals are boundary-consistent at every point.
+const oa = [10, 30, 60, 100]; // A cumulative output, aligned with ta
+assert(cumTokensAt(ta, oa, -1) === 0, "output before first => 0");
+assert(cumTokensAt(ta, oa, 10) === 30, "output boundary matches ingest boundary index");
+assert(cumTokensAt(ta, oa, 15) === 30 && cumTokensAt(ta, ca, 15) === 1500,
+  "same idx for ingest and output at interior t");
+assert(cumTokensAt(ta, oa, 1e9) === 100, "output after last => final total");
 // Normalization: at end-of-run the stack top is exactly 1.0 = full height.
 const FINAL = 2000 + 1000;
 let st = totalsStack([A, B], 1e9, FINAL);
@@ -438,7 +446,8 @@ hoverAt(margin.left + plotW / 2, margin.top + 10, "band-hover");
   hoverAt(mapX(p.t) + 40, margin.top + plotH - 5, "volume-hover");
   assert((tip.innerHTML || "").includes("ingest volume"), "volume hover fires in the stack area: " + (tip.innerHTML || "").slice(0, 80));
   assert((tip.innerHTML || "").includes("% of best"), "volume tooltip carries share-of-best");
-  assert((tip.innerHTML || "").includes("tok/s"), "volume tooltip carries window rates");
+  assert((tip.innerHTML || "").includes("output total"), "volume tooltip carries cumulative output tokens");
+  assert((tip.innerHTML || "").includes("out ") && (tip.innerHTML || "").includes("tok/s"), "volume tooltip keeps the out/s window rate");
 }
 // Toggle independence: every combination of the two TTFT checkboxes must
 // render without throwing (p95 stays available with p50 off and vice versa).

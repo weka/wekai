@@ -337,8 +337,14 @@ DATA.forEach(s => {
   s._byT = byT;
   s._cumTimes = byT.map(r => r.t);
   s._cumTokens = [];
-  let ingestAcc = 0;
-  byT.forEach(r => { ingestAcc += (r.in || 0) + (r.ca || 0); s._cumTokens.push(ingestAcc); });
+  s._cumOutTokens = []; // cumulative OUTPUT tokens, aligned with _cumTimes
+  let ingestAcc = 0, outAcc = 0;
+  byT.forEach(r => {
+    ingestAcc += (r.in || 0) + (r.ca || 0);
+    outAcc += (r.out || 0);
+    s._cumTokens.push(ingestAcc);
+    s._cumOutTokens.push(outAcc);
+  });
   const sorted = s.records.filter(r => !r.err).slice().sort((a, b) => a.t - b.t);
   s._sorted = sorted;
   const maxSn = sorted.reduce((mx, r) => Math.max(mx, r.sn), 1);
@@ -1360,8 +1366,9 @@ function volumeHoverAt(mx, my) {
   if (ci < 0) return null;
   const tc = hit.s._cumTimes[ci];
   const cumTok = hit.s._cumTokens[ci];
+  const cumOut = hit.s._cumOutTokens[ci];
   const cums = geo.visible.map(({ s }) => ({ times: s._cumTimes, cum: s._cumTokens }));
-  return { s: hit.s, si: hit.si, tc: tc, cumTok: cumTok, share: shareOfBest(cums, tc, cumTok) };
+  return { s: hit.s, si: hit.si, tc: tc, cumTok: cumTok, cumOut: cumOut, share: shareOfBest(cums, tc, cumTok) };
 }
 
 // mixTooltipHTML renders the cache-mix breakdown lines for series s at time
@@ -1553,7 +1560,8 @@ canvas.addEventListener("mousemove", e => {
     showTooltip(e,
       "<b>" + volHover.s.name + "</b> \u2014 ingest volume<br>" +
       "at " + formatTickLabel(Math.round(volHover.tc / 1000)) + ": " +
-      fmtTokens(volHover.cumTok) + " tok cumulative (" + (100 * volHover.share).toFixed(0) + "% of best)<br>" +
+      fmtTokens(volHover.cumTok) + " tok cumulative ingest (" + (100 * volHover.share).toFixed(0) + "% of best), " +
+      fmtTokens(volHover.cumOut) + " tok output total<br>" +
       (rates ? "<span style='color:#8a9096'>last " + Math.round(rates.spanS) + "s: " +
         rates.n + " req (" + rates.rps.toFixed(1) + "/s), in " + fmtTokens(rates.inPerSec) + " tok/s, out " +
         fmtTokens(rates.outPerSec) + " tok/s</span>" : ""));
