@@ -125,6 +125,22 @@ type AutoBenchmarkConfig struct {
 	// --replay-series-range by the CLI; nil means "replay all sessions".
 	RouterReplaySeriesIndices map[int]bool
 
+	// ReplayOutputRatio (--replay-output-ratio), when > 0, retargets each
+	// router-replay request's max_tokens to round(InputTokens * ReplayOutputRatio)
+	// instead of the recorded original output_tokens (which otherwise pins
+	// max_tokens to what the model produced in the ORIGINAL capture, so the
+	// model stops almost immediately on replay — a ~500:1 input:output run).
+	// 0 = off (original precedence: output_tokens, then max_tokens, then 1).
+	ReplayOutputRatio float64
+	// ReplayForceOutput, when true (the default), forces the model to fill
+	// its max_tokens budget instead of stopping early: a short continue-
+	// generating instruction is appended (system block/message) AND, on the
+	// OpenAI/vLLM wire path, "ignore_eos": true is set on the request body.
+	// Without this, a retargeted --replay-output-ratio cap is a no-op — the
+	// model just stops at its natural response length. Disabled by
+	// --replay-natural-output (CLI layer sets ReplayForceOutput = !ReplayNaturalOutput).
+	ReplayForceOutput bool
+
 	// Dry-run mode (router replay only): skip HTTP, drive with synthetic timing.
 	DryRun          bool
 	DryRunColdTPS   int

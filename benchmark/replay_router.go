@@ -634,6 +634,10 @@ func runRouterReplayInstance(
 		replayRunID = cfg.RunID
 	}
 	poster, err := newReplayPoster(cfg.Model, config.GetAPIKeys(), endpointOverride, replayRunID, cfg.DryRun, cfg.DryRunColdTPS, cfg.DryRunWarmTPS, cfg.DryRunOutputTPS, st.estimator)
+	if err == nil {
+		poster.outputRatio = cfg.ReplayOutputRatio
+		poster.forceOutput = cfg.ReplayForceOutput
+	}
 	if err != nil {
 		// Configuration error — record one error per request in this
 		// instance and exit. Future improvement: surface this once at

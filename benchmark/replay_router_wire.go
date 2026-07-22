@@ -24,18 +24,27 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 )
+
+// verboseOutputInstruction is appended as a system block/message when
+// force-output is in effect (the default; disabled by
+// --replay-natural-output). Retargeting max_tokens upward (e.g. via
+// --replay-output-ratio) is a no-op unless the model is actually nudged to
+// keep generating instead of stopping at its natural response length, so
+// this instruction is injected to make the cap load-bearing.
+const verboseOutputInstruction = "Provide a thorough, detailed response and keep elaborating rather than stopping early."
 
 // buildAnthropicMessagesBody reconstructs the body of a POST /v1/messages
 // request that matches the original capture's shape and size as closely
 // as possible. Returns the marshaled JSON bytes and the canonical text
 // string (all synthesized content concatenated in generation order) for
 // feeding into the content-level cache estimator.
-func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string) ([]byte, string, error) {
+func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool) ([]byte, string, error) {
 	body := map[string]interface{}{
 		"model":      modelName,
-		"max_tokens": pickMaxTokens(req),
+		"max_tokens": pickMaxTokens(req, outputRatio),
 		"stream":     req.Stream,
 	}
 	if req.Temperature != nil {
@@ -61,6 +70,12 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 			"text": fmt.Sprintf("<ignore>RUN_GUID: %s</ignore>", runID),
 		}
 		systemArr = append([]map[string]interface{}{stamp}, systemArr...)
+	}
+	if forceOutput {
+		systemArr = append(systemArr, map[string]interface{}{
+			"type": "text",
+			"text": verboseOutputInstruction,
+		})
 	}
 	if len(systemArr) > 0 {
 		body["system"] = systemArr
@@ -122,9 +137,23 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 	return bodyBytes, canonical.String(), err
 }
 
-// pickMaxTokens applies the same precedence used elsewhere: original
-// output_tokens, then original max_tokens, then 1 as a guard.
-func pickMaxTokens(req RouterReplayRequest) int {
+// pickMaxTokens picks the per-request max_tokens cap. When outputRatio > 0
+// (--replay-output-ratio) the cap is retargeted to outputRatio * InputTokens
+// (the FULL prompt), so the target output:input ratio is defined against the
+// full prompt. Sizing off only the new/uncached input was considered and
+// rejected: with heavy prefix caching the new input is a small fraction of the
+// prompt, which collapses output. This overrides the recorded output_tokens,
+// which otherwise pins max_tokens to what the model produced in the original
+// capture (making the model stop early on replay). Otherwise falls back to the
+// original precedence: output_tokens, then max_tokens, then 1 as a guard.
+func pickMaxTokens(req RouterReplayRequest, outputRatio float64) int {
+	if outputRatio > 0 && req.InputTokens > 0 {
+		n := int(math.Round(float64(req.InputTokens) * outputRatio))
+		if n < 1 {
+			n = 1
+		}
+		return n
+	}
 	if req.OutputTokens > 0 {
 		return req.OutputTokens
 	}
@@ -431,10 +460,10 @@ func buildOpenAITools(spec *RouterReplayToolsSpec, docs string) []map[string]int
 //   - Anthropic-specific fields (top_k, thinking) are dropped.
 //   - Stream options with include_usage are set so we get token counts in
 //     the final SSE chunk.
-func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string) ([]byte, string, error) {
+func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool) ([]byte, string, error) {
 	body := map[string]interface{}{
 		"model":      modelName,
-		"max_tokens": pickMaxTokens(req),
+		"max_tokens": pickMaxTokens(req, outputRatio),
 		"stream":     req.Stream,
 	}
 	if req.Temperature != nil {
@@ -472,6 +501,20 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 			"content": fmt.Sprintf("<ignore>RUN_GUID: %s</ignore>", runID),
 		}
 		messages = append([]map[string]interface{}{stamp}, messages...)
+	}
+	if forceOutput {
+		// Force the model to generate up to max_tokens: append a short
+		// continue-generating instruction as a system message AND set vLLM's
+		// ignore_eos (ignore the stop token) so the (possibly retargeted)
+		// output budget is actually filled — deterministic output length
+		// instead of the model stopping early. Applies to both
+		// --replay-output-ratio (cap = input*ratio) and the recorded-output
+		// path (cap = recorded output_tokens).
+		messages = append(messages, map[string]interface{}{
+			"role":    "system",
+			"content": verboseOutputInstruction,
+		})
+		body["ignore_eos"] = true
 	}
 
 	// Convert conversation messages. For text-only messages we produce a
