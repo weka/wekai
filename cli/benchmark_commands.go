@@ -367,7 +367,11 @@ func (c *BenchmarkVisualizeCommand) Execute(args []string) error {
 	}
 
 	dir := c.Args.Dir
-	htmlPath, err := benchmark.GenerateVisualization(dir, c.Concurrency)
+	maxElapsed, err := parseMaxElapsed(c.MaxElapsed)
+	if err != nil {
+		return err
+	}
+	htmlPath, err := benchmark.GenerateVisualizationWithOptions(dir, c.Concurrency, maxElapsed)
 	if err != nil {
 		return fmt.Errorf("generate visualization: %w", err)
 	}
@@ -420,12 +424,31 @@ func (c *BenchmarkVisualizeMergeCommand) Execute(args []string) error {
 		}
 	}
 
-	htmlPath, err := benchmark.GenerateVisualizationMerged(dirs, labels, c.Output, c.Concurrency)
+	maxElapsed, err := parseMaxElapsed(c.MaxElapsed)
+	if err != nil {
+		return err
+	}
+	htmlPath, err := benchmark.GenerateVisualizationMerged(dirs, labels, c.Output, c.Concurrency, maxElapsed)
 	if err != nil {
 		return fmt.Errorf("generate merged visualization: %w", err)
 	}
 	fmt.Printf("Merged visualization saved to: %s\n", htmlPath)
 	return nil
+}
+
+// parseMaxElapsed parses the --max-elapsed duration ("" = no truncation).
+func parseMaxElapsed(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid --max-elapsed %q (want a Go duration like 7h45m, 465m, or 27900s): %w", s, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("--max-elapsed must be positive, got %s", d)
+	}
+	return d, nil
 }
 
 // BenchmarkThroughputCommand implements the benchmark throughput subcommand

@@ -49,7 +49,7 @@ func TestGenerateVisualizationMergedLabelPriority(t *testing.T) {
 		})
 
 		out := filepath.Join(root, "alias", "merged")
-		if _, err := GenerateVisualizationMerged([]string{wekaDir, hbmDir}, nil, out, 0); err != nil {
+		if _, err := GenerateVisualizationMerged([]string{wekaDir, hbmDir}, nil, out, 0, 0); err != nil {
 			t.Fatalf("GenerateVisualizationMerged: %v", err)
 		}
 		assertExists(t, filepath.Join(out, "DS3H_weka-64r8w.jsonl"))
@@ -69,7 +69,7 @@ func TestGenerateVisualizationMergedLabelPriority(t *testing.T) {
 		})
 
 		out := filepath.Join(root, "override", "merged")
-		if _, err := GenerateVisualizationMerged([]string{wekaDir, hbmDir}, []string{"custom-a", "custom-b"}, out, 0); err != nil {
+		if _, err := GenerateVisualizationMerged([]string{wekaDir, hbmDir}, []string{"custom-a", "custom-b"}, out, 0, 0); err != nil {
 			t.Fatalf("GenerateVisualizationMerged: %v", err)
 		}
 		assertExists(t, filepath.Join(out, "custom-a.jsonl"))
@@ -84,7 +84,7 @@ func TestGenerateVisualizationMergedLabelPriority(t *testing.T) {
 		})
 
 		out := filepath.Join(root, "noalias", "merged")
-		if _, err := GenerateVisualizationMerged([]string{dir}, nil, out, 0); err != nil {
+		if _, err := GenerateVisualizationMerged([]string{dir}, nil, out, 0, 0); err != nil {
 			t.Fatalf("GenerateVisualizationMerged: %v", err)
 		}
 		assertExists(t, filepath.Join(out, "DS3H_weka-64r8w_reqdata.jsonl"))
@@ -97,7 +97,7 @@ func TestGenerateVisualizationMergedLabelPriority(t *testing.T) {
 		writeRecordJSONL(t, dirA, "reqs", []requestDataRecord{{Model: "dynamic/http://localhost:8000/v1,alias=a"}})
 		writeRecordJSONL(t, dirB, "reqs", []requestDataRecord{{Model: "dynamic/http://localhost:8001/v1,alias=b"}})
 
-		_, err := GenerateVisualizationMerged([]string{dirA, dirB}, []string{"only-one"}, filepath.Join(root, "mismatch", "merged"), 0)
+		_, err := GenerateVisualizationMerged([]string{dirA, dirB}, []string{"only-one"}, filepath.Join(root, "mismatch", "merged"), 0, 0)
 		if err == nil {
 			t.Fatal("expected error on --labels count mismatch, got nil")
 		}

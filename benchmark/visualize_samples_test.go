@@ -487,7 +487,7 @@ func TestMergedLabelsWinDisplayNames(t *testing.T) {
 	writeMixedJSONL(t, dirB, "reqs", recB, smpB)
 
 	outDir := filepath.Join(root, "merged")
-	htmlPath, err := GenerateVisualizationMerged([]string{dirA, dirB}, []string{"label-arm-a", "label-arm-b"}, outDir, 4)
+	htmlPath, err := GenerateVisualizationMerged([]string{dirA, dirB}, []string{"label-arm-a", "label-arm-b"}, outDir, 4, 0)
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
@@ -509,7 +509,7 @@ func TestMergedLabelsWinDisplayNames(t *testing.T) {
 	// dirs derive the same alias and collide into SHARED_alias/_2 filenames,
 	// but display names come from the records' alias.
 	outDir2 := filepath.Join(root, "merged-nolabels")
-	htmlPath2, err := GenerateVisualizationMerged([]string{dirA, dirB}, nil, outDir2, 4)
+	htmlPath2, err := GenerateVisualizationMerged([]string{dirA, dirB}, nil, outDir2, 4, 0)
 	if err != nil {
 		t.Fatalf("merge without labels: %v", err)
 	}
@@ -520,6 +520,82 @@ func TestMergedLabelsWinDisplayNames(t *testing.T) {
 	if !strings.Contains(string(b2), `"name":"SHARED_alias"`) {
 		t.Errorf("alias fallback broken when no labels are given")
 	}
+}
+
+// TestMaxElapsedTruncation covers the --max-elapsed contract: per-arm t0,
+// inclusive boundary, sample rows truncated alongside requests, and runs
+// shorter than the cutoff untouched.
+func TestMaxElapsedTruncation(t *testing.T) {
+	t.Run("boundary keep/drop + samples", func(t *testing.T) {
+		t0 := time.Date(2026, 7, 22, 0, 22, 53, 0, time.UTC)
+		mkRec := func(offset time.Duration) requestDataRecord {
+			return requestDataRecord{StartTime: t0.Add(offset), Model: "m", RequestNum: 1, InputTokens: 10}
+		}
+		mkSmp := func(offset time.Duration) vllmMetricsSample {
+			return vllmMetricsSample{RecordType: recordTypeVLLMMetricsSample, TS: t0.Add(offset), Model: "m"}
+		}
+		records := []requestDataRecord{mkRec(0), mkRec(7*time.Hour + 45*time.Minute), mkRec(7*time.Hour + 45*time.Minute + time.Second), mkRec(7*time.Hour + 51*time.Minute)}
+		samples := []vllmMetricsSample{mkSmp(time.Minute), mkSmp(7*time.Hour + 45*time.Minute), mkSmp(7*time.Hour + 46*time.Minute)}
+		gotR, gotS := truncateToElapsed(records, samples, 7*time.Hour+45*time.Minute)
+		if len(gotR) != 2 {
+			t.Fatalf("records kept = %d, want 2 (t0 + exactly-at-cutoff; past-cutoff dropped)", len(gotR))
+		}
+		if !gotR[1].StartTime.Equal(t0.Add(7*time.Hour + 45*time.Minute)) {
+			t.Errorf("boundary record (exactly at cutoff) must be KEPT")
+		}
+		if len(gotS) != 2 {
+			t.Fatalf("samples kept = %d, want 2 (sample rows truncate against the same t0)", len(gotS))
+		}
+	})
+
+	t.Run("short run unaffected; zero cutoff is a no-op", func(t *testing.T) {
+		t0 := time.Now()
+		records := []requestDataRecord{{StartTime: t0}, {StartTime: t0.Add(time.Hour)}}
+		if r, _ := truncateToElapsed(records, nil, 8*time.Hour); len(r) != 2 {
+			t.Fatal("run shorter than cutoff must be unaffected")
+		}
+		if r, _ := truncateToElapsed(records, nil, 0); len(r) != 2 {
+			t.Fatal("maxElapsed 0 must be a no-op")
+		}
+	})
+
+	t.Run("merged: per-alias independent t0", func(t *testing.T) {
+		root := t.TempDir()
+		dirA := filepath.Join(root, "armA")
+		dirB := filepath.Join(root, "armB")
+		// Arm A starts at 10:00, arm B at 11:00 — each truncates to its OWN
+		// 30m elapsed window, not a shared wall-clock cutoff.
+		mk := func(dir, alias string, start time.Time) {
+			model := "dynamic/http://h:8000/v1,type=openai_vllm,alias=" + alias
+			var recs []requestDataRecord
+			for _, off := range []time.Duration{0, 20 * time.Minute, 30 * time.Minute, 40 * time.Minute} {
+				recs = append(recs, requestDataRecord{StartTime: start.Add(off), Model: model, RequestNum: 1, InputTokens: 5})
+			}
+			smps := []vllmMetricsSample{
+				{RecordType: recordTypeVLLMMetricsSample, TS: start.Add(10 * time.Minute), Model: model},
+				{RecordType: recordTypeVLLMMetricsSample, TS: start.Add(35 * time.Minute), Model: model},
+			}
+			writeMixedJSONL(t, dir, "reqs", recs, smps)
+		}
+		mk(dirA, "trunc_a", time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC))
+		mk(dirB, "trunc_b", time.Date(2026, 7, 22, 11, 0, 0, 0, time.UTC))
+
+		outDir := filepath.Join(root, "merged")
+		if _, err := GenerateVisualizationMerged([]string{dirA, dirB}, []string{"arm-a", "arm-b"}, outDir, 0, 30*time.Minute); err != nil {
+			t.Fatalf("merge: %v", err)
+		}
+		for _, name := range []string{"arm-a", "arm-b"} {
+			records, samples, err := readJSONLFile(filepath.Join(outDir, name+".jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 0/20/30 kept (30m boundary inclusive), 40m dropped; sample at
+			// 10m kept, 35m dropped — for EACH arm against its own t0.
+			if len(records) != 3 || len(samples) != 1 {
+				t.Errorf("%s: kept %d records / %d samples, want 3/1 (per-alias t0)", name, len(records), len(samples))
+			}
+		}
+	})
 }
 
 func TestGenerateVisualizationMergedCarriesSamples(t *testing.T) {
@@ -533,7 +609,7 @@ func TestGenerateVisualizationMergedCarriesSamples(t *testing.T) {
 	writeMixedJSONL(t, dirB, "reqs", recB, smpB)
 
 	outDir := filepath.Join(root, "merged")
-	htmlPath, err := GenerateVisualizationMerged([]string{dirA, dirB}, nil, outDir, 4)
+	htmlPath, err := GenerateVisualizationMerged([]string{dirA, dirB}, nil, outDir, 4, 0)
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}

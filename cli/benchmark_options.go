@@ -82,7 +82,8 @@ type BenchmarkAutoOptions struct {
 
 // BenchmarkVisualizeOptions contains options for the benchmark visualize subcommand
 type BenchmarkVisualizeOptions struct {
-	Concurrency int `long:"concurrency" description:"Concurrency used during benchmark (for moving average window size = concurrency*3)" default:"0"`
+	Concurrency int    `long:"concurrency" description:"Concurrency used during benchmark (for moving average window size = concurrency*3)" default:"0"`
+	MaxElapsed  string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
 	Args        struct {
 		Dir string `positional-arg-name:"directory" description:"Directory containing .jsonl request data files" required:"yes"`
 	} `positional-args:"yes"`
@@ -94,6 +95,7 @@ type BenchmarkVisualizeMergeOptions struct {
 	Output      string `long:"output" short:"o" description:"Output directory for merged results (default: auto-generated next to input)"`
 	Concurrency int    `long:"concurrency" description:"Concurrency used during benchmark (for moving average window size = concurrency*3)" default:"0"`
 	Labels      string `long:"labels" description:"Comma-separated labels for each input directory, in positional order (overrides auto-detected model aliases / directory names). Count must exactly match the number of directories (post --all expansion)."`
+	MaxElapsed  string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
 	Args        struct {
 		Dirs []string `positional-arg-name:"directories" description:"Directories containing .jsonl request data files"`
 	} `positional-args:"yes"`

@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // autoRunDirRe matches the opaque per-run subdirectory that `benchmark auto
@@ -62,7 +63,12 @@ func deriveSourceLabel(dir string, records []requestDataRecord) string {
 // labels, if non-empty, overrides auto-detected labels; it must have exactly
 // one entry per entry in dirs, matched positionally. When absent, labels are
 // auto-derived per deriveSourceLabel.
-func GenerateVisualizationMerged(dirs []string, labels []string, outputDir string, concurrency int) (string, error) {
+//
+// maxElapsed > 0 truncates each source directory to its OWN elapsed window:
+// per-arm t0 = min(start_time) of that directory's records, so arms with
+// different wall-clock starts each cut at their own elapsed cutoff (see
+// truncateToElapsed). Merged JSONL and CSVs carry only the kept rows.
+func GenerateVisualizationMerged(dirs []string, labels []string, outputDir string, concurrency int, maxElapsed time.Duration) (string, error) {
 	if len(dirs) == 0 {
 		return "", fmt.Errorf("no directories provided")
 	}
@@ -114,6 +120,8 @@ func GenerateVisualizationMerged(dirs []string, labels []string, outputDir strin
 			dirRecords = append(dirRecords, records...)
 			dirSamples = append(dirSamples, samples...)
 		}
+		// Per-arm truncation: this directory's own t0, not global wall-clock.
+		dirRecords, dirSamples = truncateToElapsed(dirRecords, dirSamples, maxElapsed)
 
 		var alias string
 		if len(labels) > 0 {
@@ -184,7 +192,8 @@ func GenerateVisualizationMerged(dirs []string, labels []string, outputDir strin
 	// Explicit --labels must win as the DISPLAYED series names too, not just
 	// the merged filenames: pin display names to the label-derived basenames
 	// so a record alias shared by both arms can't collapse them into one name.
-	return generateVisualization(outputDir, concurrency, len(labels) > 0)
+	// maxElapsed 0: the sources were already truncated per-arm above.
+	return generateVisualization(outputDir, concurrency, len(labels) > 0, 0)
 }
 
 type taggedRecord struct {

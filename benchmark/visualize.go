@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/weka/wekai/llm"
 )
@@ -42,7 +43,56 @@ func extractAlias(modelStr string) string {
 // interactive HTML scatter-plot in the same directory. Returns the path
 // to the generated HTML file.
 func GenerateVisualization(dir string, concurrency int) (string, error) {
-	return generateVisualization(dir, concurrency, false)
+	return generateVisualization(dir, concurrency, false, 0)
+}
+
+// GenerateVisualizationWithOptions is GenerateVisualization with a
+// time-truncation cutoff: when maxElapsed > 0, records (and metrics
+// samples) past that elapsed time from each FILE's own run start are
+// dropped — see truncateToElapsed.
+func GenerateVisualizationWithOptions(dir string, concurrency int, maxElapsed time.Duration) (string, error) {
+	return generateVisualization(dir, concurrency, false, maxElapsed)
+}
+
+// truncateToElapsed drops request records and metrics samples whose elapsed
+// time from the run's own start exceeds maxElapsed, so a crashed run's
+// terminal error-storm can be excluded from a report. t0 is the earliest
+// request StartTime in the set (falling back to the earliest sample when a
+// file somehow has no request rows); the boundary is inclusive — a record
+// exactly AT the cutoff is kept. Samples truncate against the same t0 so
+// the cache-mix overlay, ingest volume, and ds: axis rows all stop at the
+// cutoff consistently with the request data. maxElapsed <= 0 is a no-op.
+func truncateToElapsed(records []requestDataRecord, samples []vllmMetricsSample, maxElapsed time.Duration) ([]requestDataRecord, []vllmMetricsSample) {
+	if maxElapsed <= 0 || (len(records) == 0 && len(samples) == 0) {
+		return records, samples
+	}
+	var t0 time.Time
+	for _, r := range records {
+		if t0.IsZero() || r.StartTime.Before(t0) {
+			t0 = r.StartTime
+		}
+	}
+	if t0.IsZero() {
+		for _, s := range samples {
+			if t0.IsZero() || s.TS.Before(t0) {
+				t0 = s.TS
+			}
+		}
+	}
+	cutoff := t0.Add(maxElapsed)
+	var outR []requestDataRecord
+	for _, r := range records {
+		if !r.StartTime.After(cutoff) {
+			outR = append(outR, r)
+		}
+	}
+	var outS []vllmMetricsSample
+	for _, s := range samples {
+		if !s.TS.After(cutoff) {
+			outS = append(outS, s)
+		}
+	}
+	return outR, outS
 }
 
 // generateVisualization is the implementation behind GenerateVisualization.
@@ -50,8 +100,10 @@ func GenerateVisualization(dir string, concurrency int) (string, error) {
 // label, tooltips, ds: axis rows — all render seriesData.Name) to the .jsonl
 // basename instead of re-resolving the record alias. The merged path sets it
 // when explicit --labels were given, so labels win end-to-end: two arms
-// sharing one alias would otherwise render indistinguishably.
-func generateVisualization(dir string, concurrency int, keepFileNames bool) (string, error) {
+// sharing one alias would otherwise render indistinguishably. maxElapsed > 0
+// truncates each file to its own elapsed window (per-file t0) — the merged
+// path passes 0 here because it truncates per source directory instead.
+func generateVisualization(dir string, concurrency int, keepFileNames bool, maxElapsed time.Duration) (string, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 	if err != nil {
 		return "", fmt.Errorf("glob jsonl files: %w", err)
@@ -89,6 +141,7 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool) (str
 		if err != nil {
 			return "", fmt.Errorf("read %s: %w", f, err)
 		}
+		records, samples = truncateToElapsed(records, samples, maxElapsed)
 		// Prefer the clean model alias (e.g. "DS3H_weka-64r8w") over the raw
 		// sanitized filename (e.g. "dynamic_http___..._alias_DS3H_weka-64r8w")
 		// when the file's records unambiguously identify one model — unless
