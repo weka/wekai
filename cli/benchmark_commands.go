@@ -271,12 +271,16 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		ReplayStopAtLowConcurrency: c.ReplayStopAtLowConcurrency,
 		RouterReplayFile:           c.RouterReplayFile,
 		RouterReplayRoles:          c.RouterReplayRoles,
-		DryRun:                     c.DryRun,
-		DryRunColdTPS:              c.DryRunColdTPS,
-		DryRunWarmTPS:              c.DryRunWarmTPS,
-		DryRunOutputTPS:            c.DryRunOutputTPS,
-		CacheSimChunkBytes:         c.CacheSimChunkBytes,
-		FIFOGateOrder:              c.RandomGateOrder == "false",
+		ReplayOutputRatio:          c.ReplayOutputRatio,
+		// Force-output (short continue-generating instruction + vLLM
+		// ignore_eos) is the default; --replay-natural-output opts out.
+		ReplayForceOutput:  !c.ReplayNaturalOutput,
+		DryRun:             c.DryRun,
+		DryRunColdTPS:      c.DryRunColdTPS,
+		DryRunWarmTPS:      c.DryRunWarmTPS,
+		DryRunOutputTPS:    c.DryRunOutputTPS,
+		CacheSimChunkBytes: c.CacheSimChunkBytes,
+		FIFOGateOrder:      c.RandomGateOrder == "false",
 	}
 
 	if c.FromDataset != "" && c.RouterReplayFile != "" {
@@ -288,6 +292,12 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 	if c.RouterReplayFile != "" && c.MaxOutputTokens != 0 {
 		fmt.Fprintln(os.Stderr,
 			"warning: --max-output-tokens overrides per-request budgets baked into the router replay file")
+	}
+	if c.ReplayOutputRatio < 0 {
+		return fmt.Errorf("--replay-output-ratio must be >= 0, got %v", c.ReplayOutputRatio)
+	}
+	if c.ReplayOutputRatio > 0 && c.RouterReplayFile == "" {
+		return fmt.Errorf("--replay-output-ratio requires --router-replay-file")
 	}
 
 	// Parse --replay-series-indices / --replay-series-range into a set of
