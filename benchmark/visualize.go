@@ -95,6 +95,61 @@ func truncateToElapsed(records []requestDataRecord, samples []vllmMetricsSample,
 	return outR, outS
 }
 
+// vizRecord is one request's data as embedded in a report.html's RAW_DATA.
+type vizRecord struct {
+	// T is delta-encoded against the owning seriesData's T0 (min StartTime
+	// of the series), NOT an absolute epoch — see seriesData.T0 and
+	// vizRecord.MarshalJSON.
+	T          float64
+	TTFT       float64
+	ResponseMs float64
+	IsError    bool
+	SeriesNum  int
+	RequestNum int
+	CacheHit   bool
+	// Token counts for the ingest volume layer and its hover rates.
+	InputTokens  int // net-of-cache input tokens
+	CachedTokens int // server-cached prompt tokens
+	OutputTokens int // completion tokens
+}
+
+// MarshalJSON emits vizRecord as a positional array —
+// [t,ttft,resp,err,sn,rn,ch,in,ca,out], matching REC_FIELDS in the report
+// template — instead of a JSON object. The object shape repeats all 10 key
+// strings per record; across the ~137k records a typical merged report
+// carries, that's several MB of pure key-name bytes. The report's load-time
+// rehydration shim (immediately after `const RAW_DATA = {{.Data}}` in the
+// template) converts each row back into a
+// {t,ttft,resp,err,sn,rn,ch,in,ca,out} object with an absolute t, so every
+// downstream render/filter/compute function is unchanged. err/ch are emitted
+// as 0/1 and rehydrated back to real booleans by the shim. Field order here
+// MUST match REC_FIELDS in the template exactly.
+func (r vizRecord) MarshalJSON() ([]byte, error) {
+	errV, chV := 0, 0
+	if r.IsError {
+		errV = 1
+	}
+	if r.CacheHit {
+		chV = 1
+	}
+	return json.Marshal([10]float64{
+		r.T, r.TTFT, r.ResponseMs, float64(errV), float64(r.SeriesNum), float64(r.RequestNum),
+		float64(chV), float64(r.InputTokens), float64(r.CachedTokens), float64(r.OutputTokens),
+	})
+}
+
+// seriesData is one variant's data as embedded in a report.html's RAW_DATA.
+type seriesData struct {
+	Name string `json:"name"`
+	// T0 is the base epoch-ms timestamp (min over Records) that each
+	// Records[i].T is delta-encoded against — see vizRecord.T. Rehydrated
+	// client-side as t0 + delta to recover the absolute epoch value.
+	T0      float64            `json:"t0"`
+	Records []vizRecord        `json:"records"`
+	Mix     []vizSampleSegment `json:"mix,omitempty"`
+	Adt     []vizAdtPoint      `json:"adt,omitempty"`
+}
+
 // generateVisualization is the implementation behind GenerateVisualization.
 // keepFileNames pins each series' DISPLAYED name (legend, cache-mix band
 // label, tooltips, ds: axis rows — all render seriesData.Name) to the .jsonl
@@ -113,27 +168,6 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 	}
 	sort.Strings(files)
 
-	type vizRecord struct {
-		StartTimeUnix float64 `json:"t"`
-		TTFT          float64 `json:"ttft"`
-		ResponseMs    float64 `json:"resp"`
-		IsError       bool    `json:"err"`
-		SeriesNum     int     `json:"sn"`
-		RequestNum    int     `json:"rn"`
-		CacheHit      bool    `json:"ch"`
-		// Token counts for the ingest volume layer and its hover rates.
-		InputTokens  int `json:"in"`  // net-of-cache input tokens
-		CachedTokens int `json:"ca"`  // server-cached prompt tokens
-		OutputTokens int `json:"out"` // completion tokens
-	}
-
-	type seriesData struct {
-		Name    string             `json:"name"`
-		Records []vizRecord        `json:"records"`
-		Mix     []vizSampleSegment `json:"mix,omitempty"`
-		Adt     []vizAdtPoint      `json:"adt,omitempty"`
-	}
-
 	var allSeries []seriesData
 	for _, f := range files {
 		name := strings.TrimSuffix(filepath.Base(f), ".jsonl")
@@ -151,23 +185,34 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 				name = alias
 			}
 		}
+		// t0 = min StartTime across this series' records, used to
+		// delta-encode each record's T (see vizRecord.T / seriesData.T0).
+		var t0 float64
+		haveT0 := false
+		for _, r := range records {
+			t := float64(r.StartTime.UnixMilli())
+			if !haveT0 || t < t0 {
+				t0 = t
+				haveT0 = true
+			}
+		}
 		var vr []vizRecord
 		for _, r := range records {
 			vr = append(vr, vizRecord{
-				StartTimeUnix: float64(r.StartTime.UnixMilli()),
-				TTFT:          r.TTFT,
-				ResponseMs:    r.ResponseMs,
-				IsError:       r.IsError,
-				SeriesNum:     r.SeriesNum,
-				RequestNum:    r.RequestNum,
-				CacheHit:      r.CacheHit,
-				InputTokens:   r.InputTokens,
-				CachedTokens:  r.CachedTokens,
-				OutputTokens:  r.OutputTokens,
+				T:            float64(r.StartTime.UnixMilli()) - t0,
+				TTFT:         r.TTFT,
+				ResponseMs:   r.ResponseMs,
+				IsError:      r.IsError,
+				SeriesNum:    r.SeriesNum,
+				RequestNum:   r.RequestNum,
+				CacheHit:     r.CacheHit,
+				InputTokens:  r.InputTokens,
+				CachedTokens: r.CachedTokens,
+				OutputTokens: r.OutputTokens,
 			})
 		}
 		mix, adt := buildSampleViz(samples)
-		allSeries = append(allSeries, seriesData{Name: name, Records: vr, Mix: mix, Adt: adt})
+		allSeries = append(allSeries, seriesData{Name: name, T0: t0, Records: vr, Mix: mix, Adt: adt})
 	}
 
 	seriesJSON, err := json.Marshal(allSeries)
@@ -387,6 +432,31 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 
 <script>
 const RAW_DATA = {{.Data}};
+
+// --- Rehydrate positional records back into the object shape the rest of
+// this script expects (everything below reads r.t, r.ttft, r.resp, r.err,
+// r.sn, r.rn, r.ch, r.in, r.ca, r.out as object properties). The Go emitter
+// (benchmark/visualize.go) writes each record as a positional array
+// [t,ttft,resp,err,sn,rn,ch,in,ca,out] (REC_FIELDS order, must match
+// vizRecord.MarshalJSON there) with t delta-encoded against a per-series t0,
+// instead of repeating 10 JSON key strings per record — across ~137k records
+// that was several MB of pure key-name bytes. This is encoding-only: after
+// this loop, RAW_DATA[i].records is structurally identical to the
+// pre-optimization array-of-objects shape (absolute epoch t, real booleans),
+// so nothing below this point needs to change.
+const REC_FIELDS = ["t", "ttft", "resp", "err", "sn", "rn", "ch", "in", "ca", "out"];
+const REC_BOOL_FIELDS = ["err", "ch"];
+RAW_DATA.forEach(s => {
+  const t0 = s.t0 || 0;
+  s.records = (s.records || []).map(row => {
+    const o = {};
+    REC_FIELDS.forEach((k, i) => { o[k] = row[i]; });
+    o.t += t0;
+    REC_BOOL_FIELDS.forEach(k => { o[k] = !!o[k]; });
+    return o;
+  });
+});
+
 const CONCURRENCY = {{.Concurrency}};
 
 // --- Sorting: gpu first, dram second, weka last, others alphabetically ---
@@ -476,7 +546,19 @@ function computeDerived(s) {
   s._respP50 = [];
   s._ttftP50 = [];
   s._ttftP95 = [];
-  for (let i = 0; i < sorted.length; i++) {
+  // Anchor the rolling-percentile line at ~TARGET_LINE_POINTS x-positions
+  // rather than one per request. A per-record anchor makes this loop
+  // O(n*winSize) with a fresh winSize-wide slice + 3 sorts allocated every
+  // iteration; at 60k+ records/series (137k across the merge) that is billions
+  // of ops + heavy GC and was the dominant page-load hang. A 60k-point line on
+  // a ~1400px canvas is visually identical to a ~2000-point one, so we stride
+  // the ANCHOR while keeping the window content unchanged (still the trailing
+  // winSize records ending at i) — ~30x fewer iterations/allocations, no visual
+  // change. computeDerived also runs on every context-filter, so filtering
+  // stays responsive too.
+  const TARGET_LINE_POINTS = 2000;
+  const stride = Math.max(1, Math.floor(sorted.length / TARGET_LINE_POINTS));
+  const pushAnchor = (i) => {
     const start = Math.max(0, i - winSize + 1);
     const win = sorted.slice(start, i + 1);
     const ttfts = win.map(r => r.ttft).filter(v => v > 0);
@@ -485,6 +567,12 @@ function computeDerived(s) {
     s._respP50.push({ t: t, v: percentile(resps, 0.5) });
     s._ttftP50.push({ t: t, v: ttfts.length ? percentile(ttfts, 0.5) : 0 });
     s._ttftP95.push({ t: t, v: ttfts.length ? percentile(ttfts, 0.95) : 0 });
+  };
+  for (let i = 0; i < sorted.length; i += stride) pushAnchor(i);
+  // Always anchor the final record so the line reaches the true end of the run
+  // even when stride does not land on it.
+  if (stride > 1 && sorted.length > 0 && (sorted.length - 1) % stride !== 0) {
+    pushAnchor(sorted.length - 1);
   }
   // Error bars: sample every winSize points from the view (including
   // errors), each bar anchored at the response p50 line at that time.
