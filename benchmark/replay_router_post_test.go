@@ -64,7 +64,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 		ts, seen := newVLLMStyleServer()
 		defer ts.Close()
 		p := mustPoster(t, fmt.Sprintf("dynamic/%s,type=openai_vllm,model=m", ts.URL))
-		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState()); m.Error != nil {
+		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), true); m.Error != nil {
 			t.Fatalf("first request: %v", m.Error)
 		}
 		got := seen()
@@ -75,7 +75,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 			t.Errorf("latch = %q fellBack=%v, want fallback latched", p.epResolved, p.epFellBack)
 		}
 		// Latched: the second request goes straight to /v1, one wire call.
-		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState()); m.Error != nil {
+		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState(), true); m.Error != nil {
 			t.Fatalf("second request: %v", m.Error)
 		}
 		if got = seen(); len(got) != 3 || got[2] != "/v1/chat/completions" {
@@ -87,7 +87,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 		ts, seen := newVLLMStyleServer()
 		defer ts.Close()
 		p := mustPoster(t, fmt.Sprintf("dynamic/%s/v1,type=openai_vllm,model=m", ts.URL))
-		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState()); m.Error != nil {
+		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), true); m.Error != nil {
 			t.Fatalf("request: %v", m.Error)
 		}
 		got := seen()
@@ -110,7 +110,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 		}))
 		defer ts.Close()
 		p := mustPoster(t, fmt.Sprintf("dynamic/%s,type=openai_vllm,model=m", ts.URL))
-		m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState())
+		m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), true)
 		if m.Error == nil || !strings.Contains(m.Error.Error(), "status 500") {
 			t.Fatalf("expected status-500 error, got %v", m.Error)
 		}
@@ -136,7 +136,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				m := p.do(context.Background(), minimalReq, docs, 1, "s", fmt.Sprintf("i%d", i), 1, newState())
+				m := p.do(context.Background(), minimalReq, docs, 1, "s", fmt.Sprintf("i%d", i), 1, newState(), true)
 				errs[i] = m.Error
 			}(i)
 		}
@@ -152,7 +152,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 		// Duplicate probes during the race are allowed; once latched, a new
 		// request adds exactly one wire call.
 		before := len(seen())
-		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState()); m.Error != nil {
+		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState(), true); m.Error != nil {
 			t.Fatalf("post-latch request: %v", m.Error)
 		}
 		after := seen()
@@ -378,7 +378,7 @@ func TestOpenAIReplayEndToEnd(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	metrics := p.do(ctx, req, docs, 1, "session-1", "instance-1", 1, st)
+	metrics := p.do(ctx, req, docs, 1, "session-1", "instance-1", 1, st, true)
 
 	// Verify no error.
 	if metrics.Error != nil {
@@ -459,7 +459,7 @@ func TestOpenAIReplayToolTranslation(t *testing.T) {
 		},
 	}
 
-	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false)
+	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, nil)
 	if err != nil {
 		t.Fatalf("buildOpenAIChatCompletionsBody: %v", err)
 	}
@@ -519,7 +519,7 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 				{Role: "user", Hash: "h1", Bytes: 50, BlockTypes: []string{"text"}},
 			},
 		}
-		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "run-42", 0, false)
+		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "run-42", 0, false, nil)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
@@ -548,7 +548,7 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 				{Role: "user", Hash: "h1", Bytes: 50, BlockTypes: []string{"text"}},
 			},
 		}
-		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false)
+		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, nil)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
@@ -576,7 +576,7 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 				{Role: "user", Hash: "h1", Bytes: 50, BlockTypes: []string{"text"}},
 			},
 		}
-		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false)
+		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, nil)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
@@ -602,7 +602,7 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 			Stream:       true,
 			OutputTokens: 100,
 		}
-		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false)
+		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, nil)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
@@ -652,7 +652,7 @@ func TestOpenAINonStreamingEndToEnd(t *testing.T) {
 	}
 
 	st := &autoState{stream: newCompletionStream(200)}
-	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st)
+	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, true)
 
 	if metrics.Error != nil {
 		t.Fatalf("unexpected error: %v", metrics.Error)
@@ -698,7 +698,7 @@ func TestOpenAIErrorResponse(t *testing.T) {
 	}
 
 	st := &autoState{stream: newCompletionStream(200)}
-	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st)
+	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, true)
 
 	if metrics.Error == nil {
 		t.Fatal("expected error for 500 response, got nil")
@@ -740,7 +740,7 @@ func TestOpenAISSEWithoutUsage(t *testing.T) {
 	}
 
 	st := &autoState{stream: newCompletionStream(200)}
-	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st)
+	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, true)
 
 	if metrics.Error != nil {
 		// "empty response from model" is acceptable for no-usage streams.

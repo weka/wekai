@@ -637,6 +637,21 @@ func runRouterReplayInstance(
 	if err == nil {
 		poster.outputRatio = cfg.ReplayOutputRatio
 		poster.forceOutput = cfg.ReplayForceOutput
+		// UUID cache-coherency injection (--replay-inject-uuids, router
+		// path). sessionIdx == seriesNum-1: every instance of a session
+		// shares the session's seriesNum, so every instance's poster picks
+		// the SAME session UUID/marker. uuidEnabled stays false (and
+		// buildInjection nil) whenever the flag is off, or this session's
+		// index fell outside the precomputed array (see the sizing note on
+		// AutoBenchmarkConfig.replayUUIDSets) — degrading gracefully to
+		// "no injection" for that session rather than panicking.
+		if cfg.ReplayInjectUUIDs {
+			poster.uuidEnabled = true
+			poster.sessionIdx = seriesNum - 1
+			poster.allUUIDSets = cfg.replayUUIDSets
+			poster.blockCounts = cfg.replayBlockSessionCounts
+			poster.reciteEveryRequest = cfg.ReplayReciteEveryRequest
+		}
 	}
 	if err != nil {
 		// Configuration error — record one error per request in this
@@ -693,12 +708,14 @@ func runRouterReplayInstance(
 			}
 		}
 
+		isLastRequest := ti == len(inst.Requests)-1
+
 		reqCtx, reqCancel := context.WithTimeout(ctx, reqTimeout)
 		var metrics RequestMetrics
 		if poster.dryRun {
-			metrics = poster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
+			metrics = poster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest)
 		} else {
-			metrics = poster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
+			metrics = poster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest)
 		}
 		reqCancel()
 		gate.Release()

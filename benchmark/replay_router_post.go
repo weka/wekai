@@ -62,6 +62,52 @@ type replayPoster struct {
 	// newReplayPoster, to avoid touching its many existing call sites.
 	outputRatio float64
 	forceOutput bool
+
+	// UUID cache-coherency injection (--replay-inject-uuids, router path —
+	// see replay_router_uuid.go). Set directly on the poster after
+	// construction, same rationale as outputRatio/forceOutput above.
+	// uuidEnabled gates everything: false leaves do()/dryDo() byte-for-byte
+	// identical to before this feature existed.
+	uuidEnabled bool
+	// sessionIdx is this instance's session's 0-based index into
+	// allUUIDSets/blockCounts (== seriesNum-1 — every instance of a session
+	// shares the same seriesNum, hence the same sessionIdx).
+	sessionIdx int
+	// allUUIDSets is cfg.replayUUIDSets: the full per-session UUID
+	// assignment (index i = session i's owned UUID set), shared read-only
+	// across every poster in the run — needed both to pick this session's
+	// own marker and to scan for OTHER sessions' UUIDs leaking into this
+	// response (cross-contamination).
+	allUUIDSets [][]string
+	// blockCounts is cfg.replayBlockSessionCounts: hash -> distinct-session
+	// count, used by sharedPrefixBlockCount to find each request's safe
+	// injection boundary.
+	blockCounts map[string]int
+	// reciteEveryRequest mirrors --replay-recite-every-request: true asks
+	// for the recite line on every request; false only on each instance's
+	// final request (see the isLastRequest parameter to do()/dryDo()).
+	reciteEveryRequest bool
+}
+
+// buildInjection returns this call's *uuidInjection (nil when UUID
+// injection is disabled, or when this session has no assigned UUID — e.g.
+// sessionIdx fell outside the precomputed array). isLastRequest is whether
+// req is the final request of the CURRENT instance's request list (see
+// runRouterReplayInstance) — with --replay-recite-every-request=false, only
+// that final request carries the recite ask.
+func (p *replayPoster) buildInjection(req RouterReplayRequest, isLastRequest bool) *uuidInjection {
+	if !p.uuidEnabled || p.sessionIdx < 0 || p.sessionIdx >= len(p.allUUIDSets) {
+		return nil
+	}
+	uuids := p.allUUIDSets[p.sessionIdx]
+	if len(uuids) == 0 {
+		return nil
+	}
+	return &uuidInjection{
+		Marker:          injectUUIDMarker("", uuids),
+		Recite:          p.reciteEveryRequest || isLastRequest,
+		SharedPrefixLen: sharedPrefixBlockCount(req, p.blockCounts),
+	}
 }
 
 func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string, runID string, dryRun bool, coldTPS, warmTPS, outputTPS int, estimator *cacheEstimator) (*replayPoster, error) {
@@ -270,7 +316,9 @@ func (p *replayPoster) sendOnce(ctx context.Context, url string, bodyBytes []byt
 
 // do issues one request and returns its metrics. Honors ctx for
 // cancellation / deadline. Dispatches to the appropriate body builder
-// and response parser based on p.apiType.
+// and response parser based on p.apiType. isLastRequest is whether req is
+// the final request of the calling instance's request list — see
+// buildInjection.
 func (p *replayPoster) do(
 	ctx context.Context,
 	req RouterReplayRequest,
@@ -280,17 +328,20 @@ func (p *replayPoster) do(
 	instanceID string,
 	seriesNum int,
 	st *autoState,
+	isLastRequest bool,
 ) RequestMetrics {
 	startTime := time.Now()
+
+	inj := p.buildInjection(req, isLastRequest)
 
 	var bodyBytes []byte
 	var canonical string
 	var err error
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, inj)
 	default:
-		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, inj)
 	}
 	if err != nil {
 		return RequestMetrics{
@@ -373,6 +424,17 @@ func (p *replayPoster) do(
 		m.Error = fmt.Errorf("empty response from model")
 	}
 	m.LocalCacheRatio = localCacheRatio
+
+	// UUID cache-coherency validation (--replay-inject-uuids, router path).
+	// consumeOpenAISSE/consumeOpenAIPlain/consumeSSE/consumePlain already
+	// merge reasoning/thinking into m.Response (see their doc comments), so
+	// a single Contains-scan of m.Response covers both — thinking is passed
+	// as "" here, mirroring the dataset path's own call shape.
+	if inj != nil && m.Error == nil && !m.IsEmpty {
+		m.ConvIdx = p.sessionIdx
+		m.ExpectedUUIDs = append([]string(nil), p.allUUIDSets[p.sessionIdx]...)
+		m.UUIDFound, m.LeakedUUIDs = validateReplayResponse(m.Response, "", m.ExpectedUUIDs, p.sessionIdx, p.allUUIDSets)
+	}
 	return m
 }
 
@@ -688,14 +750,20 @@ func (p *replayPoster) dryDo(
 	instanceID string,
 	seriesNum int,
 	st *autoState,
+	isLastRequest bool,
 ) RequestMetrics {
-	// Build canonical string for estimator and compute ratio.
+	// Build canonical string for estimator and compute ratio. Injection is
+	// threaded through purely so the canonical text (and therefore the
+	// cache-ratio estimate) stays consistent with a real do() call for the
+	// same request — dry-run never makes a real request, so there's no
+	// response to validate.
+	inj := p.buildInjection(req, isLastRequest)
 	var canonical string
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, inj)
 	default:
-		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, inj)
 	}
 	var ratio float64
 	if p.estimator != nil {
