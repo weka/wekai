@@ -55,6 +55,13 @@ type replayPoster struct {
 		warmTPS   int
 		outputTPS int
 	}
+
+	// outputRatio and forceOutput implement --replay-output-ratio /
+	// --replay-natural-output. Set directly on the poster after construction
+	// (see runRouterReplayInstance) rather than threaded through
+	// newReplayPoster, to avoid touching its many existing call sites.
+	outputRatio float64
+	forceOutput bool
 }
 
 func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string, runID string, dryRun bool, coldTPS, warmTPS, outputTPS int, estimator *cacheEstimator) (*replayPoster, error) {
@@ -281,9 +288,9 @@ func (p *replayPoster) do(
 	var err error
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID)
+		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
 	default:
-		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID)
+		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
 	}
 	if err != nil {
 		return RequestMetrics{
@@ -686,9 +693,9 @@ func (p *replayPoster) dryDo(
 	var canonical string
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID)
+		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
 	default:
-		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, p.runID)
+		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
 	}
 	var ratio float64
 	if p.estimator != nil {
