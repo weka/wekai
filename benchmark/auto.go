@@ -89,6 +89,30 @@ type AutoBenchmarkConfig struct {
 	// remains the normal budget C (--concurrency).
 	ReplayStopAtLowConcurrency bool
 
+	// UUID-based response validation (--replay-inject-uuids). DATASET PATH
+	// ONLY (cfg.FromDataset != ""); the CLI rejects this combined with
+	// --router-replay-file (see cli/benchmark_commands.go) — router replay
+	// reconstructs prefixes from block hashes+token counts, and injecting
+	// visible text there would break cache-hit reproduction.
+	ReplayInjectUUIDs bool // inject per-turn UUID markers and validate their presence in later responses
+	// ReplayUUIDsPerTurn is how many UUIDs each injectable turn carries.
+	ReplayUUIDsPerTurn int
+	// ReplayUUIDSeed seeds the UUID generator (see newUUIDGenerator); 0 = crypto/rand
+	// (non-deterministic across runs).
+	ReplayUUIDSeed int64
+	// ReplayUUIDMode selects which turns are injectable: "human" (default) or
+	// "all-non-gpt" (also tool + stray system turns). See replayTurnInjectable.
+	ReplayUUIDMode string
+	// ReplayReciteEveryTurn: ask the model to recite every ref-id seen so far on
+	// EVERY turn (default true), not just the conversation's final turn.
+	ReplayReciteEveryTurn bool
+	// replayUUIDSets is the precomputed per-conversation UUID list (parallel to
+	// replayConversations), populated once by RunAutoBenchmark before any
+	// per-model goroutine spawns — see buildReplayUUIDSets and the comment on
+	// replayConversations above (same sharing rationale: avoid recomputing N
+	// times in parallel, and every model must see the identical assignment).
+	replayUUIDSets [][]string
+
 	// RunID is populated internally by RunAutoBenchmark at the start of each
 	// run. It's the UUID injected into every conversation's system prompt
 	// (when ReplayNoStamp is false). Per-run scope — conversations that share
@@ -185,6 +209,17 @@ type requestDataRecord struct {
 	Question        string `json:"question,omitempty"`
 	ResponseText    string `json:"response_text,omitempty"`
 	RawResponseTail string `json:"raw_response_tail,omitempty"`
+
+	// UUID validation (dataset-replay --replay-inject-uuids only). The three
+	// counts are always populated (0 when the feature is off); the raw detail
+	// lists are populated ONLY on a miss or a leak (mirrors the
+	// failed-request-only policy above — avoid bloating every row).
+	UUIDExpected     int      `json:"uuid_expected"`
+	UUIDFound        int      `json:"uuid_found"`
+	UUIDLeaked       int      `json:"uuid_leaked"`
+	ExpectedUUIDsRaw []string `json:"expected_uuids_raw,omitempty"`
+	FoundMask        []bool   `json:"found_mask,omitempty"`
+	LeakedUUIDsRaw   []string `json:"leaked_uuids_raw,omitempty"`
 }
 
 // requestDataWriter writes requestDataRecord entries as JSONL, safe for concurrent use.
@@ -878,6 +913,17 @@ type autoState struct {
 	coldStartTTFTCount atomic.Int64 // count of cold-start samples (used for series-scaling gate)
 	ttftDegradedCount  atomic.Int64 // requests disqualified from cache-hit by TTFT degradation
 
+	// UUID validation (replay --replay-inject-uuids only). All zero when the
+	// feature is off — recordReplayRequest only touches these when
+	// metrics.ExpectedUUIDs is non-empty.
+	valReqs              atomic.Int64 // requests that carried >=1 expected UUID (i.e. validation ran)
+	valUUIDChecks        atomic.Int64 // total per-UUID presence checks made
+	valUUIDFound         atomic.Int64 // per-UUID presence checks that found the UUID
+	valPresenceMissUUIDs atomic.Int64 // per-UUID PRESENCE_MISS count (expected UUID absent)
+	valCrossContamUUIDs  atomic.Int64 // per-UUID CROSS_CONTAMINATION count (other-conversation UUID present)
+	valPresenceMissReqs  atomic.Int64 // requests with >=1 PRESENCE_MISS
+	valCrossContamReqs   atomic.Int64 // requests with >=1 CROSS_CONTAMINATION
+
 	// Persistent early-sample buffers — never trimmed, survive stream eviction.
 	printMu sync.Mutex // serialises --print-responses output across concurrent series
 
@@ -971,6 +1017,16 @@ type autoBenchmarkResult struct {
 	totalInputWarm    int64 // input tokens from warm requests (prefix was cached)
 	totalOutput       int64 // output tokens across all requests
 	totalCachedTokens int64 // server-reported cached prompt tokens
+
+	// UUID validation (replay --replay-inject-uuids only); all zero when the
+	// feature is off. See autoState's val* atomics for field meanings.
+	valReqs              int64
+	valUUIDChecks        int64
+	valUUIDFound         int64
+	valPresenceMissUUIDs int64
+	valCrossContamUUIDs  int64
+	valPresenceMissReqs  int64
+	valCrossContamReqs   int64
 }
 
 // displaySnapshot is an atomic snapshot of state for the display goroutine.
@@ -1122,6 +1178,14 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 	fmt.Println(strings.Repeat("-", 62))
 	fmt.Printf(" Total completed    : %d\n", res.totalCompleted)
 	fmt.Printf(" Total errors       : %d\n", res.totalErrors)
+	if cfg.ReplayInjectUUIDs {
+		fmt.Println(strings.Repeat("-", 62))
+		fmt.Println(" UUID validation (replay)")
+		fmt.Printf("   Requests validated                  : %d\n", res.valReqs)
+		fmt.Printf("   UUID presence                       : %d/%d\n", res.valUUIDFound, res.valUUIDChecks)
+		fmt.Printf("   PRESENCE_MISS (expected UUID absent) : %d across %d requests\n", res.valPresenceMissUUIDs, res.valPresenceMissReqs)
+		fmt.Printf("   CROSS_CONTAMINATION (other-conv)     : %d across %d requests\n", res.valCrossContamUUIDs, res.valCrossContamReqs)
+	}
 	fmt.Println(strings.Repeat("=", 62))
 }
 
@@ -2263,6 +2327,13 @@ func runSingleModelBenchmark(
 	res.totalInputWarm = tt.inputWarm
 	res.totalOutput = tt.output
 	res.totalCachedTokens = tt.cached
+	res.valReqs = st.valReqs.Load()
+	res.valUUIDChecks = st.valUUIDChecks.Load()
+	res.valUUIDFound = st.valUUIDFound.Load()
+	res.valPresenceMissUUIDs = st.valPresenceMissUUIDs.Load()
+	res.valCrossContamUUIDs = st.valCrossContamUUIDs.Load()
+	res.valPresenceMissReqs = st.valPresenceMissReqs.Load()
+	res.valCrossContamReqs = st.valCrossContamReqs.Load()
 
 	// Send a final snapshot with termReason set so multi-model display shows DONE.
 	{
@@ -2436,6 +2507,17 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		}
 		cfg.replayConversations = convs
 		fmt.Printf("Loaded %d conversations. Starting auto benchmark...\n\n", len(convs))
+
+		// Precompute the per-conversation UUID sets ONCE here, before any
+		// per-model goroutine spawns below, so every model's
+		// runSingleModelBenchmark sees the identical assignment (same
+		// sharing rationale as replayConversations itself — see its doc
+		// comment on AutoBenchmarkConfig).
+		if cfg.ReplayInjectUUIDs {
+			cfg.replayUUIDSets = buildReplayUUIDSets(cfg.replayConversations, cfg.ReplayUUIDSeed, cfg.ReplayUUIDsPerTurn, cfg.ReplayUUIDMode)
+			fmt.Printf("UUID validation enabled: %d conversation(s) prepared (mode=%s, per-turn=%d, seed=%d)\n",
+				len(cfg.replayUUIDSets), cfg.ReplayUUIDMode, cfg.ReplayUUIDsPerTurn, cfg.ReplayUUIDSeed)
+		}
 	}
 
 	// Tree-aware router replay: only the header (line 1) is read here so

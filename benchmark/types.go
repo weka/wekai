@@ -23,5 +23,12 @@ type RequestMetrics struct {
 	CachedPrompt      string  // Full system prompt text (only populated on error/empty for diagnostics)
 	Question          string  // The user question sent with the request (only populated on error/empty)
 	RawResponseTail   string  // raw SSE tail (last bytes); only populated on error/empty for diagnostics
-}
 
+	// UUID validation (dataset-replay --replay-inject-uuids only). All nil/zero
+	// when the feature is off (default) or on the router-replay/synthetic paths,
+	// which never populate these.
+	ConvIdx       int      // conversation index within cfg.replayConversations / cfg.replayUUIDSets
+	ExpectedUUIDs []string // this conversation's in-scope ref-id UUIDs at this turn (defensive copy)
+	UUIDFound     []bool   // parallel to ExpectedUUIDs: whether each was found in Response or thinking
+	LeakedUUIDs   []string // "uuid(series=N)" entries for any OTHER conversation's UUID found here
+}

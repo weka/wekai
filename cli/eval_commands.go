@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 
 	"github.com/weka/wekai/benchmark"
 	"github.com/weka/wekai/config"
@@ -197,7 +196,7 @@ func (c *EvalCacheCoherencyCommand) Execute(args []string) error {
 			}
 			// Any uuid belonging to a DIFFERENT series found in this response/thinking
 			// is cross-contamination (KV/scheduling leak across series).
-			leaked = findLeakedUUIDs(r.Response, r.Thinking, r.SeriesIdx, result.SeriesUUIDs)
+			leaked = benchmark.FindLeakedUUIDs(r.Response, r.Thinking, r.SeriesIdx, result.SeriesUUIDs)
 		}
 		uuidMissingFlakyCount += len(missing)
 		crossContamCount += len(leaked)
@@ -333,22 +332,6 @@ func resolveGarbageChars(garbageCharacters, garbageTokens int, w io.Writer) int 
 	}
 }
 
-// findLeakedUUIDs scans resp and thinking for UUIDs belonging to a series OTHER than
-// ownSeries, per the ordered seriesUUIDs list (seriesUUIDs[i] = full UUID stamp list of
-// series i — this doubles as the uuid -> owning-series mapping without needing an actual
-// map, keeping iteration order — and therefore leak-report order — deterministic for a
-// given seed). Returns "uuid(series=N)" entries, one per leaked UUID found.
-func findLeakedUUIDs(resp, thinking string, ownSeries int, seriesUUIDs [][]string) []string {
-	var leaked []string
-	for si, uuids := range seriesUUIDs {
-		if si == ownSeries {
-			continue
-		}
-		for _, u := range uuids {
-			if strings.Contains(resp, u) || strings.Contains(thinking, u) {
-				leaked = append(leaked, fmt.Sprintf("%s(series=%d)", u, si))
-			}
-		}
-	}
-	return leaked
-}
+// findLeakedUUIDs moved to benchmark.FindLeakedUUIDs (benchmark/replay_uuid.go)
+// so both this CLI and the dataset-replay UUID validation path share one
+// implementation.

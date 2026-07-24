@@ -101,7 +101,7 @@ func runReplaySeriesLoop(
 		seriesNum := convIdx + 1
 		seriesGUID := conv.ID
 
-		fullyWalked := runReplayConversation(benchCtx, cfg, st, rdw, conv, seriesNum, seriesGUID, endpointOverride, reqTimeout, gate)
+		fullyWalked := runReplayConversation(benchCtx, cfg, st, rdw, conv, convIdx, seriesNum, seriesGUID, endpointOverride, reqTimeout, gate)
 		// The conversation's slot is retired — its context no longer counts
 		// toward the active dataset.
 		st.datasetTracker.Reset(seriesNum)
@@ -116,6 +116,11 @@ func runReplaySeriesLoop(
 // benchmark request per gpt turn. Errors on individual requests are recorded
 // but don't abort the series — the next turn still runs.
 //
+// convIdx is this conversation's index into cfg.replayConversations /
+// cfg.replayUUIDSets (== seriesNum-1, passed explicitly rather than
+// re-derived so the UUID-validation wiring below doesn't have to assume that
+// relationship).
+//
 // Returns true if the whole conversation was walked; false if a stop signal
 // (--total reached, context cancel) cut it short mid-walk.
 func runReplayConversation(
@@ -124,6 +129,7 @@ func runReplayConversation(
 	st *autoState,
 	rdw *requestDataWriter,
 	conv Conversation,
+	convIdx int,
 	seriesNum int,
 	seriesGUID string,
 	endpointOverride string,
@@ -200,7 +206,31 @@ func runReplayConversation(
 	var pending strings.Builder
 	turnNum := 0
 
-	flush := func() bool {
+	// UUID validation setup (--replay-inject-uuids, dataset path only). All of
+	// this is inert when the flag is off: uuidSets stays nil, injecting is
+	// false, and every gate below short-circuits.
+	injecting := cfg.ReplayInjectUUIDs
+	var uuidSets []string
+	if injecting && convIdx >= 0 && convIdx < len(cfg.replayUUIDSets) {
+		uuidSets = cfg.replayUUIDSets[convIdx]
+	}
+	uuidCursor := 0
+	var inScope []string
+	reciteTruncWarned := false // logs the max-tokens recite-cap WARNING at most once per conversation
+
+	// lastGptIdx locates this conversation's FINAL 'gpt' turn so the recite
+	// instruction still goes out at least once (on that turn) even when
+	// --replay-recite-every-turn=false.
+	lastGptIdx := -1
+	if injecting {
+		for i := firstIdx; i < len(conv.Turns); i++ {
+			if conv.Turns[i].From == "gpt" {
+				lastGptIdx = i
+			}
+		}
+	}
+
+	flush := func(gptIdx int) bool {
 		userContent := strings.TrimSpace(pending.String())
 		pending.Reset()
 		if userContent == "" {
@@ -232,13 +262,40 @@ func runReplayConversation(
 		requestNum := int(st.totalCompleted.Load()) + 1
 
 		// Observe the accumulated history (including this turn's user message)
-		// with the content-level estimator BEFORE the server responds.
+		// with the content-level estimator BEFORE the server responds. The
+		// recite-instruction tail (below) is deliberately NOT part of what the
+		// estimator/history see — it's per-request boilerplate, not
+		// conversation content, and would otherwise skew the cache-ratio
+		// estimate every single turn (recite-every-turn is the default).
 		history.WriteString(userContent)
 		ratio := st.estimator.Observe(history.String())
 
+		// Append the recite-every-seen-ref-id instruction, if injecting. Cap
+		// the recited list to a fraction of the output budget first — an
+		// uncapped list only grows every turn and can eventually ask the model
+		// to reproduce more ref-ids than max_tokens can hold, truncating the
+		// SEEN_REFS line itself; ExpectedUUIDs is set to the SAME (possibly
+		// capped) list so a truncation-induced gap is never misread as a
+		// PRESENCE_MISS.
+		outgoingContent := userContent
+		var expectedSnapshot []string
+		if injecting {
+			recited, truncated := capRecitedUUIDs(inScope, cfg.MaxOutputTokens)
+			if truncated && !reciteTruncWarned {
+				reciteTruncWarned = true
+				fmt.Fprintf(os.Stderr,
+					"[auto][%s] WARNING: replay UUID recite list capped to fit --max-output-tokens budget (conv=%d) — PRESENCE_MISS on ref-ids dropped from recitation is expected, not corruption\n",
+					shortModelName(cfg.Model), convIdx)
+			}
+			expectedSnapshot = append([]string(nil), recited...)
+			if cfg.ReplayReciteEveryTurn || gptIdx == lastGptIdx {
+				outgoingContent = userContent + replayReciteInstruction(recited)
+			}
+		}
+
 		reqCtx, reqCancel := context.WithTimeout(benchCtx, reqTimeout)
 		resetTTFT(time.Now())
-		response, err := chat.Request(reqCtx, llm.TextParts(userContent), nil)
+		response, err := chat.Request(reqCtx, llm.TextParts(outgoingContent), nil)
 		totalTime := time.Since(startTime)
 		reqCancel()
 		gate.Release()
@@ -253,8 +310,14 @@ func runReplayConversation(
 			TotalResponseTime: totalTime,
 			Error:             err,
 		}
+		// respThinking is captured separately from metrics.Response (which may
+		// get overwritten by response.Thinking below when content is empty) so
+		// UUID validation can always scan content ∪ thinking, exactly like the
+		// cache-coherency eval does.
+		var respThinking string
 		if response != nil {
 			metrics.Response = response.Content
+			respThinking = response.Thinking
 			if strings.TrimSpace(metrics.Response) == "" {
 				metrics.Response = response.Thinking
 			}
@@ -281,6 +344,19 @@ func runReplayConversation(
 		}
 
 		metrics.LocalCacheRatio = ratio
+
+		if injecting {
+			metrics.ConvIdx = convIdx
+			metrics.ExpectedUUIDs = expectedSnapshot
+			// ERROR responses (including the synthetic "empty response" error
+			// above) are excluded from validation — no usable content/thinking
+			// to scan.
+			if metrics.Error == nil {
+				metrics.UUIDFound, metrics.LeakedUUIDs = validateReplayResponse(
+					metrics.Response, respThinking, metrics.ExpectedUUIDs, convIdx, cfg.replayUUIDSets)
+			}
+		}
+
 		recordReplayRequest(cfg, st, rdw, metrics, isFirstRequest, &coldStartTTFT)
 		isFirstRequest = false
 		return true
@@ -289,7 +365,7 @@ func runReplayConversation(
 	for i := firstIdx; i < len(conv.Turns); i++ {
 		t := conv.Turns[i]
 		if t.From == "gpt" {
-			if !flush() {
+			if !flush(i) {
 				return false
 			}
 			continue
@@ -297,7 +373,23 @@ func runReplayConversation(
 		if pending.Len() > 0 {
 			pending.WriteString("\n\n")
 		}
-		pending.WriteString(t.Value)
+		turnValue := t.Value
+		// UUID injection: this cursor/slicing logic MUST mirror
+		// computeInScopeAtEachGptTurn (replay_uuid.go) exactly — the test
+		// suite (replay_uuid_test.go) asserts the two stay in lockstep.
+		if injecting && replayTurnInjectable(t, cfg.ReplayUUIDMode) {
+			end := uuidCursor + cfg.ReplayUUIDsPerTurn
+			if end > len(uuidSets) {
+				end = len(uuidSets)
+			}
+			if uuidCursor < end {
+				turnUUIDs := uuidSets[uuidCursor:end]
+				inScope = append(inScope, turnUUIDs...)
+				turnValue = injectUUIDMarker(turnValue, turnUUIDs)
+			}
+			uuidCursor = end
+		}
+		pending.WriteString(turnValue)
 	}
 	// Trailing non-gpt content (if any) is discarded — there's no assistant
 	// response to measure for it.
@@ -347,6 +439,31 @@ func recordReplayRequest(
 	isErr := metrics.Error != nil
 	explicitCache := metrics.UsageData.CachedTokens.Count > 0
 
+	// UUID validation tallies (--replay-inject-uuids only). metrics.ExpectedUUIDs
+	// is nil/empty for every request when the feature is off (default), so this
+	// block — and the val* counters it touches — is fully inert then.
+	uuidExpectedCount := len(metrics.ExpectedUUIDs)
+	uuidFoundCount := 0
+	for _, found := range metrics.UUIDFound {
+		if found {
+			uuidFoundCount++
+		}
+	}
+	uuidLeakedCount := len(metrics.LeakedUUIDs)
+	if uuidExpectedCount > 0 {
+		st.valReqs.Add(1)
+		st.valUUIDChecks.Add(int64(uuidExpectedCount))
+		st.valUUIDFound.Add(int64(uuidFoundCount))
+		if missCount := uuidExpectedCount - uuidFoundCount; missCount > 0 {
+			st.valPresenceMissUUIDs.Add(int64(missCount))
+			st.valPresenceMissReqs.Add(1)
+		}
+		if uuidLeakedCount > 0 {
+			st.valCrossContamUUIDs.Add(int64(uuidLeakedCount))
+			st.valCrossContamReqs.Add(1)
+		}
+	}
+
 	earlyColdBaseline := st.earlyColdStartTTFT()
 
 	st.mu.Lock()
@@ -390,7 +507,7 @@ func recordReplayRequest(
 		if metrics.Error != nil {
 			errMsg = metrics.Error.Error()
 		}
-		if writeErr := rdw.write(requestDataRecord{
+		rec := requestDataRecord{
 			StartTime:            reqStart,
 			EndTime:              reqEnd,
 			TTFT:                 float64(metrics.TimeToFirstToken.Milliseconds()),
@@ -409,7 +526,20 @@ func recordReplayRequest(
 			ErrorMessage:         errMsg,
 			IsEmpty:              metrics.IsEmpty,
 			LocalCacheRatio:      metrics.LocalCacheRatio,
-		}); writeErr != nil {
+			UUIDExpected:         uuidExpectedCount,
+			UUIDFound:            uuidFoundCount,
+			UUIDLeaked:           uuidLeakedCount,
+		}
+		// Raw detail lists only on a miss or a leak — mirrors the
+		// failed-request-only policy on PromptText/ResponseText/RawResponseTail
+		// above (avoid bloating every row with data that matters only when
+		// something's wrong).
+		if uuidFoundCount < uuidExpectedCount || uuidLeakedCount > 0 {
+			rec.ExpectedUUIDsRaw = metrics.ExpectedUUIDs
+			rec.FoundMask = metrics.UUIDFound
+			rec.LeakedUUIDsRaw = metrics.LeakedUUIDs
+		}
+		if writeErr := rdw.write(rec); writeErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to write request data: %v\n", writeErr)
 		}
 	}
