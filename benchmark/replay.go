@@ -371,6 +371,9 @@ func recordReplayRequest(
 		st.valReqs.Add(1)
 		st.valUUIDChecks.Add(int64(uuidExpectedCount))
 		st.valUUIDFound.Add(int64(uuidFoundCount))
+		if metrics.ExactMatch {
+			st.valExactMatchReqs.Add(1)
+		}
 		if missCount := uuidExpectedCount - uuidFoundCount; missCount > 0 {
 			st.valPresenceMissUUIDs.Add(int64(missCount))
 			st.valPresenceMissReqs.Add(1)
@@ -446,6 +449,7 @@ func recordReplayRequest(
 			UUIDExpected:         uuidExpectedCount,
 			UUIDFound:            uuidFoundCount,
 			UUIDLeaked:           uuidLeakedCount,
+			UUIDExactMatch:       metrics.ExactMatch,
 		}
 		// Raw detail lists only on a miss or a leak — mirrors the
 		// failed-request-only policy on PromptText/ResponseText/RawResponseTail

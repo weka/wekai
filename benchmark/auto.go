@@ -91,29 +91,33 @@ type AutoBenchmarkConfig struct {
 
 	// UUID-based cache-coherency validation (--replay-inject-uuids). ROUTER
 	// PATH ONLY (cfg.RouterReplayFile != ""); the CLI rejects this combined
-	// with --from-dataset (see cli/benchmark_commands.go). One deterministic
-	// UUID is injected per SESSION at the boundary between its
-	// cross-session-shared leading blocks and its per-session content (see
-	// replay_router_uuid.go for the full design) — this puts the marker in
-	// a region cached WITHIN a session (later requests in the same session
-	// repeat it) while leaving the cross-session shared prefix byte-
-	// identical, so cache-hit reproduction against the original capture is
-	// preserved.
+	// with --from-dataset (see cli/benchmark_commands.go). Mirrors the
+	// cache-coherency eval's --shared-prefix-per-series mechanics: N
+	// deterministic, bare, space-separated UUIDs (N sized off the session's
+	// per-session cached-region bytes, via computeStampsPerSeries — see
+	// computePerSessionCachedChars) are injected per SESSION at the boundary
+	// between its cross-session-shared leading blocks and its per-session
+	// content (see replay_router_uuid.go for the full design) — this puts
+	// the UUID block in a region cached WITHIN a session (later requests in
+	// the same session repeat it, byte-identical) while leaving the
+	// cross-session shared prefix byte-identical, so cache-hit reproduction
+	// against the original capture is preserved.
 	ReplayInjectUUIDs bool
 	// ReplayUUIDSeed seeds the UUID generator (see newUUIDGenerator); 0 = crypto/rand
 	// (non-deterministic across runs).
 	ReplayUUIDSeed int64
-	// ReplayReciteEveryRequest: ask the model to recite the ref-id marker on
-	// EVERY request (default true), not just each instance's final request.
+	// ReplayReciteEveryRequest: ask the model to recite the first-line UUID
+	// list on EVERY request (default true), not just each instance's final
+	// request.
 	ReplayReciteEveryRequest bool
 	// replayUUIDSets is the precomputed per-session UUID list, populated
 	// once by RunAutoBenchmark before any per-model goroutine spawns — see
-	// buildSessionUUIDs. Index i = session i's owned singleton UUID set
-	// (index i corresponds to seriesNum-1, the order sessions are
-	// dispatched in — see the sizing note at the router-replay precompute
-	// call site). Shared, read-only, across every model in a multi-model
-	// run so every model sees the identical assignment (same sharing
-	// rationale as replayConversations below).
+	// buildSessionUUIDs. Index i = session i's owned N-UUID list (index i
+	// corresponds to seriesNum-1, the order sessions are dispatched in —
+	// see the sizing note at the router-replay precompute call site).
+	// Shared, read-only, across every model in a multi-model run so every
+	// model sees the identical assignment (same sharing rationale as
+	// replayConversations below).
 	replayUUIDSets [][]string
 	// replayBlockSessionCounts maps a replay-v3 block hash to the number of
 	// DISTINCT SESSIONS that reference it (see computeBlockSessionCounts) —
@@ -242,6 +246,7 @@ type requestDataRecord struct {
 	UUIDExpected     int      `json:"uuid_expected"`
 	UUIDFound        int      `json:"uuid_found"`
 	UUIDLeaked       int      `json:"uuid_leaked"`
+	UUIDExactMatch   bool     `json:"uuid_exact_match"`
 	ExpectedUUIDsRaw []string `json:"expected_uuids_raw,omitempty"`
 	FoundMask        []bool   `json:"found_mask,omitempty"`
 	LeakedUUIDsRaw   []string `json:"leaked_uuids_raw,omitempty"`
@@ -944,6 +949,7 @@ type autoState struct {
 	valReqs              atomic.Int64 // requests that carried >=1 expected UUID (i.e. validation ran)
 	valUUIDChecks        atomic.Int64 // total per-UUID presence checks made
 	valUUIDFound         atomic.Int64 // per-UUID presence checks that found the UUID
+	valExactMatchReqs    atomic.Int64 // requests whose first line was the exact ordered UUID list (output conformity)
 	valPresenceMissUUIDs atomic.Int64 // per-UUID PRESENCE_MISS count (expected UUID absent)
 	valCrossContamUUIDs  atomic.Int64 // per-UUID CROSS_CONTAMINATION count (other-conversation UUID present)
 	valPresenceMissReqs  atomic.Int64 // requests with >=1 PRESENCE_MISS
@@ -1048,6 +1054,7 @@ type autoBenchmarkResult struct {
 	valReqs              int64
 	valUUIDChecks        int64
 	valUUIDFound         int64
+	valExactMatchReqs    int64
 	valPresenceMissUUIDs int64
 	valCrossContamUUIDs  int64
 	valPresenceMissReqs  int64
@@ -1207,7 +1214,12 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		fmt.Println(strings.Repeat("-", 62))
 		fmt.Println(" UUID validation (replay)")
 		fmt.Printf("   Requests validated                  : %d\n", res.valReqs)
-		fmt.Printf("   UUID presence                       : %d/%d\n", res.valUUIDFound, res.valUUIDChecks)
+		// Two tests, mirroring the cache-coherency eval CLI's layout: UUID
+		// correctness (per-stamp presence, Contains anywhere in the response)
+		// and output conformity (first line is exactly the ordered,
+		// comma-joined UUID list — see firstLineConformity).
+		fmt.Printf("   UUID correctness (presence)          : %d/%d\n", res.valUUIDFound, res.valUUIDChecks)
+		fmt.Printf("   Output conformity (first-line exact) : %d/%d\n", res.valExactMatchReqs, res.valReqs)
 		fmt.Printf("   PRESENCE_MISS (expected UUID absent) : %d across %d requests\n", res.valPresenceMissUUIDs, res.valPresenceMissReqs)
 		fmt.Printf("   CROSS_CONTAMINATION (other-conv)     : %d across %d requests\n", res.valCrossContamUUIDs, res.valCrossContamReqs)
 	}
@@ -2355,6 +2367,7 @@ func runSingleModelBenchmark(
 	res.valReqs = st.valReqs.Load()
 	res.valUUIDChecks = st.valUUIDChecks.Load()
 	res.valUUIDFound = st.valUUIDFound.Load()
+	res.valExactMatchReqs = st.valExactMatchReqs.Load()
 	res.valPresenceMissUUIDs = st.valPresenceMissUUIDs.Load()
 	res.valCrossContamUUIDs = st.valCrossContamUUIDs.Load()
 	res.valPresenceMissReqs = st.valPresenceMissReqs.Load()
@@ -2586,7 +2599,16 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 					return fmt.Errorf("compute block session counts for --replay-inject-uuids: %w", cerr)
 				}
 				cfg.replayBlockSessionCounts = counts
-				cfg.replayUUIDSets = buildSessionUUIDs(effectiveSessions, cfg.ReplayUUIDSeed)
+				// Per-session cached-region byte size (the blocks AFTER each
+				// session's cross-session-shared boundary — see
+				// computePerSessionCachedChars) sizes N stamps per session
+				// exactly as the cache-coherency eval turns --garbage-chars
+				// into --stamps-per-series (computeStampsPerSeries, min 2).
+				perSessionChars, perr := computePerSessionCachedChars(cfg.RouterReplayFile, cfg.RouterReplaySeriesIndices, cfg.ReplaySeries, counts)
+				if perr != nil {
+					return fmt.Errorf("compute per-session cached chars for --replay-inject-uuids: %w", perr)
+				}
+				cfg.replayUUIDSets = buildSessionUUIDs(perSessionChars, cfg.ReplayUUIDSeed)
 
 				sharedHashes := 0
 				for _, n := range counts {
@@ -2598,8 +2620,20 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 				if berr != nil {
 					return fmt.Errorf("compute usable-boundary diagnostic for --replay-inject-uuids: %w", berr)
 				}
-				fmt.Printf("UUID validation enabled: %d session(s) prepared, %d cross-session-shared block hash(es), %d/%d sessions have a usable boundary (%d fall back to tail injection) (recite-every-request=%v, seed=%d)\n",
-					effectiveSessions, sharedHashes, usable, total, total-usable, cfg.ReplayReciteEveryRequest, cfg.ReplayUUIDSeed)
+				minStamps, maxStamps := 0, 0
+				if len(cfg.replayUUIDSets) > 0 {
+					minStamps, maxStamps = len(cfg.replayUUIDSets[0]), len(cfg.replayUUIDSets[0])
+					for _, set := range cfg.replayUUIDSets {
+						if len(set) < minStamps {
+							minStamps = len(set)
+						}
+						if len(set) > maxStamps {
+							maxStamps = len(set)
+						}
+					}
+				}
+				fmt.Printf("UUID validation enabled: %d session(s) prepared, %d cross-session-shared block hash(es), %d/%d sessions have a usable boundary (%d fall back to tail injection), %d-%d UUID stamps/session (recite-every-request=%v, seed=%d)\n",
+					effectiveSessions, sharedHashes, usable, total, total-usable, minStamps, maxStamps, cfg.ReplayReciteEveryRequest, cfg.ReplayUUIDSeed)
 			}
 		}
 	}

@@ -28,7 +28,8 @@ type RequestMetrics struct {
 	// when the feature is off (default) or on the synthetic path, which never
 	// populates these.
 	ConvIdx       int      // session index within cfg.replayUUIDSets (== seriesNum-1)
-	ExpectedUUIDs []string // this session's own UUID (singleton slice)
+	ExpectedUUIDs []string // this session's own N-UUID list, in order
 	UUIDFound     []bool   // parallel to ExpectedUUIDs: whether each was found in Response or thinking
 	LeakedUUIDs   []string // "uuid(series=N)" entries for any OTHER session's UUID found here
+	ExactMatch    bool     // first line of Response is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
 }

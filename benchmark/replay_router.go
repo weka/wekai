@@ -763,3 +763,28 @@ func BuildReplayRequestPrefix(req RouterReplayRequest) (hashes []string, tokens 
 	}
 	return
 }
+
+// requestPrefixBytes mirrors BuildReplayRequestPrefix's exact block sequence
+// (same skip-the-tiny-header-block rule, same system-blocks/tools/messages
+// order) but returns each entry's Bytes instead of its hash/token count, so
+// index i here lines up 1:1 with index i of BuildReplayRequestPrefix's
+// hashes. Used by computePerSessionCachedChars to sum the byte size of a
+// request's prefix blocks AT OR AFTER a given boundary index (e.g.
+// sharedPrefixBlockCount) — the per-session cached region --replay-inject-
+// uuids sizes its UUID-stamp count off (see replay_router_uuid.go).
+func requestPrefixBytes(req RouterReplayRequest) []int {
+	var out []int
+	for i, sb := range req.SystemBlocks {
+		if i == 0 && sb.Bytes < 200 {
+			continue
+		}
+		out = append(out, sb.Bytes)
+	}
+	if req.Tools != nil && req.Tools.Hash != "" {
+		out = append(out, req.Tools.Bytes)
+	}
+	for _, m := range req.Messages {
+		out = append(out, m.Bytes)
+	}
+	return out
+}

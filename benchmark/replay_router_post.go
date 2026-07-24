@@ -104,7 +104,7 @@ func (p *replayPoster) buildInjection(req RouterReplayRequest, isLastRequest boo
 		return nil
 	}
 	return &uuidInjection{
-		Marker:          injectUUIDMarker("", uuids),
+		UUIDs:           uuids,
 		Recite:          p.reciteEveryRequest || isLastRequest,
 		SharedPrefixLen: sharedPrefixBlockCount(req, p.blockCounts),
 	}
@@ -430,10 +430,17 @@ func (p *replayPoster) do(
 	// merge reasoning/thinking into m.Response (see their doc comments), so
 	// a single Contains-scan of m.Response covers both — thinking is passed
 	// as "" here, mirroring the dataset path's own call shape.
+	//
+	// Two independent checks, mirroring the cache-coherency eval's two
+	// reported tests: per-UUID PRESENCE (Contains anywhere in the response,
+	// via validateReplayResponse) and output CONFORMITY (the FIRST LINE of
+	// the response is exactly the ordered, comma-joined UUID list — see
+	// firstLineConformity/matchesExpectedUUIDList).
 	if inj != nil && m.Error == nil && !m.IsEmpty {
 		m.ConvIdx = p.sessionIdx
 		m.ExpectedUUIDs = append([]string(nil), p.allUUIDSets[p.sessionIdx]...)
 		m.UUIDFound, m.LeakedUUIDs = validateReplayResponse(m.Response, "", m.ExpectedUUIDs, p.sessionIdx, p.allUUIDSets)
+		m.ExactMatch = firstLineConformity(m.Response, m.ExpectedUUIDs)
 	}
 	return m
 }

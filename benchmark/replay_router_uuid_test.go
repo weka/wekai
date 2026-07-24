@@ -179,25 +179,59 @@ func TestSharedPrefixBlockCount(t *testing.T) {
 	}
 }
 
+// TestComputePerSessionCachedChars verifies the per-session cached-region
+// byte size computation: the ROOT request's (first instance, first
+// request) prefix bytes AT OR AFTER its sharedPrefixBlockCount boundary,
+// using the same synthetic 5-session fixture TestSharedPrefixBlockCount
+// exercises (sys=250 bytes, msg=100 bytes each request).
+func TestComputePerSessionCachedChars(t *testing.T) {
+	path := writeReplayV3File(t, syntheticSessionsForBoundaryTests())
+	counts, err := computeBlockSessionCounts(path, nil, 0)
+	if err != nil {
+		t.Fatalf("computeBlockSessionCounts: %v", err)
+	}
+
+	got, err := computePerSessionCachedChars(path, nil, 0, counts)
+	if err != nil {
+		t.Fatalf("computePerSessionCachedChars: %v", err)
+	}
+	// s0,s1: boundary=1 (only the shared sys1 block) -> chars = msg bytes (100).
+	// s2: boundary=0 (nothing shared) -> chars = sys(250) + msg(100) = 350.
+	// s3,s4: boundary=2 (both blocks shared, full prefix) -> chars = 0.
+	want := []int{100, 100, 350, 0, 0}
+	if len(got) != len(want) {
+		t.Fatalf("computePerSessionCachedChars len = %d, want %d (got %v)", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("session %d: chars = %d, want %d", i, got[i], w)
+		}
+	}
+}
+
 // TestBuildSessionUUIDsDeterminism verifies buildSessionUUIDs matches the
 // dataset path's determinism contract: same seed -> same per-session UUID
-// assignment; different seed -> different assignment; every UUID unique.
+// assignment; different seed -> different assignment; every UUID unique
+// across the whole run (not just within a session).
 func TestBuildSessionUUIDsDeterminism(t *testing.T) {
-	a := buildSessionUUIDs(5, 42)
-	b := buildSessionUUIDs(5, 42)
+	perSessionChars := []int{0, 0, 0, 0, 0} // all -> computeStampsPerSeries floors to 2
+	a := buildSessionUUIDs(perSessionChars, 42)
+	b := buildSessionUUIDs(perSessionChars, 42)
 	if len(a) != 5 || len(b) != 5 {
 		t.Fatalf("expected 5 sets each, got %d and %d", len(a), len(b))
 	}
 	for i := range a {
-		if len(a[i]) != 1 || len(b[i]) != 1 {
-			t.Fatalf("session %d: expected singleton sets, got %v / %v", i, a[i], b[i])
+		if len(a[i]) != 2 || len(b[i]) != 2 {
+			t.Fatalf("session %d: expected 2-UUID sets (min floor), got %v / %v", i, a[i], b[i])
 		}
-		if a[i][0] != b[i][0] {
-			t.Errorf("session %d: same seed produced different UUIDs: %q vs %q", i, a[i][0], b[i][0])
+		for j := range a[i] {
+			if a[i][j] != b[i][j] {
+				t.Errorf("session %d stamp %d: same seed produced different UUIDs: %q vs %q", i, j, a[i][j], b[i][j])
+			}
 		}
 	}
 
-	c := buildSessionUUIDs(5, 43)
+	c := buildSessionUUIDs(perSessionChars, 43)
 	same := true
 	for i := range a {
 		if a[i][0] != c[i][0] {
@@ -210,22 +244,45 @@ func TestBuildSessionUUIDsDeterminism(t *testing.T) {
 
 	seen := map[string]bool{}
 	for _, set := range a {
-		if seen[set[0]] {
-			t.Errorf("uuid %q assigned to more than one session", set[0])
+		for _, u := range set {
+			if seen[u] {
+				t.Errorf("uuid %q assigned to more than one stamp", u)
+			}
+			seen[u] = true
 		}
-		seen[set[0]] = true
 	}
 
-	if got := buildSessionUUIDs(0, 42); got != nil {
-		t.Errorf("buildSessionUUIDs(0, ...) = %v, want nil", got)
+	if got := buildSessionUUIDs(nil, 42); got != nil {
+		t.Errorf("buildSessionUUIDs(nil, ...) = %v, want nil", got)
 	}
 }
 
-// TestWireInjectionDeterminism verifies that, for a fixed session's marker,
-// buildOpenAIChatCompletionsBody / buildAnthropicMessagesBody produce
+// TestBuildSessionUUIDsScalesWithBytes verifies each session's N is exactly
+// computeStampsPerSeries(perSessionChars[i]) -- min 2, scaling with bytes --
+// mirroring the cache-coherency eval's garbageChars -> numStamps rule.
+func TestBuildSessionUUIDsScalesWithBytes(t *testing.T) {
+	perSessionChars := []int{0, 8192 * 5, 8192*10 + 100}
+	sets := buildSessionUUIDs(perSessionChars, 7)
+	want := []int{2, 5, 10}
+	for i, w := range want {
+		if got := len(sets[i]); got != w {
+			t.Errorf("session %d: len = %d, want %d (computeStampsPerSeries(%d))", i, got, w, perSessionChars[i])
+		}
+	}
+	for _, chars := range []int{0, 1, 8192, 8192 * 3, 100000} {
+		got := len(buildSessionUUIDs([]int{chars}, 1)[0])
+		want := computeStampsPerSeries(chars)
+		if got != want {
+			t.Errorf("chars=%d: N = %d, want %d (computeStampsPerSeries)", chars, got, want)
+		}
+	}
+}
+
+// TestWireInjectionDeterminism verifies that, for a fixed session's N-UUID
+// block, buildOpenAIChatCompletionsBody / buildAnthropicMessagesBody produce
 // byte-identical bodies across repeated calls (same request + same
-// injection in -> same bytes out), and that two DIFFERENT sessions' markers
-// diverge the body.
+// injection in -> same bytes out), and that two DIFFERENT sessions' UUID
+// blocks diverge the body.
 func TestWireInjectionDeterminism(t *testing.T) {
 	docs := strings.Repeat("wire-injection-docs ", 100)
 	req := RouterReplayRequest{
@@ -233,10 +290,10 @@ func TestWireInjectionDeterminism(t *testing.T) {
 		SystemBlocks: []RouterReplaySystemBlock{{Hash: "sys1", Bytes: 250}},
 		Messages:     []RouterReplayMessage{{Hash: "msgUniq0", Role: "user", BlockTypes: []string{"text"}, Bytes: 100}},
 	}
-	sets := buildSessionUUIDs(2, 7)
-	injA := &uuidInjection{Marker: injectUUIDMarker("", sets[0]), Recite: true, SharedPrefixLen: 1}
-	injA2 := &uuidInjection{Marker: injectUUIDMarker("", sets[0]), Recite: true, SharedPrefixLen: 1}
-	injB := &uuidInjection{Marker: injectUUIDMarker("", sets[1]), Recite: true, SharedPrefixLen: 1}
+	sets := buildSessionUUIDs([]int{0, 0}, 7)
+	injA := &uuidInjection{UUIDs: sets[0], Recite: true, SharedPrefixLen: 1}
+	injA2 := &uuidInjection{UUIDs: sets[0], Recite: true, SharedPrefixLen: 1}
+	injB := &uuidInjection{UUIDs: sets[1], Recite: true, SharedPrefixLen: 1}
 
 	for _, kind := range []string{"openai", "anthropic"} {
 		build := func(r RouterReplayRequest, inj *uuidInjection) []byte {
@@ -260,22 +317,94 @@ func TestWireInjectionDeterminism(t *testing.T) {
 			t.Errorf("%s: identical injection produced different bytes", kind)
 		}
 		if string(bodyA1) == string(bodyB) {
-			t.Errorf("%s: different sessions' markers produced identical bytes", kind)
+			t.Errorf("%s: different sessions' UUID blocks produced identical bytes", kind)
 		}
-		if !strings.Contains(string(bodyA1), sets[0][0]) {
-			t.Errorf("%s: body missing session A's own UUID", kind)
+		for _, u := range sets[0] {
+			if !strings.Contains(string(bodyA1), u) {
+				t.Errorf("%s: body missing session A's own UUID %q", kind, u)
+			}
 		}
-		if strings.Contains(string(bodyA1), sets[1][0]) {
-			t.Errorf("%s: body A leaked session B's UUID into the wire body", kind)
+		for _, u := range sets[1] {
+			if strings.Contains(string(bodyA1), u) {
+				t.Errorf("%s: body A leaked session B's UUID %q into the wire body", kind, u)
+			}
 		}
+		if strings.Contains(string(bodyA1), "ref-id") {
+			t.Errorf("%s: injected block still carries the old [ref-id: ...] wrapper", kind)
+		}
+	}
+}
+
+// TestBoundaryInjectionEmitsBareSpaceSeparatedUUIDs verifies the injected
+// block is exactly N bare, space-separated UUIDs (no wrapper text) —
+// mirroring the cache-coherency eval's buildCoherencySharedSeriesPrompt tail
+// — and that it is byte-identical across two DIFFERENT requests belonging
+// to the SAME session (the within-session cache-reuse property), while the
+// cross-session-shared leading system block stays untouched.
+func TestBoundaryInjectionEmitsBareSpaceSeparatedUUIDs(t *testing.T) {
+	docs := strings.Repeat("boundary-multi-docs ", 100)
+	uuids := []string{"uuid-0", "uuid-1", "uuid-2"}
+	inj := &uuidInjection{UUIDs: uuids, Recite: false, SharedPrefixLen: 1}
+
+	req1 := RouterReplayRequest{
+		InputTokens:  500,
+		SystemBlocks: []RouterReplaySystemBlock{{Hash: "sys1", Bytes: 250}},
+		Messages:     []RouterReplayMessage{{Hash: "msgTurn1", Role: "user", BlockTypes: []string{"text"}, Bytes: 100}},
+	}
+	req2 := RouterReplayRequest{
+		InputTokens:  500,
+		SystemBlocks: []RouterReplaySystemBlock{{Hash: "sys1", Bytes: 250}}, // same shared system block
+		Messages:     []RouterReplayMessage{{Hash: "msgTurn2", Role: "user", BlockTypes: []string{"text"}, Bytes: 140}},
+	}
+
+	body1, _, err := buildAnthropicMessagesBody(req1, docs, "model", "", 0, false, inj)
+	if err != nil {
+		t.Fatalf("build 1: %v", err)
+	}
+	body2, _, err := buildAnthropicMessagesBody(req2, docs, "model", "", 0, false, inj)
+	if err != nil {
+		t.Fatalf("build 2: %v", err)
+	}
+
+	var parsed1, parsed2 map[string]interface{}
+	if err := json.Unmarshal(body1, &parsed1); err != nil {
+		t.Fatalf("unmarshal 1: %v", err)
+	}
+	if err := json.Unmarshal(body2, &parsed2); err != nil {
+		t.Fatalf("unmarshal 2: %v", err)
+	}
+
+	sys1, _ := parsed1["system"].([]interface{})
+	sys2, _ := parsed2["system"].([]interface{})
+	if len(sys1) != 2 || len(sys2) != 2 {
+		t.Fatalf("expected system = [shared block, uuid block], got lens %d and %d", len(sys1), len(sys2))
+	}
+
+	wantText := "uuid-0 uuid-1 uuid-2"
+	block1 := sys1[1].(map[string]interface{})
+	block2 := sys2[1].(map[string]interface{})
+	if block1["text"] != wantText {
+		t.Errorf("uuid block 1 text = %q, want %q (bare, space-separated)", block1["text"], wantText)
+	}
+	if block2["text"] != wantText {
+		t.Errorf("uuid block diverged across two requests in the SAME session: %v vs %v", block2["text"], wantText)
+	}
+
+	// The shared leading system block (index 0) must stay byte-identical —
+	// injection must never perturb the cross-session-shared prefix.
+	shared1, _ := json.Marshal(sys1[0])
+	shared2, _ := json.Marshal(sys2[0])
+	if string(shared1) != string(shared2) {
+		t.Errorf("shared leading system block diverged across requests: %s vs %s", shared1, shared2)
 	}
 }
 
 // TestCacheFidelityBoundaryInvariant verifies the core Option-C guarantee:
 // two DIFFERENT sessions that share a leading system block emit
 // byte-identical content for that shared block, diverging only at (or
-// after) the injected per-session marker — i.e. injection never perturbs
-// the cross-session-shared prefix a real server would prefix-cache on.
+// after) the injected per-session UUID block — i.e. injection never
+// perturbs the cross-session-shared prefix a real server would
+// prefix-cache on.
 func TestCacheFidelityBoundaryInvariant(t *testing.T) {
 	docs := strings.Repeat("fidelity-docs ", 100)
 	reqA := RouterReplayRequest{
@@ -288,8 +417,8 @@ func TestCacheFidelityBoundaryInvariant(t *testing.T) {
 		SystemBlocks: []RouterReplaySystemBlock{{Hash: "sys1", Bytes: 250}}, // SAME shared system block
 		Messages:     []RouterReplayMessage{{Hash: "msgUniq-B", Role: "user", BlockTypes: []string{"text"}, Bytes: 100}},
 	}
-	injA := &uuidInjection{Marker: injectUUIDMarker("", []string{"uuid-session-A"}), Recite: false, SharedPrefixLen: 1}
-	injB := &uuidInjection{Marker: injectUUIDMarker("", []string{"uuid-session-B"}), Recite: false, SharedPrefixLen: 1}
+	injA := &uuidInjection{UUIDs: []string{"uuid-session-A"}, Recite: false, SharedPrefixLen: 1}
+	injB := &uuidInjection{UUIDs: []string{"uuid-session-B"}, Recite: false, SharedPrefixLen: 1}
 
 	bodyA, _, err := buildAnthropicMessagesBody(reqA, docs, "model", "", 0, false, injA)
 	if err != nil {
@@ -311,7 +440,7 @@ func TestCacheFidelityBoundaryInvariant(t *testing.T) {
 	sysA, _ := parsedA["system"].([]interface{})
 	sysB, _ := parsedB["system"].([]interface{})
 	if len(sysA) != 2 || len(sysB) != 2 {
-		t.Fatalf("expected system = [shared block, marker], got lens %d and %d", len(sysA), len(sysB))
+		t.Fatalf("expected system = [shared block, uuid block], got lens %d and %d", len(sysA), len(sysB))
 	}
 	// Index 0 (the shared system block, "sys1") must be byte-identical.
 	sharedA, _ := json.Marshal(sysA[0])
@@ -319,22 +448,22 @@ func TestCacheFidelityBoundaryInvariant(t *testing.T) {
 	if string(sharedA) != string(sharedB) {
 		t.Errorf("shared leading system block diverged between sessions:\nA: %s\nB: %s", sharedA, sharedB)
 	}
-	// Index 1 (the injected marker) MUST diverge — that's the whole point.
-	markerA, _ := json.Marshal(sysA[1])
-	markerB, _ := json.Marshal(sysB[1])
-	if string(markerA) == string(markerB) {
-		t.Error("injected markers were identical across two different sessions")
+	// Index 1 (the injected uuid block) MUST diverge — that's the whole point.
+	blockA, _ := json.Marshal(sysA[1])
+	blockB, _ := json.Marshal(sysB[1])
+	if string(blockA) == string(blockB) {
+		t.Error("injected uuid blocks were identical across two different sessions")
 	}
-	if !strings.Contains(string(markerA), "uuid-session-A") {
-		t.Errorf("session A's marker missing its own uuid: %s", markerA)
+	if !strings.Contains(string(blockA), "uuid-session-A") {
+		t.Errorf("session A's block missing its own uuid: %s", blockA)
 	}
-	if !strings.Contains(string(markerB), "uuid-session-B") {
-		t.Errorf("session B's marker missing its own uuid: %s", markerB)
+	if !strings.Contains(string(blockB), "uuid-session-B") {
+		t.Errorf("session B's block missing its own uuid: %s", blockB)
 	}
 }
 
 // TestTailFallbackInjection verifies that when SharedPrefixLen == 0 (no
-// usable boundary), the marker is folded into the tail (messages array)
+// usable boundary), the UUID block is folded into the tail (messages array)
 // rather than the system array, and the request remains well-formed.
 func TestTailFallbackInjection(t *testing.T) {
 	docs := strings.Repeat("tail-fallback-docs ", 100)
@@ -343,7 +472,7 @@ func TestTailFallbackInjection(t *testing.T) {
 		SystemBlocks: []RouterReplaySystemBlock{{Hash: "sys-unique", Bytes: 250}},
 		Messages:     []RouterReplayMessage{{Hash: "msg-unique", Role: "user", BlockTypes: []string{"text"}, Bytes: 100}},
 	}
-	inj := &uuidInjection{Marker: injectUUIDMarker("", []string{"uuid-tail"}), Recite: true, SharedPrefixLen: 0}
+	inj := &uuidInjection{UUIDs: []string{"uuid-tail"}, Recite: true, SharedPrefixLen: 0}
 
 	body, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, inj)
 	if err != nil {
@@ -358,11 +487,11 @@ func TestTailFallbackInjection(t *testing.T) {
 		t.Fatalf("expected system to carry ONLY the original block (no boundary splice), got %d entries", len(sys))
 	}
 	if strings.Contains(string(body), "uuid-tail") == false {
-		t.Fatal("marker missing from body entirely")
+		t.Fatal("uuid block missing from body entirely")
 	}
 	msgs, _ := parsed["messages"].([]interface{})
 	if len(msgs) == 0 {
-		t.Fatal("expected messages to carry the tail-injected marker/recite content")
+		t.Fatal("expected messages to carry the tail-injected uuid block/recite content")
 	}
 	last := msgs[len(msgs)-1].(map[string]interface{})
 	if last["role"] != "user" {
@@ -370,19 +499,26 @@ func TestTailFallbackInjection(t *testing.T) {
 	}
 }
 
-// TestUUIDValidationEndToEnd exercises buildSessionUUIDs + injectUUIDMarker +
-// validateReplayResponse together, mirroring how replayPoster.do() wires
-// them: a response containing the OWN session's uuid scores found/no-leak;
-// a response containing ANOTHER session's uuid scores CROSS_CONTAMINATION
-// against the correct series index.
+// TestUUIDValidationEndToEnd exercises validateReplayResponse (presence +
+// cross-session leak) directly against N-stamp sessions (N=2), mirroring
+// how replayPoster.do() wires it: a response containing ALL of the OWN
+// session's uuids scores found/no-leak; a response containing ANOTHER
+// session's uuid scores CROSS_CONTAMINATION against the correct series
+// index; a response missing one of its own uuids scores a partial
+// PRESENCE_MISS. Semantics are unchanged from the single-uuid path — only
+// the stamp count (N) is now typically > 1.
 func TestUUIDValidationEndToEnd(t *testing.T) {
-	sets := buildSessionUUIDs(3, 123)
+	sets := [][]string{
+		{"uuid-s0-a", "uuid-s0-b"},
+		{"uuid-s1-a", "uuid-s1-b"},
+		{"uuid-s2-a", "uuid-s2-b"},
+	}
 
-	t.Run("own uuid present, no leak", func(t *testing.T) {
-		resp := "Sure, the ref-id I recall is " + sets[0][0] + ". Anyway, here's your answer."
+	t.Run("own uuids present, no leak", func(t *testing.T) {
+		resp := "Sure, the ids I recall are " + sets[0][0] + " and " + sets[0][1] + ". Anyway, here's your answer."
 		found, leaked := validateReplayResponse(resp, "", sets[0], 0, sets)
-		if len(found) != 1 || !found[0] {
-			t.Errorf("found = %v, want [true]", found)
+		if len(found) != 2 || !found[0] || !found[1] {
+			t.Errorf("found = %v, want [true true]", found)
 		}
 		if len(leaked) != 0 {
 			t.Errorf("leaked = %v, want none", leaked)
@@ -390,20 +526,31 @@ func TestUUIDValidationEndToEnd(t *testing.T) {
 	})
 
 	t.Run("cross contamination from another session", func(t *testing.T) {
-		resp := "SEEN_REF: " + sets[0][0] + " and also " + sets[2][0]
+		resp := sets[0][0] + ", " + sets[0][1] + ", and also " + sets[2][0]
 		found, leaked := validateReplayResponse(resp, "", sets[0], 0, sets)
-		if len(found) != 1 || !found[0] {
-			t.Errorf("found = %v, want [true]", found)
+		if len(found) != 2 || !found[0] || !found[1] {
+			t.Errorf("found = %v, want [true true]", found)
 		}
 		if len(leaked) != 1 || !strings.Contains(leaked[0], sets[2][0]) || !strings.Contains(leaked[0], "series=2") {
 			t.Errorf("leaked = %v, want one entry naming session 2's uuid", leaked)
 		}
 	})
 
-	t.Run("presence miss", func(t *testing.T) {
+	t.Run("partial presence miss", func(t *testing.T) {
+		resp := "only " + sets[1][0] + " here"
+		found, leaked := validateReplayResponse(resp, "", sets[1], 1, sets)
+		if len(found) != 2 || !found[0] || found[1] {
+			t.Errorf("found = %v, want [true false]", found)
+		}
+		if len(leaked) != 0 {
+			t.Errorf("leaked = %v, want none", leaked)
+		}
+	})
+
+	t.Run("total presence miss", func(t *testing.T) {
 		found, leaked := validateReplayResponse("no ref ids here", "", sets[1], 1, sets)
-		if found[0] {
-			t.Error("expected PRESENCE_MISS (found=false)")
+		if found[0] || found[1] {
+			t.Error("expected PRESENCE_MISS on both stamps (found=[false false])")
 		}
 		if len(leaked) != 0 {
 			t.Errorf("leaked = %v, want none", leaked)
@@ -411,27 +558,78 @@ func TestUUIDValidationEndToEnd(t *testing.T) {
 	})
 }
 
-// TestApplyReciteFloor verifies the max_tokens recite-floor helper: raises
-// a too-small budget to replayReciteFloorTokens only when recite is
-// requested; leaves larger budgets and non-recite calls untouched.
-func TestApplyReciteFloor(t *testing.T) {
+// TestFirstLineConformity exercises firstLineConformity (the output-
+// conformity check --replay-inject-uuids scores, mirroring the coherency
+// eval's matchesExpectedUUIDList/ExactMatch): pass on an exact ordered
+// comma-joined first line; fail on missing, reordered, or chatty first
+// lines; pass when line 1 is exact even though LATER lines contain filler
+// (the whole point of front-loading the ask to line 1 while forced-output
+// keeps generating).
+func TestFirstLineConformity(t *testing.T) {
+	expected := []string{"uuid-a", "uuid-b", "uuid-c"}
+
 	cases := []struct {
-		name   string
-		tokens int
-		recite bool
-		want   int
+		name string
+		resp string
+		want bool
 	}{
-		{"below floor, recite -> raised", 10, true, replayReciteFloorTokens},
-		{"at floor, recite -> unchanged", replayReciteFloorTokens, true, replayReciteFloorTokens},
-		{"above floor, recite -> unchanged", 1000, true, 1000},
-		{"below floor, no recite -> unchanged", 10, false, 10},
+		{"exact single line", "uuid-a, uuid-b, uuid-c", true},
+		{"exact with surrounding whitespace tolerated", "  uuid-a, uuid-b, uuid-c  ", true},
+		{"exact first line, filler after", "uuid-a, uuid-b, uuid-c\nHere is more detail about your request...", true},
+		{"exact first line, multiple filler lines after", "uuid-a, uuid-b, uuid-c\nline2\nline3 with more text", true},
+		{"missing a uuid", "uuid-a, uuid-c", false},
+		{"reordered", "uuid-b, uuid-a, uuid-c", false},
+		{"chatty first line", "Sure! The UUIDs are uuid-a, uuid-b, uuid-c", false},
+		{"uuids only on line 2, not line 1", "Sure, here you go:\nuuid-a, uuid-b, uuid-c", false},
+		{"empty response", "", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := applyReciteFloor(c.tokens, c.recite); got != c.want {
-				t.Errorf("applyReciteFloor(%d, %v) = %d, want %d", c.tokens, c.recite, got, c.want)
+			if got := firstLineConformity(c.resp, expected); got != c.want {
+				t.Errorf("firstLineConformity(%q) = %v, want %v", c.resp, got, c.want)
 			}
 		})
+	}
+}
+
+// TestApplyReciteFloor verifies the max_tokens recite-floor helper: raises
+// a too-small budget to replayReciteFloorTokens(numUUIDs) only when recite
+// is requested; leaves larger budgets and non-recite calls untouched.
+func TestApplyReciteFloor(t *testing.T) {
+	cases := []struct {
+		name     string
+		tokens   int
+		recite   bool
+		numUUIDs int
+	}{
+		{"below floor, recite -> raised", 5, true, 2},
+		{"at floor, recite -> unchanged", replayReciteFloorTokens(2), true, 2},
+		{"above floor, recite -> unchanged", 100000, true, 2},
+		{"below floor, no recite -> unchanged", 5, false, 2},
+		{"below floor, more uuids, recite -> raised higher", 5, true, 20},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			floor := replayReciteFloorTokens(c.numUUIDs)
+			want := c.tokens
+			if c.recite && c.tokens < floor {
+				want = floor
+			}
+			if got := applyReciteFloor(c.tokens, c.recite, c.numUUIDs); got != want {
+				t.Errorf("applyReciteFloor(%d, %v, %d) = %d, want %d", c.tokens, c.recite, c.numUUIDs, got, want)
+			}
+		})
+	}
+}
+
+// TestReciteFloorScalesWithN verifies the recite floor grows with numUUIDs —
+// more UUIDs to recite on the first line needs a bigger budget — the
+// N-per-session analogue of the old fixed-64-token constant.
+func TestReciteFloorScalesWithN(t *testing.T) {
+	small := replayReciteFloorTokens(2)
+	large := replayReciteFloorTokens(20)
+	if large <= small {
+		t.Errorf("replayReciteFloorTokens(20) = %d, want > replayReciteFloorTokens(2) = %d", large, small)
 	}
 }
 
@@ -447,7 +645,9 @@ func TestMaxTokensFloorAppliedInWireBuilders(t *testing.T) {
 		SystemBlocks: []RouterReplaySystemBlock{{Hash: "sys1", Bytes: 250}},
 		Messages:     []RouterReplayMessage{{Hash: "msg1", Role: "user", BlockTypes: []string{"text"}, Bytes: 100}},
 	}
-	inj := &uuidInjection{Marker: injectUUIDMarker("", []string{"uuid-floor"}), Recite: true, SharedPrefixLen: 1}
+	uuids := []string{"uuid-floor-0", "uuid-floor-1"}
+	inj := &uuidInjection{UUIDs: uuids, Recite: true, SharedPrefixLen: 1}
+	wantFloor := float64(replayReciteFloorTokens(len(uuids)))
 
 	anthBody, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, inj)
 	if err != nil {
@@ -457,8 +657,8 @@ func TestMaxTokensFloorAppliedInWireBuilders(t *testing.T) {
 	if err := json.Unmarshal(anthBody, &anthParsed); err != nil {
 		t.Fatalf("anthropic unmarshal: %v", err)
 	}
-	if got, want := anthParsed["max_tokens"].(float64), float64(replayReciteFloorTokens); got != want {
-		t.Errorf("anthropic max_tokens = %v, want %v (floor)", got, want)
+	if got := anthParsed["max_tokens"].(float64); got != wantFloor {
+		t.Errorf("anthropic max_tokens = %v, want %v (floor)", got, wantFloor)
 	}
 
 	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, inj)
@@ -469,8 +669,8 @@ func TestMaxTokensFloorAppliedInWireBuilders(t *testing.T) {
 	if err := json.Unmarshal(openaiBody, &openaiParsed); err != nil {
 		t.Fatalf("openai unmarshal: %v", err)
 	}
-	if got, want := openaiParsed["max_tokens"].(float64), float64(replayReciteFloorTokens); got != want {
-		t.Errorf("openai max_tokens = %v, want %v (floor)", got, want)
+	if got := openaiParsed["max_tokens"].(float64); got != wantFloor {
+		t.Errorf("openai max_tokens = %v, want %v (floor)", got, wantFloor)
 	}
 
 	// Without injection (nil), the tiny recorded output_tokens is honored

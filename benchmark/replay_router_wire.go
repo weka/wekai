@@ -46,9 +46,13 @@ const verboseOutputInstruction = "Provide a thorough, detailed response and keep
 // router path — see replay_router_uuid.go); nil means "no injection",
 // leaving the body byte-for-byte identical to before this feature existed.
 func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool, inj *uuidInjection) ([]byte, string, error) {
+	injNumUUIDs := 0
+	if inj != nil {
+		injNumUUIDs = len(inj.UUIDs)
+	}
 	body := map[string]interface{}{
 		"model":      modelName,
-		"max_tokens": applyReciteFloor(pickMaxTokens(req, outputRatio), inj != nil && inj.Recite),
+		"max_tokens": applyReciteFloor(pickMaxTokens(req, outputRatio), inj != nil && inj.Recite, injNumUUIDs),
 		"stream":     req.Stream,
 	}
 	if req.Temperature != nil {
@@ -76,19 +80,23 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 		systemArr = append([]map[string]interface{}{stamp}, systemArr...)
 	}
 
-	// UUID marker injection at the system/conversation boundary (Option C —
+	// UUID block injection at the system/conversation boundary (Option C —
 	// see replay_router_uuid.go). Only spliced in here when the leading run
 	// of cross-session-shared blocks covers every emitted system block;
 	// otherwise it falls back to tail injection below, alongside the
 	// messages array, so it never lands ahead of genuinely per-session
 	// system content (which would poison that session's OWN cache key,
 	// not just cross-session sharing).
-	markerAtBoundary := inj != nil && inj.Marker != "" &&
+	injUUIDText := ""
+	if inj != nil {
+		injUUIDText = bareUUIDBlock(inj.UUIDs)
+	}
+	markerAtBoundary := inj != nil && injUUIDText != "" &&
 		inj.SharedPrefixLen > 0 && inj.SharedPrefixLen >= len(effectiveSystemBlocks(req.SystemBlocks))
 	if markerAtBoundary {
 		systemArr = append(systemArr, map[string]interface{}{
 			"type": "text",
-			"text": inj.Marker,
+			"text": injUUIDText,
 		})
 	}
 	if forceOutput {
@@ -108,11 +116,11 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 		msgs = buildMessages(req.Messages, docs)
 	}
 	if inj != nil {
-		if !markerAtBoundary && inj.Marker != "" {
-			msgs = appendTailMessageAnthropic(msgs, inj.Marker)
+		if !markerAtBoundary && injUUIDText != "" {
+			msgs = appendTailMessageAnthropic(msgs, injUUIDText)
 		}
 		if inj.Recite {
-			msgs = appendTailMessageAnthropic(msgs, replayReciteFromContextInstruction())
+			msgs = appendTailMessageAnthropic(msgs, replayReciteFirstLineInstruction())
 		}
 	}
 	if len(msgs) > 0 {
@@ -128,7 +136,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 		canonical.WriteString(synthText(b.Hash, b.Bytes, docs))
 	}
 	if markerAtBoundary {
-		canonical.WriteString(inj.Marker)
+		canonical.WriteString(injUUIDText)
 	}
 	if req.Tools != nil && req.Tools.Count > 0 {
 		n := req.Tools.Count
@@ -168,11 +176,11 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 		}
 	}
 	if inj != nil {
-		if !markerAtBoundary && inj.Marker != "" {
-			canonical.WriteString(inj.Marker)
+		if !markerAtBoundary && injUUIDText != "" {
+			canonical.WriteString(injUUIDText)
 		}
 		if inj.Recite {
-			canonical.WriteString(replayReciteFromContextInstruction())
+			canonical.WriteString(replayReciteFirstLineInstruction())
 		}
 	}
 
@@ -541,9 +549,13 @@ func buildOpenAITools(spec *RouterReplayToolsSpec, docs string) []map[string]int
 // inj carries the UUID cache-coherency injection (--replay-inject-uuids,
 // router path — see replay_router_uuid.go); nil means "no injection".
 func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool, inj *uuidInjection) ([]byte, string, error) {
+	injNumUUIDs := 0
+	if inj != nil {
+		injNumUUIDs = len(inj.UUIDs)
+	}
 	body := map[string]interface{}{
 		"model":      modelName,
-		"max_tokens": applyReciteFloor(pickMaxTokens(req, outputRatio), inj != nil && inj.Recite),
+		"max_tokens": applyReciteFloor(pickMaxTokens(req, outputRatio), inj != nil && inj.Recite, injNumUUIDs),
 		"stream":     req.Stream,
 	}
 	if req.Temperature != nil {
@@ -583,17 +595,21 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		messages = append([]map[string]interface{}{stamp}, messages...)
 	}
 
-	// UUID marker injection at the system/conversation boundary (Option C —
+	// UUID block injection at the system/conversation boundary (Option C —
 	// see replay_router_uuid.go and the mirrored comment in
 	// buildAnthropicMessagesBody). Only spliced in here when the leading
 	// run of cross-session-shared blocks covers every emitted system
 	// block; otherwise it falls back to tail injection below.
-	markerAtBoundary := inj != nil && inj.Marker != "" &&
+	injUUIDText := ""
+	if inj != nil {
+		injUUIDText = bareUUIDBlock(inj.UUIDs)
+	}
+	markerAtBoundary := inj != nil && injUUIDText != "" &&
 		inj.SharedPrefixLen > 0 && inj.SharedPrefixLen >= len(effectiveSystemBlocks(req.SystemBlocks))
 	if markerAtBoundary {
 		messages = append(messages, map[string]interface{}{
 			"role":    "system",
-			"content": inj.Marker,
+			"content": injUUIDText,
 		})
 	}
 	if forceOutput {
@@ -623,11 +639,11 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 	}
 
 	if inj != nil {
-		if !markerAtBoundary && inj.Marker != "" {
-			messages = appendTailMessageOpenAI(messages, inj.Marker)
+		if !markerAtBoundary && injUUIDText != "" {
+			messages = appendTailMessageOpenAI(messages, injUUIDText)
 		}
 		if inj.Recite {
-			messages = appendTailMessageOpenAI(messages, replayReciteFromContextInstruction())
+			messages = appendTailMessageOpenAI(messages, replayReciteFirstLineInstruction())
 		}
 	}
 
@@ -645,7 +661,7 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		canonical.WriteString(synthText(b.Hash, b.Bytes, docs))
 	}
 	if markerAtBoundary {
-		canonical.WriteString(inj.Marker)
+		canonical.WriteString(injUUIDText)
 	}
 	for _, m := range req.Messages {
 		blocks := buildMessageContent(m, docs)
@@ -662,11 +678,11 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		}
 	}
 	if inj != nil {
-		if !markerAtBoundary && inj.Marker != "" {
-			canonical.WriteString(inj.Marker)
+		if !markerAtBoundary && injUUIDText != "" {
+			canonical.WriteString(injUUIDText)
 		}
 		if inj.Recite {
-			canonical.WriteString(replayReciteFromContextInstruction())
+			canonical.WriteString(replayReciteFirstLineInstruction())
 		}
 	}
 
