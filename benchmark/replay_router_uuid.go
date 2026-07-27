@@ -71,8 +71,12 @@ type uuidInjection struct {
 	// SharedPrefixLen is this request's leading run of cross-session-shared
 	// prefix blocks (see sharedPrefixBlockCount). It tells the wire builder
 	// whether the UUID block can be spliced in at the natural system/
-	// message boundary (SharedPrefixLen covers every emitted system block)
-	// or must fall back to tail injection (SharedPrefixLen == 0).
+	// message boundary (SharedPrefixLen > 0 and does NOT extend past the
+	// emitted system blocks — i.e. the first tool/message block is not
+	// itself part of the shared run) or must fall back to tail injection
+	// (SharedPrefixLen == 0, or the shared run extends into tools/messages,
+	// in which case boundary-splicing would poison THEIR cross-session
+	// cache key too).
 	SharedPrefixLen int
 }
 
@@ -328,8 +332,10 @@ func computePerSessionCachedChars(path string, allowed map[int]bool, sessionLimi
 // This is the offline analogue of "how much of this request's prefix is
 // safe to leave byte-identical" — the wire builder uses it to decide
 // whether the UUID marker can be spliced in at the natural boundary
-// (SharedPrefixLen covers every system block) or must fall back to tail
-// injection.
+// (SharedPrefixLen > 0 and does not extend past the system blocks) or must
+// fall back to tail injection (SharedPrefixLen == 0, or it extends into
+// tools/messages, which would otherwise poison their cross-session cache
+// key too).
 func sharedPrefixBlockCount(req RouterReplayRequest, counts map[string]int) int {
 	hashes, _ := BuildReplayRequestPrefix(req)
 	n := 0

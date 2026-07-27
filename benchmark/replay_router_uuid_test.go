@@ -6,6 +6,7 @@ package benchmark
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -460,6 +461,129 @@ func TestCacheFidelityBoundaryInvariant(t *testing.T) {
 	if !strings.Contains(string(blockB), "uuid-session-B") {
 		t.Errorf("session B's block missing its own uuid: %s", blockB)
 	}
+}
+
+// TestCacheFidelityBoundaryDoesNotExtendPastSystemBlocks covers the M1 fix:
+// SharedPrefixLen counts the leading run of cross-session-shared blocks over
+// the FULL cache order (system blocks, then tools, then messages — see
+// BuildReplayRequestPrefix). When that shared run extends PAST the system
+// blocks into shared tools (or a shared leading message), splicing the
+// per-session UUID marker at the system/tools boundary would land it ahead
+// of the shared tools, making them diverge per session on the wire and
+// losing their cross-session prefix-cache hit — even though the tools
+// themselves stay byte-identical. The fix requires SharedPrefixLen <=
+// len(effectiveSystemBlocks(...)) for boundary splicing; when it's greater
+// (shared run reaches into tools), injection must fall back to the tail
+// instead. Exercises both the Anthropic and OpenAI builders.
+func TestCacheFidelityBoundaryDoesNotExtendPastSystemBlocks(t *testing.T) {
+	docs := strings.Repeat("shared-tools-docs ", 100)
+
+	// Two sessions share BOTH the leading system block (index 0) AND the
+	// tools block (index 1) — SharedPrefixLen=2 — but diverge starting at
+	// their own message. len(effectiveSystemBlocks(...)) is only 1, so the
+	// shared run extends past the system blocks into tools.
+	sharedTools := &RouterReplayToolsSpec{Count: 2, Bytes: 300, Hash: "toolshash"}
+	reqA := RouterReplayRequest{
+		InputTokens:  500,
+		SystemBlocks: []RouterReplaySystemBlock{{Hash: "sys1", Bytes: 250}},
+		Tools:        sharedTools,
+		Messages:     []RouterReplayMessage{{Hash: "msgUniq-A", Role: "user", BlockTypes: []string{"text"}, Bytes: 100}},
+	}
+	reqB := RouterReplayRequest{
+		InputTokens:  500,
+		SystemBlocks: []RouterReplaySystemBlock{{Hash: "sys1", Bytes: 250}}, // same shared system block
+		Tools:        sharedTools,                                          // same shared tools
+		Messages:     []RouterReplayMessage{{Hash: "msgUniq-B", Role: "user", BlockTypes: []string{"text"}, Bytes: 100}},
+	}
+	injA := &uuidInjection{UUIDs: []string{"uuid-session-A"}, Recite: false, SharedPrefixLen: 2}
+	injB := &uuidInjection{UUIDs: []string{"uuid-session-B"}, Recite: false, SharedPrefixLen: 2}
+
+	t.Run("anthropic", func(t *testing.T) {
+		bodyA, _, err := buildAnthropicMessagesBody(reqA, docs, "model", "", 0, false, injA)
+		if err != nil {
+			t.Fatalf("build A: %v", err)
+		}
+		bodyB, _, err := buildAnthropicMessagesBody(reqB, docs, "model", "", 0, false, injB)
+		if err != nil {
+			t.Fatalf("build B: %v", err)
+		}
+		var parsedA, parsedB map[string]interface{}
+		if err := json.Unmarshal(bodyA, &parsedA); err != nil {
+			t.Fatalf("unmarshal A: %v", err)
+		}
+		if err := json.Unmarshal(bodyB, &parsedB); err != nil {
+			t.Fatalf("unmarshal B: %v", err)
+		}
+
+		// The marker must NOT be spliced into the system array — it must
+		// carry ONLY the original shared block.
+		sysA, _ := parsedA["system"].([]interface{})
+		sysB, _ := parsedB["system"].([]interface{})
+		if len(sysA) != 1 || len(sysB) != 1 {
+			t.Fatalf("expected system to carry ONLY the original shared block (no boundary splice), got lens %d and %d", len(sysA), len(sysB))
+		}
+
+		// The shared tools array must stay byte-identical across sessions —
+		// nothing per-session was spliced ahead of it.
+		toolsA, _ := json.Marshal(parsedA["tools"])
+		toolsB, _ := json.Marshal(parsedB["tools"])
+		if string(toolsA) != string(toolsB) {
+			t.Errorf("shared tools diverged between sessions:\nA: %s\nB: %s", toolsA, toolsB)
+		}
+
+		// The UUID marker must have landed in the tail (messages) instead.
+		if !strings.Contains(string(bodyA), "uuid-session-A") {
+			t.Error("session A's uuid missing from the body entirely — expected tail injection")
+		}
+		msgsA, _ := parsedA["messages"].([]interface{})
+		if len(msgsA) == 0 {
+			t.Fatal("expected messages to carry the tail-injected uuid block")
+		}
+		lastA := msgsA[len(msgsA)-1].(map[string]interface{})
+		if !strings.Contains(fmt.Sprintf("%v", lastA["content"]), "uuid-session-A") {
+			t.Errorf("uuid marker not found in the tail message: %v", lastA["content"])
+		}
+	})
+
+	t.Run("openai", func(t *testing.T) {
+		bodyA, _, err := buildOpenAIChatCompletionsBody(reqA, docs, "model", "", 0, false, injA)
+		if err != nil {
+			t.Fatalf("build A: %v", err)
+		}
+		bodyB, _, err := buildOpenAIChatCompletionsBody(reqB, docs, "model", "", 0, false, injB)
+		if err != nil {
+			t.Fatalf("build B: %v", err)
+		}
+		var parsedA, parsedB map[string]interface{}
+		if err := json.Unmarshal(bodyA, &parsedA); err != nil {
+			t.Fatalf("unmarshal A: %v", err)
+		}
+		if err := json.Unmarshal(bodyB, &parsedB); err != nil {
+			t.Fatalf("unmarshal B: %v", err)
+		}
+
+		// The shared tools array must stay byte-identical across sessions.
+		toolsA, _ := json.Marshal(parsedA["tools"])
+		toolsB, _ := json.Marshal(parsedB["tools"])
+		if string(toolsA) != string(toolsB) {
+			t.Errorf("shared tools diverged between sessions:\nA: %s\nB: %s", toolsA, toolsB)
+		}
+
+		// No system-role message besides the original system block should
+		// carry the uuid marker (i.e. it must not be boundary-spliced as an
+		// extra system message).
+		messagesA, _ := parsedA["messages"].([]interface{})
+		for _, raw := range messagesA {
+			msg, _ := raw.(map[string]interface{})
+			if msg["role"] == "system" && strings.Contains(fmt.Sprintf("%v", msg["content"]), "uuid-session-A") {
+				t.Errorf("uuid marker was boundary-spliced into a system message: %v", msg)
+			}
+		}
+		// It must still appear somewhere in the body (tail injection).
+		if !strings.Contains(string(bodyA), "uuid-session-A") {
+			t.Error("session A's uuid missing from the body entirely — expected tail injection")
+		}
+	})
 }
 
 // TestTailFallbackInjection verifies that when SharedPrefixLen == 0 (no

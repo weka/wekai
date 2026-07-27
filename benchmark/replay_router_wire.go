@@ -82,17 +82,20 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 
 	// UUID block injection at the system/conversation boundary (Option C —
 	// see replay_router_uuid.go). Only spliced in here when the leading run
-	// of cross-session-shared blocks covers every emitted system block;
-	// otherwise it falls back to tail injection below, alongside the
-	// messages array, so it never lands ahead of genuinely per-session
-	// system content (which would poison that session's OWN cache key,
-	// not just cross-session sharing).
+	// of cross-session-shared blocks does NOT extend past the emitted
+	// system blocks — i.e. the first tool/message block is not itself part
+	// of the shared run; otherwise splicing the per-session marker here
+	// would land it ahead of shared tools/messages and poison THEIR
+	// cross-session cache key too, not just add a per-session block after
+	// genuinely-shared content. When the shared run does extend into
+	// tools/messages, fall back to tail injection below instead, so the
+	// marker never lands ahead of content this session shares with others.
 	injUUIDText := ""
 	if inj != nil {
 		injUUIDText = bareUUIDBlock(inj.UUIDs)
 	}
 	markerAtBoundary := inj != nil && injUUIDText != "" &&
-		inj.SharedPrefixLen > 0 && inj.SharedPrefixLen >= len(effectiveSystemBlocks(req.SystemBlocks))
+		inj.SharedPrefixLen > 0 && inj.SharedPrefixLen <= len(effectiveSystemBlocks(req.SystemBlocks))
 	if markerAtBoundary {
 		systemArr = append(systemArr, map[string]interface{}{
 			"type": "text",
@@ -598,14 +601,16 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 	// UUID block injection at the system/conversation boundary (Option C —
 	// see replay_router_uuid.go and the mirrored comment in
 	// buildAnthropicMessagesBody). Only spliced in here when the leading
-	// run of cross-session-shared blocks covers every emitted system
-	// block; otherwise it falls back to tail injection below.
+	// run of cross-session-shared blocks does NOT extend past the emitted
+	// system blocks; otherwise it falls back to tail injection below, so it
+	// never lands ahead of shared tools/messages and poisons their
+	// cross-session cache key too.
 	injUUIDText := ""
 	if inj != nil {
 		injUUIDText = bareUUIDBlock(inj.UUIDs)
 	}
 	markerAtBoundary := inj != nil && injUUIDText != "" &&
-		inj.SharedPrefixLen > 0 && inj.SharedPrefixLen >= len(effectiveSystemBlocks(req.SystemBlocks))
+		inj.SharedPrefixLen > 0 && inj.SharedPrefixLen <= len(effectiveSystemBlocks(req.SystemBlocks))
 	if markerAtBoundary {
 		messages = append(messages, map[string]interface{}{
 			"role":    "system",
