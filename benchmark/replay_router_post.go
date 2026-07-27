@@ -436,7 +436,16 @@ func (p *replayPoster) do(
 	// via validateReplayResponse) and output CONFORMITY (the FIRST LINE of
 	// the response is exactly the ordered, comma-joined UUID list — see
 	// firstLineConformity/matchesExpectedUUIDList).
-	if inj != nil && m.Error == nil && !m.IsEmpty {
+	//
+	// Gated on inj.Recite, NOT just inj != nil: buildInjection returns a
+	// non-nil *uuidInjection on EVERY request once the feature is on (it
+	// always carries the UUID block, so the stamp stays warm in KV across a
+	// session's turns — see the package doc in replay_router_uuid.go), but
+	// only inj.Recite (reciteEveryRequest || isLastRequest) says the model
+	// was actually ASKED to recite this turn. Scoring a non-recite turn
+	// would count "the model didn't volunteer the UUID list" as a
+	// PRESENCE_MISS/conformity failure even though nothing asked it to.
+	if inj != nil && inj.Recite && m.Error == nil && !m.IsEmpty {
 		m.ConvIdx = p.sessionIdx
 		m.ExpectedUUIDs = append([]string(nil), p.allUUIDSets[p.sessionIdx]...)
 		m.UUIDFound, m.LeakedUUIDs = validateReplayResponse(m.Response, "", m.ExpectedUUIDs, p.sessionIdx, p.allUUIDSets)
@@ -654,6 +663,12 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 }
 
 // consumeOpenAIPlain reads a non-streaming OpenAI chat/completions response.
+// Like consumeOpenAISSE, this merges message.reasoning_content (or
+// message.reasoning, the vLLM field name) into m.Response ahead of
+// message.content — a non-streaming reasoning-model response carries its
+// full reasoning text on the message object rather than as incremental
+// deltas, and skipping it here would make a UUID recited/leaked only in the
+// reasoning channel invisible to the presence/leak scan.
 func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	b, err := io.ReadAll(body)
 	if err != nil {
@@ -664,7 +679,9 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 	var resp struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				Reasoning        string `json:"reasoning"` // vLLM uses "reasoning"
 			} `json:"message"`
 		} `json:"choices"`
 		Usage struct {
@@ -681,7 +698,12 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 		return
 	}
 	if len(resp.Choices) > 0 {
-		m.Response = resp.Choices[0].Message.Content
+		msg := resp.Choices[0].Message
+		reasoning := msg.ReasoningContent
+		if reasoning == "" {
+			reasoning = msg.Reasoning
+		}
+		m.Response = reasoning + msg.Content
 	}
 	cached := 0
 	if resp.Usage.PromptTokensDetails != nil {
@@ -690,7 +712,12 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 	m.UsageData = buildReplayUsage(resp.Usage.PromptTokens, cached, resp.Usage.CompletionTokens)
 }
 
-// consumePlain reads a non-streaming Anthropic response.
+// consumePlain reads a non-streaming Anthropic response. Like consumeSSE,
+// this merges "thinking" content blocks into m.Response alongside "text"
+// blocks — a non-streaming extended-thinking response carries its thinking
+// block(s) as ordinary entries in the content array (field "thinking", not
+// "text"), and skipping them here would make a UUID recited/leaked only in
+// the thinking channel invisible to the presence/leak scan.
 func consumePlain(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	b, err := io.ReadAll(body)
 	if err != nil {
@@ -700,8 +727,9 @@ func consumePlain(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	m.TimeToFirstToken = time.Since(startTime)
 	var resp struct {
 		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			Thinking string `json:"thinking"`
 		} `json:"content"`
 		StopReason string `json:"stop_reason"`
 		Usage      struct {
@@ -717,8 +745,11 @@ func consumePlain(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	}
 	var sb strings.Builder
 	for _, c := range resp.Content {
-		if c.Type == "text" {
+		switch c.Type {
+		case "text":
 			sb.WriteString(c.Text)
+		case "thinking":
+			sb.WriteString(c.Thinking)
 		}
 	}
 	m.Response = sb.String()

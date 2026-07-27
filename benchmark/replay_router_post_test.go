@@ -750,3 +750,150 @@ func TestOpenAISSEWithoutUsage(t *testing.T) {
 		t.Errorf("response = %q, want %q", metrics.Response, "ok")
 	}
 }
+
+// TestUUIDScoringGatedOnRecite covers the H1 fix: buildInjection returns a
+// non-nil *uuidInjection on EVERY request once UUID injection is on (see
+// its doc comment), but only inj.Recite says the model was actually ASKED
+// to recite this turn. With --replay-recite-every-request=false, a
+// non-final request must still get the UUID block injected (so it stays
+// warm in KV — see replay_router_uuid.go's package doc) but must NOT be
+// scored: scoring it would count "the model didn't volunteer the UUID
+// list" as a false PRESENCE_MISS/conformity failure even though nothing
+// asked it to. This drives the poster through p.do() end-to-end (real HTTP
+// round trip against an httptest server) rather than calling buildInjection
+// directly, so the assertion covers the actual gate in do().
+func TestUUIDScoringGatedOnRecite(t *testing.T) {
+	docs := strings.Repeat("uuid-gate-docs ", 100)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		// Response deliberately omits the UUID list entirely — if this
+		// non-recite request were (wrongly) scored, it would register as a
+		// presence-miss on every expected UUID.
+		fmt.Fprintf(w, `{
+			"id": "chatcmpl-1",
+			"object": "chat.completion",
+			"model": "test-model",
+			"choices": [{"index": 0, "message": {"role": "assistant", "content": "just a normal answer, no uuids here"}, "finish_reason": "stop"}],
+			"usage": {"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35}
+		}`)
+	}))
+	defer ts.Close()
+
+	modelSpec := fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL)
+	keys := llm.APIKeys{OpenAI: "sk-test"}
+	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("newReplayPoster: %v", err)
+	}
+	// Wire up UUID injection exactly as runRouterReplayInstance does (see
+	// replay_router.go), with reciteEveryRequest=false so only the FINAL
+	// request of an instance's list carries the recite ask.
+	p.uuidEnabled = true
+	p.sessionIdx = 0
+	p.allUUIDSets = [][]string{{"uuid-alpha", "uuid-beta"}}
+	p.blockCounts = map[string]int{}
+	p.reciteEveryRequest = false
+
+	req := RouterReplayRequest{
+		Stream:       false,
+		OutputTokens: 100,
+		Messages: []RouterReplayMessage{
+			{Role: "user", Hash: "h1", Bytes: 50, BlockTypes: []string{"text"}},
+		},
+	}
+	st := &autoState{stream: newCompletionStream(200)}
+
+	// isLastRequest=false -> inj.Recite=false (reciteEveryRequest is also
+	// false) -> the H1 gate must skip scoring entirely.
+	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, false)
+
+	if metrics.Error != nil {
+		t.Fatalf("unexpected error: %v", metrics.Error)
+	}
+	if len(metrics.ExpectedUUIDs) != 0 {
+		t.Errorf("ExpectedUUIDs = %v, want empty (non-recite request must not be scored)", metrics.ExpectedUUIDs)
+	}
+	if len(metrics.UUIDFound) != 0 {
+		t.Errorf("UUIDFound = %v, want empty (non-recite request must not be scored)", metrics.UUIDFound)
+	}
+	if len(metrics.LeakedUUIDs) != 0 {
+		t.Errorf("LeakedUUIDs = %v, want empty (non-recite request must not be scored)", metrics.LeakedUUIDs)
+	}
+	if metrics.ExactMatch {
+		t.Error("ExactMatch = true, want false (non-recite request must not be scored)")
+	}
+
+	// Sanity check the OTHER half of the invariant: the SAME request, with
+	// isLastRequest=true (recite asked), DOES get scored — otherwise this
+	// test could be vacuously passing because scoring never fires at all.
+	metrics2 := p.do(context.Background(), req, docs, 1, "s1", "i2", 1, st, true)
+	if metrics2.Error != nil {
+		t.Fatalf("unexpected error on recite request: %v", metrics2.Error)
+	}
+	if len(metrics2.ExpectedUUIDs) == 0 {
+		t.Fatal("ExpectedUUIDs empty on a recite=true request — scoring gate is broken (never scores) rather than fixed")
+	}
+}
+
+// TestConsumeOpenAIPlainMergesReasoning covers the M2 fix: a non-streaming
+// OpenAI response's message.reasoning_content must be merged into
+// m.Response alongside message.content, matching consumeOpenAISSE's
+// streaming behavior — otherwise a UUID recited/leaked only in the
+// reasoning channel would be invisible to the presence/leak scan.
+func TestConsumeOpenAIPlainMergesReasoning(t *testing.T) {
+	body := strings.NewReader(`{
+		"choices": [{"index": 0, "message": {"role": "assistant", "content": "the answer is 42", "reasoning_content": "let me think about uuid-in-reasoning first"}, "finish_reason": "stop"}],
+		"usage": {"prompt_tokens": 10, "completion_tokens": 5}
+	}`)
+	var m RequestMetrics
+	consumeOpenAIPlain(body, time.Now(), &m)
+
+	if !strings.Contains(m.Response, "uuid-in-reasoning") {
+		t.Errorf("m.Response = %q, want it to contain the reasoning_content text", m.Response)
+	}
+	if !strings.Contains(m.Response, "the answer is 42") {
+		t.Errorf("m.Response = %q, want it to also contain message.content", m.Response)
+	}
+}
+
+// TestConsumeOpenAIPlainMergesReasoningVLLMField covers vLLM's alternate
+// "reasoning" field name (used when reasoning_content is absent).
+func TestConsumeOpenAIPlainMergesReasoningVLLMField(t *testing.T) {
+	body := strings.NewReader(`{
+		"choices": [{"index": 0, "message": {"role": "assistant", "content": "final text", "reasoning": "uuid-in-vllm-reasoning-field"}, "finish_reason": "stop"}],
+		"usage": {"prompt_tokens": 10, "completion_tokens": 5}
+	}`)
+	var m RequestMetrics
+	consumeOpenAIPlain(body, time.Now(), &m)
+
+	if !strings.Contains(m.Response, "uuid-in-vllm-reasoning-field") {
+		t.Errorf("m.Response = %q, want it to contain the reasoning field text", m.Response)
+	}
+}
+
+// TestConsumePlainMergesThinking covers the M2 fix: a non-streaming
+// Anthropic response's "thinking" content block must be merged into
+// m.Response alongside "text" blocks, matching consumeSSE's streaming
+// behavior — otherwise a UUID recited/leaked only in the thinking channel
+// would be invisible to the presence/leak scan.
+func TestConsumePlainMergesThinking(t *testing.T) {
+	body := strings.NewReader(`{
+		"content": [
+			{"type": "thinking", "thinking": "pondering uuid-in-thinking-block"},
+			{"type": "text", "text": "here is my answer"}
+		],
+		"stop_reason": "end_turn",
+		"usage": {"input_tokens": 10, "output_tokens": 5}
+	}`)
+	var m RequestMetrics
+	consumePlain(body, time.Now(), &m)
+
+	if !strings.Contains(m.Response, "uuid-in-thinking-block") {
+		t.Errorf("m.Response = %q, want it to contain the thinking block text", m.Response)
+	}
+	if !strings.Contains(m.Response, "here is my answer") {
+		t.Errorf("m.Response = %q, want it to also contain the text block", m.Response)
+	}
+}
