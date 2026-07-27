@@ -640,17 +640,28 @@ func runRouterReplayInstance(
 		// UUID cache-coherency injection (--replay-inject-uuids, router
 		// path). sessionIdx == seriesNum-1: every instance of a session
 		// shares the session's seriesNum, so every instance's poster picks
-		// the SAME session UUID/marker. uuidEnabled stays false (and
-		// buildInjection nil) whenever the flag is off, or this session's
-		// index fell outside the precomputed array (see the sizing note on
-		// AutoBenchmarkConfig.replayUUIDSets) — degrading gracefully to
-		// "no injection" for that session rather than panicking.
+		// the SAME session's turn-UUID assignment. uuidEnabled stays false
+		// (and buildInjection nil) whenever the flag is off, or this
+		// session's index fell outside the precomputed array (see the
+		// sizing note on AutoBenchmarkConfig.replayUUIDSets) — degrading
+		// gracefully to "no injection" for that session rather than
+		// panicking. turnHashes/hashToTurn are session-global (every
+		// instance of the session sees the SAME turn numbering, even though
+		// any one instance's requests typically only surface its own
+		// subset of turns) — built once here rather than per request.
 		if cfg.ReplayInjectUUIDs {
 			poster.uuidEnabled = true
 			poster.sessionIdx = seriesNum - 1
 			poster.allUUIDSets = cfg.replayUUIDSets
-			poster.blockCounts = cfg.replayBlockSessionCounts
+			poster.owner = cfg.replayUUIDOwner
 			poster.reciteEveryRequest = cfg.ReplayReciteEveryRequest
+			if poster.sessionIdx >= 0 && poster.sessionIdx < len(cfg.replaySessionTurnHashes) {
+				poster.turnHashes = cfg.replaySessionTurnHashes[poster.sessionIdx]
+				poster.hashToTurn = make(map[string]int, len(poster.turnHashes))
+				for t, h := range poster.turnHashes {
+					poster.hashToTurn[h] = t
+				}
+			}
 		}
 	}
 	if err != nil {
@@ -762,29 +773,4 @@ func BuildReplayRequestPrefix(req RouterReplayRequest) (hashes []string, tokens 
 		tokens = append(tokens, m.Tokens)
 	}
 	return
-}
-
-// requestPrefixBytes mirrors BuildReplayRequestPrefix's exact block sequence
-// (same skip-the-tiny-header-block rule, same system-blocks/tools/messages
-// order) but returns each entry's Bytes instead of its hash/token count, so
-// index i here lines up 1:1 with index i of BuildReplayRequestPrefix's
-// hashes. Used by computePerSessionCachedChars to sum the byte size of a
-// request's prefix blocks AT OR AFTER a given boundary index (e.g.
-// sharedPrefixBlockCount) — the per-session cached region --replay-inject-
-// uuids sizes its UUID-stamp count off (see replay_router_uuid.go).
-func requestPrefixBytes(req RouterReplayRequest) []int {
-	var out []int
-	for i, sb := range req.SystemBlocks {
-		if i == 0 && sb.Bytes < 200 {
-			continue
-		}
-		out = append(out, sb.Bytes)
-	}
-	if req.Tools != nil && req.Tools.Hash != "" {
-		out = append(out, req.Tools.Bytes)
-	}
-	for _, m := range req.Messages {
-		out = append(out, m.Bytes)
-	}
-	return out
 }

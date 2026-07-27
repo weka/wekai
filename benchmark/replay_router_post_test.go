@@ -793,7 +793,8 @@ func TestUUIDScoringGatedOnRecite(t *testing.T) {
 	p.uuidEnabled = true
 	p.sessionIdx = 0
 	p.allUUIDSets = [][]string{{"uuid-alpha", "uuid-beta"}}
-	p.blockCounts = map[string]int{}
+	p.turnHashes = []string{"h1", "h2"}
+	p.hashToTurn = map[string]int{"h1": 0, "h2": 1}
 	p.reciteEveryRequest = false
 
 	req := RouterReplayRequest{

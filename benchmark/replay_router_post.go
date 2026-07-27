@@ -70,19 +70,29 @@ type replayPoster struct {
 	// identical to before this feature existed.
 	uuidEnabled bool
 	// sessionIdx is this instance's session's 0-based index into
-	// allUUIDSets/blockCounts (== seriesNum-1 — every instance of a session
-	// shares the same seriesNum, hence the same sessionIdx).
+	// allUUIDSets/cfg.replaySessionTurnHashes (== seriesNum-1 — every
+	// instance of a session shares the same seriesNum, hence the same
+	// sessionIdx).
 	sessionIdx int
-	// allUUIDSets is cfg.replayUUIDSets: the full per-session UUID
-	// assignment (index i = session i's owned UUID set), shared read-only
-	// across every poster in the run — needed both to pick this session's
-	// own marker and to scan for OTHER sessions' UUIDs leaking into this
-	// response (cross-contamination).
+	// allUUIDSets is cfg.replayUUIDSets: the full per-session-per-turn UUID
+	// assignment (index i = session i's ordered turn-UUID list, index t =
+	// turn t's UUID), shared read-only across every poster in the run.
 	allUUIDSets [][]string
-	// blockCounts is cfg.replayBlockSessionCounts: hash -> distinct-session
-	// count, used by sharedPrefixBlockCount to find each request's safe
-	// injection boundary.
-	blockCounts map[string]int
+	// turnHashes is this poster's session's ordered turn-hash list
+	// (cfg.replaySessionTurnHashes[sessionIdx] — see
+	// computeSessionTurnHashes): turnHashes[t] is the hash of turn t.
+	// Session-global (spans every instance of the session), even though any
+	// one instance's requests typically only ever surface its own subset of
+	// turns.
+	turnHashes []string
+	// hashToTurn is turnHashes inverted (hash -> turn index), computed once
+	// per instance (see runRouterReplayInstance) rather than per request.
+	hashToTurn map[string]int
+	// owner is cfg.replayUUIDOwner: the reverse uuid -> owning-session-index
+	// map (see buildSessionTurnUUIDs), shared read-only across every poster
+	// in the run — used by findLeakedUUIDsByOwner to flag cross-session
+	// contamination in O(response) time.
+	owner map[string]int
 	// reciteEveryRequest mirrors --replay-recite-every-request: true asks
 	// for the recite line on every request; false only on each instance's
 	// final request (see the isLastRequest parameter to do()/dryDo()).
@@ -90,23 +100,84 @@ type replayPoster struct {
 }
 
 // buildInjection returns this call's *uuidInjection (nil when UUID
-// injection is disabled, or when this session has no assigned UUID — e.g.
-// sessionIdx fell outside the precomputed array). isLastRequest is whether
-// req is the final request of the CURRENT instance's request list (see
+// injection is disabled, this session has no assigned turns — e.g.
+// sessionIdx fell outside the precomputed array, or this session had zero
+// qualifying turns — or this particular request has no qualifying turn
+// visible in its message history yet). isLastRequest is whether req is the
+// final request of the CURRENT instance's request list (see
 // runRouterReplayInstance) — with --replay-recite-every-request=false, only
 // that final request carries the recite ask.
+//
+// Every VISIBLE qualifying turn in req.Messages gets stamped into
+// StampByHash (keeping every turn's marker warm in KV as later requests
+// repeat it) — see uuidInjection's doc. The recite WINDOW is separate and
+// bounded: the first (visible) turn plus up to 3 most-recent turns
+// EXCLUDING the current turn (the highest-index turn visible in THIS
+// request), deduplicated and capped at 4 (see the package doc in
+// replay_router_uuid.go for the design rationale and edge cases at turns
+// 1-3).
 func (p *replayPoster) buildInjection(req RouterReplayRequest, isLastRequest bool) *uuidInjection {
-	if !p.uuidEnabled || p.sessionIdx < 0 || p.sessionIdx >= len(p.allUUIDSets) {
+	if !p.uuidEnabled || p.sessionIdx < 0 || p.sessionIdx >= len(p.allUUIDSets) || len(p.turnHashes) == 0 {
 		return nil
 	}
 	uuids := p.allUUIDSets[p.sessionIdx]
 	if len(uuids) == 0 {
 		return nil
 	}
+
+	stampByHash := map[string]turnStamp{}
+	var visible []int // turn indices visible in this request, in first-appearance order
+	seenTurn := map[int]bool{}
+	for _, m := range req.Messages {
+		t, ok := p.hashToTurn[m.Hash]
+		if !ok || t < 0 || t >= len(uuids) {
+			continue
+		}
+		stampByHash[m.Hash] = turnStamp{Idx: t, UUID: uuids[t], Label: fmt.Sprintf("turn-%d", t+1)}
+		if !seenTurn[t] {
+			seenTurn[t] = true
+			visible = append(visible, t)
+		}
+	}
+	if len(visible) == 0 {
+		return nil
+	}
+
+	// Window: first visible turn, plus up to 3 most-recent turns EXCLUDING
+	// the current turn (visible's last entry — the highest turn index
+	// present, since turns only ever get appended to a growing history).
+	first := visible[0]
+	var recentCandidates []int
+	if len(visible) > 1 {
+		recentCandidates = visible[:len(visible)-1]
+	}
+	recent := recentCandidates
+	if len(recent) > 3 {
+		recent = recent[len(recent)-3:]
+	}
+	window := []int{first}
+	for _, t := range recent {
+		if t == first {
+			continue
+		}
+		window = append(window, t)
+	}
+	if len(window) > 4 {
+		window = window[:4]
+	}
+
+	labels := make([]string, len(window))
+	reciteUUIDs := make([]string, len(window))
+	for i, t := range window {
+		labels[i] = fmt.Sprintf("turn-%d", t+1)
+		reciteUUIDs[i] = uuids[t]
+	}
+
 	return &uuidInjection{
-		UUIDs:           uuids,
-		Recite:          p.reciteEveryRequest || isLastRequest,
-		SharedPrefixLen: sharedPrefixBlockCount(req, p.blockCounts),
+		StampByHash:  stampByHash,
+		Recite:       p.reciteEveryRequest || isLastRequest,
+		ReciteLabels: labels,
+		ReciteUUIDs:  reciteUUIDs,
 	}
 }
 
@@ -433,23 +504,33 @@ func (p *replayPoster) do(
 	//
 	// Two independent checks, mirroring the cache-coherency eval's two
 	// reported tests: per-UUID PRESENCE (Contains anywhere in the response,
-	// via validateReplayResponse) and output CONFORMITY (the FIRST LINE of
-	// the response is exactly the ordered, comma-joined UUID list — see
-	// firstLineConformity/matchesExpectedUUIDList).
+	// scored against inj.ReciteUUIDs — this request's recite WINDOW, not the
+	// session's full turn history) and output CONFORMITY (the FIRST LINE of
+	// the response is exactly the ordered, comma-joined window UUID list —
+	// see firstLineConformity/matchesExpectedUUIDList). Cross-contamination
+	// uses findLeakedUUIDsByOwner (replay_uuid.go), an O(response) reverse-
+	// map scan — NOT FindLeakedUUIDs, whose O(population) iteration over
+	// every session's UUID set no longer fits once turns (not sessions) are
+	// the stamping unit.
 	//
 	// Gated on inj.Recite, NOT just inj != nil: buildInjection returns a
-	// non-nil *uuidInjection on EVERY request once the feature is on (it
-	// always carries the UUID block, so the stamp stays warm in KV across a
-	// session's turns — see the package doc in replay_router_uuid.go), but
-	// only inj.Recite (reciteEveryRequest || isLastRequest) says the model
-	// was actually ASKED to recite this turn. Scoring a non-recite turn
-	// would count "the model didn't volunteer the UUID list" as a
-	// PRESENCE_MISS/conformity failure even though nothing asked it to.
+	// non-nil *uuidInjection whenever ANY qualifying turn is visible in this
+	// request (it always stamps every visible turn inline, so those stamps
+	// stay warm in KV across the session — see the package doc in
+	// replay_router_uuid.go), but only inj.Recite (reciteEveryRequest ||
+	// isLastRequest) says the model was actually ASKED to recite this turn.
+	// Scoring a non-recite turn would count "the model didn't volunteer the
+	// UUID list" as a PRESENCE_MISS/conformity failure even though nothing
+	// asked it to.
 	if inj != nil && inj.Recite && m.Error == nil && !m.IsEmpty {
 		m.ConvIdx = p.sessionIdx
-		m.ExpectedUUIDs = append([]string(nil), p.allUUIDSets[p.sessionIdx]...)
-		m.UUIDFound, m.LeakedUUIDs = validateReplayResponse(m.Response, "", m.ExpectedUUIDs, p.sessionIdx, p.allUUIDSets)
-		m.ExactMatch = firstLineConformity(m.Response, m.ExpectedUUIDs)
+		m.ExpectedUUIDs = append([]string(nil), inj.ReciteUUIDs...)
+		m.UUIDFound = make([]bool, len(inj.ReciteUUIDs))
+		for i, u := range inj.ReciteUUIDs {
+			m.UUIDFound[i] = strings.Contains(m.Response, u)
+		}
+		m.LeakedUUIDs = findLeakedUUIDsByOwner(m.Response, "", p.sessionIdx, p.owner)
+		m.ExactMatch = firstLineConformity(m.Response, inj.ReciteUUIDs)
 	}
 	return m
 }

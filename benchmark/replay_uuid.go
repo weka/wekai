@@ -15,8 +15,52 @@ package benchmark
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
+
+// uuidRe matches a canonical hyphenated UUID string (8-4-4-4-12 hex digits).
+// Used by findLeakedUUIDsByOwner to pull UUID-shaped substrings out of a
+// response/thinking blob without needing to know the candidate set up
+// front.
+var uuidRe = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+
+// findLeakedUUIDsByOwner scans resp and thinking for UUID-shaped substrings
+// and flags any that are a KNOWN turn UUID (present in owner, the
+// uuid -> owning-session-index reverse map — see buildSessionTurnUUIDs)
+// belonging to a session OTHER than ownIdx. Unlike FindLeakedUUIDs (which
+// iterates every UUID ever assigned across the whole population — O(total
+// UUIDs)), this scans only the response/thinking text once via uuidRe and
+// does an O(1) map lookup per match — O(response), not O(population) —
+// which matters once turns (not sessions) are the stamping unit: the total
+// UUID population grows with conversation length instead of session count.
+// A UUID-shaped string with no entry in owner (or that happens to match a
+// hex pattern but isn't a real stamp) is silently ignored, not flagged.
+// Returns "uuid(series=N)" entries, one per distinct leaked UUID found, in
+// first-appearance (scan) order — deterministic for a given response.
+func findLeakedUUIDsByOwner(resp, thinking string, ownIdx int, owner map[string]int) []string {
+	if len(owner) == 0 {
+		return nil
+	}
+	combined := resp
+	if thinking != "" {
+		combined = resp + "\n" + thinking
+	}
+	var leaked []string
+	seen := map[string]bool{}
+	for _, u := range uuidRe.FindAllString(combined, -1) {
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		si, ok := owner[u]
+		if !ok || si == ownIdx {
+			continue
+		}
+		leaked = append(leaked, fmt.Sprintf("%s(series=%d)", u, si))
+	}
+	return leaked
+}
 
 // injectUUIDMarker appends one visible marker per uuid to turnValue. Unlike
 // the cache-coherency eval's <ignore>...</ignore> filler, the model MUST see

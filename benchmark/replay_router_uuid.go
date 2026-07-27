@@ -1,48 +1,37 @@
 package benchmark
 
 // UUID-based cache-coherency validation for the ROUTER-REPLAY path
-// (--router-replay-file, --replay-inject-uuids). This mirrors the mechanics
-// of the cache-coherency eval's --shared-prefix-per-series mode
-// (cache_coherency.go's buildCoherencySharedSeriesPrompt/userMessage/
-// matchesExpectedUUIDList) as closely as the router-replay wire shape
-// allows: N bare, space-separated UUIDs stamped once per session, a recite-
-// the-list instruction, and exact first-line conformity scoring — rather
-// than a single wrapped "[ref-id: ...]" marker recited anywhere in the
-// response. (Path-agnostic primitives — injectUUIDMarker/
-// validateReplayResponse/FindLeakedUUIDs — are still shared with, not
-// duplicated from, replay_uuid.go; injectUUIDMarker itself remains the
-// dataset-replay path's own wrapper and is untouched here.)
+// (--router-replay-file, --replay-inject-uuids).
 //
-// Strategy (Option C — boundary injection, with tail fallback): every
-// session in a replay-v3 capture opens with one or more blocks (system
-// blocks, tools, or leading messages) whose content hash is shared across
-// MANY OTHER sessions too — the router's own leading system prompt(s),
-// repeated verbatim capture after capture. Everything AFTER that shared
-// run is genuinely per-session (the user's actual turn). We inject exactly
-// N deterministic, bare, space-separated UUIDs per session at that
-// boundary — mirroring buildCoherencySharedSeriesPrompt's tail
-// ("UUID0 UUID1 … UUIDlast") rather than the dataset path's wrapped
-// "[ref-id: <uuid>]" marker:
+// Strategy: one deterministic UUID is injected inline into EVERY qualifying
+// user turn — a role=="user" message with >=1 text block whose hash is
+// referenced by exactly one session (see isQualifyingUserTurn, which reuses
+// computeBlockSessionCounts' distinct-session-count map to exclude blocks
+// shared across sessions) — spread through the conversation rather than
+// clustered at a session boundary. Turn i's marker
+// ("\n\n[turn-N id: <uuid>]") is appended to that turn's own synthesized
+// text content (see buildMessageContent's stampByHash param in
+// replay_router_wire.go), keyed by the turn's session-global
+// first-appearance index (see computeSessionTurnHashes/
+// buildSessionTurnUUIDs below). Content synthesis is already deterministic
+// in the block hash (synthText, seeded "<hash>:block:<i>"), so every request
+// that repeats a given turn in its growing history re-emits byte-identical
+// content for it — the fidelity invariant that makes cache-hit reproduction
+// against the original capture possible: two sessions sharing a leading
+// block still collide on the server's prefix cache exactly as in the
+// original traffic, because only count==1 (genuinely per-session) turns
+// ever carry a stamp.
 //
-//	[ RUN_GUID ][ shared system blocks ][ UUID0 UUID1 … UUIDlast ][ forceOutput instr ] [ messages... ] [ recite-first-line ask ]
-//	 \_______________________ byte-identical across sessions ________________________/ \_ per-session, grows each turn _/
-//
-// Putting the UUID block there means:
-//   - the cross-session shared prefix stays byte-identical (cache-hit
-//     reproduction against the original capture is preserved: two sessions
-//     that shared a system prompt still collide on the server's prefix
-//     cache exactly as they did in the original traffic)
-//   - the UUID block itself lands in a region that IS cached WITHIN a
-//     session (every subsequent request in the same session repeats it,
-//     byte-identical), so asking the model to recall it later is a genuine
-//     KV-coherency signal, not an artifact of it being freshly re-sent
-//     every turn.
-//
-// A session with no shared leading block at all (empirically none, across
-// 5441 real sessions, lack one — but the file format doesn't guarantee it)
-// falls back to tail injection: the UUID block is folded into the end of
-// the request instead, forfeiting the "cached within a session" property
-// but still producing a valid, scorable request.
+// Each request asks the model to recite a WINDOW of turns rather than the
+// whole history: the first (visible) turn plus up to 3 most-recent turns,
+// EXCLUDING the current turn, deduplicated and capped at 4 (see
+// replayPoster.buildInjection in replay_router_post.go and
+// replayReciteWindowInstruction below). This keeps the recite cost/response
+// budget constant regardless of session length while still spreading
+// coverage across the whole conversation over time — turn N's stamp gets
+// asked about at turns N, N+1, N+2, N+3, then ages out of the window (but
+// stays warm in KV via the always-embedded StampByHash markers above, which
+// cover every visible turn, not just the recited window).
 
 import (
 	"bufio"
@@ -53,42 +42,40 @@ import (
 	"sync"
 )
 
+// turnStamp is the per-user-turn UUID marker injected inline into that
+// turn's own message content (see buildMessageContent's stampByHash param
+// in replay_router_wire.go).
+type turnStamp struct {
+	Idx   int    // this session's global turn index (0-based, first-appearance order)
+	UUID  string // this turn's deterministic UUID
+	Label string // "turn-N" (Idx+1 — 1-based, for human-readable instructions)
+}
+
 // uuidInjection describes the per-request UUID injection to apply when
 // building a router-replay wire body. A nil *uuidInjection means "no
 // injection" — buildAnthropicMessagesBody / buildOpenAIChatCompletionsBody
 // must behave identically to before this feature existed.
 type uuidInjection struct {
-	// UUIDs is the session's full ordered N-UUID list (see buildSessionUUIDs),
-	// spliced bare and space-separated (see bareUUIDBlock) — mirrors the
-	// cache-coherency eval's buildCoherencySharedSeriesPrompt tail. Nil/empty
-	// means no UUID block this call (still allows Recite alone, though
-	// callers currently always set both together).
-	UUIDs []string
-	// Recite asks the model to output, as the FIRST line of its response,
-	// the exact ordered UUID list (see replayReciteFirstLineInstruction),
-	// then continue normally.
+	// StampByHash carries one turnStamp per user-turn message VISIBLE in
+	// this request (keyed by RouterReplayMessage.Hash) — every qualifying
+	// turn gets its UUID marker embedded inline in its own synthesized
+	// content (see buildMessageContent), keeping every turn's stamp warm in
+	// KV as later requests repeat that history in full, not just the turns
+	// named in the recite window below.
+	StampByHash map[string]turnStamp
+	// Recite asks the model to output, on the FIRST line of its response,
+	// the ReciteUUIDs values (identified to the model by ReciteLabels'
+	// inline tags — see replayReciteWindowInstruction), then continue
+	// normally.
 	Recite bool
-	// SharedPrefixLen is this request's leading run of cross-session-shared
-	// prefix blocks (see sharedPrefixBlockCount). It tells the wire builder
-	// whether the UUID block can be spliced in at the natural system/
-	// message boundary (SharedPrefixLen > 0 and does NOT extend past the
-	// emitted system blocks — i.e. the first tool/message block is not
-	// itself part of the shared run) or must fall back to tail injection
-	// (SharedPrefixLen == 0, or the shared run extends into tools/messages,
-	// in which case boundary-splicing would poison THEIR cross-session
-	// cache key too).
-	SharedPrefixLen int
-}
-
-// bareUUIDBlock returns uuids joined bare and space-separated — mirrors the
-// cache-coherency eval's buildCoherencySharedSeriesPrompt tail
-// ("UUID0 UUID1 … UUIDlast", no wrapper text) — for splicing as one system
-// message/block at the session boundary (or the tail, on fallback). Bare
-// UUIDs (vs. the dataset path's "[ref-id: <uuid>]" wrapper) both match the
-// coherency test's mechanics and avoid the model treating a marker-shaped
-// wrapper as instruction text to echo verbatim.
-func bareUUIDBlock(uuids []string) string {
-	return strings.Join(uuids, " ")
+	// ReciteLabels is the ordered window of turn labels ("turn-N") the
+	// instruction names — first (visible) turn, then up to 3 most-recent
+	// turns EXCLUDING the current turn, deduplicated, capped at 4.
+	ReciteLabels []string
+	// ReciteUUIDs is ReciteLabels' matching ordered UUID values — what
+	// firstLineConformity/matchesExpectedUUIDList checks the response's
+	// first line against.
+	ReciteUUIDs []string
 }
 
 // firstLineConformity implements this feature's output-conformity check:
@@ -98,6 +85,8 @@ func bareUUIDBlock(uuids []string) string {
 // eval's ExactMatch, adapted for a recite-FIRST instruction that lets the
 // model keep generating after line 1 (so forced-output/ignore_eos still
 // fills the remainder of the output budget with a normal continuation).
+// expected is inj.ReciteUUIDs — the current request's recite WINDOW, not
+// every UUID ever stamped in the session.
 func firstLineConformity(resp string, expected []string) bool {
 	line := resp
 	if idx := strings.Index(resp, "\n"); idx >= 0 {
@@ -109,10 +98,15 @@ func firstLineConformity(resp string, expected []string) bool {
 // computeBlockSessionCounts streams a replay-v3 file once and returns, for
 // every distinct block hash seen, the number of DISTINCT SESSIONS that
 // reference it at least once (not the number of requests — a hash reused
-// many times within one session still counts once for that session). A
-// hash with count > 1 is shared across sessions, which is exactly the
-// "safe to leave byte-identical" prefix content sharedPrefixBlockCount looks
-// for.
+// many times within one session still counts once for that session).
+//
+// A hash with count > 1 is shared across sessions — the router's own
+// leading system prompt(s), repeated verbatim capture after capture, are
+// the common case — and is never eligible for UUID stamping: stamping it
+// would perturb content this session shares with others, poisoning their
+// cross-session prefix-cache key too. computeSessionTurnHashes uses this
+// map (via isQualifyingUserTurn) to restrict turn-stamping to hashes with
+// count == 1: genuinely per-session, per-turn content.
 //
 // allowed and sessionLimit mirror openRouterReplayStream's filtering
 // exactly (nil allowed = every session; sessionLimit <= 0 = no cap) so the
@@ -180,93 +174,41 @@ func computeBlockSessionCounts(path string, allowed map[int]bool, sessionLimit i
 	return counts, nil
 }
 
-// countSessionsWithUsableBoundary makes a second lightweight streaming pass
-// (same filtering as computeBlockSessionCounts) purely to report, for the
-// startup diagnostic, how many sessions have at least one request whose
-// leading run of shared blocks is non-empty (a "usable boundary" — the
-// marker can be spliced in at the natural system/message boundary) versus
-// how many would fall back to tail injection for every one of their
-// requests. Returns (usable, total, error); usable <= total.
-func countSessionsWithUsableBoundary(path string, allowed map[int]bool, sessionLimit int, counts map[string]int) (usable int, total int, err error) {
-	f, ferr := os.Open(path)
-	if ferr != nil {
-		return 0, 0, ferr
+// isQualifyingUserTurn reports whether m is a "user-input turn" for the
+// purposes of UUID stamping: role=="user", at least one "text" content
+// block, and a hash referenced by exactly one session (counts[m.Hash]==1 —
+// see computeBlockSessionCounts). tool_result-only messages, assistant/
+// system messages, and any message whose hash is shared across sessions
+// never qualify.
+func isQualifyingUserTurn(m RouterReplayMessage, counts map[string]int) bool {
+	if m.Role != "user" {
+		return false
 	}
-	defer f.Close()
-
-	br := bufio.NewReaderSize(f, 1<<20)
-	if _, rerr := br.ReadBytes('\n'); rerr != nil {
-		return 0, 0, fmt.Errorf("read header line: %w", rerr)
+	if m.Hash == "" || counts[m.Hash] != 1 {
+		return false
 	}
-
-	lineIdx := 0
-	produced := 0
-	for {
-		if sessionLimit > 0 && produced >= sessionLimit {
-			break
-		}
-		if allowed != nil && produced >= len(allowed) {
-			break
-		}
-		line, rerr := br.ReadBytes('\n')
-		if len(line) > 0 {
-			line = trimNL(line)
-			if len(line) > 0 {
-				currentIdx := lineIdx
-				lineIdx++
-				if allowed != nil && !allowed[currentIdx] {
-					if rerr != nil {
-						break
-					}
-					continue
-				}
-				var sess RouterReplaySession
-				if jerr := json.Unmarshal(line, &sess); jerr == nil {
-					total++
-					hasBoundary := false
-					for _, inst := range sess.Instances {
-						for _, req := range inst.Requests {
-							if sharedPrefixBlockCount(req, counts) > 0 {
-								hasBoundary = true
-								break
-							}
-						}
-						if hasBoundary {
-							break
-						}
-					}
-					if hasBoundary {
-						usable++
-					}
-					produced++
-				}
-			}
-		}
-		if rerr != nil {
-			break
+	for _, t := range m.BlockTypes {
+		if t == "text" {
+			return true
 		}
 	}
-	return usable, total, nil
+	return false
 }
 
-// computePerSessionCachedChars makes a second streaming pass (same filtering
-// as computeBlockSessionCounts) and returns, in dispatch order (index i =
-// the i-th session encountered — the SAME order buildSessionUUIDs' returned
-// slice is indexed by, and the same order cfg.replayUUIDSets ends up in),
-// each session's per-session cached-region byte size: the ROOT request's
-// (first instance, first request) prefix bytes (see requestPrefixBytes) AT
-// OR AFTER that request's cross-session-shared boundary
-// (sharedPrefixBlockCount, using counts from computeBlockSessionCounts).
-//
-// This is a proxy for "how much content is genuinely per-session and reused,
-// byte-identical, across the session's own later requests" — the region the
-// injected UUID block actually sits within once spliced at the boundary
-// (see the package doc comment above). computeStampsPerSeries then turns
-// this byte count into a stamp count exactly as the cache-coherency eval
-// turns --garbage-chars into --stamps-per-series. A session with no
-// requests at all (degenerate/empty) contributes 0, which
-// computeStampsPerSeries floors to its minimum of 2.
-func computePerSessionCachedChars(path string, allowed map[int]bool, sessionLimit int, counts map[string]int) ([]int, error) {
+// computeSessionTurnHashes makes a second streaming pass (same filtering as
+// computeBlockSessionCounts — nil allowed = every session; sessionLimit <= 0
+// = no cap) and returns, in dispatch order (index i = the i-th session
+// encountered, the SAME order buildSessionTurnUUIDs' returned slice is
+// indexed by and cfg.replayUUIDSets ends up in), that session's ordered list
+// of DISTINCT qualifying user-turn hashes (see isQualifyingUserTurn), in
+// first-appearance order across the session's instances/requests/messages
+// (walked in file order — Instances, then each instance's Requests, then
+// each request's Messages). A request's Messages carries the FULL growing
+// conversation history, so the same turn hash reappears in every later
+// request of the same instance; only its FIRST appearance contributes an
+// entry here — turnHashes[i][t] is session i's turn-t hash, and len(...) is
+// that session's total turn count.
+func computeSessionTurnHashes(path string, allowed map[int]bool, sessionLimit int, counts map[string]int) ([][]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -278,7 +220,7 @@ func computePerSessionCachedChars(path string, allowed map[int]bool, sessionLimi
 		return nil, fmt.Errorf("read header line: %w", err)
 	}
 
-	var perSession []int
+	var turnHashes [][]string
 	lineIdx := 0
 	produced := 0
 	for {
@@ -302,16 +244,23 @@ func computePerSessionCachedChars(path string, allowed map[int]bool, sessionLimi
 				}
 				var sess RouterReplaySession
 				if jerr := json.Unmarshal(line, &sess); jerr == nil {
-					chars := 0
-					if len(sess.Instances) > 0 && len(sess.Instances[0].Requests) > 0 {
-						root := sess.Instances[0].Requests[0]
-						boundary := sharedPrefixBlockCount(root, counts)
-						prefixBytes := requestPrefixBytes(root)
-						for i := boundary; i < len(prefixBytes); i++ {
-							chars += prefixBytes[i]
+					seen := map[string]bool{}
+					var hashes []string
+					for _, inst := range sess.Instances {
+						for _, req := range inst.Requests {
+							for _, m := range req.Messages {
+								if !isQualifyingUserTurn(m, counts) {
+									continue
+								}
+								if seen[m.Hash] {
+									continue
+								}
+								seen[m.Hash] = true
+								hashes = append(hashes, m.Hash)
+							}
 						}
 					}
-					perSession = append(perSession, chars)
+					turnHashes = append(turnHashes, hashes)
 					produced++
 				}
 			}
@@ -320,84 +269,70 @@ func computePerSessionCachedChars(path string, allowed map[int]bool, sessionLimi
 			break
 		}
 	}
-	return perSession, nil
+	return turnHashes, nil
 }
 
-// sharedPrefixBlockCount returns the length of req's LEADING run of blocks
-// (per BuildReplayRequestPrefix's cache-order hash sequence: system blocks,
-// then tools, then messages) whose hash is shared across more than one
-// session, per counts (see computeBlockSessionCounts). The run stops at the
-// first hash that is either unshared (counts[hash] <= 1) or empty.
-//
-// This is the offline analogue of "how much of this request's prefix is
-// safe to leave byte-identical" — the wire builder uses it to decide
-// whether the UUID marker can be spliced in at the natural boundary
-// (SharedPrefixLen > 0 and does not extend past the system blocks) or must
-// fall back to tail injection (SharedPrefixLen == 0, or it extends into
-// tools/messages, which would otherwise poison their cross-session cache
-// key too).
-func sharedPrefixBlockCount(req RouterReplayRequest, counts map[string]int) int {
-	hashes, _ := BuildReplayRequestPrefix(req)
-	n := 0
-	for _, h := range hashes {
-		if h == "" || counts[h] <= 1 {
-			break
-		}
-		n++
-	}
-	return n
-}
-
-// replayReciteFirstLineInstruction returns the tail instruction asking the
-// model to output, as the FIRST line of its response, every UUID injected
-// at the session boundary — in order, comma-separated — then continue
-// normally. Mirrors the cache-coherency eval's userMessage ("List every
-// UUID shown in the request, in order, separated by commas. Output only the
-// UUIDs and commas, nothing else.") but front-loads the ask to line 1
-// specifically (rather than the entire response), so a forced-output /
-// ignore_eos budget can still fill the remainder with the model's normal
-// continuation. Like the dataset-path instruction it replaces, this text
-// never embeds the UUIDs themselves: first-line conformity in the response
-// therefore reflects genuine recall from cached KV context, not an echo of
-// the ask.
-func replayReciteFirstLineInstruction() string {
-	return "\n\nBefore anything else, output on the FIRST line every UUID shown above in the request, in order, " +
-		"separated by commas, and nothing else on that first line. Then continue with your normal response."
-}
-
-// buildSessionUUIDs returns len(perSessionChars) UUID sets, one per session,
-// drawn in order (session-major, stamp-minor) from a single seeded
-// generator — same determinism/disjointness rationale as the dataset path's
-// buildReplayUUIDSets: same seed -> same per-session UUID assignment across
-// runs and across every model in a multi-model run (see the precompute call
-// site in RunAutoBenchmark, which populates cfg.replayUUIDSets once, before
-// any per-model goroutine spawns, so every model sees the identical
+// buildSessionTurnUUIDs returns, for each session, one UUID per turn
+// (sets[i][t] = session i's turn-t UUID), drawn session-major/turn-minor
+// from a single seeded generator (see newUUIDGenerator) — same determinism/
+// disjointness rationale as the dataset path's buildReplayUUIDSets: same
+// seed -> same per-session-per-turn UUID assignment across runs and across
+// every model in a multi-model run (see the precompute call site in
+// RunAutoBenchmark, which populates cfg.replayUUIDSets once, before any
+// per-model goroutine spawns, so every model sees the identical
 // assignment).
 //
-// Session i's set size is N = computeStampsPerSeries(perSessionChars[i]) —
-// the SAME sizing rule the cache-coherency eval uses to turn a garbage-char
-// budget into a stamp count (min 2) — applied here to perSessionChars[i],
-// session i's per-session cached-region byte size (see
-// computePerSessionCachedChars): the blocks AFTER the cross-session-shared
-// boundary that get reused, byte-identical, across every one of the
-// session's own requests. A larger reused region gets more UUID stamps
-// spread across it, mirroring the coherency test's
-// garbageChars -> numStamps relationship.
-func buildSessionUUIDs(perSessionChars []int, seed int64) [][]string {
-	if len(perSessionChars) == 0 {
-		return nil
+// owner is the reverse mapping (uuid -> the owning session's index i) used
+// by findLeakedUUIDsByOwner (replay_uuid.go) to flag cross-session
+// contamination in O(response) time — a substring scan of the response
+// plus map lookups, rather than iterating every session's UUID set.
+func buildSessionTurnUUIDs(turnCounts []int, seed int64) (sets [][]string, owner map[string]int) {
+	owner = map[string]int{}
+	if len(turnCounts) == 0 {
+		return nil, owner
 	}
 	newUUID := newUUIDGenerator(seed)
-	sets := make([][]string, len(perSessionChars))
-	for i, chars := range perSessionChars {
-		n := computeStampsPerSeries(chars)
+	sets = make([][]string, len(turnCounts))
+	for i, n := range turnCounts {
+		if n <= 0 {
+			continue
+		}
 		uuids := make([]string, n)
 		for j := range uuids {
-			uuids[j] = newUUID()
+			u := newUUID()
+			uuids[j] = u
+			owner[u] = i
 		}
 		sets[i] = uuids
 	}
-	return sets
+	return sets, owner
+}
+
+// replayReciteWindowInstruction returns the tail instruction asking the
+// model to output, as the FIRST line of its response, the id VALUES for the
+// given ordered window of inline "[turn-N id: ...]" tags — in the same
+// order, comma-separated — then continue normally. Unlike the retired
+// per-session replayReciteFirstLineInstruction (which asked for "every UUID
+// shown above" verbatim), this instruction names the exact turns to recite
+// by LABEL, not position or value, so the model must locate each tagged
+// turn in its own (possibly long) context rather than simply copying
+// whatever happens to be nearby. Mirrors the cache-coherency eval's
+// userMessage ("List every UUID shown in the request...") but (a)
+// front-loads the ask to line 1 specifically, so a forced-output/
+// ignore_eos budget can still fill the remainder with the model's normal
+// continuation, and (b) references labels instead of embedding the UUIDs
+// themselves, so first-line conformity in the response reflects genuine
+// recall from cached KV context, not an echo of the ask.
+func replayReciteWindowInstruction(labels []string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	tagged := make([]string, len(labels))
+	for i, l := range labels {
+		tagged[i] = "[" + l + "]"
+	}
+	return "\n\nSomewhere above, several ids are tagged like [turn-N id: ...]. On the FIRST line output ONLY the id values for these tags, " +
+		"in this exact order, comma-separated and nothing else: " + strings.Join(tagged, ", ") + ". Then continue normally."
 }
 
 // ---- max_tokens recite floor ----
@@ -413,13 +348,24 @@ const replayReciteFloorMultiplier = 3.0
 // to fit the FIRST-LINE numUUIDs-UUID comma-joined list this feature asks
 // for (reuses the cache-coherency eval's computeMaxOutputTokens sizing:
 // numUUIDs*36 chars + separating commas, /4 for an approximate token count,
-// x replayReciteFloorMultiplier). A router-replay request's max_tokens is
-// normally sized off the ORIGINAL capture's output_tokens (see
-// pickMaxTokens) — which for a tool-call-only turn can be a handful of
-// tokens, nowhere near enough to also emit the first-line UUID list. Without
-// this floor, a tiny budget truncates that first line, which would misread
-// as PRESENCE_MISS/NOT_EXACT (coherency failure) when it's actually just an
-// output-size artifact.
+// x replayReciteFloorMultiplier). numUUIDs is now len(inj.ReciteUUIDs) — the
+// current request's recite WINDOW, capped at 4 (see uuidInjection) — so the
+// floor itself is now bounded and constant regardless of session length,
+// unlike the retired per-session-N scheme where a long session's floor grew
+// without bound. The tradeoff: for a request whose recorded output budget
+// is tiny (a handful of tokens, e.g. a pure tool-call turn), this constant
+// floor is a much LARGER ratio of the original budget than an N-scaled
+// floor would have been at N=2 — i.e. the recite ask now perturbs a small
+// turn's output-size profile proportionally more. Accepted: correctness
+// (not truncating the recite line into a false PRESENCE_MISS) takes
+// priority over preserving the exact captured output-size ratio.
+//
+// A router-replay request's max_tokens is normally sized off the ORIGINAL
+// capture's output_tokens (see pickMaxTokens) — which for a tool-call-only
+// turn can be a handful of tokens, nowhere near enough to also emit the
+// first-line UUID list. Without this floor, a tiny budget truncates that
+// first line, which would misread as PRESENCE_MISS/NOT_EXACT (coherency
+// failure) when it's actually just an output-size artifact.
 func replayReciteFloorTokens(numUUIDs int) int {
 	return computeMaxOutputTokens(numUUIDs, replayReciteFloorMultiplier)
 }

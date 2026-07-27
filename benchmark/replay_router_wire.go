@@ -46,9 +46,11 @@ const verboseOutputInstruction = "Provide a thorough, detailed response and keep
 // router path — see replay_router_uuid.go); nil means "no injection",
 // leaving the body byte-for-byte identical to before this feature existed.
 func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool, inj *uuidInjection) ([]byte, string, error) {
+	var stampByHash map[string]turnStamp
 	injNumUUIDs := 0
 	if inj != nil {
-		injNumUUIDs = len(inj.UUIDs)
+		stampByHash = inj.StampByHash
+		injNumUUIDs = len(inj.ReciteUUIDs)
 	}
 	body := map[string]interface{}{
 		"model":      modelName,
@@ -80,28 +82,6 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 		systemArr = append([]map[string]interface{}{stamp}, systemArr...)
 	}
 
-	// UUID block injection at the system/conversation boundary (Option C —
-	// see replay_router_uuid.go). Only spliced in here when the leading run
-	// of cross-session-shared blocks does NOT extend past the emitted
-	// system blocks — i.e. the first tool/message block is not itself part
-	// of the shared run; otherwise splicing the per-session marker here
-	// would land it ahead of shared tools/messages and poison THEIR
-	// cross-session cache key too, not just add a per-session block after
-	// genuinely-shared content. When the shared run does extend into
-	// tools/messages, fall back to tail injection below instead, so the
-	// marker never lands ahead of content this session shares with others.
-	injUUIDText := ""
-	if inj != nil {
-		injUUIDText = bareUUIDBlock(inj.UUIDs)
-	}
-	markerAtBoundary := inj != nil && injUUIDText != "" &&
-		inj.SharedPrefixLen > 0 && inj.SharedPrefixLen <= len(effectiveSystemBlocks(req.SystemBlocks))
-	if markerAtBoundary {
-		systemArr = append(systemArr, map[string]interface{}{
-			"type": "text",
-			"text": injUUIDText,
-		})
-	}
 	if forceOutput {
 		systemArr = append(systemArr, map[string]interface{}{
 			"type": "text",
@@ -116,30 +96,25 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 	}
 	var msgs []map[string]interface{}
 	if len(req.Messages) > 0 {
-		msgs = buildMessages(req.Messages, docs)
+		msgs = buildMessages(req.Messages, docs, stampByHash)
 	}
-	if inj != nil {
-		if !markerAtBoundary && injUUIDText != "" {
-			msgs = appendTailMessageAnthropic(msgs, injUUIDText)
-		}
-		if inj.Recite {
-			msgs = appendTailMessageAnthropic(msgs, replayReciteFirstLineInstruction())
-		}
+	if inj != nil && inj.Recite {
+		msgs = appendTailMessageAnthropic(msgs, replayReciteWindowInstruction(inj.ReciteLabels))
 	}
 	if len(msgs) > 0 {
 		body["messages"] = msgs
 	}
 
-	// Collect canonical text for the cache estimator.
+	// Collect canonical text for the cache estimator. Uses the SAME
+	// buildMessageContent(m, docs, stampByHash) call as buildMessages above
+	// so the cache-estimate canonical matches the wire body exactly
+	// (including any inline turn-stamp markers).
 	var canonical strings.Builder
 	if runID != "" {
 		canonical.WriteString(fmt.Sprintf("<ignore>RUN_GUID: %s</ignore>", runID))
 	}
 	for _, b := range effectiveSystemBlocks(req.SystemBlocks) {
 		canonical.WriteString(synthText(b.Hash, b.Bytes, docs))
-	}
-	if markerAtBoundary {
-		canonical.WriteString(injUUIDText)
 	}
 	if req.Tools != nil && req.Tools.Count > 0 {
 		n := req.Tools.Count
@@ -158,7 +133,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 		}
 	}
 	for _, m := range req.Messages {
-		blocks := buildMessageContent(m, docs)
+		blocks := buildMessageContent(m, docs, stampByHash)
 		for _, blk := range blocks {
 			if t, ok := blk["text"]; ok {
 				canonical.WriteString(fmt.Sprintf("%v", t))
@@ -178,13 +153,8 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 			}
 		}
 	}
-	if inj != nil {
-		if !markerAtBoundary && injUUIDText != "" {
-			canonical.WriteString(injUUIDText)
-		}
-		if inj.Recite {
-			canonical.WriteString(replayReciteFirstLineInstruction())
-		}
+	if inj != nil && inj.Recite {
+		canonical.WriteString(replayReciteWindowInstruction(inj.ReciteLabels))
 	}
 
 	bodyBytes, err := json.Marshal(body)
@@ -289,10 +259,13 @@ func buildTools(spec *RouterReplayToolsSpec, docs string) []map[string]interface
 // share of the message's total Bytes. For tool_use and tool_result blocks
 // we preserve the original ids verbatim so the conversation maintains a
 // valid reference graph that matches what the original capture sent.
-func buildMessages(msgs []RouterReplayMessage, docs string) []map[string]interface{} {
+// stampByHash is inj.StampByHash (nil when --replay-inject-uuids is off) —
+// threaded down to buildMessageContent, which appends each qualifying
+// turn's inline UUID marker to its own synthesized content.
+func buildMessages(msgs []RouterReplayMessage, docs string, stampByHash map[string]turnStamp) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(msgs))
 	for _, m := range msgs {
-		content := buildMessageContent(m, docs)
+		content := buildMessageContent(m, docs, stampByHash)
 		entry := map[string]interface{}{
 			"role":    roleOrUser(m.Role),
 			"content": content,
@@ -318,8 +291,9 @@ func roleOrUser(role string) string {
 	return "user"
 }
 
-// appendTailMessageAnthropic appends text (a UUID marker or the recite ask)
-// to the end of an Anthropic messages array, preserving strict user/
+// appendTailMessageAnthropic appends text (the windowed recite ask — see
+// replayReciteWindowInstruction) to the end of an Anthropic messages array,
+// preserving strict user/
 // assistant role alternation (Anthropic rejects consecutive same-role
 // messages, and "system" is not a valid role inside `messages` at all):
 //   - if the array is empty, or the last message is role "assistant", a
@@ -356,7 +330,18 @@ func appendTailMessageAnthropic(msgs []map[string]interface{}, text string) []ma
 // block_types lists the kinds in order; we use tool_use_ids and
 // tool_result_ids to populate ids on the matching blocks (in order of
 // appearance in block_types).
-func buildMessageContent(m RouterReplayMessage, docs string) []map[string]interface{} {
+//
+// stampByHash is inj.StampByHash (nil when --replay-inject-uuids is off, or
+// when this message isn't a qualifying turn). When m.Hash is a key in
+// stampByHash, the labeled marker "\n\n[turn-N id: <uuid>]" is appended to
+// the LAST "text"-type block's synthesized content, at a position wholly
+// determined by m.Hash (same seed synthText already keys on) — so two
+// requests carrying the same turn emit byte-identical content for it,
+// preserving the within-session cache-hit property. Only count==1
+// (genuinely per-session) messages are ever present in stampByHash — see
+// isQualifyingUserTurn — so a cross-session-shared message is never
+// perturbed.
+func buildMessageContent(m RouterReplayMessage, docs string, stampByHash map[string]turnStamp) []map[string]interface{} {
 	nText := 0
 	for _, t := range m.BlockTypes {
 		if t == "text" {
@@ -433,6 +418,15 @@ func buildMessageContent(m RouterReplayMessage, docs string) []map[string]interf
 				"type": "text",
 				"text": synthText(blockSeed+":fallback", perText, docs),
 			})
+		}
+	}
+	if stamp, ok := stampByHash[m.Hash]; ok {
+		marker := "\n\n[" + stamp.Label + " id: " + stamp.UUID + "]"
+		for i := len(out) - 1; i >= 0; i-- {
+			if out[i]["type"] == "text" {
+				out[i]["text"] = fmt.Sprintf("%v", out[i]["text"]) + marker
+				break
+			}
 		}
 	}
 	return out
@@ -552,9 +546,11 @@ func buildOpenAITools(spec *RouterReplayToolsSpec, docs string) []map[string]int
 // inj carries the UUID cache-coherency injection (--replay-inject-uuids,
 // router path — see replay_router_uuid.go); nil means "no injection".
 func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool, inj *uuidInjection) ([]byte, string, error) {
+	var stampByHash map[string]turnStamp
 	injNumUUIDs := 0
 	if inj != nil {
-		injNumUUIDs = len(inj.UUIDs)
+		stampByHash = inj.StampByHash
+		injNumUUIDs = len(inj.ReciteUUIDs)
 	}
 	body := map[string]interface{}{
 		"model":      modelName,
@@ -598,25 +594,6 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		messages = append([]map[string]interface{}{stamp}, messages...)
 	}
 
-	// UUID block injection at the system/conversation boundary (Option C —
-	// see replay_router_uuid.go and the mirrored comment in
-	// buildAnthropicMessagesBody). Only spliced in here when the leading
-	// run of cross-session-shared blocks does NOT extend past the emitted
-	// system blocks; otherwise it falls back to tail injection below, so it
-	// never lands ahead of shared tools/messages and poisons their
-	// cross-session cache key too.
-	injUUIDText := ""
-	if inj != nil {
-		injUUIDText = bareUUIDBlock(inj.UUIDs)
-	}
-	markerAtBoundary := inj != nil && injUUIDText != "" &&
-		inj.SharedPrefixLen > 0 && inj.SharedPrefixLen <= len(effectiveSystemBlocks(req.SystemBlocks))
-	if markerAtBoundary {
-		messages = append(messages, map[string]interface{}{
-			"role":    "system",
-			"content": injUUIDText,
-		})
-	}
 	if forceOutput {
 		// Force the model to generate up to max_tokens: append a short
 		// continue-generating instruction as a system message AND set vLLM's
@@ -639,17 +616,12 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 	// each block and join them with newlines, and log a one-time warning so
 	// the operator knows tool fidelity is lost.
 	if len(req.Messages) > 0 {
-		openaiMsgs := buildOpenAIMessages(req.Messages, docs)
+		openaiMsgs := buildOpenAIMessages(req.Messages, docs, stampByHash)
 		messages = append(messages, openaiMsgs...)
 	}
 
-	if inj != nil {
-		if !markerAtBoundary && injUUIDText != "" {
-			messages = appendTailMessageOpenAI(messages, injUUIDText)
-		}
-		if inj.Recite {
-			messages = appendTailMessageOpenAI(messages, replayReciteFirstLineInstruction())
-		}
+	if inj != nil && inj.Recite {
+		messages = appendTailMessageOpenAI(messages, replayReciteWindowInstruction(inj.ReciteLabels))
 	}
 
 	body["messages"] = messages
@@ -657,7 +629,11 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		body["tools"] = buildOpenAITools(req.Tools, docs)
 	}
 
-	// Collect canonical text for the cache estimator (system blocks + messages).
+	// Collect canonical text for the cache estimator (system blocks +
+	// messages). Uses the SAME buildMessageContent(m, docs, stampByHash)
+	// call as buildOpenAIMessages above so the cache-estimate canonical
+	// matches the wire body exactly (including any inline turn-stamp
+	// markers).
 	var canonical strings.Builder
 	if runID != "" {
 		canonical.WriteString(fmt.Sprintf("<ignore>RUN_GUID: %s</ignore>", runID))
@@ -665,11 +641,8 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 	for _, b := range effectiveSystemBlocks(req.SystemBlocks) {
 		canonical.WriteString(synthText(b.Hash, b.Bytes, docs))
 	}
-	if markerAtBoundary {
-		canonical.WriteString(injUUIDText)
-	}
 	for _, m := range req.Messages {
-		blocks := buildMessageContent(m, docs)
+		blocks := buildMessageContent(m, docs, stampByHash)
 		for _, blk := range blocks {
 			if t, ok := blk["text"]; ok {
 				canonical.WriteString(fmt.Sprintf("%v", t))
@@ -682,21 +655,17 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 			}
 		}
 	}
-	if inj != nil {
-		if !markerAtBoundary && injUUIDText != "" {
-			canonical.WriteString(injUUIDText)
-		}
-		if inj.Recite {
-			canonical.WriteString(replayReciteFirstLineInstruction())
-		}
+	if inj != nil && inj.Recite {
+		canonical.WriteString(replayReciteWindowInstruction(inj.ReciteLabels))
 	}
 
 	bodyBytes, err := json.Marshal(body)
 	return bodyBytes, canonical.String(), err
 }
 
-// appendTailMessageOpenAI appends text (a UUID marker or the recite ask) to
-// the end of an OpenAI messages array. Unlike Anthropic, OpenAI has no
+// appendTailMessageOpenAI appends text (the windowed recite ask — see
+// replayReciteWindowInstruction) to the end of an OpenAI messages array.
+// Unlike Anthropic, OpenAI has no
 // strict role-alternation requirement, but we still fold the text into the
 // last message's content when that message is one the model would read as
 // its own turn's input (user/system/tool) rather than always creating a
@@ -730,12 +699,13 @@ func appendTailMessageOpenAI(msgs []map[string]interface{}, text string) []map[s
 // messages. tool_use blocks become tool_calls on the assistant message;
 // tool_result blocks become separate role="tool" messages. Orphaned
 // tool_result blocks (no matching prior tool_call) are folded into user text.
-func buildOpenAIMessages(msgs []RouterReplayMessage, docs string) []map[string]interface{} {
+// stampByHash is threaded through to buildMessageContent (see its doc).
+func buildOpenAIMessages(msgs []RouterReplayMessage, docs string, stampByHash map[string]turnStamp) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(msgs))
 	seenToolCallIDs := map[string]bool{}
 
 	for _, m := range msgs {
-		blocks := buildMessageContent(m, docs)
+		blocks := buildMessageContent(m, docs, stampByHash)
 		role := roleOrUser(m.Role)
 
 		if role == "assistant" {
