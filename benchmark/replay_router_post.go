@@ -44,7 +44,6 @@ type replayPoster struct {
 	epMu       sync.Mutex
 	epResolved string // latched endpoint; "" until the first success
 	epFellBack bool
-	epLogOnce  sync.Once
 	apiType    string // "anthropic", "openai", or "openai_vllm"
 	client     *http.Client
 	runID      string
@@ -221,11 +220,22 @@ func (p *replayPoster) endpointAttempts() []string {
 	return []string{p.epPrimary, p.epFallback}
 }
 
+// Endpoint resolutions logged so far, PACKAGE-scoped: replayPoster is
+// constructed per replay instance (per series), so a per-poster sync.Once
+// printed "[router-replay] endpoint resolved" once per SERIES — thousands
+// of lines per soak. Log once per distinct resolved endpoint instead; a
+// genuine endpoint change still logs.
+var (
+	epLogMu   sync.Mutex
+	epLogSeen = map[string]bool{}
+)
+
 // latchEndpoint records the first endpoint form that returned 2xx and logs
-// the resolution once. Concurrent first requests may each probe both forms
-// in parallel — benign duplicate probes by design (no single-flight, so a
-// high-concurrency launch is never serialized behind one resolver); the
-// first success wins and later latches are no-ops.
+// the resolution once per distinct endpoint (process-wide). Concurrent
+// first requests may each probe both forms in parallel — benign duplicate
+// probes by design (no single-flight, so a high-concurrency launch is
+// never serialized behind one resolver); the first success wins and later
+// latches are no-ops.
 func (p *replayPoster) latchEndpoint(url string) {
 	p.epMu.Lock()
 	if p.epResolved == "" {
@@ -234,13 +244,19 @@ func (p *replayPoster) latchEndpoint(url string) {
 	}
 	resolved, fellBack := p.epResolved, p.epFellBack
 	p.epMu.Unlock()
-	p.epLogOnce.Do(func() {
+	epLogMu.Lock()
+	seen := epLogSeen[resolved]
+	if !seen {
+		epLogSeen[resolved] = true
+	}
+	epLogMu.Unlock()
+	if !seen {
 		note := ""
 		if fellBack {
 			note = " (fallback /v1 applied)"
 		}
 		fmt.Fprintf(os.Stderr, "[router-replay] endpoint resolved: %s%s\n", resolved, note)
-	})
+	}
 }
 
 // sendOnce POSTs bodyBytes to url with the poster's auth/accept headers.
