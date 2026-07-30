@@ -85,6 +85,27 @@ storageSize: 10Gi          # PVC size, chart-provisioned claim only
 # values files keep persisting instead of silently falling back to emptyDir.
 storeResults: false
 
+# ── Scheduling ──────────────────────────────────────────────────────────────
+# Where the benchmark pod lands. It is a load generator pointed at `endpoint`,
+# so it wants a short network path to the inference nodes without running on
+# them — sharing a GPU node's CPU with the server skews the very TTFT numbers
+# the run exists to measure. Tolerations are usually the way onto a pool that
+# is tainted for inference; a nodeSelector is the way to stay off it.
+#
+#   nodeSelector:
+#     node-role.kubernetes.io/worker: ""
+#     topology.kubernetes.io/zone: us-east-1a
+#
+#   tolerations:
+#     - key: nvidia.com/gpu
+#       operator: Exists
+#       effect: NoSchedule
+#
+# Note the PVC (resultsClaim or a chart-provisioned one) is ReadWriteOnce, so
+# on zonal storage these must not conflict with the volume's own zone.
+nodeSelector: {}
+tolerations: []
+
 resources:
   requests:
     memory: "256Mi"

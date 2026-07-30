@@ -339,6 +339,7 @@ fixed concurrency 28 with a 4-worker hot pool).
 | `resultsClaim` | `""` | Mount an existing PVC at `resultsMountPath` — the one value needed to persist results (see below) |
 | `createResultsClaim` / `storageSize` / `storageClassName` | `false` / `10Gi` / `""` | Have the chart provision the PVC instead |
 | `resultsMountPath` | `/results` | Where results are written inside the pod |
+| `nodeSelector` / `tolerations` | `{}` / `[]` | Standard pod scheduling — keep the load generator off the inference nodes it measures, or tolerate a tainted pool to reach them |
 | `resources` | 256Mi/250m → 4Gi/4 | Pod resources |
 
 Authoritative list with inline docs: `chart/wekai/values.yaml`
