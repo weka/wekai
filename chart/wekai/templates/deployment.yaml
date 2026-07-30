@@ -29,7 +29,11 @@ spec:
             - "sh"
             - "-c"
             - |
-              wekai benchmark auto \
+              # Build argv once into the positional params, then echo and run
+              # it. The flag list below stays the single source of truth — a
+              # separate echo of the same command would drift the moment one
+              # of these conditionals changed.
+              set -- wekai benchmark auto \
                 --router-replay-file={{ .Values.replay.replayFile }} \
                 {{- if .Values.endpoint }}
                 --models={{ if .Values.model }}{{ printf "%s,model=%s" .Values.endpoint .Values.model | quote }}{{ else }}{{ .Values.endpoint | quote }}{{ end }} \
@@ -88,8 +92,10 @@ spec:
                 --dry-run-output-tps={{ .Values.replay.dryRunOutputTPS | int64 }} \
                 {{- end }}
                 {{- end }}
-                --save-request-data={{ .Values.resultsMountPath }} \
-                || echo "wekai benchmark auto exited with status $?"
+                --save-request-data={{ .Values.resultsMountPath }}
+
+              echo "+ $*"
+              "$@" || echo "wekai benchmark auto exited with status $?"
               echo "Benchmark finished. Sleeping so results under {{ .Values.resultsMountPath }} stay explorable (kubectl exec/cp); delete the pod to rerun."
               sleep infinity
           {{- if .Values.llmApiKeySecretName }}
