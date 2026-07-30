@@ -39,6 +39,64 @@ wekai router serve --help
 wekai eval simple-tool --help
 ```
 
+## Run the router locally
+
+Front a local model endpoint on `http://127.0.0.1:25201` with the router on
+`http://127.0.0.1:25202`, sending every model to that one upstream:
+
+```
+wekai router serve \
+  --listen 127.0.0.1:25202 \
+  --default 'http://127.0.0.1:25201' \
+  --strip-auth-when '*'
+```
+
+- `--default` is the catch-all rule (`* => <upstream>`): every requested model
+  name matches. The request path and query are appended to the upstream, so a
+  `POST /v1/messages` is forwarded to
+  `http://127.0.0.1:25201/v1/messages`.
+- `--strip-auth-when '*'` drops the inbound `Authorization`/`x-api-key`
+  headers, which unauth'd local servers (vLLM, llama.cpp, …) otherwise reject.
+- The model name is handled for you. Claude Code sends `claude-*`, which a
+  single-model server doesn't recognize — vLLM answers `POST /v1/messages`
+  with a bare `404`. On startup the router asks each upstream that has no
+  explicit `as <model>` what it serves (`GET <upstream>/v1/models`); if the
+  answer is exactly one model, every matching request's `model` is rewritten
+  to it:
+
+  ```
+  auto-model: http://127.0.0.1:25201 serves "zai-org/GLM-5.2-FP8" — rewriting every matching request's model to it
+    route: * => http://127.0.0.1:25201 as zai-org/GLM-5.2-FP8 (auto-discovered) (strip-auth)
+  ```
+
+  A multi-model upstream is left alone, so this can't silently collapse a
+  real fan-out onto one model. Control it with `--auto-model`: `auto`
+  (default), `force` (always take the first listed model), `off` (never
+  probe). An upstream that isn't up yet is retried in the background.
+- Append `as <model>` to pin the rewrite explicitly and skip discovery:
+  `--default 'http://127.0.0.1:25201 as my-local-model'`.
+- Use repeated `--route '<substr>,<substr> => <upstream>[ as <model>]'` rules
+  (first match wins) when you want per-model fan-out instead of one catch-all.
+- Add `--capture redacted` to record traffic under
+  `~/.wekai/router/capture/redacted/` for later `wekai router replay-prepare`.
+
+`/healthz`, `/livez`, and `/metrics` are served on the same listener.
+
+### Pointing Claude Code at it
+
+```
+export ANTHROPIC_BASE_URL=http://127.0.0.1:25202
+export ANTHROPIC_AUTH_TOKEN=dummy   # any non-empty value — stripped by --strip-auth-when '*'
+claude
+```
+
+With `--user-prefix` on the router, each client tags itself via the first path
+segment, and requests/captures/log lines carry that user:
+
+```
+export ANTHROPIC_BASE_URL=http://127.0.0.1:25202/alice
+```
+
 ## Replay benchmark
 
 `wekai benchmark auto --router-replay-file` replays previously captured
