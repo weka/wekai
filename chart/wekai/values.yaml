@@ -46,6 +46,14 @@ replay:
   replayStopAtLowConcurrency: false
   stderrLogs: false
 
+  # Print request errors to the pod log as they happen, rate-limited to at
+  # most one line per this interval. On by default: the run summary only ever
+  # reported an error *count*, so a pod quietly failing every request looked
+  # the same as one succeeding until you dug the JSONL off the volume. Rate
+  # limiting is what makes it safe to leave on — a total outage costs one line
+  # per second, not one per failed request. Set "" (or 0) for silence.
+  printErrorsThreshold: "1s"
+
   # Dry-run mode: simulate the replay's timing/rates offline (no real
   # requests) using synthetic cold/warm/output token rates.
   dryRun: false

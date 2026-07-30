@@ -70,6 +70,9 @@ spec:
                 {{- if .Values.replay.replayStopAtLowConcurrency }}
                 --replay-stop-at-low-concurrency \
                 {{- end }}
+                {{- if .Values.replay.printErrorsThreshold }}
+                --print-errors-threshold={{ .Values.replay.printErrorsThreshold }} \
+                {{- end }}
                 {{- if .Values.replay.stderrLogs }}
                 --stderr-logs \
                 {{- end }}

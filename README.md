@@ -334,6 +334,7 @@ fixed concurrency 28 with a 4-worker hot pool).
 | `replay.replayNoStamp` | `false` | Disable per-run cache-busting stamp (bitwise-faithful replay) |
 | `replay.abortOnCollapse` / `replay.replayStopAtLowConcurrency` | `false` | Early-stop behaviors |
 | `replay.dryRun` + `replay.dryRun{Cold,Warm,Output}TPS` | `false` / `0` | Synthetic timing mode, no real LLM calls |
+| `replay.printErrorsThreshold` | `"1s"` | Print request errors to the pod log as they happen, at most one line per interval (`""` or `0` = silent) |
 | `replay.stderrLogs` | `false` | Log to stderr |
 | `llmApiKeySecretName` | `""` | K8s secret with LLM API-key env vars (for endpoints that need auth) |
 | `resultsClaim` | `""` | Mount an existing PVC at `resultsMountPath` — the one value needed to persist results (see below) |
