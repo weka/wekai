@@ -84,9 +84,16 @@ type vllmMetricsSample struct {
 var promSourceLabelRe = regexp.MustCompile(`\bsource="([^"]*)"`)
 
 // parsePromptTokensBySource scans Prometheus text exposition for the
-// vllm:prompt_tokens_by_source family (with or without the counter _total
-// suffix) and returns cumulative values keyed by the source label, summed
-// across all other label combinations (engine index, model_name).
+// vllm:prompt_tokens_by_source family and returns cumulative values keyed by
+// the source label, summed across all other label combinations (engine index,
+// model_name).
+//
+// The series to match is vllm:prompt_tokens_by_source_total — prometheus_client
+// appends the counter suffix, so that is the only form a real vLLM /metrics
+// emits. The bare name is accepted too, purely as tolerance for an exposition
+// path that doesn't append it; the two never coexist in one scrape. (The bare
+// name does appear on the # HELP/# TYPE lines, but those are skipped as
+// comments before any name matching.)
 func parsePromptTokensBySource(r io.Reader) (map[string]float64, error) {
 	out := map[string]float64{}
 	sc := bufio.NewScanner(r)

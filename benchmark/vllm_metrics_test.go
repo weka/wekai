@@ -50,7 +50,8 @@ func TestParsePromptTokensBySource(t *testing.T) {
 }
 
 func TestParsePromptTokensBySourceNoSuffixAndTimestamp(t *testing.T) {
-	// Tolerate the family without the counter _total suffix and trailing
+	// Real vLLM always emits the _total suffix (see promFixture); this pins
+	// the fallback for an exposition path that doesn't, plus trailing
 	// timestamps after the value.
 	in := `vllm:prompt_tokens_by_source{engine="0",source="local_compute"} 7 1720000000000` + "\n"
 	vals, err := parsePromptTokensBySource(strings.NewReader(in))

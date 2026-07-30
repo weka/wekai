@@ -179,12 +179,13 @@ the `/v1` API suffix stripped — once a minute and appends the result to the
 same JSONL. This is what splits the report's prompt tokens into compute vs
 local cache vs external cache.
 
-Exactly one metric family is read:
-`vllm:prompt_tokens_by_source` (accepted with or without the `_total`
-exposition suffix), keeping the three `source` label values
-`local_compute`, `local_cache_hit`, and `external_kv_transfer`. Values are
-summed over every other label (`model_name`, engine index); nothing else
-from `/metrics` is retained. Each sample is one JSONL row with
+Exactly one series is read — `vllm:prompt_tokens_by_source_total` — keeping
+the three `source` label values `local_compute`, `local_cache_hit`, and
+`external_kv_transfer`. Values are summed over every other label
+(`model_name`, engine index); nothing else from `/metrics` is retained. The
+`_total` is `prometheus_client` appending the counter suffix to the family
+declared as `vllm:prompt_tokens_by_source`, which is why the bare name still
+appears on the `# HELP`/`# TYPE` lines. Each sample is one JSONL row with
 `record_type: "vllm_metrics_sample"` and fields `ts`, `model`,
 `sources.compute` / `sources.local_cache` / `sources.external_cache`, plus
 the locally-computed `active_dataset_tokens` and `active_series`.
