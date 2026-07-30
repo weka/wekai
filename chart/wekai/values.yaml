@@ -55,15 +55,35 @@ replay:
 
 llmApiKeySecretName: ""   # K8s secret with LLM API key env vars (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...)
 
+# ── Results ─────────────────────────────────────────────────────────────────
 # Per-request JSONL data + the auto-generated report.html are ALWAYS saved
-# (--save-request-data) under resultsMountPath/<run-timestamp>/. After the
-# benchmark finishes (or fails) the pod sleeps so you can explore/extract
-# results (kubectl exec / kubectl cp); delete the pod to have the Deployment
-# restart the benchmark.
-storeResults: false        # true = persist results on a PVC; false = pod-local emptyDir (lost when the pod is deleted)
-storageClassName: ""       # empty = cluster default
-storageSize: 10Gi          # PVC size for results storage
+# (--save-request-data) under resultsMountPath/<run-timestamp>/. That is not
+# configurable; the only choice is what storage backs that path:
+#
+#   nothing set               ephemeral emptyDir — results go away with the pod
+#   resultsClaim=<pvc-name>   mount a PVC you already created (nothing else needed)
+#   createResultsClaim=true   chart provisions its own PVC, <release>-results
+#
+# After the benchmark finishes (or fails) the pod sleeps so you can
+# explore/extract results (kubectl exec / kubectl cp); delete the pod to have
+# the Deployment restart the benchmark — the volume survives that either way.
 resultsMountPath: /results
+
+# Mount an existing PVC. The only value needed to persist results onto storage
+# you already manage; storageClassName/storageSize/createResultsClaim are all
+# ignored, since the volume already exists and is yours to size and delete.
+resultsClaim: ""
+
+# Have the chart provision the PVC instead. It is annotated
+# helm.sh/resource-policy: keep, so `helm uninstall` leaves the results behind
+# — delete the PVC by hand once you've pulled them off.
+createResultsClaim: false
+storageClassName: ""       # empty = cluster default
+storageSize: 10Gi          # PVC size, chart-provisioned claim only
+
+# Deprecated: the old name for createResultsClaim, still honored so existing
+# values files keep persisting instead of silently falling back to emptyDir.
+storeResults: false
 
 resources:
   requests:

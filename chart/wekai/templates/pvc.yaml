@@ -1,10 +1,15 @@
-{{- if .Values.storeResults }}
+{{- if include "wekai.results.ownClaim" . }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: {{ include "wekai.fullname" . }}-results
   labels:
     {{- include "wekai.labels" . | nindent 4 }}
+  annotations:
+    # Helm deletes what it created, and a benchmark's results are usually the
+    # only reason the run happened — keep the volume so `helm uninstall`
+    # doesn't take the data with it. Delete the PVC by hand when done.
+    helm.sh/resource-policy: keep
 spec:
   accessModes:
     - ReadWriteOnce

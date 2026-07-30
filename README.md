@@ -309,9 +309,9 @@ the benchmark completes (or fails) the pod sleeps forever so results stay
 explorable via `kubectl exec`/`kubectl cp`; delete the pod and the
 Deployment restarts the benchmark. Per-request JSONL data plus an
 auto-generated `report.html` visualization are always written under
-`resultsMountPath/<run-timestamp>/` (`--save-request-data`) — set
-`storeResults=true` to back that path with a PVC instead of a pod-local
-emptyDir. The chart is deliberately minimal: the only value most installs
+`resultsMountPath/<run-timestamp>/` (`--save-request-data`); the only
+choice is what storage backs that path — see below. The chart is
+deliberately minimal: the only value most installs
 need to set is `endpoint`, the target model server; everything else has a
 working default (all sessions replayed by 256 parallel series workers at
 fixed concurrency 28 with a 4-worker hot pool).
@@ -336,11 +336,41 @@ fixed concurrency 28 with a 4-worker hot pool).
 | `replay.dryRun` + `replay.dryRun{Cold,Warm,Output}TPS` | `false` / `0` | Synthetic timing mode, no real LLM calls |
 | `replay.stderrLogs` | `false` | Log to stderr |
 | `llmApiKeySecretName` | `""` | K8s secret with LLM API-key env vars (for endpoints that need auth) |
-| `storeResults` / `storageSize` / `storageClassName` / `resultsMountPath` | `false` / `10Gi` / `""` / `/results` | Results (JSONL + `report.html`) are always saved under `resultsMountPath`; `storeResults=true` backs it with a PVC, otherwise emptyDir |
+| `resultsClaim` | `""` | Mount an existing PVC at `resultsMountPath` — the one value needed to persist results (see below) |
+| `createResultsClaim` / `storageSize` / `storageClassName` | `false` / `10Gi` / `""` | Have the chart provision the PVC instead |
+| `resultsMountPath` | `/results` | Where results are written inside the pod |
 | `resources` | 256Mi/250m → 4Gi/4 | Pod resources |
 
 Authoritative list with inline docs: `chart/wekai/values.yaml`
 (or `helm show values oci://quay.io/weka.io/helm/wekai --version <vX>`).
+
+### Where results are stored
+
+Results are *always* written to `resultsMountPath`. The only decision is
+what backs it:
+
+| | |
+|---|---|
+| nothing set | ephemeral `emptyDir` — results go away with the pod |
+| `--set resultsClaim=<pvc-name>` | mounts a PVC you already created; no other value required |
+| `--set createResultsClaim=true` | chart provisions `<release>-results` (`storageSize`, `storageClassName` apply) |
+
+```
+helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
+  --namespace weka \
+  --set endpoint=http://YOUR-LLM-HOST:8000 \
+  --set resultsClaim=my-existing-pvc
+```
+
+`resultsClaim` wins over `createResultsClaim`: the volume is yours to size
+and delete, so the chart won't provision a second one beside it. A
+chart-provisioned claim carries `helm.sh/resource-policy: keep`, so
+`helm uninstall` leaves the results behind — delete that PVC by hand once
+you've pulled them off. Either way the volume outlives the pod, so deleting
+the pod to rerun the benchmark is safe.
+
+`storeResults` is the old name for `createResultsClaim` and still works, so
+existing values files keep their PVC.
 
 Charts are published to `oci://quay.io/weka.io/helm/wekai`. The chart
 `--version` is mandatory (versions are `v999.0.0-<sha12>` prerelease stamps,

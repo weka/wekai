@@ -101,9 +101,10 @@ spec:
               mountPath: {{ .Values.resultsMountPath }}
       volumes:
         - name: results
-          {{- if .Values.storeResults }}
+          {{- $claim := include "wekai.results.claimName" . }}
+          {{- if $claim }}
           persistentVolumeClaim:
-            claimName: {{ include "wekai.fullname" . }}-results
+            claimName: {{ $claim }}
           {{- else }}
           emptyDir: {}
           {{- end }}
