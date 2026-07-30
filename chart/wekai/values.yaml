@@ -114,10 +114,23 @@ storeResults: false
 nodeSelector: {}
 tolerations: []
 
+# Requests are sized for the real workload — 256 series workers holding
+# replay sessions, prompt buffers and the cache estimator — rather than the
+# idle floor, so the scheduler reserves what the run actually uses instead of
+# discovering it under load.
+#
+# No limits by design. A CPU limit makes CFS throttle the process in exactly
+# the moments it is busiest, and a throttled load generator adds its own
+# latency to every TTFT and token-rate number the run reports — measurement
+# error indistinguishable from a slow server. Add limits back only if a
+# namespace LimitRange requires them, and set the CPU one well above the
+# request if you do:
+#
+#   resources:
+#     limits:
+#       memory: "16Gi"
+#       cpu: "8"
 resources:
   requests:
-    memory: "256Mi"
-    cpu: "250m"
-  limits:
-    memory: "4Gi"
+    memory: "8Gi"
     cpu: "4"

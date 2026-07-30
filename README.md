@@ -341,7 +341,7 @@ fixed concurrency 28 with a 4-worker hot pool).
 | `createResultsClaim` / `storageSize` / `storageClassName` | `false` / `10Gi` / `""` | Have the chart provision the PVC instead |
 | `resultsMountPath` | `/results` | Where results are written inside the pod |
 | `nodeSelector` / `tolerations` | `{}` / `[]` | Standard pod scheduling — keep the load generator off the inference nodes it measures, or tolerate a tainted pool to reach them |
-| `resources` | 256Mi/250m → 4Gi/4 | Pod resources |
+| `resources` | requests 8Gi / 4 CPU, no limits | Pod resources. Limits are omitted deliberately — CPU throttling on the load generator would show up as inflated TTFT in the results |
 
 Authoritative list with inline docs: `chart/wekai/values.yaml`
 (or `helm show values oci://quay.io/weka.io/helm/wekai --version <vX>`).
