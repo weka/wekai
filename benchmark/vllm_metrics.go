@@ -1,13 +1,22 @@
 package benchmark
 
-// vLLM metrics collector: during `benchmark auto` runs against a
-// type=openai_vllm endpoint, a per-model sampler goroutine polls the server's
-// Prometheus /metrics endpoint every vllmMetricsSampleInterval and persists
-// per-source cumulative prompt-token counters into the same
-// --save-request-data JSONL stream as the request rows, as records of their
-// own type ("vllm_metrics_sample"). Sampling is strictly best-effort: any
-// fetch/parse failure skips that sample silently and can never affect the
-// benchmark itself.
+// vLLM metrics collector: during `benchmark auto` runs against an
+// OpenAI-compatible (chat/completions) endpoint, a per-model sampler goroutine
+// polls the server's Prometheus /metrics endpoint every
+// vllmMetricsSampleInterval and persists per-source cumulative prompt-token
+// counters into the same --save-request-data JSONL stream as the request rows,
+// as records of their own type ("vllm_metrics_sample"). Sampling is strictly
+// best-effort: any fetch/parse failure skips that sample and can never affect
+// the benchmark itself.
+//
+// Eligibility is deliberately looser than type=openai_vllm. Any chat/completions
+// endpoint — type=openai, the default type, or an autodiscovered bare host:port
+// — may well be vLLM behind the scenes, and the only way to find out is to ask.
+// The cost of guessing wrong is bounded by vllmMetricsSpeculativeBudget; the
+// cost of not guessing is a whole benchmark run with no cache-source breakdown.
+// type=openai_vllm still differs in one way: the operator asserted the server
+// is vLLM, so a sampler for such a spec keeps retrying forever rather than
+// giving up (see noteFailure).
 //
 // The counter family is the fork's vllm:prompt_tokens_by_source
 // (vllm/v1/metrics/loggers.py) with label source in {local_compute,
@@ -22,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -40,6 +50,15 @@ const (
 
 	vllmMetricsSampleInterval = 60 * time.Second
 	vllmMetricsFetchTimeout   = 5 * time.Second
+
+	// vllmMetricsSpeculativeBudget is how many consecutive failed samples a
+	// speculatively-started sampler (one whose spec did not say
+	// type=openai_vllm) tolerates before concluding the endpoint simply isn't
+	// vLLM and shutting itself down. Bounding it matters because the endpoint
+	// may be a public API that never had a /metrics: three 404s spread over two
+	// minutes is a fair price for the guess, an hourly drip is not. One
+	// successful sample retires the budget for good — see noteSuccess.
+	vllmMetricsSpeculativeBudget = 3
 )
 
 // vllmSourceCounters holds cumulative prompt-token counter values by source
@@ -152,63 +171,99 @@ func (t *activeDatasetTracker) Sum() (tokens int64, series int) {
 	return tokens, series
 }
 
-// vllmMetricsEndpoints derives the Prometheus /metrics URLs for an
-// openai_vllm dynamic model spec (the /v1 API suffix is stripped to reach the
-// server root). Returns nil when the spec is not a vLLM endpoint — the
-// sampler simply doesn't start for other model types.
-func vllmMetricsEndpoints(model string) []string {
+// vllmMetricsEligibility says whether a model spec is worth polling for vLLM
+// metrics, and how sure we are.
+type vllmMetricsEligibility struct {
+	// urls are the Prometheus /metrics URLs, one per endpoint. Empty means the
+	// spec is not a chat/completions endpoint and no sampler should start.
+	urls []string
+	// explicit is true when the spec said type=openai_vllm outright. Such a
+	// sampler never gives up on failures; a speculative one does.
+	explicit bool
+}
+
+// vllmMetricsEndpoints derives the Prometheus /metrics URLs for a dynamic
+// model spec pointing at an OpenAI-compatible endpoint (the /v1 API suffix is
+// stripped to reach the server root, where vLLM mounts /metrics).
+//
+// Every chat/completions type qualifies, not just openai_vllm: "openai" is
+// also what a bare host:port resolves to once autodiscovery has confirmed a
+// /v1/models listing, and that shape is exactly what a local vLLM serves.
+// type=anthropic and type=gemini are excluded — no vLLM deployment answers on
+// those wire formats, so probing them would be pure noise.
+func vllmMetricsEndpoints(model string) vllmMetricsEligibility {
 	if !llm.IsDynamicModel(model) {
-		return nil
+		return vllmMetricsEligibility{}
 	}
 	dyn, err := llm.ParseDynamicModel(model)
-	if err != nil || dyn.Type != "openai_vllm" {
-		return nil
+	if err != nil {
+		return vllmMetricsEligibility{}
 	}
-	var urls []string
+	// "" cannot come out of ParseDynamicModel today (it defaults to "openai"),
+	// but treat it as the default anyway so a future zero-valued config here
+	// fails open rather than silently dropping sampling.
+	switch dyn.Type {
+	case "openai", "openai_vllm", "":
+	default:
+		return vllmMetricsEligibility{}
+	}
+	out := vllmMetricsEligibility{explicit: dyn.Type == "openai_vllm"}
 	for _, u := range dyn.BaseURLs {
 		u = strings.TrimRight(u, "/")
 		u = strings.TrimSuffix(u, "/v1")
-		urls = append(urls, u+"/metrics")
+		out.urls = append(out.urls, u+"/metrics")
 	}
-	return urls
+	return out
 }
 
 // vllmMetricsSampler polls one model's endpoints and writes samples to rdw.
 type vllmMetricsSampler struct {
 	model    string
 	urls     []string
+	explicit bool
 	tracker  *activeDatasetTracker
 	rdw      *requestDataWriter
 	interval time.Duration
 	client   *http.Client
 	skipped  atomic.Int64
 	now      func() time.Time
+	logf     func(format string, args ...any)
+
+	// Outcome bookkeeping. Touched only by the run goroutine, so no locking.
+	consecFails   int
+	everSucceeded bool
 
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
 // startVLLMMetricsSampler launches the sampler goroutine for cfg.Model when
-// the spec is a type=openai_vllm endpoint and request data is being saved.
+// the spec is an OpenAI-compatible endpoint and request data is being saved.
 // Returns nil when sampling doesn't apply. Callers must invoke stop() before
 // closing rdw.
+//
+// Starting is not a promise that samples will land: a speculatively-started
+// sampler shuts itself down once it establishes the endpoint has no vLLM
+// metrics (see noteFailure). stop() stays safe to call either way.
 func startVLLMMetricsSampler(ctx context.Context, model string, tracker *activeDatasetTracker, rdw *requestDataWriter) *vllmMetricsSampler {
 	if rdw == nil || tracker == nil {
 		return nil
 	}
-	urls := vllmMetricsEndpoints(model)
-	if len(urls) == 0 {
+	elig := vllmMetricsEndpoints(model)
+	if len(elig.urls) == 0 {
 		return nil
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	s := &vllmMetricsSampler{
 		model:    model,
-		urls:     urls,
+		urls:     elig.urls,
+		explicit: elig.explicit,
 		tracker:  tracker,
 		rdw:      rdw,
 		interval: vllmMetricsSampleInterval,
 		client:   &http.Client{},
 		now:      time.Now,
+		logf:     func(f string, a ...any) { fmt.Fprintf(os.Stderr, "[vllm-metrics] "+f+"\n", a...) },
 		cancel:   cancel,
 		done:     make(chan struct{}),
 	}
@@ -227,7 +282,9 @@ func (s *vllmMetricsSampler) run(ctx context.Context) {
 	defer close(s.done)
 	// Immediate first sample establishes the cumulative baseline for delta
 	// computation in the report.
-	s.sampleOnce(ctx)
+	if !s.sampleOnce(ctx) {
+		return
+	}
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 	for {
@@ -235,7 +292,9 @@ func (s *vllmMetricsSampler) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.sampleOnce(ctx)
+			if !s.sampleOnce(ctx) {
+				return
+			}
 		}
 	}
 }
@@ -243,19 +302,28 @@ func (s *vllmMetricsSampler) run(ctx context.Context) {
 // sampleOnce fetches every endpoint and writes one sample record. Any
 // endpoint failing (refused/timeout/non-200/parse failure/family absent)
 // skips the whole sample so the cumulative sums stay consistent across the
-// endpoint set; failures are silent by design.
-func (s *vllmMetricsSampler) sampleOnce(ctx context.Context) {
+// endpoint set — a partial sum would read as a counter reset downstream.
+//
+// It reports whether the sampler should keep polling; false means the
+// endpoint has been established as one that will never answer.
+func (s *vllmMetricsSampler) sampleOnce(ctx context.Context) (keepPolling bool) {
 	sums := map[string]float64{}
 	for _, u := range s.urls {
 		vals, err := s.fetchOne(ctx, u)
 		if err != nil {
 			s.skipped.Add(1)
-			return
+			// A cancelled run is the benchmark ending, not the endpoint
+			// failing; don't spend the speculative budget on it.
+			if ctx.Err() != nil {
+				return false
+			}
+			return s.noteFailure(u, err)
 		}
 		for k, v := range vals {
 			sums[k] += v
 		}
 	}
+	s.noteSuccess()
 	adt, active := s.tracker.Sum()
 	rec := vllmMetricsSample{
 		RecordType: recordTypeVLLMMetricsSample,
@@ -271,6 +339,49 @@ func (s *vllmMetricsSampler) sampleOnce(ctx context.Context) {
 	}
 	// Write errors are swallowed: sampling must never affect the benchmark.
 	_ = s.rdw.writeAny(rec)
+	return true
+}
+
+// noteSuccess records a landed sample. The first one is announced, and it
+// retires the speculative budget permanently: the endpoint has proven it
+// serves the counter family, so any later failure is a blip (server restart,
+// transient timeout) to ride out, not evidence of a bad guess.
+func (s *vllmMetricsSampler) noteSuccess() {
+	s.consecFails = 0
+	if s.everSucceeded {
+		return
+	}
+	s.everSucceeded = true
+	s.log("%s serves %s — sampling every %s", strings.Join(s.urls, ", "), vllmPromptTokensBySourceFamily, s.interval)
+}
+
+// noteFailure records a skipped sample and decides whether to keep going.
+//
+// An explicit type=openai_vllm spec (or any endpoint that has already
+// answered once) keeps polling indefinitely: the operator said this is vLLM,
+// and a server still loading weights or restarted mid-run must not cost the
+// rest of the run's samples. A speculative sampler instead spends
+// vllmMetricsSpeculativeBudget attempts and then stops.
+func (s *vllmMetricsSampler) noteFailure(url string, err error) (keepPolling bool) {
+	s.consecFails++
+	if s.explicit || s.everSucceeded {
+		if s.consecFails == 1 {
+			s.log("%s unavailable (%v) — skipping samples, still polling every %s", url, err, s.interval)
+		}
+		return true
+	}
+	if s.consecFails < vllmMetricsSpeculativeBudget {
+		return true
+	}
+	s.log("%s did not serve %s in %d attempts (%v) — sampling off; pass type=openai_vllm to keep polling",
+		url, vllmPromptTokensBySourceFamily, s.consecFails, err)
+	return false
+}
+
+func (s *vllmMetricsSampler) log(format string, args ...any) {
+	if s.logf != nil {
+		s.logf(format, args...)
+	}
 }
 
 func (s *vllmMetricsSampler) fetchOne(ctx context.Context, url string) (map[string]float64, error) {

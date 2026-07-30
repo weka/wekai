@@ -2,11 +2,13 @@ package benchmark
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -72,25 +74,37 @@ func TestParsePromptTokensBySourceGarbage(t *testing.T) {
 
 func TestVLLMMetricsEndpoints(t *testing.T) {
 	cases := []struct {
-		spec string
-		want []string
+		spec         string
+		want         []string
+		wantExplicit bool
 	}{
-		{"dynamic/http://localhost:8000/v1,type=openai_vllm,alias=x", []string{"http://localhost:8000/metrics"}},
-		{"dynamic/http://a:8000/v1|http://b:8001/v1,type=openai_vllm", []string{"http://a:8000/metrics", "http://b:8001/metrics"}},
-		{"dynamic/http://localhost:8000/v1,type=openai", nil},
-		{"dynamic/http://localhost:8000/v1,type=anthropic", nil},
-		{"anthropic/claude-3", nil},
+		{"dynamic/http://localhost:8000/v1,type=openai_vllm,alias=x", []string{"http://localhost:8000/metrics"}, true},
+		{"dynamic/http://a:8000/v1|http://b:8001/v1,type=openai_vllm", []string{"http://a:8000/metrics", "http://b:8001/metrics"}, true},
+		// Every chat/completions spec is eligible, just speculatively: the
+		// endpoint may still be vLLM and the only way to know is to ask.
+		{"dynamic/http://localhost:8000/v1,type=openai", []string{"http://localhost:8000/metrics"}, false},
+		// No type= at all — ParseDynamicModel's "openai" default.
+		{"dynamic/http://localhost:8000/v1", []string{"http://localhost:8000/metrics"}, false},
+		// Bare host:port, as autodiscovery leaves it before appending /v1.
+		{"dynamic/http://localhost:8000,type=openai", []string{"http://localhost:8000/metrics"}, false},
+		// Wire formats no vLLM deployment answers on.
+		{"dynamic/http://localhost:8000/v1,type=anthropic", nil, false},
+		{"dynamic/http://localhost:8000/v1,type=gemini", nil, false},
+		{"anthropic/claude-3", nil, false},
 	}
 	for _, c := range cases {
 		got := vllmMetricsEndpoints(c.spec)
-		if len(got) != len(c.want) {
-			t.Errorf("%s: got %v, want %v", c.spec, got, c.want)
+		if len(got.urls) != len(c.want) {
+			t.Errorf("%s: got %v, want %v", c.spec, got.urls, c.want)
 			continue
 		}
-		for i := range got {
-			if got[i] != c.want[i] {
-				t.Errorf("%s: got %v, want %v", c.spec, got, c.want)
+		for i := range got.urls {
+			if got.urls[i] != c.want[i] {
+				t.Errorf("%s: got %v, want %v", c.spec, got.urls, c.want)
 			}
+		}
+		if got.explicit != c.wantExplicit {
+			t.Errorf("%s: explicit = %v, want %v", c.spec, got.explicit, c.wantExplicit)
 		}
 	}
 }
@@ -341,9 +355,9 @@ func TestStartVLLMMetricsSamplerLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Non-vLLM spec or nil writer: sampler must not start.
-	if s := startVLLMMetricsSampler(context.Background(), "dynamic/"+srv.URL+"/v1,type=openai", newActiveDatasetTracker(), rdw); s != nil {
-		t.Fatal("sampler started for non-vllm spec")
+	// Non-chat/completions spec or nil writer: sampler must not start.
+	if s := startVLLMMetricsSampler(context.Background(), "dynamic/"+srv.URL+"/v1,type=anthropic", newActiveDatasetTracker(), rdw); s != nil {
+		t.Fatal("sampler started for non-chat/completions spec")
 	}
 	if s := startVLLMMetricsSampler(context.Background(), "dynamic/"+srv.URL+"/v1,type=openai_vllm", newActiveDatasetTracker(), nil); s != nil {
 		t.Fatal("sampler started without writer")
@@ -378,5 +392,155 @@ func TestStartVLLMMetricsSamplerLifecycle(t *testing.T) {
 	}
 	if samples[0].ActiveDatasetTokens != 123 || samples[0].ActiveSeries != 1 {
 		t.Errorf("sample = %+v", samples[0])
+	}
+}
+
+// A plain type=openai spec — what a bare host:port resolves to — must still
+// collect, since the endpoint behind it is commonly vLLM.
+func TestStartVLLMMetricsSamplerSpeculativeCollects(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(promFixture))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	rdw, err := newRequestDataWriter(dir, "speculative_model", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := startVLLMMetricsSampler(context.Background(), "dynamic/"+srv.URL+"/v1,type=openai", newActiveDatasetTracker(), rdw)
+	if s == nil {
+		t.Fatal("sampler did not start for a chat/completions spec")
+	}
+	if s.explicit {
+		t.Error("type=openai sampler should be speculative, not explicit")
+	}
+
+	path := filepath.Join(dir, "speculative_model.jsonl")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), recordTypeVLLMMetricsSample) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.stop()
+	if err := rdw.close(); err != nil {
+		t.Fatal(err)
+	}
+	_, samples, err := readJSONLFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 {
+		t.Fatalf("got %d samples, want 1", len(samples))
+	}
+}
+
+// The give-up rule, exercised through sampleOnce directly so the test doesn't
+// have to wait out vllmMetricsSampleInterval between attempts.
+func TestVLLMMetricsSamplerGiveUp(t *testing.T) {
+	// A server that has no /metrics at all — a public API, a gateway, or any
+	// non-vLLM OpenAI-compatible endpoint.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	newSampler := func(explicit bool) (*vllmMetricsSampler, *[]string) {
+		var logs []string
+		return &vllmMetricsSampler{
+			model:    "m",
+			urls:     []string{srv.URL + "/metrics"},
+			explicit: explicit,
+			tracker:  newActiveDatasetTracker(),
+			interval: time.Minute,
+			client:   &http.Client{},
+			now:      time.Now,
+			logf:     func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+		}, &logs
+	}
+
+	t.Run("speculative gives up after the budget", func(t *testing.T) {
+		s, logs := newSampler(false)
+		for i := 1; i < vllmMetricsSpeculativeBudget; i++ {
+			if !s.sampleOnce(context.Background()) {
+				t.Fatalf("gave up after %d attempts, budget is %d", i, vllmMetricsSpeculativeBudget)
+			}
+		}
+		if s.sampleOnce(context.Background()) {
+			t.Fatalf("still polling after %d attempts, budget is %d", vllmMetricsSpeculativeBudget, vllmMetricsSpeculativeBudget)
+		}
+		if len(*logs) != 1 {
+			t.Errorf("want exactly one log line on give-up, got %v", *logs)
+		}
+	})
+
+	t.Run("explicit keeps polling", func(t *testing.T) {
+		s, logs := newSampler(true)
+		for i := 0; i < vllmMetricsSpeculativeBudget+3; i++ {
+			if !s.sampleOnce(context.Background()) {
+				t.Fatalf("explicit sampler gave up on attempt %d", i+1)
+			}
+		}
+		// One line for the first failure, then silence — a down upstream must
+		// not spam a line per minute for the whole run.
+		if len(*logs) != 1 {
+			t.Errorf("want exactly one log line across repeated failures, got %v", *logs)
+		}
+	})
+
+	t.Run("cancellation is not a failure", func(t *testing.T) {
+		s, _ := newSampler(false)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if s.sampleOnce(ctx) {
+			t.Error("cancelled sample should stop the loop")
+		}
+		if s.consecFails != 0 {
+			t.Errorf("cancellation spent %d of the speculative budget", s.consecFails)
+		}
+	})
+}
+
+// One good sample retires the speculative budget: later failures are blips to
+// ride out, not evidence the guess was wrong.
+func TestVLLMMetricsSamplerSuccessRetiresBudget(t *testing.T) {
+	var serve atomic.Bool
+	serve.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !serve.Load() {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(promFixture))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	rdw, err := newRequestDataWriter(dir, "retire_model", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rdw.close() }()
+
+	s := &vllmMetricsSampler{
+		model:    "m",
+		urls:     []string{srv.URL + "/metrics"},
+		tracker:  newActiveDatasetTracker(),
+		rdw:      rdw,
+		interval: time.Minute,
+		client:   &http.Client{},
+		now:      time.Now,
+		logf:     func(string, ...any) {},
+	}
+	if !s.sampleOnce(context.Background()) {
+		t.Fatal("first sample should have succeeded")
+	}
+	serve.Store(false)
+	for i := 0; i < vllmMetricsSpeculativeBudget+3; i++ {
+		if !s.sampleOnce(context.Background()) {
+			t.Fatalf("gave up on attempt %d after a proven-good endpoint went down", i+1)
+		}
 	}
 }

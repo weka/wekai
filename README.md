@@ -172,6 +172,31 @@ load.
 there at the end of the run. Regenerate or combine runs later with
 `wekai benchmark visualize <dir>` and `wekai benchmark visualize-merge`.
 
+**Server-side cache-source sampling.** When `--save-request-data` is on and
+the model spec points at an OpenAI-compatible (chat/completions) endpoint,
+a sampler polls the server's Prometheus endpoint — `<base>/metrics`, with
+the `/v1` API suffix stripped — once a minute and appends the result to the
+same JSONL. This is what splits the report's prompt tokens into compute vs
+local cache vs external cache.
+
+Exactly one metric family is read:
+`vllm:prompt_tokens_by_source` (accepted with or without the `_total`
+exposition suffix), keeping the three `source` label values
+`local_compute`, `local_cache_hit`, and `external_kv_transfer`. Values are
+summed over every other label (`model_name`, engine index); nothing else
+from `/metrics` is retained. Each sample is one JSONL row with
+`record_type: "vllm_metrics_sample"` and fields `ts`, `model`,
+`sources.compute` / `sources.local_cache` / `sources.external_cache`, plus
+the locally-computed `active_dataset_tokens` and `active_series`.
+
+Collection is best-effort and never affects the benchmark: an unreachable
+or non-Prometheus endpoint just skips samples. Since any chat/completions
+endpoint is probed — it may well be vLLM — a spec that didn't say
+`type=openai_vllm` gives up after 3 consecutive failures rather than
+polling a public API for the rest of the run. Spelling out
+`type=openai_vllm` asserts the server *is* vLLM and keeps it polling
+through restarts and slow weight loads.
+
 ## Cache coherency eval
 
 `wekai eval coherency` verifies that an inference server's prefix/KV cache
