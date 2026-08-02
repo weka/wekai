@@ -358,7 +358,7 @@ what backs it:
 | `--set createResultsClaim=true` | chart provisions `<release>-results` (`storageSize`, `storageClassName` apply) |
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
+helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --namespace weka \
   --set endpoint=http://YOUR-LLM-HOST:8000 \
   --set resultsClaim=my-existing-pvc
@@ -390,14 +390,14 @@ description includes these commands pre-filled with its own version.
 Default install — runs for the default duration (8h):
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai \
+helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai \
   --version <vX> --set endpoint=http://10.71.0.4:8000
 ```
 
 Smoke test — shorten `duration` (maps to `--timeout`), e.g. 3 minutes:
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
+helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
   --set duration=3m
 ```
@@ -406,7 +406,7 @@ Explicit model override — by default the model id is autodiscovered (see
 "Bare-URL model selector" below); set `model` to skip discovery:
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
+helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
   --set model=nvidia/Kimi-K2.6-NVFP4
 ```
@@ -417,7 +417,7 @@ target an Anthropic-shaped server, append `,type=anthropic`. Because Helm's
 with a values file instead:
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
+helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set-string endpoint='http://10.71.0.4:8000\,type=anthropic' \
   --set duration=3m
 ```
@@ -428,14 +428,14 @@ proxy, reference an existing `kubernetes.io/dockerconfigjson` secret via
 `imagePullSecrets`:
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
+helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
   --set 'imagePullSecrets[0].name=my-pull-secret'
 ```
 
 For local development installs from the chart directory, pass the image tag
 explicitly (the in-tree `Chart.yaml` carries a placeholder `appVersion`):
-`helm install my-replay chart/wekai --set imageTag=<vX> --set endpoint=...`
+`helm upgrade --install my-replay chart/wekai --set imageTag=<vX> --set endpoint=...`
 
 ```
 helm lint chart/wekai
