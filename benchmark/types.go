@@ -24,4 +24,3 @@ type RequestMetrics struct {
 	Question          string  // The user question sent with the request (only populated on error/empty)
 	RawResponseTail   string  // raw SSE tail (last bytes); only populated on error/empty for diagnostics
 }
-
