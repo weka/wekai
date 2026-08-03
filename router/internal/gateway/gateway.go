@@ -234,6 +234,8 @@ func (s *Server) handleGetLoads(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAddWorker(w http.ResponseWriter, r *http.Request) {
 	url := r.URL.Query().Get("url")
+	kind := ""
+	cap := int64(0)
 	if url == "" {
 		var req struct {
 			URL      string `json:"url"`
@@ -241,10 +243,16 @@ func (s *Server) handleAddWorker(w http.ResponseWriter, r *http.Request) {
 			Capacity int64  `json:"capacity"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err == nil {
-			url = req.URL
+			url, kind, cap = req.URL, req.Kind, req.Capacity
 		}
 	}
 	spec := registry.Spec{URL: url, Prov: registry.ProvStatic, Capacity: s.cfg.MaxInflightPerBackend}
+	if cap != 0 {
+		spec.Capacity = cap
+	}
+	if kind == "router" {
+		spec.Kind = registry.KindRouter
+	}
 	// Canonical() rejects non-http(s) schemes, which is the SSRF guard on this
 	// endpoint (SEC-5).
 	b, err := s.reg.Add(spec)
