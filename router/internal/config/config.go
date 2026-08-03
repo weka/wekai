@@ -125,6 +125,7 @@ type Discovery struct {
 // one of its two divergent name tables.
 var ValidPolicies = []string{
 	"least-outstanding", "round-robin", "random", "prefix-cache-aware",
+	"prefix-cache-candidates",
 }
 
 func Default() Config {
@@ -333,18 +334,25 @@ func (c Config) Validate() error {
 			errs = append(errs, errors.New(`cors_origins "*" cannot be combined with an API key (SEC-10)`))
 		}
 	}
-	if c.Policy == "prefix-cache-aware" {
+	if c.Policy == "prefix-cache-aware" || c.Policy == "prefix-cache-candidates" {
 		if c.Cache.CacheThreshold <= 0 || c.Cache.CacheThreshold > 1 {
 			errs = append(errs, fmt.Errorf("cache.cache_threshold %v must be in (0,1]", c.Cache.CacheThreshold))
-		}
-		if c.Cache.BalanceRelThreshold < 1 {
-			errs = append(errs, fmt.Errorf("cache.balance_rel_threshold %v must be >= 1", c.Cache.BalanceRelThreshold))
 		}
 		if c.Cache.MaxTokens <= 0 || c.Cache.MaxNodes <= 0 {
 			errs = append(errs, errors.New("cache.max_tokens_per_backend and max_nodes_per_backend must be > 0"))
 		}
 		if c.Cache.ChunkBytes <= 0 {
 			errs = append(errs, errors.New("cache.chunk_bytes must be > 0"))
+		}
+	}
+	if c.Policy == "prefix-cache-aware" {
+		if c.Cache.BalanceRelThreshold < 1 {
+			errs = append(errs, fmt.Errorf("cache.balance_rel_threshold %v must be >= 1", c.Cache.BalanceRelThreshold))
+		}
+	}
+	if c.Policy == "prefix-cache-candidates" {
+		if c.Cache.BalanceAbsThreshold <= 0 {
+			errs = append(errs, fmt.Errorf("cache.balance_abs_threshold %v must be > 0 (used as the pending-tasks threshold)", c.Cache.BalanceAbsThreshold))
 		}
 	}
 	if c.Discovery.Enabled {

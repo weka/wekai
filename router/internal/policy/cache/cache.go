@@ -67,9 +67,7 @@ func DefaultConfig() Config {
 type Policy struct {
 	cfg      Config
 	fallback policy.Policy
-
-	mu    sync.RWMutex
-	tries map[string]*kvcache.Trie // by canonical backend URL
+	store    *trieStore
 }
 
 func New(cfg Config, fallback policy.Policy) *Policy {
@@ -85,54 +83,22 @@ func New(cfg Config, fallback policy.Policy) *Policy {
 	if fallback == nil {
 		fallback = policy.LeastOutstanding{}
 	}
-	return &Policy{cfg: cfg, fallback: fallback, tries: map[string]*kvcache.Trie{}}
+	return &Policy{cfg: cfg, fallback: fallback, store: newTrieStore(cfg.Trie)}
 }
 
 func (p *Policy) Name() string { return "prefix-cache-aware" }
 
 // AddBackend creates a model for a backend. Wired to the registry's add hook.
-func (p *Policy) AddBackend(b *registry.Backend) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if _, ok := p.tries[b.URL]; !ok {
-		p.tries[b.URL] = kvcache.New(p.cfg.Trie)
-	}
-}
+func (p *Policy) AddBackend(b *registry.Backend) { p.store.add(b.URL) }
 
 // DropBackend discards a backend's model. Its prefixes are NOT reassigned to any
 // other backend: nothing else has served them (CACHE-10).
-func (p *Policy) DropBackend(b *registry.Backend) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.tries, b.URL)
-}
+func (p *Policy) DropBackend(b *registry.Backend) { p.store.drop(b.URL) }
 
 // Flush clears every model. Backs POST /flush_cache; touches nothing else.
-func (p *Policy) Flush() {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	for _, t := range p.tries {
-		t.Reset()
-	}
-}
+func (p *Policy) Flush() { p.store.flush() }
 
-func (p *Policy) trieFor(url string) *kvcache.Trie {
-	p.mu.RLock()
-	t, ok := p.tries[url]
-	p.mu.RUnlock()
-	if ok {
-		return t
-	}
-	// A backend can be selected before the add hook has run.
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if t, ok := p.tries[url]; ok {
-		return t
-	}
-	t = kvcache.New(p.cfg.Trie)
-	p.tries[url] = t
-	return t
-}
+func (p *Policy) trieFor(url string) *kvcache.Trie { return p.store.get(url) }
 
 // Select picks the backend most likely to hold the request's prefix.
 func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *policy.RoutingRequest) (*registry.Backend, error) {
@@ -236,11 +202,67 @@ func (p *Policy) PublishGauges() {
 }
 
 // Stats reports per-backend model size, for metrics.
-func (p *Policy) Stats() map[string][2]int64 {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	out := make(map[string][2]int64, len(p.tries))
-	for url, t := range p.tries {
+func (p *Policy) Stats() map[string][2]int64 { return p.store.stats() }
+
+// trieStore is the per-backend-trie bookkeeping shared by every cache-aware
+// policy in this package: creation on add, discard on drop (CACHE-10), reset
+// on flush, lazy get, and size reporting. The scoring/selection algorithm on
+// top of it is what actually differs between policies.
+type trieStore struct {
+	mu    sync.RWMutex
+	cfg   kvcache.Config
+	tries map[string]*kvcache.Trie // by canonical backend URL
+}
+
+func newTrieStore(cfg kvcache.Config) *trieStore {
+	return &trieStore{cfg: cfg, tries: map[string]*kvcache.Trie{}}
+}
+
+func (s *trieStore) add(url string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.tries[url]; !ok {
+		s.tries[url] = kvcache.New(s.cfg)
+	}
+}
+
+func (s *trieStore) drop(url string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tries, url)
+}
+
+func (s *trieStore) flush() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, t := range s.tries {
+		t.Reset()
+	}
+}
+
+func (s *trieStore) get(url string) *kvcache.Trie {
+	s.mu.RLock()
+	t, ok := s.tries[url]
+	s.mu.RUnlock()
+	if ok {
+		return t
+	}
+	// A backend can be selected before the add hook has run.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.tries[url]; ok {
+		return t
+	}
+	t = kvcache.New(s.cfg)
+	s.tries[url] = t
+	return t
+}
+
+func (s *trieStore) stats() map[string][2]int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string][2]int64, len(s.tries))
+	for url, t := range s.tries {
 		n, tok, _ := t.Stats()
 		out[url] = [2]int64{n, tok}
 	}
