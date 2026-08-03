@@ -118,14 +118,23 @@ type Spec struct {
 // Membership is immutable once published in a Snapshot; the mutable per-backend
 // state below is atomic, so a policy holding a snapshot sees a stable
 // membership list with live counters — which is exactly what WRK-4 requires.
+//
+// Kind, Model and Locality are ALSO atomic, even though they look like static
+// identity, because Add's update path (re-registration and discovery
+// reconciliation) can rewrite them on a *Backend already shared across
+// published snapshots and read concurrently on the request path (gateway
+// filtering, admin serialization). URL, DialectID, HealthMod and Prov are
+// genuinely set once at construction and never touched by Add's update path,
+// so they stay plain fields.
 type Backend struct {
 	URL       string // canonical
-	Kind      Kind
 	DialectID string
 	HealthMod HealthModel
 	Prov      Provenance
-	Model     string
-	Locality  string
+
+	kind     atomic.Int32
+	model    atomic.Pointer[string]
+	locality atomic.Pointer[string]
 
 	CB            *circuit.Breaker
 	InflightGauge Gauge
@@ -137,6 +146,25 @@ type Backend struct {
 
 	Served, Failed atomic.Uint64
 }
+
+func (b *Backend) Kind() Kind     { return Kind(b.kind.Load()) }
+func (b *Backend) SetKind(k Kind) { b.kind.Store(int32(k)) }
+
+func (b *Backend) Model() string {
+	if p := b.model.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+func (b *Backend) SetModel(m string) { b.model.Store(&m) }
+
+func (b *Backend) Locality() string {
+	if p := b.locality.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+func (b *Backend) SetLocality(l string) { b.locality.Store(&l) }
 
 func (b *Backend) Inflight() int64 { return b.inflight.Load() }
 
