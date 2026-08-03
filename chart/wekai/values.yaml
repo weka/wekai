@@ -46,6 +46,14 @@ replay:
   replayStopAtLowConcurrency: false
   stderrLogs: false
 
+  # Print request errors to the pod log as they happen, rate-limited to at
+  # most one line per this interval. On by default: the run summary only ever
+  # reported an error *count*, so a pod quietly failing every request looked
+  # the same as one succeeding until you dug the JSONL off the volume. Rate
+  # limiting is what makes it safe to leave on — a total outage costs one line
+  # per second, not one per failed request. Set "" (or 0) for silence.
+  printErrorsThreshold: "1s"
+
   # Dry-run mode: simulate the replay's timing/rates offline (no real
   # requests) using synthetic cold/warm/output token rates.
   dryRun: false
@@ -55,20 +63,74 @@ replay:
 
 llmApiKeySecretName: ""   # K8s secret with LLM API key env vars (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...)
 
+# ── Results ─────────────────────────────────────────────────────────────────
 # Per-request JSONL data + the auto-generated report.html are ALWAYS saved
-# (--save-request-data) under resultsMountPath/<run-timestamp>/. After the
-# benchmark finishes (or fails) the pod sleeps so you can explore/extract
-# results (kubectl exec / kubectl cp); delete the pod to have the Deployment
-# restart the benchmark.
-storeResults: false        # true = persist results on a PVC; false = pod-local emptyDir (lost when the pod is deleted)
-storageClassName: ""       # empty = cluster default
-storageSize: 10Gi          # PVC size for results storage
+# (--save-request-data) under resultsMountPath/<run-timestamp>/. That is not
+# configurable; the only choice is what storage backs that path:
+#
+#   nothing set               ephemeral emptyDir — results go away with the pod
+#   resultsClaim=<pvc-name>   mount a PVC you already created (nothing else needed)
+#   createResultsClaim=true   chart provisions its own PVC, <release>-results
+#
+# After the benchmark finishes (or fails) the pod sleeps so you can
+# explore/extract results (kubectl exec / kubectl cp); delete the pod to have
+# the Deployment restart the benchmark — the volume survives that either way.
 resultsMountPath: /results
 
+# Mount an existing PVC. The only value needed to persist results onto storage
+# you already manage; storageClassName/storageSize/createResultsClaim are all
+# ignored, since the volume already exists and is yours to size and delete.
+resultsClaim: ""
+
+# Have the chart provision the PVC instead. It is annotated
+# helm.sh/resource-policy: keep, so `helm uninstall` leaves the results behind
+# — delete the PVC by hand once you've pulled them off.
+createResultsClaim: false
+storageClassName: ""       # empty = cluster default
+storageSize: 10Gi          # PVC size, chart-provisioned claim only
+
+# Deprecated: the old name for createResultsClaim, still honored so existing
+# values files keep persisting instead of silently falling back to emptyDir.
+storeResults: false
+
+# ── Scheduling ──────────────────────────────────────────────────────────────
+# Where the benchmark pod lands. It is a load generator pointed at `endpoint`,
+# so it wants a short network path to the inference nodes without running on
+# them — sharing a GPU node's CPU with the server skews the very TTFT numbers
+# the run exists to measure. Tolerations are usually the way onto a pool that
+# is tainted for inference; a nodeSelector is the way to stay off it.
+#
+#   nodeSelector:
+#     node-role.kubernetes.io/worker: ""
+#     topology.kubernetes.io/zone: us-east-1a
+#
+#   tolerations:
+#     - key: nvidia.com/gpu
+#       operator: Exists
+#       effect: NoSchedule
+#
+# Note the PVC (resultsClaim or a chart-provisioned one) is ReadWriteOnce, so
+# on zonal storage these must not conflict with the volume's own zone.
+nodeSelector: {}
+tolerations: []
+
+# Requests are sized for the real workload — 256 series workers holding
+# replay sessions, prompt buffers and the cache estimator — rather than the
+# idle floor, so the scheduler reserves what the run actually uses instead of
+# discovering it under load.
+#
+# No limits by design. A CPU limit makes CFS throttle the process in exactly
+# the moments it is busiest, and a throttled load generator adds its own
+# latency to every TTFT and token-rate number the run reports — measurement
+# error indistinguishable from a slow server. Add limits back only if a
+# namespace LimitRange requires them, and set the CPU one well above the
+# request if you do:
+#
+#   resources:
+#     limits:
+#       memory: "16Gi"
+#       cpu: "8"
 resources:
   requests:
-    memory: "256Mi"
-    cpu: "250m"
-  limits:
-    memory: "4Gi"
+    memory: "8Gi"
     cpu: "4"
