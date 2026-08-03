@@ -1,0 +1,283 @@
+// Command wllm-router is an OpenAI-compatible routing gateway for vLLM fleets.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"syscall"
+	"time"
+
+	"github.com/weka/wekai/kvcache"
+	"github.com/weka/wekai/router/internal/circuit"
+	"github.com/weka/wekai/router/internal/clock"
+	"github.com/weka/wekai/router/internal/config"
+	"github.com/weka/wekai/router/internal/dialect"
+	"github.com/weka/wekai/router/internal/dialect/openai"
+	k8sdisc "github.com/weka/wekai/router/internal/discovery/k8s"
+	"github.com/weka/wekai/router/internal/gateway"
+	"github.com/weka/wekai/router/internal/health"
+	"github.com/weka/wekai/router/internal/metrics"
+	"github.com/weka/wekai/router/internal/obs"
+	"github.com/weka/wekai/router/internal/policy"
+	cachepolicy "github.com/weka/wekai/router/internal/policy/cache"
+	"github.com/weka/wekai/router/internal/proxy"
+	"github.com/weka/wekai/router/internal/registry"
+)
+
+// Build metadata, injected with -ldflags at build time so the running image can
+// be identified from its logs and /get_server_info.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		// Config errors are reported before the logger is configured, so they go
+		// to stderr plainly. Note what is NOT printed anywhere: the argv itself.
+		// v1 dumped the whole command line — including secrets passed as flags —
+		// to stdout before logging existed, where no log level could suppress it
+		// (CFG-9, CFG-N2).
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	// -version is handled before config loading so it works with no other flags
+	// and in a container with no configuration mounted.
+	for _, a := range args {
+		if a == "-version" || a == "--version" {
+			fmt.Printf("wllm-router %s (commit %s, built %s, %s)\n",
+				version, commit, date, runtime.Version())
+			return nil
+		}
+	}
+
+	cfg, err := config.Load(args, os.Getenv)
+	if err != nil {
+		return err
+	}
+
+	// Logging is configured before any other subsystem can emit output (CFG-10).
+	log := obs.Init(obs.Config{Level: cfg.LogLevel, Format: cfg.LogFormat})
+	if cfg.APIKey == "" {
+		log.Warn("no API key configured: the inference listener is unauthenticated",
+			"listen", cfg.Listen)
+	}
+
+	// One dialect in v2.0. Registration lives here, at the wiring layer, rather
+	// than as a package side effect, so what is compiled in is explicit (API-3).
+	d := openai.New()
+	dialect.Register(d)
+
+	reg := metrics.Registry()
+	clk := clock.Real{}
+
+	pol, cachePol, err := buildPolicy(cfg)
+	if err != nil {
+		return err
+	}
+
+	opts := registry.Options{
+		Clock:         clk,
+		DrainDeadline: cfg.DrainDeadline.D(),
+		NewGauge: func(url string) registry.Gauge {
+			// Resolved once here, not per request (R5).
+			return metrics.BackendInflight.WithLabelValues(url)
+		},
+	}
+	if cachePol != nil {
+		// Per-backend models follow backend lifecycle, so a backend discovered and
+		// later removed does not leak its model, and its prefixes are never
+		// reassigned to anyone else (CACHE-10, CU-4, CU-12).
+		opts.OnAdd = cachePol.AddBackend
+		opts.OnDrop = cachePol.DropBackend
+	}
+	rtr := registry.New(opts)
+
+	for _, b := range cfg.Backends {
+		spec := registry.Spec{
+			URL: b.URL, DialectID: orDefault(b.Dialect, d.ID()),
+			Prov: registry.ProvStatic, Model: b.Model, Locality: b.Locality,
+			Capacity: orDefaultInt(b.Capacity, cfg.MaxInflightPerBackend),
+		}
+		if b.Kind == "router" {
+			spec.Kind = registry.KindRouter
+		}
+		if b.Health == "passive" {
+			spec.Health = registry.HealthPassive
+		}
+		be, err := rtr.Add(spec)
+		if err != nil {
+			return fmt.Errorf("backend %q: %w", b.URL, err)
+		}
+		be.CB.OnTransition(transitionLogger(log, be.URL))
+	}
+
+	px := proxy.New(proxy.Config{
+		MaxAttempts:        cfg.MaxAttempts,
+		UpstreamCredential: cfg.UpstreamCredential,
+		StreamBufferBytes:  cfg.StreamBufferBytes,
+		RequestTimeout:     cfg.RequestTimeout.D(),
+		IdleTimeout:        cfg.IdleTimeout.D(),
+	})
+
+	gw := gateway.New(cfg, rtr, pol, px, d)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Kubernetes discovery, when enabled. It only ever proposes backends; the
+	// registry decides admission and health decides eligibility (SD-4).
+	if cfg.Discovery.Enabled {
+		client, err := k8sdisc.NewInClusterOrKubeconfig(cfg.Discovery.Kubeconfig)
+		if err != nil {
+			return fmt.Errorf("kubernetes client: %w", err)
+		}
+		disc, err := k8sdisc.New(k8sdisc.Config{
+			Mode:            k8sdisc.Mode(cfg.Discovery.Mode),
+			Namespace:       cfg.Discovery.Namespace,
+			Service:         cfg.Discovery.Service,
+			Selector:        cfg.Discovery.Selector,
+			Port:            cfg.Discovery.Port,
+			PortName:        cfg.Discovery.PortName,
+			Scheme:          cfg.Discovery.Scheme,
+			ResyncInterval:  cfg.Discovery.ResyncInterval.D(),
+			DefaultCapacity: cfg.MaxInflightPerBackend,
+			DefaultDialect:  d.ID(),
+		}, client, rtr, log)
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := disc.Run(ctx); err != nil && ctx.Err() == nil {
+				log.Error("discovery stopped", "err", err)
+			}
+		}()
+	}
+
+	checker := health.New(health.Config{
+		Interval: cfg.HealthInterval.D(), Timeout: cfg.HealthTimeout.D(), Path: cfg.HealthPath,
+		FailureThreshold: 3, SuccessThreshold: 2,
+	}, rtr, clk)
+	go checker.Run(ctx)
+
+	if cachePol != nil {
+		// Publish per-backend model size on the health interval so cache memory is
+		// observable in production, not just in a unit test.
+		go func() {
+			t := clk.NewTicker(cfg.HealthInterval.D())
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C():
+					cachePol.PublishGauges()
+				}
+			}
+		}()
+	}
+
+	// Metrics on a separate listener; never reachable on the inference mux
+	// (GW-13).
+	metricsSrv := &http.Server{
+		Addr:              cfg.MetricsListen,
+		Handler:           metrics.Handler(reg),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("metrics listener failed", "err", err)
+		}
+	}()
+
+	srv := gw.HTTPServer(cfg.Listen)
+	errCh := make(chan error, 1)
+	go func() {
+		log.Info("router listening",
+			"listen", cfg.Listen, "metrics", cfg.MetricsListen,
+			"policy", pol.Name(), "static_backends", len(cfg.Backends),
+			"discovery", cfg.Discovery.Enabled, "auth", cfg.APIKey != "",
+			"version", version, "commit", commit)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+	}
+
+	// Graceful shutdown: in-flight requests, including streams, are allowed to
+	// finish up to the drain deadline (REL-8).
+	log.Info("shutting down", "drain_deadline", cfg.DrainDeadline.D())
+	sdCtx, cancel := context.WithTimeout(context.Background(), cfg.DrainDeadline.D())
+	defer cancel()
+	_ = metricsSrv.Shutdown(sdCtx)
+	if err := srv.Shutdown(sdCtx); err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
+	log.Info("stopped")
+	return nil
+}
+
+func buildPolicy(cfg config.Config) (proxy.Selector, *cachepolicy.Policy, error) {
+	switch cfg.Policy {
+	case "least-outstanding":
+		return policy.LeastOutstanding{}, nil, nil
+	case "round-robin":
+		return policy.NewRoundRobin(), nil, nil
+	case "random":
+		return policy.Random{}, nil, nil
+	case "prefix-cache-aware":
+		// Falls back to least-outstanding whenever affinity is not decisive, so
+		// the cache policy can never be worse than the load policy by much.
+		p := cachepolicy.New(cachepolicy.Config{
+			CacheThreshold:      cfg.Cache.CacheThreshold,
+			BalanceAbsThreshold: cfg.Cache.BalanceAbsThreshold,
+			BalanceRelThreshold: cfg.Cache.BalanceRelThreshold,
+			Trie: kvcache.Config{
+				MaxNodes:  cfg.Cache.MaxNodes,
+				MaxTokens: cfg.Cache.MaxTokens,
+			},
+		}, policy.LeastOutstanding{})
+		return p, p, nil
+	}
+	return nil, nil, fmt.Errorf("unknown policy %q", cfg.Policy)
+}
+
+// transitionLogger logs every circuit transition with the counters that caused
+// it, so an operator can tell an overload from an outage (HLT-10).
+func transitionLogger(log *slog.Logger, url string) circuit.TransitionFunc {
+	return func(from, to circuit.State, ok, fail int) {
+		log.Warn("circuit breaker transition",
+			"backend", url, "from", from.String(), "to", to.String(),
+			"window_ok", ok, "window_fail", fail)
+		metrics.CircuitTransitions.WithLabelValues(url, from.String(), to.String()).Inc()
+	}
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func orDefaultInt(v, def int64) int64 {
+	if v == 0 {
+		return def
+	}
+	return v
+}
