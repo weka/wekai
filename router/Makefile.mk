@@ -1,8 +1,8 @@
 # Go build targets for the v2 router. Included by the top-level Makefile, which
 # still drives the Rust crate during the transition.
 #
-#   make -f router/Makefile.mk help
-#
+#   make -f Makefile.go.mk help
+
 GO           ?= go
 BINARY       := wllm-router
 CMD          := ./cmd/wllm-router

@@ -127,30 +127,6 @@ changing the pod spec.
 Unknown config keys are a hard startup error, and validation reports every
 problem at once rather than failing on the first.
 
-### Path allowlist
-
-`FORWARD_PATH_ALLOWLIST` (comma-separated), or `path_allowlist` in the config
-file, or `-path-allowlist`. It keeps v1's variable name on purpose — every other
-variable here is `WLLM_`-prefixed, but the migration is "swap the image, keep the
-env", and a renamed variable would leave the allowlist quietly inactive.
-
-It gates which paths are **served**, and is independent of auth:
-
-- Unset or empty serves every path. Auth still applies to every path.
-- Non-empty serves only listed paths; anything else is `404` — including for a
-  caller with a valid key, and including the admin endpoints. It is `404` rather
-  than `403` so an unlisted path does not reveal whether a credential would have
-  been accepted.
-- Listing a path does not exempt it from auth. `/get_loads` on the allowlist is
-  reachable, not public.
-- Matching is on segment boundaries. `/v1/responses` admits `/v1/responses` and
-  `/v1/responses/abc` but not `/v1/responses_evil`; a trailing `/` denotes a
-  subtree. Entries must start with `/` or startup fails.
-- `GET /liveness` is served regardless, so a kubelet `httpGet` probe still works
-  in strict mode. `GET /readiness` and `GET /health` likewise, unless
-  `require_auth_for_probes` is set. This differs from v1, where strict mode
-  404'd `/readiness` and `/health` unless you listed them.
-
 ## Observability
 
 Metrics are on a separate listener, default `127.0.0.1:29000`. **The manifest
@@ -161,16 +137,6 @@ listener.
 The metric worth alerting on is `router_load_accounting_errors_total`. It must
 stay at zero: any non-zero value means the in-flight accounting invariant is
 broken, which is the defect this rewrite exists to fix.
-
-Cache-affinity and load-balance quality are tracked by
-`router_worker_load_{avg,max,min}` (fleet load spread across available
-backends), `router_cache_prediction_{avg,max,min}` (predicted-hit-fraction
-spread across a request's queried candidates), and
-`router_route_decisions_total{decision="cache"|"load"|"other"}` (how
-selections are actually being made). `router/deploy/watch-metrics.sh` polls
-these from the command line; the "wllm-router — Cache & Load Routing" row in
-`wllm`'s `grafana/dashboard.json` (the same dashboard the vLLM workers report
-into) graphs them over time alongside worker-side stats.
 
 ## Local run
 
