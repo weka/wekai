@@ -260,6 +260,7 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		Total:                      c.Total,
 		Tokens:                     c.Tokens,
 		HotSeriesConcurrency:       c.HotSeriesConcurrency,
+		EndpointOverloadThreshold:  c.EndpointOverloadThreshold,
 		SharedPrefixPerSeries:      c.SharedPrefixPerSeries,
 		GlobalCacheHitRateTarget:   c.GlobalCacheHitRateTarget,
 		MaxOutputTokens:            c.MaxOutputTokens,

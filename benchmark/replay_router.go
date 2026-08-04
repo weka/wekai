@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/weka/wekai/config"
+	"github.com/weka/wekai/llm"
 )
 
 // ---- File schema (mirrors wekai router replay-prepare output) ----
@@ -458,13 +459,43 @@ func resolveInstanceActions(instances []RouterReplayInstance, includeRole func(s
 
 // ---- Series-loop body for tree replay ----
 
+// endpointPicker resolves which endpoint an instance should use and tracks the
+// resulting in-flight load. With a multi-endpoint spec the router prefers the
+// series' home endpoint but fails over when that endpoint is overloaded; with a
+// single endpoint it degrades to a fixed string and no accounting.
+type endpointPicker struct {
+	router *llm.EndpointRouter
+	static string
+}
+
+// pick returns the endpoint URL for this instance and the index to account it
+// against (-1 when there is nothing to track).
+func (p endpointPicker) pick(seriesNum int) (string, int) {
+	if p.router == nil {
+		return p.static, -1
+	}
+	return p.router.PickEndpoint(seriesNum)
+}
+
+func (p endpointPicker) acquire(idx int) {
+	if p.router != nil {
+		p.router.AcquireIndex(idx)
+	}
+}
+
+func (p endpointPicker) release(idx int) {
+	if p.router != nil {
+		p.router.ReleaseIndex(idx)
+	}
+}
+
 func runRouterReplaySeriesLoop(
 	benchCtx context.Context,
 	cfg AutoBenchmarkConfig,
 	st *autoState,
 	rdw *requestDataWriter,
 	queue *routerReplayStream,
-	endpointOverride string,
+	picker endpointPicker,
 	docs string,
 	updateSnap func(*autoState),
 	gate *concurrencyGate,
@@ -490,7 +521,7 @@ func runRouterReplaySeriesLoop(
 		}
 		seriesNum := idx + 1
 		runRouterReplaySession(benchCtx, cfg, st, rdw,
-			sess, seriesNum, endpointOverride, reqTimeout, docs, gate)
+			sess, seriesNum, picker, reqTimeout, docs, gate)
 		// Session slot retired — drop its active-dataset snapshot.
 		st.datasetTracker.Reset(seriesNum)
 		st.seriesReplayCompleted.Add(1)
@@ -520,7 +551,7 @@ func runRouterReplaySession(
 	rdw *requestDataWriter,
 	sess RouterReplaySession,
 	seriesNum int,
-	endpointOverride string,
+	picker endpointPicker,
 	reqTimeout time.Duration,
 	docs string,
 	gate *concurrencyGate,
@@ -571,7 +602,7 @@ func runRouterReplaySession(
 				return
 			}
 			runRouterReplayInstance(benchCtx, cfg, st, rdw,
-				sess.SessionID, seriesNum, inst, endpointOverride, reqTimeout, docs, requestDone, gate)
+				sess.SessionID, seriesNum, inst, picker, reqTimeout, docs, requestDone, gate)
 		}()
 	}
 	wg.Wait()
@@ -615,7 +646,7 @@ func runRouterReplayInstance(
 	sessionID string,
 	seriesNum int,
 	inst RouterReplayInstance,
-	endpointOverride string,
+	picker endpointPicker,
 	reqTimeout time.Duration,
 	docs string,
 	requestDone map[uint64]chan struct{},
@@ -633,6 +664,13 @@ func runRouterReplayInstance(
 	if !cfg.ReplayNoStamp {
 		replayRunID = cfg.RunID
 	}
+	// Resolve the endpoint per INSTANCE, not per series: fan-out means one
+	// series can have many instances live at once, and that burstiness — not
+	// series count — is what actually overloads an endpoint. Hold the in-flight
+	// slot for the whole instance so concurrent instances see each other.
+	endpointOverride, endpointIdx := picker.pick(seriesNum)
+	picker.acquire(endpointIdx)
+	defer picker.release(endpointIdx)
 	poster, err := newReplayPoster(cfg.Model, config.GetAPIKeys(), endpointOverride, replayRunID, cfg.DryRun, cfg.DryRunColdTPS, cfg.DryRunWarmTPS, cfg.DryRunOutputTPS, st.estimator)
 	if err == nil {
 		poster.outputRatio = cfg.ReplayOutputRatio

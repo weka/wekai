@@ -56,6 +56,7 @@ type AutoBenchmarkConfig struct {
 	SaveRequestDataDir       string        // if non-empty, write per-request JSONL to this dir
 	Total                    int           // stop after N total completed requests (0 = unlimited)
 	HotSeriesConcurrency     int           // H of the --series workers run as a 'hot' pool with a dedicated gate; 0 = no hot pool.
+	EndpointOverloadThreshold float64      // Multi-endpoint only: fail over off an endpoint once its in-flight exceeds this multiple of its fair share. 0 = default (1.5).
 	RequestTimeout           time.Duration // per-request timeout (default 5m)
 	Step                     int           // 0=disabled; token step size for prefix growth per request
 	StepStartingTokens       int           // 0=start at Step; initial prefix token size for each series when Step > 0
@@ -1515,7 +1516,12 @@ func runSingleModelBenchmark(
 	var endpointRouter *llm.EndpointRouter
 	if llm.IsDynamicModel(cfg.Model) {
 		if dynCfg, err := llm.ParseDynamicModel(cfg.Model); err == nil && len(dynCfg.BaseURLs) > 1 {
-			endpointRouter = llm.NewEndpointRouter(dynCfg.BaseURLs)
+			// Fair share = total benchmark concurrency / endpoints. Hot series
+			// run on their own gate, so their concurrency adds to the fleet
+			// total rather than being carved out of Concurrency.
+			totalConc := cfg.Concurrency + cfg.HotSeriesConcurrency
+			endpointRouter = llm.NewEndpointRouterWithFailover(
+				dynCfg.BaseURLs, totalConc, cfg.EndpointOverloadThreshold)
 		}
 	}
 
@@ -1590,11 +1596,8 @@ func runSingleModelBenchmark(
 			go func() {
 				defer seriesWg.Done()
 				defer st.activeReplayWorkers.Add(-1)
-				var endpointOverride string
-				if endpointRouter != nil {
-					endpointOverride = endpointRouter.EndpointForSeries(seriesNum)
-				}
-				runRouterReplaySeriesLoop(benchCtx, cfg, st, rdw, st.routerReplay, endpointOverride, fullDocs, updateSnap, workerGate)
+				picker := endpointPicker{router: endpointRouter}
+				runRouterReplaySeriesLoop(benchCtx, cfg, st, rdw, st.routerReplay, picker, fullDocs, updateSnap, workerGate)
 			}()
 			return
 		}
