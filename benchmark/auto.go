@@ -1342,26 +1342,13 @@ func runSingleModelBenchmark(
 	fullDocs string,
 	snapCh chan<- modelSnapshotUpdate,
 	modelIndex int,
+	// rdw is the already-open per-request JSONL writer for this model, or nil
+	// when --save-request-data wasn't given. RunAutoBenchmark opens it before
+	// any model starts so an unwritable destination fails the run immediately
+	// rather than after hours, and owns closing it.
+	rdw *requestDataWriter,
 ) autoBenchmarkResult {
 	startTime := time.Now()
-
-	// Set up per-request JSONL writer if configured.
-	var rdw *requestDataWriter
-	if cfg.SaveRequestDataDir != "" {
-		var err error
-		rdw, err = newRequestDataWriter(cfg.SaveRequestDataDir, cfg.Model, startTime)
-		if err != nil {
-			// Loud: the run continues but produces NO request data, and that is
-			// only discoverable afterwards by noticing the missing file. A
-			// 12-hour benchmark has been lost to this warning scrolling past.
-			fmt.Fprintf(os.Stderr,
-				"\n*** REQUEST DATA WILL NOT BE SAVED: %v\n"+
-					"*** --save-request-data was requested but the file could not be created.\n"+
-					"*** This run will produce no per-request JSONL and no report.\n\n", err)
-		} else {
-			defer rdw.close()
-		}
-	}
 
 	// Apply defaults.
 	if cfg.MaxSeries <= 0 {
@@ -2460,6 +2447,34 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		return fmt.Errorf("no model specified")
 	}
 
+	// Open the per-request JSONL writers BEFORE any work starts, and fail the
+	// run if any cannot be opened. --save-request-data means the data IS the
+	// deliverable: a run that quietly produces none has wasted its entire
+	// duration, and the failure is only noticed afterwards. Opening here costs
+	// nothing and turns hours of loss into an immediate error.
+	writers := make([]*requestDataWriter, len(models))
+	if cfg.SaveRequestDataDir != "" {
+		for i, model := range models {
+			w, err := newRequestDataWriter(cfg.SaveRequestDataDir, model, time.Now())
+			if err != nil {
+				for _, prev := range writers[:i] {
+					if prev != nil {
+						prev.close()
+					}
+				}
+				return fmt.Errorf("--save-request-data: %w", err)
+			}
+			writers[i] = w
+		}
+		defer func() {
+			for _, w := range writers {
+				if w != nil {
+					w.close()
+				}
+			}
+		}()
+	}
+
 	// Apply defaults once (passed through to runSingleModelBenchmark via per-model cfg copy).
 	if cfg.MaxSeries <= 0 {
 		cfg.MaxSeries = 64
@@ -2608,7 +2623,7 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		wg.Add(1)
 		go func(idx int, mcfg AutoBenchmarkConfig) {
 			defer wg.Done()
-			res := runSingleModelBenchmark(benchCtx, mcfg, fullDocs, snapCh, idx)
+			res := runSingleModelBenchmark(benchCtx, mcfg, fullDocs, snapCh, idx, writers[idx])
 			results[idx] = modelBenchmarkResult{model: mcfg.Model, result: res}
 		}(i, modelCfg)
 	}

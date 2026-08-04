@@ -1,6 +1,7 @@
 package benchmark
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -133,5 +134,59 @@ func TestRequestDataWriterCreatesLongNamedFile(t *testing.T) {
 
 	if _, err := os.Stat(files[0]); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestSaveRequestDataFailsFast: --save-request-data means the data IS the
+// deliverable, so an unwritable destination must abort the run immediately
+// rather than warn and proceed. The previous behaviour printed one line and
+// ran anyway; a 12-hour benchmark finished having written nothing, and the
+// loss was only discovered afterwards.
+func TestSaveRequestDataFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	// A regular file where the output directory should be: MkdirAll fails, the
+	// same class of failure as a read-only mount or a bad path.
+	notADir := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A deliberately unreachable endpoint: if the guard did NOT fire, the run
+	// would proceed to issue requests and fail differently (or hang), so
+	// returning promptly with this error is itself the assertion.
+	cfg := AutoBenchmarkConfig{
+		Model:              "dynamic/http://127.0.0.1:1/v1,type=openai_vllm,alias=failfast",
+		SaveRequestDataDir: notADir,
+		Timeout:            time.Hour,
+		Concurrency:        1,
+		MaxSeries:          1,
+		StartSeries:        1,
+		Total:              1,
+	}
+
+	start := time.Now()
+	err := RunAutoBenchmark(context.Background(), cfg)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("run succeeded despite being unable to save request data")
+	}
+	if !strings.Contains(err.Error(), "save-request-data") {
+		t.Errorf("error should name the flag that was honoured; got: %v", err)
+	}
+	// The point is that it aborts BEFORE any benchmarking work.
+	if elapsed > 10*time.Second {
+		t.Errorf("took %s to fail — the guard should fire before any work starts", elapsed)
+	}
+}
+
+// TestNoSaveRequestDataDirSkipsWriters: without the flag there is nothing to
+// open, and the fail-fast guard must not invent a reason to abort.
+func TestNoSaveRequestDataDirSkipsWriters(t *testing.T) {
+	// Model resolution happens before the writer guard, so an empty model is a
+	// cheap way to prove the guard did not fire first.
+	err := RunAutoBenchmark(context.Background(), AutoBenchmarkConfig{})
+	if err == nil || !strings.Contains(err.Error(), "no model specified") {
+		t.Errorf("want the pre-existing no-model error, got: %v", err)
 	}
 }
