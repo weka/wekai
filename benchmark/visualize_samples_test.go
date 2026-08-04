@@ -1607,3 +1607,102 @@ console.log("ALL_OK");
 		check(t, dir)
 	})
 }
+
+// TestRequestHoverTokensJS pins the per-request token breakdown. Toggling "Show
+// Requests" exposes latency outliers, but a slow request is a different problem
+// depending on whether it carried an enormous prompt, missed the cache, or
+// generated a long completion — none of which the tooltip used to say.
+func TestRequestHoverTokensJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS request-hover test skipped")
+	}
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	model := "dynamic/http://localhost:8000/v1,type=openai_vllm,alias=hovertok"
+	var rec []requestDataRecord
+	// Nine ordinary requests at 500-token context, then one outlier: 20x the
+	// context, almost none of it cached, and slow — the shape being diagnosed.
+	for i := 0; i < 9; i++ {
+		st := base.Add(time.Duration(i) * 10 * time.Second)
+		rec = append(rec, requestDataRecord{
+			StartTime: st, EndTime: st.Add(time.Second),
+			TTFT: 150, ResponseMs: 900, Model: model,
+			SeriesNum: 1, RequestNum: i + 1,
+			InputTokens: 100, CachedTokens: 400, OutputTokens: 50,
+		})
+	}
+	outlier := base.Add(90 * time.Second)
+	rec = append(rec, requestDataRecord{
+		StartTime: outlier, EndTime: outlier.Add(40 * time.Second),
+		TTFT: 30000, ResponseMs: 40000, Model: model,
+		SeriesNum: 1, RequestNum: 10,
+		InputTokens: 9000, CachedTokens: 1000, OutputTokens: 2500,
+	})
+	writeMixedJSONL(t, dir, "hovertok", rec, nil)
+
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+// The breakdown only reaches the user with request dots drawn, which is the
+// mode the outliers are spotted in.
+document.getElementById("showDots").checked = true;
+draw();
+const mm = (__listeners["chart:mousemove"] || [])[0];
+const tip = document.getElementById("tooltip");
+const s = DATA[0];
+
+function hoverRequest(rn) {
+  const r = s._view.find(x => x.rn === rn);
+  assert(r, "fixture has request " + rn);
+  tip.innerHTML = ""; tip.style.display = "none";
+  mm({ clientX: mapX(r.t), clientY: mapY(r.resp) });
+  assert(tip.style.display === "block", "req " + rn + ": tooltip shown");
+  return tip.innerHTML;
+}
+
+// The outlier: 9k uncached + 1k cached = 10k prompt, only 10% cached, and 20x
+// the 500-token median context — every clause of "why was this slow".
+const out = hoverRequest(10);
+assert(out.indexOf("Input: 10.0k tok") >= 0, "prompt = uncached + cached = 10k: " + out);
+assert(out.indexOf("cached: 1.0k") >= 0, "cached input shown: " + out);
+assert(out.indexOf("(10.0%)") >= 0, "cached share shown: " + out);
+assert(out.indexOf("uncached: 9.0k") >= 0, "uncached input shown: " + out);
+assert(out.indexOf("Output: 2.5k tok") >= 0, "output shown: " + out);
+assert(out.indexOf("20.0x median ctx") >= 0, "context vs the series median shown: " + out);
+// The identity and latency lines it already carried must survive.
+assert(out.indexOf("series 1, req 10") >= 0, "identity kept: " + out);
+assert(out.indexOf("Response: 40000.0 ms") >= 0, "response time kept: " + out);
+
+// An ordinary request reads as ordinary: 80% cached, 1.0x the median.
+const ord = hoverRequest(3);
+assert(ord.indexOf("Input: 500 tok") >= 0, "ordinary prompt: " + ord);
+assert(ord.indexOf("(80.0%)") >= 0, "ordinary cached share: " + ord);
+assert(ord.indexOf("1.0x median ctx") >= 0, "ordinary ctx vs median: " + ord);
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "hover_tokens_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node request-hover test failed: %v\n%s", err, out)
+	}
+}

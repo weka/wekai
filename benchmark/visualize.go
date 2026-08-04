@@ -2358,10 +2358,30 @@ canvas.addEventListener("mousemove", e => {
     } else {
       const r = best.r;
       const mixInfo = mixTooltipHTML(best.s, r.t);
+      // Token breakdown for the hovered request. This is what makes a latency
+      // outlier diagnosable: a slow request is a different problem depending on
+      // whether it carried an enormous prompt, missed the cache, or generated a
+      // long completion. r.in is net-of-cache and r.ca is the cached subset
+      // (see buildReplayUsage), so the prompt the server saw is the sum.
+      const prompt = (r.in || 0) + (r.ca || 0);
+      const cachedPct = prompt > 0 ? (r.ca || 0) / prompt * 100 : 0;
+      // How this request's context compares with its series' median tells you
+      // whether "large" means large for this run or just large in absolute
+      // terms — an outlier at the typical size is a different story.
+      const ctxs = best.s._view.map(x => (x.in || 0) + (x.ca || 0));
+      const medCtx = percentile(ctxs, 0.5);
+      const vsMed = medCtx > 0 ? (prompt / medCtx).toFixed(1) + "x median ctx" : "";
       showTooltip(e,
         "<b>" + best.s.name + "</b> (series " + r.sn + ", req " + r.rn + ")<br>" +
         "TTFT: " + r.ttft.toFixed(1) + " ms<br>" +
         "Response: " + r.resp.toFixed(1) + " ms<br>" +
+        "<span style='color:#8a9096'>—</span><br>" +
+        "Input: " + fmtTokens(prompt) + " tok" +
+        (vsMed ? " <span style='color:#8a9096'>(" + vsMed + ")</span>" : "") + "<br>" +
+        "&nbsp;&nbsp;cached: " + fmtTokens(r.ca || 0) +
+        " <span style='color:#8a9096'>(" + cachedPct.toFixed(1) + "%)</span><br>" +
+        "&nbsp;&nbsp;uncached: " + fmtTokens(r.in || 0) + "<br>" +
+        "Output: " + fmtTokens(r.out || 0) + " tok<br>" +
         (r.ch ? "Cache hit<br>" : "") +
         (r.err ? "<span style='color:#FF6B6B'>ERROR</span>" : "") +
         (mixInfo ? "<br>" + mixInfo : ""));
