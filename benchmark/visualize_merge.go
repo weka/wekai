@@ -136,7 +136,11 @@ func GenerateVisualizationMerged(dirs []string, labels []string, outputDir strin
 		} else {
 			alias = deriveSourceLabel(dir, dirRecords)
 		}
-		alias = sanitizeModelRe.ReplaceAllString(alias, "_")
+		// The label names four files: <alias>.jsonl, <alias>.csv and the
+		// chunked <alias>_partN.csv set. Reserve for the longest of those so a
+		// pathological label can't produce an unwritable chunk after the JSONL
+		// already succeeded — see safeFileBase.
+		alias = safeFileBase(alias, len("_part9999.csv"))
 		if alias == "" {
 			alias = fmt.Sprintf("source%d", i+1)
 		}

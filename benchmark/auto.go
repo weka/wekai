@@ -2,6 +2,8 @@ package benchmark
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -215,12 +217,54 @@ type requestDataWriter struct {
 
 var sanitizeModelRe = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
 
+// maxFileNameLen is the per-component file-name limit these results land on.
+// ext4, xfs, overlayfs and NFS all cap a single name at 255 BYTES — the limit
+// is on the component, not the path, so a shorter output dir does not help.
+const maxFileNameLen = 255
+
+// safeFileBase turns an arbitrary identifier into a file-name base guaranteed
+// to fit, reserving `reserve` bytes for the extension and any suffix the caller
+// appends (e.g. "_part12.csv").
+//
+// A multi-endpoint dynamic model spec embeds EVERY endpoint URL alongside the
+// model name and the alias. A six-endpoint failover run produced a 260-byte
+// name, os.Create failed with ENAMETOOLONG, and the run wrote no request data
+// at all — a 12-hour benchmark reduced to a single stderr warning. Four
+// characters of alias separated the run that worked from the one that didn't.
+//
+// When shortening is needed the ALIAS is kept in preference to the endpoint
+// list — it is the part a human named the run by, and the part every reader
+// identifies the arm by — with a hash of the FULL identifier appended so two
+// specs differing only past the cut can never collide on one file. Names that
+// already fit are returned unchanged, so existing runs keep their filenames.
+func safeFileBase(id string, reserve int) string {
+	// Sanitizing leaves only [a-zA-Z0-9._-], so the result is pure ASCII and
+	// slicing by byte below cannot split a rune.
+	safe := sanitizeModelRe.ReplaceAllString(id, "_")
+	limit := maxFileNameLen - reserve
+	if limit < 24 {
+		limit = 24 // always leave room for a usable head plus the hash
+	}
+	if len(safe) <= limit {
+		return safe
+	}
+	sum := sha256.Sum256([]byte(id))
+	suffix := "_" + hex.EncodeToString(sum[:])[:12]
+	head := safe
+	if alias := extractAlias(id); alias != "" {
+		head = sanitizeModelRe.ReplaceAllString(alias, "_")
+	}
+	if len(head)+len(suffix) > limit {
+		head = head[:limit-len(suffix)]
+	}
+	return head + suffix
+}
+
 func newRequestDataWriter(outputDir, model string, _ time.Time) (*requestDataWriter, error) {
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return nil, fmt.Errorf("create output dir: %w", err)
 	}
-	safeModel := sanitizeModelRe.ReplaceAllString(model, "_")
-	filename := safeModel + ".jsonl"
+	filename := safeFileBase(model, len(".jsonl")) + ".jsonl"
 	f, err := os.Create(outputDir + "/" + filename)
 	if err != nil {
 		return nil, fmt.Errorf("create JSONL file: %w", err)
@@ -1307,7 +1351,13 @@ func runSingleModelBenchmark(
 		var err error
 		rdw, err = newRequestDataWriter(cfg.SaveRequestDataDir, cfg.Model, startTime)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to create request data writer: %v\n", err)
+			// Loud: the run continues but produces NO request data, and that is
+			// only discoverable afterwards by noticing the missing file. A
+			// 12-hour benchmark has been lost to this warning scrolling past.
+			fmt.Fprintf(os.Stderr,
+				"\n*** REQUEST DATA WILL NOT BE SAVED: %v\n"+
+					"*** --save-request-data was requested but the file could not be created.\n"+
+					"*** This run will produce no per-request JSONL and no report.\n\n", err)
 		} else {
 			defer rdw.close()
 		}
