@@ -9,7 +9,13 @@ import (
 
 // DefaultOverloadThreshold is the multiple of the well-balanced in-flight share
 // at which an endpoint is considered overloaded and requests fail over.
-const DefaultOverloadThreshold = 1.5
+//
+// 1.2 rather than something looser: measured on a 6-node fleet (fair share 32),
+// 1.5 left the spread at 19..49 in flight after an hour — one endpoint at the
+// limit while another sat at a third of it. Allowing only 20% over the fair
+// share tightens that without giving up stickiness, since a request still
+// prefers its series' home endpoint and only the overflow moves.
+const DefaultOverloadThreshold = 1.2
 
 // EndpointRouter assigns series to endpoints stickily — each series always
 // prefers the same endpoint — but fails over when that endpoint is carrying
@@ -53,7 +59,7 @@ func NewEndpointRouter(endpoints []string) *EndpointRouter {
 // totalConcurrency is the benchmark's aggregate concurrency across all
 // endpoints — for router replay that is Concurrency + HotSeriesConcurrency.
 // With 168 + 24 over 6 endpoints the fair share is 32, and at the default
-// threshold of 1.5 an endpoint fails over above 48 in flight.
+// threshold of 1.2 an endpoint fails over above 38 in flight.
 func NewEndpointRouterWithFailover(endpoints []string, totalConcurrency int, threshold float64) *EndpointRouter {
 	if threshold <= 0 {
 		threshold = DefaultOverloadThreshold

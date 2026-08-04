@@ -225,3 +225,21 @@ func TestAcquireForRequestRespectsLimitUnderConcurrency(t *testing.T) {
 		}
 	}
 }
+
+// The default must stay tight enough to matter: at the 6-node fair share of 32
+// it has to fail over well below the 48 that a 1.5 multiple allowed, since 1.5
+// measurably left one endpoint at the limit while another idled at a third of
+// it. This pins the default so a future loosening is a deliberate act.
+func TestDefaultThresholdIsTight(t *testing.T) {
+	if DefaultOverloadThreshold > 1.25 {
+		t.Fatalf("DefaultOverloadThreshold = %v; too loose to balance a fan-out burst", DefaultOverloadThreshold)
+	}
+	r := NewEndpointRouterWithFailover(eps(6), 192, 0) // 0 -> default
+	home := r.PickIndex(1)
+	for i := int64(0); i < 39; i++ { // 39 > 32*1.2 = 38
+		r.AcquireIndex(home)
+	}
+	if r.PickIndex(1) == home {
+		t.Fatalf("default %v did not fail over at 39 in flight (fair share 32)", DefaultOverloadThreshold)
+	}
+}
