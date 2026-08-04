@@ -825,6 +825,82 @@ console.log("ALL_OK");
 	}
 }
 
+// TestNoDatasetAxisRowsJS pins the removal of the per-tick "ds:<size>" axis
+// rows. They cost one row of bottom margin per visible sampled series — 140px
+// of chart height on a 10-variant report — to repeat, in near-identical
+// numbers across every tick, what the band label and band hover already state
+// exactly. Enabling the cache-mix overlay must no longer grow the bottom
+// margin at all; only "Show X-axis values" may.
+func TestNoDatasetAxisRowsJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS axis-row test skipped")
+	}
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	for _, alias := range []string{"armA", "armB", "armC"} {
+		rec, smp := benchFixtureData(alias, base)
+		writeMixedJSONL(t, dir, alias, rec, smp)
+	}
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	if strings.Contains(html, `"ds:"`) {
+		t.Errorf("generated report still emits the ds: axis-row label")
+	}
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+assert(DATA.length === 3 && DATA.every(s => s.adt && s.adt.length), "3 sampled series in the fixture");
+const mix = document.getElementById("showCacheMix"), xax = document.getElementById("showXAxisValues");
+
+// The cache-mix overlay must not buy any bottom margin.
+mix.checked = false; xax.checked = false;
+const bare = calcBottomMargin();
+mix.checked = true;
+assert(calcBottomMargin() === bare, "cache-mix overlay must not grow the bottom margin (got " +
+  calcBottomMargin() + " vs " + bare + ")");
+
+// The x-axis values toggle still buys one row per visible series, and that
+// remains the ONLY thing that does.
+xax.checked = true;
+const withRows = calcBottomMargin();
+assert(withRows === bare + 3 * 14, "x-axis values add one row per series, got " + withRows);
+mix.checked = false;
+assert(calcBottomMargin() === withRows, "rows come from the x-axis toggle alone");
+
+// Chart height actually reclaims the space: overlay on, axis values off.
+mix.checked = true; xax.checked = false;
+resize(); draw();
+const tallPlotH = plotH;
+xax.checked = true;
+resize(); draw();
+assert(plotH < tallPlotH, "axis rows still cost plot height when explicitly enabled");
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "axis_rows_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node axis-row test failed: %v\n%s", err, out)
+	}
+}
+
 // TestDragZoomPrecisionJS pins the drag-to-zoom selection to the pixels
 // actually dragged. unmapX is relative to the CURRENT view, so assigning
 // viewTMin before resolving the far edge made the second unmapX resolve

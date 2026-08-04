@@ -60,7 +60,7 @@ func GenerateVisualizationWithOptions(dir string, concurrency int, maxElapsed ti
 // request StartTime in the set (falling back to the earliest sample when a
 // file somehow has no request rows); the boundary is inclusive — a record
 // exactly AT the cutoff is kept. Samples truncate against the same t0 so
-// the cache-mix overlay, ingest volume, and ds: axis rows all stop at the
+// the cache-mix overlay and ingest volume all stop at the
 // cutoff consistently with the request data. maxElapsed <= 0 is a no-op.
 func truncateToElapsed(records []requestDataRecord, samples []vllmMetricsSample, maxElapsed time.Duration) ([]requestDataRecord, []vllmMetricsSample) {
 	if maxElapsed <= 0 || (len(records) == 0 && len(samples) == 0) {
@@ -152,7 +152,7 @@ type seriesData struct {
 
 // generateVisualization is the implementation behind GenerateVisualization.
 // keepFileNames pins each series' DISPLAYED name (legend, cache-mix band
-// label, tooltips, ds: axis rows — all render seriesData.Name) to the .jsonl
+// label, tooltips — all render seriesData.Name) to the .jsonl
 // basename instead of re-resolving the record alias. The merged path sets it
 // when explicit --labels were given, so labels win end-to-end: two arms
 // sharing one alias would otherwise render indistinguishably. maxElapsed > 0
@@ -703,15 +703,13 @@ function calcBottomMargin() {
   if (typeof xAxisValuesEnabled === "function" && xAxisValuesEnabled()) {
     reqRows = DATA.filter((_, i) => !hiddenSeries.has(i)).length;
   }
-  // Dataset-size rows: one extra row per visible sampled series when the
-  // cache-mix overlay is enabled.
-  let dsRows = 0;
-  if (typeof cacheMixEnabled === "function" && cacheMixEnabled()) {
-    dsRows = DATA.filter((s, i) => !hiddenSeries.has(i) && s.adt && s.adt.length).length;
-  }
+  // Dataset size gets NO axis rows: it's a slow-moving level, so a per-tick
+  // column of near-identical "ds:13.5M" readings cost one row per series
+  // (140px on a 10-variant report) to repeat what the band label and the band
+  // hover already say exactly. The band is the place for it.
   // 20px for the time label + 14px per printed row (single line each);
   // adaptive ticks (11-17 columns) leave ample width.
-  return 20 + (reqRows + dsRows) * 14;
+  return 20 + reqRows * 14;
 }
 
 function resize() {
@@ -1501,29 +1499,12 @@ function draw() {
       ctx.textAlign = "center";
       row++;
     });
-    // Dataset-size rows: active-dataset tokens as of each tick, one row per
-    // visible sampled series, sharing the sparse adaptive tick columns.
-    // Text stays neutral; the row's left-edge chip names the series.
-    if (cacheMixEnabled()) {
-      DATA.forEach((ds, si) => {
-        if (hiddenSeries.has(si) || !ds.adt || !ds.adt.length) return;
-        const p = adtAt(ds.adt, tickTime);
-        const label = "ds:" + (p ? fmtTokens(p.v) : "-");
-        const yBase = margin.top + plotH + 20 + row * 14;
-        ctx.textAlign = "left";
-        ctx.fillStyle = "#C9C9C9";
-        ctx.fillText(label, x - ctx.measureText(label).width / 2, yBase);
-        ctx.textAlign = "center";
-        row++;
-      });
-    }
     ctx.font = "11px monospace";
     ctx.fillStyle = "#8a9096";
   }
 
   // Row-identity chips: annotation text is neutral, so a small colored chip
-  // at the left edge of each row names its series (request rows first, then
-  // ds: rows, matching the per-tick row order).
+  // at the left edge of each request-count row names its series.
   {
     let row = 0;
     const chip = si => {
@@ -1533,11 +1514,6 @@ function draw() {
     };
     if (xAxisValuesEnabled()) {
       DATA.forEach((ds, si) => { if (!hiddenSeries.has(si)) chip(si); });
-    }
-    if (cacheMixEnabled()) {
-      DATA.forEach((ds, si) => {
-        if (!hiddenSeries.has(si) && ds.adt && ds.adt.length) chip(si);
-      });
     }
   }
 
