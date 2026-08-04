@@ -337,7 +337,47 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   .brandbar { height: 3px; margin: 0 -16px 12px; background: linear-gradient(90deg, #7C03EC, #C91FF8, #FF3FD5); }
   h1 { font-size: 1.4em; font-weight: 500; margin-bottom: 8px; color: #F2F2EB; }
   .info { font-size: 0.85em; color: #8a9096; margin-bottom: 12px; }
+  /* Upper view is two panels side by side: toggles on the left, a per-variant
+     summary of the SELECTED timeframe on the right. Below ~1100px the grid
+     collapses to one column so the summary stacks under the controls rather
+     than squeezing both. The summary column is capped (not auto-sized) so a
+     10-variant report can never squeeze the controls out. */
+  .topgrid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 780px); gap: 12px; align-items: start; margin-bottom: 12px; }
+  @media (max-width: 1100px) { .topgrid { grid-template-columns: minmax(0, 1fr); } }
+  .panel { background: #171C20; border: 1px solid #42464A; border-radius: 8px; padding: 10px 12px; min-width: 0; }
+  .panel-title { font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.07em; color: #8a9096; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+  .panel-title .range { color: #C79FF1; text-transform: none; letter-spacing: 0; }
+  .panel-title .spacer { margin-left: auto; }
+  /* Collapse control: both panels can be shrunk vertically to hand their
+     height back to the chart, which is the only element that benefits from
+     it. resize() re-measures the header on toggle, so the canvas grows. */
+  .panel-toggle { font-size: 1.1em; line-height: 1; padding: 0 5px; background: transparent; color: #8a9096; border: 1px solid #42464A; border-radius: 4px; cursor: pointer; }
+  .panel-toggle:hover { background: #2A3038; color: #F2F2EB; }
+  .panel.collapsed .panel-title { margin-bottom: 0; }
+  .panel.collapsed .panel-body { display: none; }
+  /* The summary scrolls in BOTH axes inside a capped box: vertically because
+     variants are rows (10 arms must stay navigable), horizontally for narrow
+     viewports. The header row and the variant-name column are sticky so
+     neither scroll direction can leave a number unlabelled. */
+  .summary-wrap { overflow: auto; max-height: 200px; }
+  #summaryTable { border-collapse: separate; border-spacing: 0; font-size: 0.8em; white-space: nowrap; width: 100%; }
+  #summaryTable th, #summaryTable td { padding: 3px 0 3px 13px; text-align: right; }
+  #summaryTable thead th { position: sticky; top: 0; z-index: 2; background: #171C20; color: #F2F2EB; font-weight: 500; border-bottom: 1px solid #42464A; padding-bottom: 6px; }
+  #summaryTable .vcol { position: sticky; left: 0; z-index: 1; background: #171C20; text-align: left; padding-left: 0; padding-right: 14px; }
+  #summaryTable thead .vcol { z-index: 3; }
+  /* Variant names run long (45+ chars on router/variant-suffixed arms). Cap
+     the name column and ellipsize so the six metric columns always fit rather
+     than being pushed off the right edge — the full name stays on hover. */
+  .summary-name { display: block; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #summaryTable tbody td { color: #F2F2EB; font-variant-numeric: tabular-nums; padding-top: 4px; padding-bottom: 4px; }
+  #summaryTable tbody tr { cursor: pointer; }
+  #summaryTable tbody tr:hover td, #summaryTable tbody tr:hover .vcol { background: #1E2429; }
+  #summaryTable tbody tr.row-hidden { opacity: 0.32; }
+  #summaryTable td.err-hot { color: #FF6B6B; }
+  .summary-head { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; }
+  .summary-head .legend-dot { flex: 0 0 auto; }
   .controls { margin-bottom: 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .controls:last-child { margin-bottom: 0; }
   .controls label { font-size: 0.85em; cursor: pointer; }
   .controls input[type=checkbox] { margin-right: 4px; }
   .controls button { font-size: 0.8em; padding: 3px 10px; background: #1E2429; color: #F2F2EB; border: 1px solid #42464A; border-radius: 4px; cursor: pointer; }
@@ -376,26 +416,41 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 </head>
 <body>
 <div class="brandbar"></div>
+<div id="header">
 <h1>Benchmark Request Timeline</h1>
 <div class="info" id="info"></div>
-<div class="controls">
-  <label><input type="checkbox" id="showTTFT" checked> TTFT p50</label>
-  <label><input type="checkbox" id="showTTFTP95"> TTFT p95</label>
-  <label><input type="checkbox" id="showResp" checked> Show Response Time</label>
-  <label><input type="checkbox" id="showDots"> Show Requests</label>
-  <label><input type="checkbox" id="showErrors" checked> Show Errors</label>
-  <label><input type="checkbox" id="showTotals" checked> Show Totals (ingest)</label>
-  <label><input type="checkbox" id="showXAxisValues"> Show X-axis values</label>
-  <button id="resetZoom" disabled>Reset Zoom</button>
-  <span id="zoomInfo" style="font-size:0.8em;color:#8a9096;"></span>
-</div>
-<div style="margin-bottom:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-  <button id="ctxFilterBtn" style="font-size:0.8em;padding:3px 10px;background:#1E2429;color:#F2F2EB;border:1px solid #7C03EC;border-radius:4px;cursor:pointer;">Context Filter</button>
-  <button id="selectAll" style="font-size:0.8em;padding:3px 10px;background:#1E2429;color:#F2F2EB;border:1px solid #42464A;border-radius:4px;cursor:pointer;">Select All</button>
-  <button id="deselectAll" style="font-size:0.8em;padding:3px 10px;background:#1E2429;color:#F2F2EB;border:1px solid #42464A;border-radius:4px;cursor:pointer;">Deselect All</button>
-  <input id="variantFilter" type="text" placeholder="Filter variants..." style="font-size:0.8em;padding:3px 8px;background:#1E2429;color:#F2F2EB;border:1px solid #42464A;border-radius:4px;width:200px;">
+<div class="topgrid">
+  <div class="panel" id="controlsPanel">
+    <div class="panel-title">Controls<span class="spacer"></span><button class="panel-toggle" id="controlsToggle" title="Collapse">&minus;</button></div>
+    <div class="panel-body">
+    <div class="controls">
+      <label><input type="checkbox" id="showTTFT" checked> TTFT p50</label>
+      <label><input type="checkbox" id="showTTFTP95"> TTFT p95</label>
+      <label><input type="checkbox" id="showResp" checked> Show Response Time</label>
+      <label><input type="checkbox" id="showDots"> Show Requests</label>
+      <label><input type="checkbox" id="showErrors" checked> Show Errors</label>
+      <label><input type="checkbox" id="showTotals" checked> Show Totals (ingest)</label>
+      <label><input type="checkbox" id="showXAxisValues"> Show X-axis values</label>
+      <button id="resetZoom" disabled>Reset Zoom</button>
+      <span id="zoomInfo" style="font-size:0.8em;color:#8a9096;"></span>
+    </div>
+    <div class="controls">
+      <button id="ctxFilterBtn" style="border-color:#7C03EC;">Context Filter</button>
+      <button id="selectAll">Select All</button>
+      <button id="deselectAll">Deselect All</button>
+      <input id="variantFilter" type="text" placeholder="Filter variants..." style="font-size:0.8em;padding:3px 8px;background:#1E2429;color:#F2F2EB;border:1px solid #42464A;border-radius:4px;width:200px;">
+    </div>
+    </div>
+  </div>
+  <div class="panel" id="summaryPanel">
+    <div class="panel-title">Summary<span class="range" id="sumRange"></span><span class="spacer"></span><button class="panel-toggle" id="summaryToggle" title="Collapse">&minus;</button></div>
+    <div class="panel-body">
+      <div class="summary-wrap"><table id="summaryTable"><thead><tr id="sumHead"></tr></thead><tbody id="sumBody"></tbody></table></div>
+    </div>
+  </div>
 </div>
 <div id="legend"></div>
+</div>
 <canvas id="chart"></canvas>
 <div id="tooltip"></div>
 <div id="ctxModal" class="modal-backdrop">
@@ -615,6 +670,7 @@ function applyCtxFilter(minTok, maxTok) {
       : s.records;
     computeDerived(s);
   });
+  statsEpoch++; // every series' view changed — invalidate the summary cache
   const btn = document.getElementById("ctxFilterBtn");
   if (btn) {
     let label = "Context Filter";
@@ -715,7 +771,13 @@ function calcBottomMargin() {
 function resize() {
   margin.bottom = calcBottomMargin();
   W = Math.min(window.innerWidth - 32, 1800);
-  H = Math.max(500, Math.min(window.innerHeight - 200, 800));
+  // Measure the header instead of assuming a fixed chrome allowance: the
+  // controls/summary grid reflows with variant count and viewport width (it
+  // stacks to one column under 1100px), so a hardcoded reserve would either
+  // clip the canvas or leave a gap.
+  const headEl = document.getElementById("header");
+  const headH = headEl ? headEl.getBoundingClientRect().height : 160;
+  H = Math.max(420, Math.min(window.innerHeight - headH - 40, 800));
   canvas.style.width = W + "px";
   canvas.style.height = H + "px";
   canvas.width = W * dpr;
@@ -752,12 +814,59 @@ viewTMin = globalTMin; viewTMax = globalTMax; viewYMax = globalYMax;
 
 function isZoomed() { return viewTMin !== globalTMin || viewTMax !== globalTMax; }
 
-function countRecords(records) {
-  let ok = 0, err = 0;
+// windowStats reduces a series' current view to everything the header needs,
+// in ONE pass: request counts, token volumes, and the record-time extent used
+// as the rate denominator. Called once per series per draw() (via updateInfo),
+// including during a zoom drag, so it must stay single-pass — the old
+// countRecords did the same walk for counts alone.
+//
+// Token semantics, per the net-of-cache contract in
+// benchmark/replay_router_post.go (buildReplayUsage): r.in EXCLUDES cached
+// tokens and r.ca is the cached subset, so total prompt tokens the server
+// processed = in + ca. That matches the "ingest" volume layer, which sums the
+// same pair. Volumes include errored requests (a failed request still cost
+// its prompt); "completed" counts only non-errors.
+function windowStats(records) {
+  let ok = 0, err = 0, inTok = 0, caTok = 0, outTok = 0;
+  let tFirst = Infinity, tLast = -Infinity;
+  // TTFT percentiles come from non-error requests that actually reported a
+  // first token, matching the plotted rolling-percentile lines exactly — so a
+  // zoomed summary agrees with the curve it sits above.
+  const ttfts = [];
   records.forEach(r => {
-    if (r.t >= viewTMin && r.t <= viewTMax) { if (r.err) err++; else ok++; }
+    if (r.t < viewTMin || r.t > viewTMax) return;
+    if (r.err) err++; else {
+      ok++;
+      if (r.ttft > 0) ttfts.push(r.ttft);
+    }
+    inTok += (r.in || 0);
+    caTok += (r.ca || 0);
+    outTok += (r.out || 0);
+    if (r.t < tFirst) tFirst = r.t;
+    if (r.t > tLast) tLast = r.t;
   });
-  return { ok, err, total: ok + err };
+  // One numeric sort serves both percentiles. Float64Array.sort is numeric by
+  // default and materially faster than a comparator on a plain array, which
+  // matters at 55k+ rows per series.
+  const sortedTtft = Float64Array.from(ttfts).sort();
+  const total = ok + err;
+  // Rate denominator: the variant's own first->last record inside the window,
+  // not the window width. Zooming past where an arm's data ends would
+  // otherwise dilute its rate with empty time it never ran through. Falls
+  // back to the window width when the extent is degenerate (0 or 1 record).
+  let spanSec = total > 1 ? (tLast - tFirst) / 1000 : 0;
+  if (spanSec <= 0) spanSec = Math.max((viewTMax - viewTMin) / 1000, 1);
+  return {
+    ok, err, total, inTok, caTok, outTok, prompt: inTok + caTok, spanSec,
+    ttft50: percentileSorted(sortedTtft, 0.5),
+    ttft95: percentileSorted(sortedTtft, 0.95),
+    ttftN: sortedTtft.length,
+  };
+}
+
+function countRecords(records) {
+  const s = windowStats(records);
+  return { ok: s.ok, err: s.err, total: s.total };
 }
 
 function formatCount(ok, err) {
@@ -765,15 +874,28 @@ function formatCount(ok, err) {
   return '<span style="color:#C9C9C9">' + ok + '</span>, <span style="color:#FF6B6B">' + err + '</span>';
 }
 
+// windowStats is a full pass over every series (plus a sort for the TTFT
+// percentiles), while draw() runs on every mousemove of a zoom drag — during
+// which the VIEW does not move, only the selection rectangle. Cache the pass
+// against the view bounds and a filter epoch so dragging repaints for free.
+let statsCache = null, statsCacheKey = "";
+let statsEpoch = 0;
+function seriesStats() {
+  const key = viewTMin + "|" + viewTMax + "|" + statsEpoch;
+  if (statsCache && statsCacheKey === key) return statsCache;
+  statsCache = DATA.map(s => windowStats(s._view));
+  statsCacheKey = key;
+  return statsCache;
+}
+
 function updateInfo() {
   let totalOk = 0, totalErr = 0;
-  const perSeries = [];
-  DATA.forEach((s, i) => {
-    const c = countRecords(s._view);
-    perSeries.push(c);
+  const perSeries = seriesStats();
+  perSeries.forEach(c => {
     totalOk += c.ok;
     totalErr += c.err;
   });
+  renderSummary(perSeries);
 
   const span = ((viewTMax - viewTMin) / 1000).toFixed(1);
   const totalStr = formatCount(totalOk, totalErr);
@@ -819,6 +941,129 @@ function syncLegendVisuals() {
     item.classList.toggle("hidden", hiddenSeries.has(i));
   });
 }
+
+// --- Summary panel: per-variant totals over the SELECTED timeframe ---
+// One ROW per variant, one column per metric: a report can carry ~10 arms but
+// the metric set is fixed at six, so growth is vertical and the pane scrolls
+// down a stable set of columns rather than sideways past the labels.
+// Everything here honours the current view: the zoom window, the context
+// band, and the in-dataset series selection (via s._view) — so zooming into
+// an interesting stretch reprices every number. The skeleton is built once
+// and only cell text is rewritten per draw, so a zoom drag never rebuilds DOM.
+// Headers are abbreviated to keep all eight columns inside the pane; each
+// carries the full wording as a hover title.
+const SUMMARY_METRICS = [
+  { key: "in",      short: "Input",  label: "Input tokens (prompt = uncached + server-cached)", fmt: st => fmtTokens(st.prompt) },
+  { key: "out",     short: "Output", label: "Output tokens",            fmt: st => fmtTokens(st.outTok) },
+  { key: "reqs",    short: "Reqs",   label: "Completed (non-error) requests", fmt: st => st.ok.toLocaleString() },
+  { key: "inrate",  short: "In/s",   label: "Avg input tokens/s",       fmt: st => fmtTokens(st.prompt / st.spanSec) },
+  { key: "outrate", short: "Out/s",  label: "Avg output tokens/s",      fmt: st => fmtTokens(st.outTok / st.spanSec) },
+  { key: "ttft50",  short: "TTFT50", label: "TTFT p50 over the selected window (non-error requests)", fmt: st => fmtMs(st.ttft50) },
+  { key: "ttft95",  short: "TTFT95", label: "TTFT p95 over the selected window (non-error requests)", fmt: st => fmtMs(st.ttft95) },
+  { key: "err1k",   short: "Err/1k", label: "Errors per 1000 requests",  fmt: st => (st.total ? st.err / st.total * 1000 : 0).toFixed(1) },
+];
+const sumCells = []; // sumCells[seriesIndex][metricIndex] — mirrors the layout
+const sumRows = [];
+(function buildSummary() {
+  const head = document.getElementById("sumHead");
+  const vth = document.createElement("th");
+  vth.className = "vcol";
+  vth.textContent = "Variant";
+  head.appendChild(vth);
+  SUMMARY_METRICS.forEach(m => {
+    const th = document.createElement("th");
+    th.textContent = m.short;
+    th.title = m.label;
+    head.appendChild(th);
+  });
+  const body = document.getElementById("sumBody");
+  DATA.forEach((s, i) => {
+    const tr = document.createElement("tr");
+    const name = document.createElement("td");
+    name.className = "vcol";
+    const wrap = document.createElement("span");
+    wrap.className = "summary-head";
+    const dot = document.createElement("span");
+    dot.className = "legend-dot";
+    dot.style.background = seriesColors[i];
+    const nameText = document.createElement("span");
+    nameText.className = "summary-name";
+    nameText.textContent = s.name;
+    wrap.appendChild(dot);
+    wrap.appendChild(nameText);
+    name.appendChild(wrap);
+    name.title = s.name;
+    tr.appendChild(name);
+    const cells = [];
+    SUMMARY_METRICS.forEach(() => {
+      const td = document.createElement("td");
+      tr.appendChild(td);
+      cells.push(td);
+    });
+    // A row IS a variant here, so it carries the same show/hide affordance as
+    // the legend entry — with 10 arms the summary is where you're looking.
+    tr.onclick = () => {
+      if (hiddenSeries.has(i)) hiddenSeries.delete(i); else hiddenSeries.add(i);
+      syncLegendVisuals();
+      draw();
+    };
+    sumCells.push(cells);
+    sumRows.push(tr);
+    body.appendChild(tr);
+  });
+})();
+
+// renderSummary repaints the panel from the per-series windowStats already
+// computed by updateInfo — no extra pass over the records.
+function renderSummary(perSeries) {
+  DATA.forEach((s, si) => {
+    const st = perSeries[si];
+    SUMMARY_METRICS.forEach((m, mi) => {
+      const td = sumCells[si][mi];
+      td.textContent = st ? m.fmt(st) : "-";
+      // The cached share is what a KV-offload arm actually buys, so it rides
+      // along as a hover on the input cell instead of costing a column.
+      if (m.key === "in" && st) {
+        td.title = "prompt tokens = " + fmtTokens(st.inTok) + " uncached + " +
+          fmtTokens(st.caTok) + " server-cached" +
+          (st.prompt > 0 ? " (" + (st.caTok / st.prompt * 100).toFixed(1) + "% cached)" : "");
+      }
+      // Percentiles over a thin window are noise — say how many requests back
+      // them rather than presenting 3 samples as a p95.
+      if ((m.key === "ttft50" || m.key === "ttft95") && st) {
+        td.title = st.ttftN + " non-error requests reported a first token in this window";
+      }
+      if (m.key === "err1k") td.classList.toggle("err-hot", !!st && st.err > 0);
+    });
+    if (sumRows[si]) sumRows[si].classList.toggle("row-hidden", hiddenSeries.has(si));
+  });
+  // A summary without its timeframe stated is a trap — always label the range.
+  const rangeEl = document.getElementById("sumRange");
+  if (rangeEl) {
+    const off = t => formatTickLabel(Math.round((t - globalTMin) / 1000));
+    rangeEl.textContent = isZoomed()
+      ? off(viewTMin) + " – " + off(viewTMax)
+      : "full run (" + off(globalTMax) + ")";
+  }
+}
+
+// Panel collapse: hand the panel's vertical space back to the chart. resize()
+// measures #header, so hiding a body immediately grows the canvas.
+function wirePanelToggle(btnId, panelId) {
+  const btn = document.getElementById(btnId);
+  const panel = document.getElementById(panelId);
+  if (!btn || !panel) return;
+  btn.addEventListener("click", () => {
+    const collapsed = panel.className.indexOf("collapsed") >= 0;
+    panel.className = collapsed ? "panel" : "panel collapsed";
+    btn.textContent = collapsed ? "−" : "+";
+    btn.title = collapsed ? "Collapse" : "Expand";
+    resize();
+    draw();
+  });
+}
+wirePanelToggle("controlsToggle", "controlsPanel");
+wirePanelToggle("summaryToggle", "summaryPanel");
 
 document.getElementById("selectAll").addEventListener("click", () => {
   const filter = document.getElementById("variantFilter").value.toLowerCase();
@@ -962,6 +1207,15 @@ function fmtTokens(v) {
   return "" + Math.round(v);
 }
 
+// fmtMs renders a latency compactly for the summary table; 0/absent reads as
+// "-" rather than "0ms", so a window with no completed request can't be
+// mistaken for an instant one.
+function fmtMs(v) {
+  if (!(v > 0)) return "-";
+  if (v >= 1000) return (v / 1000).toFixed(2) + "s";
+  return Math.round(v) + "ms";
+}
+
 // mixAt returns the sample interval covering t, or — when t is past the last
 // interval — the latest interval at or before t. null when t precedes the
 // first interval (no data yet at that point in the run).
@@ -984,6 +1238,15 @@ function percentile(arr, p) {
   const s = arr.slice().sort((a, b) => a - b);
   const idx = Math.ceil(s.length * p) - 1;
   return s[Math.max(0, idx)];
+}
+
+// percentileSorted is percentile() for an ALREADY-sorted sequence — same
+// nearest-rank definition, no copy and no re-sort. The summary panel sorts a
+// window's TTFTs once and reads several percentiles off that one sort.
+function percentileSorted(sorted, p) {
+  if (!sorted || sorted.length === 0) return 0;
+  const idx = Math.ceil(sorted.length * p) - 1;
+  return sorted[Math.min(Math.max(idx, 0), sorted.length - 1)];
 }
 
 // percentileDash: canvas dash pattern per plotted line kind — the pattern

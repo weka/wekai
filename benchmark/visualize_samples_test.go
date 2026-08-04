@@ -185,6 +185,22 @@ assert(adtAt(adt, 59999).v === 100, "holds until next sample");
 assert(adtAt(adt, 60001).v === 200 && adtAt(adt, 60001).s === 2, "latest at-or-before");
 assert(adtAt(adt, 1e12).v === 300, "after last => last");
 assert(fmtTokens(1234567) === "1.2M" && fmtTokens(999) === "999", "fmtTokens");
+assert(fmtMs(0) === "-" && fmtMs(-1) === "-", "no latency reads as '-', never 0ms");
+assert(fmtMs(150) === "150ms" && fmtMs(999) === "999ms", "sub-second stays in ms");
+assert(fmtMs(1000) === "1.00s" && fmtMs(2940) === "2.94s", "second and over switches to s");
+// percentileSorted matches percentile()'s nearest-rank definition, without
+// copying or re-sorting -- the summary sorts once and reads both p50 and p95.
+{
+  const raw = [5, 1, 4, 2, 3];
+  const srt = Float64Array.from(raw).sort();
+  [0.5, 0.95, 0.0, 1.0].forEach(p => {
+    assert(percentileSorted(srt, p) === percentile(raw, p),
+      "percentileSorted agrees with percentile at p=" + p);
+  });
+  assert(percentileSorted([], 0.5) === 0 && percentileSorted(null, 0.5) === 0, "empty => 0");
+  assert(percentileSorted(Float64Array.from([7]), 0.95) === 7, "single sample");
+}
+
 // adtWindow / adtWindowMax: the active-dataset band is re-framed by zoom, so
 // the scale and the "last dataset size" label must come from the window, not
 // the whole run.
@@ -434,6 +450,7 @@ __el("selectAll"); __el("deselectAll"); __el("seriesFilter");
 const document = {
   getElementById: id => __el(id),
   createElement: () => __el("dyn" + Math.random()),
+  createTextNode: text => ({ nodeType: 3, textContent: String(text) }),
   querySelector: () => __el("controls"),
 };
 const window = {
@@ -707,6 +724,148 @@ func TestGenerateVisualizationMergedCarriesSamples(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"mix":`) {
 		t.Errorf("merged report missing cache-mix overlay data")
+	}
+}
+
+// TestSummaryPanelJS runs the emitted report under the DOM stub and asserts
+// every cell of the per-variant summary panel against hand-computed values.
+// The panel is the header's headline claim about a run, so its arithmetic
+// gets pinned exactly rather than smoke-tested:
+//
+//	4 requests at t = 0/10/20/30s, the last one an error.
+//	prompt tokens (in + ca, net-of-cache contract) = 3*500 + 1000 = 2500
+//	output tokens = 3*50 + 100 = 250
+//	completed (non-error) = 3
+//	rate denominator = first->last record extent = 30s
+//	  => in/s = 2500/30 = 83.3 -> "83"; out/s = 250/30 = 8.3 -> "8"
+//	errors per 1k = 1/4 * 1000 = "250.0"
+//
+// Volumes deliberately include the errored request (a failed request still
+// cost its prompt), which is why its 1000/100 tokens are in the totals.
+func TestSummaryPanelJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS summary test skipped")
+	}
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	model := "dynamic/http://localhost:8000/v1,type=openai_vllm,alias=sumfix"
+	var records []requestDataRecord
+	for i := 0; i < 4; i++ {
+		st := base.Add(time.Duration(i) * 10 * time.Second)
+		r := requestDataRecord{
+			StartTime: st, EndTime: st.Add(2 * time.Second),
+			TTFT: 150, ResponseMs: 2000, Model: model,
+			SeriesNum: 1, RequestNum: i + 1,
+			InputTokens: 100, CachedTokens: 400, OutputTokens: 50,
+		}
+		if i == 3 {
+			r.IsError = true
+			r.InputTokens, r.CachedTokens, r.OutputTokens = 200, 800, 100
+		}
+		records = append(records, r)
+	}
+	writeMixedJSONL(t, dir, "a", records, nil)
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+// sumCells is [variantIndex][metricIndex] -- variants are rows.
+function expect(si, mi, want, label) {
+  const got = sumCells[si][mi].textContent;
+  assert(got === want, label + ": want " + JSON.stringify(want) + ", got " + JSON.stringify(got));
+}
+assert(SUMMARY_METRICS.length === 8, "eight metric columns, got " + SUMMARY_METRICS.length);
+assert(sumCells.length === DATA.length && sumCells[0].length === 8, "one row per variant, eight cells each");
+assert(sumRows.length === DATA.length, "one <tr> per variant");
+expect(0, 0, "2.5k", "input tokens");
+expect(0, 1, "250",  "output tokens");
+expect(0, 2, "3",    "completed requests");
+expect(0, 3, "83",   "avg input/s");
+expect(0, 4, "8",    "avg output/s");
+expect(0, 5, "150ms","ttft p50");
+expect(0, 6, "150ms","ttft p95");
+expect(0, 7, "250.0","errors per 1k");
+// TTFT percentiles are backed by the non-error requests only: the errored
+// 4th row must not count even though it carries a ttft.
+assert(sumCells[0][5].title.indexOf("3 non-error requests") === 0, "ttft sample count, got " + sumCells[0][5].title);
+assert(document.getElementById("sumRange").textContent === "full run (30s)",
+  "range label, got " + JSON.stringify(document.getElementById("sumRange").textContent));
+
+// The cached split rides along as a hover on the input row:
+// in = 3*100 + 200 = 500 uncached, ca = 3*400 + 800 = 2000 server-cached,
+// 2000/2500 = 80% cached.
+const tip = sumCells[0][0].title || "";
+assert(tip.indexOf("500 uncached") >= 0 && tip.indexOf("2.0k server-cached") >= 0 && tip.indexOf("80.0% cached") >= 0,
+  "input-row cached breakdown, got " + JSON.stringify(tip));
+
+// Zooming reprices every cell: clip to [0, 10s] and only the first two
+// requests remain (2 x 500 prompt, 2 x 50 out, 0 errors, 10s extent).
+viewTMin = globalTMin; viewTMax = globalTMin + 10000;
+draw();
+expect(0, 0, "1.0k", "zoomed input tokens");
+expect(0, 1, "100",  "zoomed output tokens");
+expect(0, 2, "2",    "zoomed completed requests");
+expect(0, 3, "100",  "zoomed avg input/s");
+expect(0, 4, "10",   "zoomed avg output/s");
+expect(0, 5, "150ms","zoomed ttft p50");
+expect(0, 6, "150ms","zoomed ttft p95");
+expect(0, 7, "0.0",  "zoomed errors per 1k");
+assert(document.getElementById("sumRange").textContent === "0s – 10s",
+  "zoomed range label, got " + JSON.stringify(document.getElementById("sumRange").textContent));
+
+// The context filter feeds the panel too: min above the fixture's ctx keeps
+// only the errored row (ctx 1000), so completed drops to 0 and the error
+// rate saturates.
+viewTMin = globalTMin; viewTMax = globalTMax;
+applyCtxFilter(600, 0);
+expect(0, 2, "0",      "ctx-filtered completed requests");
+expect(0, 7, "1000.0", "ctx-filtered errors per 1k");
+// No completed request in the view => the percentiles read "-", never "0ms".
+expect(0, 5, "-", "ctx-filtered ttft p50 has no sample");
+expect(0, 6, "-", "ctx-filtered ttft p95 has no sample");
+applyCtxFilter(0, 0);
+expect(0, 2, "3", "reset restores completed requests");
+
+// Collapsing a panel hands its height to the chart and must not disturb the
+// numbers: the toggle re-runs resize() + draw().
+const hBefore = H;
+(__listeners["controlsToggle:click"] || []).forEach(fn => fn());
+assert(document.getElementById("controlsPanel").className.indexOf("collapsed") >= 0, "controls panel collapses");
+assert(H >= hBefore, "collapsing controls does not shrink the canvas");
+expect(0, 2, "3", "numbers survive a collapse");
+(__listeners["controlsToggle:click"] || []).forEach(fn => fn());
+assert(document.getElementById("controlsPanel").className.indexOf("collapsed") < 0, "controls panel expands again");
+
+// Clicking a summary row toggles that variant, same as its legend entry.
+sumRows[0].onclick();
+assert(hiddenSeries.has(0), "row click hides the variant");
+sumRows[0].onclick();
+assert(!hiddenSeries.has(0), "row click shows it again");
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "summary_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node summary test failed: %v\n%s", err, out)
 	}
 }
 
