@@ -404,7 +404,6 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: "Onest", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-weight: 400; background: #0D1013; color: #C9C9C9; padding: 0 16px 16px; }
   .brandbar { height: 3px; margin: 0 -16px 12px; background: linear-gradient(90deg, #7C03EC, #C91FF8, #FF3FD5); }
-  h1 { font-size: 1.4em; font-weight: 500; margin-bottom: 8px; color: #F2F2EB; }
   .info { font-size: 0.85em; color: #8a9096; margin-bottom: 12px; }
   /* Upper view is two panels side by side: toggles on the left, a per-variant
      summary of the SELECTED timeframe on the right. Below ~1100px the grid
@@ -503,8 +502,6 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 <body>
 <div class="brandbar"></div>
 <div id="header">
-<h1>Benchmark Request Timeline</h1>
-<div class="info" id="info"></div>
 <div class="info" id="runparams"></div>
 <div class="topgrid">
   <div class="panel" id="controlsPanel">
@@ -896,14 +893,12 @@ function resize() {
 }
 
 // Compute global ranges
-let totalRequests = 0;
 DATA.forEach(s => {
   s.records.forEach(r => {
     if (r.t < globalTMin) globalTMin = r.t;
     if (r.t > globalTMax) globalTMax = r.t;
     if (r.resp > globalYMax) globalYMax = r.resp;
     if (r.ttft > globalYMax) globalYMax = r.ttft;
-    totalRequests++;
   });
   // Cache-mix samples extend the time range (a final sample can land after
   // the last request completes) but never the latency axis.
@@ -997,20 +992,8 @@ function seriesStats() {
 }
 
 function updateInfo() {
-  let totalOk = 0, totalErr = 0;
   const perSeries = seriesStats();
-  perSeries.forEach(c => {
-    totalOk += c.ok;
-    totalErr += c.err;
-  });
   renderSummary(perSeries);
-
-  const span = ((viewTMax - viewTMin) / 1000).toFixed(1);
-  const totalStr = formatCount(totalOk, totalErr);
-  document.getElementById("info").innerHTML =
-    DATA.length + " variants, " + totalStr + " requests" +
-    (isZoomed() ? " (of " + totalRequests + " total)" : "") +
-    ", time span: " + span + "s";
 
   // Update legend counts
   DATA.forEach((s, i) => {
