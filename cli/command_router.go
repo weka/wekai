@@ -45,6 +45,7 @@ type RouterServeCommand struct {
 	Routes        []string      `short:"r" long:"route" description:"Routing rule: '<pattern> => <upstream>[ as <model>]'. Pattern is comma-separated substrings or '*'. Repeat for multiple rules; first match wins."`
 	Default       string        `short:"d" long:"default" description:"Catch-all rule: '<upstream>[ as <model>]'. Used when no --route matches."`
 	StripAuth     []string      `long:"strip-auth-when" description:"Strip Authorization/x-api-key headers when route pattern matches (comma-separated patterns, repeatable). Useful for unauth'd local upstreams."`
+	AutoModel     string        `long:"auto-model" choice:"auto" choice:"off" choice:"force" default:"auto" description:"For routes with no explicit 'as <model>', ask the upstream (GET /v1/models) what it serves and rewrite the request's model to it. 'auto' (default) only rewrites when the upstream serves exactly one model; 'force' always takes the first listed; 'off' disables probing."`
 	LogHeaders    bool          `long:"log-headers" description:"Log full request/response headers (verbose, may leak tokens)"`
 	Capture       string        `long:"capture" choice:"raw" choice:"redacted" description:"Capture each request/response to JSONL for later analysis or replay. 'raw' saves bodies as-is (auth headers always redacted); 'redacted' replaces bodies with 'REDACTED_TOKENS=<approx>'."`
 	CaptureDir    string        `long:"capture-dir" description:"Override capture output directory. Default: ~/.wekai/router/capture/<mode>/"`
@@ -58,6 +59,26 @@ type routeRule struct {
 	upstream     *url.URL
 	rewriteModel string
 	stripAuth    bool
+
+	// autoModel holds the model discovered from the upstream's /v1/models when
+	// the rule carries no explicit `as <model>` (see command_router_automodel.go).
+	// Nil until a probe succeeds, and written by a background retry goroutine
+	// while requests are being served — hence the atomic. Read via
+	// effectiveRewrite, never directly.
+	autoModel atomic.Pointer[string]
+}
+
+// effectiveRewrite is the model name to write into the forwarded body, or ""
+// to forward the client's own. An explicit `as <model>` always wins over
+// discovery: the operator said it, we don't second-guess it.
+func (r *routeRule) effectiveRewrite() string {
+	if r.rewriteModel != "" {
+		return r.rewriteModel
+	}
+	if m := r.autoModel.Load(); m != nil {
+		return *m
+	}
+	return ""
 }
 
 func (r *routeRule) matches(model string) bool {
@@ -81,6 +102,8 @@ func (r *routeRule) describe() string {
 	out := fmt.Sprintf("%s => %s", pat, r.upstream.String())
 	if r.rewriteModel != "" {
 		out += " as " + r.rewriteModel
+	} else if m := r.autoModel.Load(); m != nil {
+		out += " as " + *m + " (auto-discovered)"
 	}
 	if r.stripAuth {
 		out += " (strip-auth)"
@@ -103,6 +126,10 @@ func (c *RouterServeCommand) Execute(args []string) error {
 			r.stripAuth = true
 		}
 	}
+
+	// Probe before the listener opens so the route lines logged below already
+	// name whatever was discovered.
+	resolveAutoModels(rules, c.AutoModel)
 
 	handler := &routerHandler{rules: rules, logHeaders: c.LogHeaders, userPrefix: c.UserPrefix}
 
@@ -419,10 +446,10 @@ func (h *routerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	outBody := body
 	rewroteTo := ""
-	if rule.rewriteModel != "" && len(body) > 0 {
-		if rewritten, ok := rewriteModelField(body, rule.rewriteModel); ok {
+	if rw := rule.effectiveRewrite(); rw != "" && len(body) > 0 {
+		if rewritten, ok := rewriteModelField(body, rw); ok {
 			outBody = rewritten
-			rewroteTo = rule.rewriteModel
+			rewroteTo = rw
 		}
 	}
 

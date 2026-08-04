@@ -180,10 +180,17 @@ func (c *EvalCacheCoherencyCommand) Execute(args []string) error {
 	// corruption *opportunity* — result.AbortedCount above is their only mention.
 	hasFailures := false
 	var errorCount, crossContamCount, uuidMissingFlakyCount, notExactCount int
+	// Cold/warm cycle breakdown of misses and NOT_EXACT responses (cycle 1 = cold,
+	// cycle >= 2 = warm), plus the set of distinct cycle numbers actually seen — needed
+	// to normalize by cycle cardinality (there is always exactly one cold cycle per
+	// series, but --total can produce many warm cycles) in the summary below.
+	var coldMissingCount, warmMissingCount, coldNotExactCount, warmNotExactCount int
+	cyclesSeen := make(map[int]bool)
 	for _, r := range result.Results {
 		if r.Aborted {
 			continue
 		}
+		cyclesSeen[r.Cycle] = true
 		isError := r.Error != ""
 
 		var missing []string
@@ -200,6 +207,11 @@ func (c *EvalCacheCoherencyCommand) Execute(args []string) error {
 		}
 		uuidMissingFlakyCount += len(missing)
 		crossContamCount += len(leaked)
+		if r.Cycle == 1 {
+			coldMissingCount += len(missing)
+		} else {
+			warmMissingCount += len(missing)
+		}
 
 		if !isError && len(missing) == 0 && len(leaked) == 0 && r.ExactMatch {
 			continue // fully correct request — nothing to report
@@ -224,6 +236,11 @@ func (c *EvalCacheCoherencyCommand) Execute(args []string) error {
 			// exact comma-joined format (extra prose/whitespace/etc).
 			marker = "NOT_EXACT"
 			notExactCount++
+			if r.Cycle == 1 {
+				coldNotExactCount++
+			} else {
+				warmNotExactCount++
+			}
 		}
 
 		// --full-missing-responses: by default (false) content/thinking are truncated
@@ -281,6 +298,9 @@ func (c *EvalCacheCoherencyCommand) Execute(args []string) error {
 	} else {
 		fmt.Printf("  Implicit cache hit rate: N/A (no cycle-2 requests)\n")
 	}
+	nCold, nWarm := coldWarmCycleCounts(cyclesSeen)
+	fmt.Printf("  Miss distribution:      %s\n", formatCycleDistribution(coldMissingCount, warmMissingCount, nCold, nWarm))
+	fmt.Printf("  NOT_EXACT distribution: %s\n", formatCycleDistribution(coldNotExactCount, warmNotExactCount, nCold, nWarm))
 
 	if !uuidPass {
 		return fmt.Errorf("cache coherency FAILED: UUID correctness %d/%d", uuidCorrect, totalUUIDChecks)
@@ -335,3 +355,55 @@ func resolveGarbageChars(garbageCharacters, garbageTokens int, w io.Writer) int 
 // findLeakedUUIDs moved to benchmark.FindLeakedUUIDs (benchmark/replay_uuid.go)
 // so both this CLI and the dataset-replay UUID validation path share one
 // implementation.
+
+// coldWarmCycleCounts returns the number of distinct COLD (cycle 1) and WARM (cycle >= 2)
+// cycle numbers present in cyclesSeen — cycle-number CARDINALITY, not a request count.
+// There is always at most one cold cycle (cycle 1), but --total can produce many warm
+// cycles (e.g. SERIES=64 TOTAL=1024 -> cycles 2..16, nWarm=15). formatCycleDistribution
+// uses this cardinality to normalize raw counts by per-cycle rate instead of raw volume.
+func coldWarmCycleCounts(cyclesSeen map[int]bool) (nCold, nWarm int) {
+	for c := range cyclesSeen {
+		switch {
+		case c == 1:
+			nCold++
+		case c >= 2:
+			nWarm++
+		}
+	}
+	return nCold, nWarm
+}
+
+// formatCycleDistribution renders a "cold N (A% abs / B% norm)  warm M (C% abs / D% norm)"
+// summary of how a raw (coldCount, warmCount) pair — e.g. missing UUIDs or NOT_EXACT
+// responses — splits across cold (cycle 1) vs warm (cycle >= 2) cycles:
+//
+//   - abs  = coldCount / (coldCount+warmCount): the raw count share. "n/a" when both
+//     counts are zero.
+//   - norm = (coldCount/nCold) / (coldCount/nCold + warmCount/nWarm): the PER-CYCLE-RATE
+//     share, correcting for cold always contributing exactly one cycle while warm can
+//     contribute many (--total mode) — without this, raw counts alone look warm-heavy
+//     purely from cycle volume, not miss rate. "n/a" when either bucket's cycle count is
+//     zero (e.g. a --total run too short to reach cycle 2, or no requests survived).
+//
+// A norm share far below 50% for cold flags warm-biased loss (a warm-read data problem);
+// far above 50% flags a cold-path problem.
+func formatCycleDistribution(coldCount, warmCount, nCold, nWarm int) string {
+	total := coldCount + warmCount
+	absCold, absWarm := "n/a", "n/a"
+	if total > 0 {
+		absCold = fmt.Sprintf("%.1f%%", float64(coldCount)/float64(total)*100)
+		absWarm = fmt.Sprintf("%.1f%%", float64(warmCount)/float64(total)*100)
+	}
+
+	normCold, normWarm := "n/a", "n/a"
+	if nCold > 0 && nWarm > 0 {
+		coldRate := float64(coldCount) / float64(nCold)
+		warmRate := float64(warmCount) / float64(nWarm)
+		if rateTotal := coldRate + warmRate; rateTotal > 0 {
+			normCold = fmt.Sprintf("%.1f%%", coldRate/rateTotal*100)
+			normWarm = fmt.Sprintf("%.1f%%", warmRate/rateTotal*100)
+		}
+	}
+
+	return fmt.Sprintf("cold %d (%s abs / %s norm)  warm %d (%s abs / %s norm)", coldCount, absCold, normCold, warmCount, absWarm, normWarm)
+}

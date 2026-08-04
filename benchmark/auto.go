@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/weka/wekai/config"
 	"github.com/weka/wekai/llm"
 )
 
@@ -27,42 +28,43 @@ const hotGateFanoutMultiplier = 8
 
 // AutoBenchmarkConfig holds configuration for the auto benchmark mode.
 type AutoBenchmarkConfig struct {
-	DocsDir                  string
-	DocsContent              string   // Pre-loaded documentation content (used instead of DocsDir when set)
-	Model                    string   // single model (legacy); prefer Models
-	Models                   []string // multi-model; takes priority over Model
-	Question                 string
-	Timeout                  time.Duration
-	MaxSeries                int           // safety cap, default 64
-	StartSeries              int           // initial series count, default 1
-	MaxConcurrency           int           // 0 = unlimited
-	MinEvalRequests          int           // minimum total completed before any eval, default 10
-	CacheTarget              float64       // cache hit rate threshold at which series scaling begins, default 0.90
-	CacheWindowSize          int           // fixed number of recent requests for cache hit measurement, default 20
-	ScaleWaitFactor          int           // fast measurement window factor for backoff recovery detection (series × this), default 2
-	MinStabilization         int           // minimum requests for any stabilization window, default 20
-	ScaleFactor              float64       // fractional scale step (0.20 = 20%), default 0.20
-	MaxScaleStep             int           // maximum delta per scale event, default 8
-	ErrorRateLimit           float64       // DEPRECATED: no-op, retained for flag compatibility (see MaxConsecutiveFailures)
-	MaxConsecutiveFailures   int           // abort after this many failures in a row (any success resets the counter); default 512
-	MaxTotalErrors           int           // abort after this many TOTAL errors (monotonic, not reset by success); 0 = disabled
-	MinSeries                int           // informational minimum (not used in algo), default 2
-	TTFTDegradationFactor    int           // TTFT multiplier above early cold-start baseline that disqualifies the heuristic entirely (default 4)
-	TTFTHitThreshold         float64       // fraction of cold-start baseline below which a request is classified as a cache hit (default 0.5 = 50%)
-	Concurrency              int           // fixed concurrency; disables hill-climber entirely (0 = auto)
-	VerboseCache             bool          // print TTFT baseline/threshold/miss distribution on hit-rate change; forces non-TTY (periodic) display mode
-	PrintResponses           bool          // print each request/response to stdout; forces non-TTY display mode
-	PrintErrorsThreshold     time.Duration // if >0, print at most one error to stderr per this interval (rate-limited)
-	SaveRequestDataDir       string        // if non-empty, write per-request JSONL to this dir
-	Total                    int           // stop after N total completed requests (0 = unlimited)
-	HotSeriesConcurrency     int           // H of the --series workers run as a 'hot' pool with a dedicated gate; 0 = no hot pool.
-	RequestTimeout           time.Duration // per-request timeout (default 5m)
-	Step                     int           // 0=disabled; token step size for prefix growth per request
-	StepStartingTokens       int           // 0=start at Step; initial prefix token size for each series when Step > 0
-	Tokens                   int           // upper bound on per-request prompt tokens (caps Step growth and DocsDir source). 0 = bounded only by len(fullDocs)/4.
-	SharedPrefixPerSeries    int           // 0=disabled; N series share same doc prefix
-	GlobalCacheHitRateTarget float64       // 0=disabled; block new series until global hit rate >= this
-	MaxOutputTokens          int           // 0=use model spec default; override max_tokens for all requests
+	DocsDir                   string
+	DocsContent               string   // Pre-loaded documentation content (used instead of DocsDir when set)
+	Model                     string   // single model (legacy); prefer Models
+	Models                    []string // multi-model; takes priority over Model
+	Question                  string
+	Timeout                   time.Duration
+	MaxSeries                 int           // safety cap, default 64
+	StartSeries               int           // initial series count, default 1
+	MaxConcurrency            int           // 0 = unlimited
+	MinEvalRequests           int           // minimum total completed before any eval, default 10
+	CacheTarget               float64       // cache hit rate threshold at which series scaling begins, default 0.90
+	CacheWindowSize           int           // fixed number of recent requests for cache hit measurement, default 20
+	ScaleWaitFactor           int           // fast measurement window factor for backoff recovery detection (series × this), default 2
+	MinStabilization          int           // minimum requests for any stabilization window, default 20
+	ScaleFactor               float64       // fractional scale step (0.20 = 20%), default 0.20
+	MaxScaleStep              int           // maximum delta per scale event, default 8
+	ErrorRateLimit            float64       // DEPRECATED: no-op, retained for flag compatibility (see MaxConsecutiveFailures)
+	MaxConsecutiveFailures    int           // abort after this many failures in a row (any success resets the counter); default 512
+	MaxTotalErrors            int           // abort after this many TOTAL errors (monotonic, not reset by success); 0 = disabled
+	MinSeries                 int           // informational minimum (not used in algo), default 2
+	TTFTDegradationFactor     int           // TTFT multiplier above early cold-start baseline that disqualifies the heuristic entirely (default 4)
+	TTFTHitThreshold          float64       // fraction of cold-start baseline below which a request is classified as a cache hit (default 0.5 = 50%)
+	Concurrency               int           // fixed concurrency; disables hill-climber entirely (0 = auto)
+	VerboseCache              bool          // print TTFT baseline/threshold/miss distribution on hit-rate change; forces non-TTY (periodic) display mode
+	PrintResponses            bool          // print each request/response to stdout; forces non-TTY display mode
+	PrintErrorsThreshold      time.Duration // if >0, print at most one error to stderr per this interval (rate-limited)
+	SaveRequestDataDir        string        // if non-empty, write per-request JSONL to this dir
+	Total                     int           // stop after N total completed requests (0 = unlimited)
+	HotSeriesConcurrency      int           // H of the --series workers run as a 'hot' pool with a dedicated gate; 0 = no hot pool.
+	EndpointOverloadThreshold float64       // Multi-endpoint only: fail over off an endpoint once its in-flight exceeds this multiple of its fair share. 0 = default (1.5).
+	RequestTimeout            time.Duration // per-request timeout (default 5m)
+	Step                      int           // 0=disabled; token step size for prefix growth per request
+	StepStartingTokens        int           // 0=start at Step; initial prefix token size for each series when Step > 0
+	Tokens                    int           // upper bound on per-request prompt tokens (caps Step growth and DocsDir source). 0 = bounded only by len(fullDocs)/4.
+	SharedPrefixPerSeries     int           // 0=disabled; N series share same doc prefix
+	GlobalCacheHitRateTarget  float64       // 0=disabled; block new series until global hit rate >= this
+	MaxOutputTokens           int           // 0=use model spec default; override max_tokens for all requests
 	// ExhaustSessions: when Step > 0 and a series' grown prefix reaches the
 	// token cap, recycle the slot with a fresh session GUID instead of
 	// pinning at 100% cache. The same goroutine continues with a new
@@ -1458,6 +1460,18 @@ func runSingleModelBenchmark(
 		cfg.HotSeriesConcurrency = cfg.StartSeries
 	}
 
+	// Header row describing the run, written once ahead of the request rows.
+	// Deliberately emitted HERE rather than where the writer is opened: the
+	// block above clamps and defaults cfg, and the file must record what the
+	// run actually used, not what the caller typed. Readers key off
+	// record_type, so this is additive — older tooling skips it as an unknown
+	// type and reads the request rows exactly as before.
+	if rdw != nil {
+		if err := rdw.writeAny(buildRunParams(cfg, startTime)); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to write run params: %v\n", err)
+		}
+	}
+
 	display := newDisplayState()
 
 	// sendSnap forwards a display snapshot to the orchestrator non-blocking.
@@ -1608,7 +1622,58 @@ func runSingleModelBenchmark(
 	var endpointRouter *llm.EndpointRouter
 	if llm.IsDynamicModel(cfg.Model) {
 		if dynCfg, err := llm.ParseDynamicModel(cfg.Model); err == nil && len(dynCfg.BaseURLs) > 1 {
-			endpointRouter = llm.NewEndpointRouter(dynCfg.BaseURLs)
+			// Fair share = total benchmark concurrency / endpoints. Hot series
+			// run on their own gate, so their concurrency adds to the fleet
+			// total rather than being carved out of Concurrency.
+			totalConc := cfg.Concurrency + cfg.HotSeriesConcurrency
+			endpointRouter = llm.NewEndpointRouterWithFailover(
+				dynCfg.BaseURLs, totalConc, cfg.EndpointOverloadThreshold)
+		}
+	}
+
+	// One poster per endpoint, built ONCE and shared by every series worker.
+	// Posters are safe for concurrent use (epMu guards the latched URL form),
+	// and building them per-worker would mean len(endpoints) x series HTTP
+	// clients — 9k+ at our scale, with no connection reuse between them.
+	var replayPicker endpointPicker
+	if endpointRouter != nil {
+		replayRunID := ""
+		if !cfg.ReplayNoStamp {
+			replayRunID = cfg.RunID
+		}
+		eps := endpointRouter.Endpoints()
+		posters := make([]*replayPoster, len(eps))
+		ok := true
+		for i, ep := range eps {
+			pp, perr := newReplayPoster(cfg.Model, config.GetAPIKeys(), ep, replayRunID,
+				cfg.DryRun, cfg.DryRunColdTPS, cfg.DryRunWarmTPS, cfg.DryRunOutputTPS, st.estimator)
+			if perr != nil {
+				ok = false
+				break
+			}
+			pp.outputRatio = cfg.ReplayOutputRatio
+			pp.forceOutput = cfg.ReplayForceOutput
+			// UUID cache-coherency injection (--replay-inject-uuids). Same
+			// global/read-only refs set on the per-instance poster in
+			// replay_router.go — every poster in the run, per-instance or
+			// pooled-per-endpoint, shares these identical slices/maps, so
+			// this poster (potentially shared across many concurrent
+			// sessions once picked by the router) can safely serve any
+			// session: do()/dryDo() derive the per-request sessionIdx from
+			// seriesNum and buildInjection looks up that session's data from
+			// these globals, with no mutable per-session state on the
+			// poster itself.
+			if cfg.ReplayInjectUUIDs {
+				pp.uuidEnabled = true
+				pp.allUUIDSets = cfg.replayUUIDSets
+				pp.sessionTurnHashes = cfg.replaySessionTurnHashes
+				pp.owner = cfg.replayUUIDOwner
+				pp.reciteEveryRequest = cfg.ReplayReciteEveryRequest
+			}
+			posters[i] = pp
+		}
+		if ok {
+			replayPicker = endpointPicker{router: endpointRouter, posters: posters}
 		}
 	}
 
@@ -1683,11 +1748,7 @@ func runSingleModelBenchmark(
 			go func() {
 				defer seriesWg.Done()
 				defer st.activeReplayWorkers.Add(-1)
-				var endpointOverride string
-				if endpointRouter != nil {
-					endpointOverride = endpointRouter.EndpointForSeries(seriesNum)
-				}
-				runRouterReplaySeriesLoop(benchCtx, cfg, st, rdw, st.routerReplay, endpointOverride, fullDocs, updateSnap, workerGate)
+				runRouterReplaySeriesLoop(benchCtx, cfg, st, rdw, st.routerReplay, replayPicker, fullDocs, updateSnap, workerGate)
 			}()
 			return
 		}

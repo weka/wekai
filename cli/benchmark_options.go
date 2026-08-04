@@ -49,6 +49,7 @@ type BenchmarkAutoOptions struct {
 	ErrorRateLimit             float64  `long:"error-rate-limit" description:"DEPRECATED: no-op. Retained for backwards compatibility. See --max-consecutive-failures." default:"0.10" env:"BENCHMARK_ERROR_RATE_LIMIT"`
 	MaxConsecutiveFailures     int      `long:"max-consecutive-failures" description:"Abort the benchmark after this many request failures in a row (any successful request resets the counter). Default 512 — high enough that brief server overload recovers before triggering." default:"512" env:"BENCHMARK_MAX_CONSECUTIVE_FAILURES"`
 	MaxTotalErrors             int      `long:"max-total-errors" description:"Abort the benchmark after this many TOTAL request errors (monotonic; NOT reset by successes). 0 = disabled. Set to 1 to stop on the first error for investigation." default:"0" env:"BENCHMARK_MAX_TOTAL_ERRORS"`
+	EndpointOverloadThreshold  float64  `long:"endpoint-overload-threshold" default:"1.2" env:"BENCHMARK_ENDPOINT_OVERLOAD_THRESHOLD" description:"Multi-endpoint specs only (a|b|c): a series sticks to its assigned endpoint until that endpoint's in-flight requests exceed this multiple of its fair share (total concurrency / endpoints), then the request fails over to a deterministically hash-selected endpoint that is not overloaded. 1.2 = default."`
 	HotSeriesConcurrency       int      `long:"hot-series-concurrency" default:"0" env:"BENCHMARK_HOT_SERIES_CONCURRENCY" description:"H of the --series workers run as a 'hot' pool with a dedicated gate so they issue back-to-back requests; the rest share --concurrency. 0 = no hot pool."`
 	RequestTimeout             string   `long:"request-timeout" description:"Per-request timeout (e.g. 5m, 2m). Default 5m." default:"5m" env:"BENCHMARK_REQUEST_TIMEOUT"`
 	Step                       string   `long:"step" description:"Token step size for incremental prefix growth per request (e.g., 3k, 3000). Simulates agentic context growth. 0 or empty = disabled." env:"BENCHMARK_STEP"`
@@ -92,7 +93,7 @@ type BenchmarkAutoOptions struct {
 
 // BenchmarkVisualizeOptions contains options for the benchmark visualize subcommand
 type BenchmarkVisualizeOptions struct {
-	Concurrency int    `long:"concurrency" description:"Concurrency used during benchmark (for moving average window size = concurrency*3)" default:"0"`
+	Concurrency int    `long:"concurrency" description:"Override the concurrency used for the moving-average window (window = concurrency*3). Normally unnecessary: runs record their own concurrency in the reqdata JSONL and each arm is sized from its own. Use only for data recorded before run params were saved, or to force a different smoothing window." default:"0"`
 	MaxElapsed  string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
 	Args        struct {
 		Dir string `positional-arg-name:"directory" description:"Directory containing .jsonl request data files" required:"yes"`
@@ -103,7 +104,7 @@ type BenchmarkVisualizeOptions struct {
 type BenchmarkVisualizeMergeOptions struct {
 	All         bool   `long:"all" description:"Treat the first argument as a parent directory and include all subdirectories"`
 	Output      string `long:"output" short:"o" description:"Output directory for merged results (default: auto-generated next to input)"`
-	Concurrency int    `long:"concurrency" description:"Concurrency used during benchmark (for moving average window size = concurrency*3)" default:"0"`
+	Concurrency int    `long:"concurrency" description:"Override the concurrency used for the moving-average window (window = concurrency*3). Normally unnecessary: runs record their own concurrency in the reqdata JSONL and each arm is sized from its own. Use only for data recorded before run params were saved, or to force a different smoothing window." default:"0"`
 	Labels      string `long:"labels" description:"Comma-separated labels for each input directory, in positional order (overrides auto-detected model aliases / directory names). Count must exactly match the number of directories (post --all expansion)."`
 	MaxElapsed  string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
 	Args        struct {

@@ -308,23 +308,20 @@ func TestBuildSessionTurnUUIDsScalesWithTurnCount(t *testing.T) {
 
 // newFixturePoster builds a replayPoster wired up exactly as
 // runRouterReplayInstance does (see replay_router.go), for a single session
-// with nTurns turns, without touching HTTP/newReplayPoster.
+// (sessionIdx 0) with nTurns turns, without touching HTTP/newReplayPoster.
+// All UUID state is global/read-only on the poster (see replay_router_post.go);
+// the fixture's session lives at index 0 in the global slices, and callers
+// pass sessionIdx=0 into buildInjection.
 func newFixturePoster(nTurns int, seed int64, reciteEveryRequest bool) *replayPoster {
 	turnHashes := make([]string, nTurns)
 	for i := range turnHashes {
 		turnHashes[i] = fmt.Sprintf("h%d", i)
 	}
 	sets, owner := buildSessionTurnUUIDs([]int{nTurns}, seed)
-	hashToTurn := make(map[string]int, nTurns)
-	for i, h := range turnHashes {
-		hashToTurn[h] = i
-	}
 	return &replayPoster{
 		uuidEnabled:        true,
-		sessionIdx:         0,
 		allUUIDSets:        sets,
-		turnHashes:         turnHashes,
-		hashToTurn:         hashToTurn,
+		sessionTurnHashes:  [][]string{turnHashes},
 		owner:              owner,
 		reciteEveryRequest: reciteEveryRequest,
 	}
@@ -364,7 +361,7 @@ func TestBuildInjectionWindowSelection(t *testing.T) {
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("turn-%d", c.turn), func(t *testing.T) {
 			req := visibleTurnsRequest(c.turn)
-			inj := p.buildInjection(req, false)
+			inj := p.buildInjection(req, 0, false)
 			if inj == nil {
 				t.Fatal("buildInjection returned nil, want a non-nil injection")
 			}
@@ -416,27 +413,26 @@ func TestBuildInjectionNilCases(t *testing.T) {
 	t.Run("uuidEnabled false", func(t *testing.T) {
 		p := newFixturePoster(3, 1, true)
 		p.uuidEnabled = false
-		if got := p.buildInjection(visibleTurnsRequest(2), false); got != nil {
+		if got := p.buildInjection(visibleTurnsRequest(2), 0, false); got != nil {
 			t.Errorf("buildInjection = %v, want nil (disabled)", got)
 		}
 	})
 	t.Run("sessionIdx out of range", func(t *testing.T) {
 		p := newFixturePoster(3, 1, true)
-		p.sessionIdx = 5
-		if got := p.buildInjection(visibleTurnsRequest(2), false); got != nil {
+		if got := p.buildInjection(visibleTurnsRequest(2), 5, false); got != nil {
 			t.Errorf("buildInjection = %v, want nil (sessionIdx out of range)", got)
 		}
 	})
 	t.Run("zero-turn session", func(t *testing.T) {
 		p := newFixturePoster(0, 1, true)
-		if got := p.buildInjection(visibleTurnsRequest(0), false); got != nil {
+		if got := p.buildInjection(visibleTurnsRequest(0), 0, false); got != nil {
 			t.Errorf("buildInjection = %v, want nil (no turns)", got)
 		}
 	})
 	t.Run("no qualifying turn visible in this request", func(t *testing.T) {
 		p := newFixturePoster(3, 1, true)
 		req := RouterReplayRequest{Messages: []RouterReplayMessage{assistantText("unrelated", 30)}}
-		if got := p.buildInjection(req, false); got != nil {
+		if got := p.buildInjection(req, 0, false); got != nil {
 			t.Errorf("buildInjection = %v, want nil (nothing visible)", got)
 		}
 	})
@@ -448,15 +444,15 @@ func TestBuildInjectionRecite(t *testing.T) {
 	req := visibleTurnsRequest(2)
 
 	pAlways := newFixturePoster(3, 1, true)
-	if inj := pAlways.buildInjection(req, false); inj == nil || !inj.Recite {
+	if inj := pAlways.buildInjection(req, 0, false); inj == nil || !inj.Recite {
 		t.Error("reciteEveryRequest=true, isLastRequest=false: expected Recite=true")
 	}
 
 	pFinalOnly := newFixturePoster(3, 1, false)
-	if inj := pFinalOnly.buildInjection(req, false); inj == nil || inj.Recite {
+	if inj := pFinalOnly.buildInjection(req, 0, false); inj == nil || inj.Recite {
 		t.Error("reciteEveryRequest=false, isLastRequest=false: expected Recite=false")
 	}
-	if inj := pFinalOnly.buildInjection(req, true); inj == nil || !inj.Recite {
+	if inj := pFinalOnly.buildInjection(req, 0, true); inj == nil || !inj.Recite {
 		t.Error("reciteEveryRequest=false, isLastRequest=true: expected Recite=true")
 	}
 }

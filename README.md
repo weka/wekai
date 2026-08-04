@@ -39,6 +39,64 @@ wekai router serve --help
 wekai eval simple-tool --help
 ```
 
+## Run the router locally
+
+Front a local model endpoint on `http://127.0.0.1:25201` with the router on
+`http://127.0.0.1:25202`, sending every model to that one upstream:
+
+```
+wekai router serve \
+  --listen 127.0.0.1:25202 \
+  --default 'http://127.0.0.1:25201' \
+  --strip-auth-when '*'
+```
+
+- `--default` is the catch-all rule (`* => <upstream>`): every requested model
+  name matches. The request path and query are appended to the upstream, so a
+  `POST /v1/messages` is forwarded to
+  `http://127.0.0.1:25201/v1/messages`.
+- `--strip-auth-when '*'` drops the inbound `Authorization`/`x-api-key`
+  headers, which unauth'd local servers (vLLM, llama.cpp, …) otherwise reject.
+- The model name is handled for you. Claude Code sends `claude-*`, which a
+  single-model server doesn't recognize — vLLM answers `POST /v1/messages`
+  with a bare `404`. On startup the router asks each upstream that has no
+  explicit `as <model>` what it serves (`GET <upstream>/v1/models`); if the
+  answer is exactly one model, every matching request's `model` is rewritten
+  to it:
+
+  ```
+  auto-model: http://127.0.0.1:25201 serves "zai-org/GLM-5.2-FP8" — rewriting every matching request's model to it
+    route: * => http://127.0.0.1:25201 as zai-org/GLM-5.2-FP8 (auto-discovered) (strip-auth)
+  ```
+
+  A multi-model upstream is left alone, so this can't silently collapse a
+  real fan-out onto one model. Control it with `--auto-model`: `auto`
+  (default), `force` (always take the first listed model), `off` (never
+  probe). An upstream that isn't up yet is retried in the background.
+- Append `as <model>` to pin the rewrite explicitly and skip discovery:
+  `--default 'http://127.0.0.1:25201 as my-local-model'`.
+- Use repeated `--route '<substr>,<substr> => <upstream>[ as <model>]'` rules
+  (first match wins) when you want per-model fan-out instead of one catch-all.
+- Add `--capture redacted` to record traffic under
+  `~/.wekai/router/capture/redacted/` for later `wekai router replay-prepare`.
+
+`/healthz`, `/livez`, and `/metrics` are served on the same listener.
+
+### Pointing Claude Code at it
+
+```
+export ANTHROPIC_BASE_URL=http://127.0.0.1:25202
+export ANTHROPIC_AUTH_TOKEN=dummy   # any non-empty value — stripped by --strip-auth-when '*'
+claude
+```
+
+With `--user-prefix` on the router, each client tags itself via the first path
+segment, and requests/captures/log lines carry that user:
+
+```
+export ANTHROPIC_BASE_URL=http://127.0.0.1:25202/alice
+```
+
 ## Replay benchmark
 
 `wekai benchmark auto --router-replay-file` replays previously captured
@@ -113,6 +171,32 @@ load.
 `report.html` scatter-plot (TTFT / response time / cache hits over time)
 there at the end of the run. Regenerate or combine runs later with
 `wekai benchmark visualize <dir>` and `wekai benchmark visualize-merge`.
+
+**Server-side cache-source sampling.** When `--save-request-data` is on and
+the model spec points at an OpenAI-compatible (chat/completions) endpoint,
+a sampler polls the server's Prometheus endpoint — `<base>/metrics`, with
+the `/v1` API suffix stripped — once a minute and appends the result to the
+same JSONL. This is what splits the report's prompt tokens into compute vs
+local cache vs external cache.
+
+Exactly one series is read — `vllm:prompt_tokens_by_source_total` — keeping
+the three `source` label values `local_compute`, `local_cache_hit`, and
+`external_kv_transfer`. Values are summed over every other label
+(`model_name`, engine index); nothing else from `/metrics` is retained. The
+`_total` is `prometheus_client` appending the counter suffix to the family
+declared as `vllm:prompt_tokens_by_source`, which is why the bare name still
+appears on the `# HELP`/`# TYPE` lines. Each sample is one JSONL row with
+`record_type: "vllm_metrics_sample"` and fields `ts`, `model`,
+`sources.compute` / `sources.local_cache` / `sources.external_cache`, plus
+the locally-computed `active_dataset_tokens` and `active_series`.
+
+Collection is best-effort and never affects the benchmark: an unreachable
+or non-Prometheus endpoint just skips samples. Since any chat/completions
+endpoint is probed — it may well be vLLM — a spec that didn't say
+`type=openai_vllm` gives up after 3 consecutive failures rather than
+polling a public API for the rest of the run. Spelling out
+`type=openai_vllm` asserts the server *is* vLLM and keeps it polling
+through restarts and slow weight loads.
 
 ## Cache coherency eval
 
@@ -225,9 +309,9 @@ the benchmark completes (or fails) the pod sleeps forever so results stay
 explorable via `kubectl exec`/`kubectl cp`; delete the pod and the
 Deployment restarts the benchmark. Per-request JSONL data plus an
 auto-generated `report.html` visualization are always written under
-`resultsMountPath/<run-timestamp>/` (`--save-request-data`) — set
-`storeResults=true` to back that path with a PVC instead of a pod-local
-emptyDir. The chart is deliberately minimal: the only value most installs
+`resultsMountPath/<run-timestamp>/` (`--save-request-data`); the only
+choice is what storage backs that path — see below. The chart is
+deliberately minimal: the only value most installs
 need to set is `endpoint`, the target model server; everything else has a
 working default (all sessions replayed by 256 parallel series workers at
 fixed concurrency 28 with a 4-worker hot pool).
@@ -250,13 +334,45 @@ fixed concurrency 28 with a 4-worker hot pool).
 | `replay.replayNoStamp` | `false` | Disable per-run cache-busting stamp (bitwise-faithful replay) |
 | `replay.abortOnCollapse` / `replay.replayStopAtLowConcurrency` | `false` | Early-stop behaviors |
 | `replay.dryRun` + `replay.dryRun{Cold,Warm,Output}TPS` | `false` / `0` | Synthetic timing mode, no real LLM calls |
+| `replay.printErrorsThreshold` | `"1s"` | Print request errors to the pod log as they happen, at most one line per interval (`""` or `0` = silent) |
 | `replay.stderrLogs` | `false` | Log to stderr |
 | `llmApiKeySecretName` | `""` | K8s secret with LLM API-key env vars (for endpoints that need auth) |
-| `storeResults` / `storageSize` / `storageClassName` / `resultsMountPath` | `false` / `10Gi` / `""` / `/results` | Results (JSONL + `report.html`) are always saved under `resultsMountPath`; `storeResults=true` backs it with a PVC, otherwise emptyDir |
-| `resources` | 256Mi/250m → 4Gi/4 | Pod resources |
+| `resultsClaim` | `""` | Mount an existing PVC at `resultsMountPath` — the one value needed to persist results (see below) |
+| `createResultsClaim` / `storageSize` / `storageClassName` | `false` / `10Gi` / `""` | Have the chart provision the PVC instead |
+| `resultsMountPath` | `/results` | Where results are written inside the pod |
+| `nodeSelector` / `tolerations` | `{}` / `[]` | Standard pod scheduling — keep the load generator off the inference nodes it measures, or tolerate a tainted pool to reach them |
+| `resources` | requests 8Gi / 4 CPU, no limits | Pod resources. Limits are omitted deliberately — CPU throttling on the load generator would show up as inflated TTFT in the results |
 
 Authoritative list with inline docs: `chart/wekai/values.yaml`
 (or `helm show values oci://quay.io/weka.io/helm/wekai --version <vX>`).
+
+### Where results are stored
+
+Results are *always* written to `resultsMountPath`. The only decision is
+what backs it:
+
+| | |
+|---|---|
+| nothing set | ephemeral `emptyDir` — results go away with the pod |
+| `--set resultsClaim=<pvc-name>` | mounts a PVC you already created; no other value required |
+| `--set createResultsClaim=true` | chart provisions `<release>-results` (`storageSize`, `storageClassName` apply) |
+
+```
+helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
+  --namespace weka \
+  --set endpoint=http://YOUR-LLM-HOST:8000 \
+  --set resultsClaim=my-existing-pvc
+```
+
+`resultsClaim` wins over `createResultsClaim`: the volume is yours to size
+and delete, so the chart won't provision a second one beside it. A
+chart-provisioned claim carries `helm.sh/resource-policy: keep`, so
+`helm uninstall` leaves the results behind — delete that PVC by hand once
+you've pulled them off. Either way the volume outlives the pod, so deleting
+the pod to rerun the benchmark is safe.
+
+`storeResults` is the old name for `createResultsClaim` and still works, so
+existing values files keep their PVC.
 
 Charts are published to `oci://quay.io/weka.io/helm/wekai`. The chart
 `--version` is mandatory (versions are `v999.0.0-<sha12>` prerelease stamps,
@@ -274,14 +390,14 @@ description includes these commands pre-filled with its own version.
 Default install — runs for the default duration (8h):
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai \
+helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai \
   --version <vX> --set endpoint=http://10.71.0.4:8000
 ```
 
 Smoke test — shorten `duration` (maps to `--timeout`), e.g. 3 minutes:
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
+helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
   --set duration=3m
 ```
@@ -290,7 +406,7 @@ Explicit model override — by default the model id is autodiscovered (see
 "Bare-URL model selector" below); set `model` to skip discovery:
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
+helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
   --set model=nvidia/Kimi-K2.6-NVFP4
 ```
@@ -301,7 +417,7 @@ target an Anthropic-shaped server, append `,type=anthropic`. Because Helm's
 with a values file instead:
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
+helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set-string endpoint='http://10.71.0.4:8000\,type=anthropic' \
   --set duration=3m
 ```
@@ -312,14 +428,14 @@ proxy, reference an existing `kubernetes.io/dockerconfigjson` secret via
 `imagePullSecrets`:
 
 ```
-helm install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
+helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
   --set endpoint=http://10.71.0.4:8000 \
   --set 'imagePullSecrets[0].name=my-pull-secret'
 ```
 
 For local development installs from the chart directory, pass the image tag
 explicitly (the in-tree `Chart.yaml` carries a placeholder `appVersion`):
-`helm install my-replay chart/wekai --set imageTag=<vX> --set endpoint=...`
+`helm upgrade --install my-replay chart/wekai --set imageTag=<vX> --set endpoint=...`
 
 ```
 helm lint chart/wekai

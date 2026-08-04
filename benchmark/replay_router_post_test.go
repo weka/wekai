@@ -788,13 +788,13 @@ func TestUUIDScoringGatedOnRecite(t *testing.T) {
 		t.Fatalf("newReplayPoster: %v", err)
 	}
 	// Wire up UUID injection exactly as runRouterReplayInstance does (see
-	// replay_router.go), with reciteEveryRequest=false so only the FINAL
-	// request of an instance's list carries the recite ask.
+	// replay_router.go): global/read-only slices indexed by sessionIdx
+	// (0, matching seriesNum=1 below via sessionIdx = seriesNum-1), with
+	// reciteEveryRequest=false so only the FINAL request of an instance's
+	// list carries the recite ask.
 	p.uuidEnabled = true
-	p.sessionIdx = 0
 	p.allUUIDSets = [][]string{{"uuid-alpha", "uuid-beta"}}
-	p.turnHashes = []string{"h1", "h2"}
-	p.hashToTurn = map[string]int{"h1": 0, "h2": 1}
+	p.sessionTurnHashes = [][]string{{"h1", "h2"}}
 	p.reciteEveryRequest = false
 
 	req := RouterReplayRequest{

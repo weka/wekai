@@ -44,7 +44,6 @@ type replayPoster struct {
 	epMu       sync.Mutex
 	epResolved string // latched endpoint; "" until the first success
 	epFellBack bool
-	epLogOnce  sync.Once
 	apiType    string // "anthropic", "openai", or "openai_vllm"
 	client     *http.Client
 	runID      string
@@ -68,26 +67,28 @@ type replayPoster struct {
 	// construction, same rationale as outputRatio/forceOutput above.
 	// uuidEnabled gates everything: false leaves do()/dryDo() byte-for-byte
 	// identical to before this feature existed.
+	//
+	// EVERY field below this point is GLOBAL and READ-ONLY for the lifetime
+	// of the poster: with multi-endpoint routing a single replayPoster is
+	// SHARED across every session whose requests currently land on that
+	// endpoint (see endpointPicker in auto.go), so there is no such thing as
+	// "this poster's session" — a poster serves whichever sessionIdx the
+	// caller passes into buildInjection per-request. All per-session state is
+	// therefore looked up from these global slices/maps by an explicit
+	// sessionIdx argument rather than cached mutable fields on the poster —
+	// see buildInjection.
 	uuidEnabled bool
-	// sessionIdx is this instance's session's 0-based index into
-	// allUUIDSets/cfg.replaySessionTurnHashes (== seriesNum-1 — every
-	// instance of a session shares the same seriesNum, hence the same
-	// sessionIdx).
-	sessionIdx int
 	// allUUIDSets is cfg.replayUUIDSets: the full per-session-per-turn UUID
 	// assignment (index i = session i's ordered turn-UUID list, index t =
 	// turn t's UUID), shared read-only across every poster in the run.
 	allUUIDSets [][]string
-	// turnHashes is this poster's session's ordered turn-hash list
-	// (cfg.replaySessionTurnHashes[sessionIdx] — see
-	// computeSessionTurnHashes): turnHashes[t] is the hash of turn t.
-	// Session-global (spans every instance of the session), even though any
-	// one instance's requests typically only ever surface its own subset of
-	// turns.
-	turnHashes []string
-	// hashToTurn is turnHashes inverted (hash -> turn index), computed once
-	// per instance (see runRouterReplayInstance) rather than per request.
-	hashToTurn map[string]int
+	// sessionTurnHashes is cfg.replaySessionTurnHashes: the full per-session
+	// ordered turn-hash list (index i = session i's ordered turn-hash list;
+	// sessionTurnHashes[i][t] is the hash of session i's turn t), shared
+	// read-only across every poster in the run. buildInjection indexes this
+	// by the caller-supplied sessionIdx and builds that session's
+	// hash-to-turn map locally, per call — see buildInjection.
+	sessionTurnHashes [][]string
 	// owner is cfg.replayUUIDOwner: the reverse uuid -> owning-session-index
 	// map (see buildSessionTurnUUIDs), shared read-only across every poster
 	// in the run — used by findLeakedUUIDsByOwner to flag cross-session
@@ -100,13 +101,17 @@ type replayPoster struct {
 }
 
 // buildInjection returns this call's *uuidInjection (nil when UUID
-// injection is disabled, this session has no assigned turns — e.g.
-// sessionIdx fell outside the precomputed array, or this session had zero
-// qualifying turns — or this particular request has no qualifying turn
-// visible in its message history yet). isLastRequest is whether req is the
-// final request of the CURRENT instance's request list (see
-// runRouterReplayInstance) — with --replay-recite-every-request=false, only
-// that final request carries the recite ask.
+// injection is disabled, sessionIdx has no assigned turns — e.g. it fell
+// outside the precomputed array, or that session had zero qualifying turns
+// — or this particular request has no qualifying turn visible in its
+// message history yet). sessionIdx identifies which session's global UUID
+// assignment to use (== seriesNum-1 — see callers); it is passed explicitly
+// rather than cached on the poster because a single poster may be SHARED
+// across sessions under multi-endpoint routing (see the struct doc).
+// isLastRequest is whether req is the final request of the CURRENT
+// instance's request list (see runRouterReplayInstance) — with
+// --replay-recite-every-request=false, only that final request carries the
+// recite ask.
 //
 // Every VISIBLE qualifying turn in req.Messages gets stamped into
 // StampByHash (keeping every turn's marker warm in KV as later requests
@@ -116,20 +121,31 @@ type replayPoster struct {
 // request), deduplicated and capped at 4 (see the package doc in
 // replay_router_uuid.go for the design rationale and edge cases at turns
 // 1-3).
-func (p *replayPoster) buildInjection(req RouterReplayRequest, isLastRequest bool) *uuidInjection {
-	if !p.uuidEnabled || p.sessionIdx < 0 || p.sessionIdx >= len(p.allUUIDSets) || len(p.turnHashes) == 0 {
+func (p *replayPoster) buildInjection(req RouterReplayRequest, sessionIdx int, isLastRequest bool) *uuidInjection {
+	if !p.uuidEnabled || sessionIdx < 0 || sessionIdx >= len(p.allUUIDSets) || sessionIdx >= len(p.sessionTurnHashes) {
 		return nil
 	}
-	uuids := p.allUUIDSets[p.sessionIdx]
-	if len(uuids) == 0 {
+	uuids := p.allUUIDSets[sessionIdx]
+	turnHashes := p.sessionTurnHashes[sessionIdx]
+	if len(uuids) == 0 || len(turnHashes) == 0 {
 		return nil
+	}
+	// hashToTurn is built fresh per call rather than cached: it's a small,
+	// cheap map (one entry per turn) with no shared mutable state, which is
+	// exactly the point — a shared poster can serve any sessionIdx
+	// concurrently with no data race.
+	hashToTurn := make(map[string]int, len(turnHashes))
+	for i, h := range turnHashes {
+		if h != "" {
+			hashToTurn[h] = i
+		}
 	}
 
 	stampByHash := map[string]turnStamp{}
 	var visible []int // turn indices visible in this request, in first-appearance order
 	seenTurn := map[int]bool{}
 	for _, m := range req.Messages {
-		t, ok := p.hashToTurn[m.Hash]
+		t, ok := hashToTurn[m.Hash]
 		if !ok || t < 0 || t >= len(uuids) {
 			continue
 		}
@@ -338,11 +354,22 @@ func (p *replayPoster) endpointAttempts() []string {
 	return []string{p.epPrimary, p.epFallback}
 }
 
+// Endpoint resolutions logged so far, PACKAGE-scoped: replayPoster is
+// constructed per replay instance (per series), so a per-poster sync.Once
+// printed "[router-replay] endpoint resolved" once per SERIES — thousands
+// of lines per soak. Log once per distinct resolved endpoint instead; a
+// genuine endpoint change still logs.
+var (
+	epLogMu   sync.Mutex
+	epLogSeen = map[string]bool{}
+)
+
 // latchEndpoint records the first endpoint form that returned 2xx and logs
-// the resolution once. Concurrent first requests may each probe both forms
-// in parallel — benign duplicate probes by design (no single-flight, so a
-// high-concurrency launch is never serialized behind one resolver); the
-// first success wins and later latches are no-ops.
+// the resolution once per distinct endpoint (process-wide). Concurrent
+// first requests may each probe both forms in parallel — benign duplicate
+// probes by design (no single-flight, so a high-concurrency launch is
+// never serialized behind one resolver); the first success wins and later
+// latches are no-ops.
 func (p *replayPoster) latchEndpoint(url string) {
 	p.epMu.Lock()
 	if p.epResolved == "" {
@@ -351,13 +378,19 @@ func (p *replayPoster) latchEndpoint(url string) {
 	}
 	resolved, fellBack := p.epResolved, p.epFellBack
 	p.epMu.Unlock()
-	p.epLogOnce.Do(func() {
+	epLogMu.Lock()
+	seen := epLogSeen[resolved]
+	if !seen {
+		epLogSeen[resolved] = true
+	}
+	epLogMu.Unlock()
+	if !seen {
 		note := ""
 		if fellBack {
 			note = " (fallback /v1 applied)"
 		}
 		fmt.Fprintf(os.Stderr, "[router-replay] endpoint resolved: %s%s\n", resolved, note)
-	})
+	}
 }
 
 // sendOnce POSTs bodyBytes to url with the poster's auth/accept headers.
@@ -403,7 +436,8 @@ func (p *replayPoster) do(
 ) RequestMetrics {
 	startTime := time.Now()
 
-	inj := p.buildInjection(req, isLastRequest)
+	sessionIdx := seriesNum - 1
+	inj := p.buildInjection(req, sessionIdx, isLastRequest)
 
 	var bodyBytes []byte
 	var canonical string
@@ -523,13 +557,13 @@ func (p *replayPoster) do(
 	// UUID list" as a PRESENCE_MISS/conformity failure even though nothing
 	// asked it to.
 	if inj != nil && inj.Recite && m.Error == nil && !m.IsEmpty {
-		m.ConvIdx = p.sessionIdx
+		m.ConvIdx = sessionIdx
 		m.ExpectedUUIDs = append([]string(nil), inj.ReciteUUIDs...)
 		m.UUIDFound = make([]bool, len(inj.ReciteUUIDs))
 		for i, u := range inj.ReciteUUIDs {
 			m.UUIDFound[i] = strings.Contains(m.Response, u)
 		}
-		m.LeakedUUIDs = findLeakedUUIDsByOwner(m.Response, "", p.sessionIdx, p.owner)
+		m.LeakedUUIDs = findLeakedUUIDsByOwner(m.Response, "", sessionIdx, p.owner)
 		m.ExactMatch = firstLineConformity(m.Response, inj.ReciteUUIDs)
 	}
 	return m
@@ -876,7 +910,8 @@ func (p *replayPoster) dryDo(
 	// cache-ratio estimate) stays consistent with a real do() call for the
 	// same request — dry-run never makes a real request, so there's no
 	// response to validate.
-	inj := p.buildInjection(req, isLastRequest)
+	sessionIdx := seriesNum - 1
+	inj := p.buildInjection(req, sessionIdx, isLastRequest)
 	var canonical string
 	switch p.apiType {
 	case "openai", "openai_vllm":

@@ -112,13 +112,20 @@ func GenerateVisualizationMerged(dirs []string, labels []string, outputDir strin
 
 		var dirRecords []requestDataRecord
 		var dirSamples []vllmMetricsSample
+		var dirParams runParamsRecord
+		var dirHasParams bool
 		for _, f := range files {
-			records, samples, err := readJSONLFile(f)
+			records, samples, params, hasParams, err := readJSONLFileWithParams(f)
 			if err != nil {
 				return "", fmt.Errorf("read %s: %w", f, err)
 			}
 			dirRecords = append(dirRecords, records...)
 			dirSamples = append(dirSamples, samples...)
+			// First header in the directory wins — an arm is one run, and a
+			// dir holding several files is that run split across models.
+			if hasParams && !dirHasParams {
+				dirParams, dirHasParams = params, true
+			}
 		}
 		// Per-arm truncation: this directory's own t0, not global wall-clock.
 		dirRecords, dirSamples = truncateToElapsed(dirRecords, dirSamples, maxElapsed)
@@ -149,6 +156,16 @@ func GenerateVisualizationMerged(dirs []string, labels []string, outputDir strin
 			return "", fmt.Errorf("create merged file %s: %w", outFile, err)
 		}
 		enc := json.NewEncoder(out)
+		// Lead with the run-params header so the merged file describes its own
+		// arm: generateVisualization re-reads these files, and without this the
+		// merged report would lose the concurrency/series shape that the source
+		// dir recorded and fall back to legacy inference.
+		if dirHasParams {
+			if err := enc.Encode(dirParams); err != nil {
+				out.Close()
+				return "", fmt.Errorf("write run params to %s: %w", outFile, err)
+			}
+		}
 		for _, r := range dirRecords {
 			if err := enc.Encode(r); err != nil {
 				out.Close()

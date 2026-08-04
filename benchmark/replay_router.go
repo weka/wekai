@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/weka/wekai/config"
+	"github.com/weka/wekai/llm"
 )
 
 // ---- File schema (mirrors wekai router replay-prepare output) ----
@@ -458,13 +459,55 @@ func resolveInstanceActions(instances []RouterReplayInstance, includeRole func(s
 
 // ---- Series-loop body for tree replay ----
 
+// endpointPicker chooses an endpoint PER REQUEST and accounts the in-flight
+// slot for exactly that request's duration.
+//
+// Selection is per-request, not per-series or per-instance, because in-flight
+// load is a per-request property: an instance runs its turns sequentially, so
+// holding a slot for a whole instance measures "live agents", not "concurrent
+// requests" — and the 429 cap we are avoiding counts the latter.
+//
+// Stickiness is preserved as a PREFERENCE: every request first tries its
+// series' home endpoint, and only fails over when that endpoint is above the
+// overload threshold. So the common case keeps prefix locality and only the
+// overflow moves.
+type endpointPicker struct {
+	router *llm.EndpointRouter
+	// posters holds one poster per endpoint index, mirroring router.Endpoints().
+	// A poster latches its resolved URL form on first success, so a request
+	// cannot simply retarget an existing one — it selects the right one.
+	posters []*replayPoster
+	// single is used when there is nothing to route between.
+	single *replayPoster
+}
+
+// acquire selects the endpoint for one request and takes its in-flight slot.
+// Returns the poster to use and the index to release afterwards (-1 = nothing
+// to release).
+func (p *endpointPicker) acquire(seriesNum int) (*replayPoster, int) {
+	if p.router == nil || len(p.posters) == 0 {
+		return p.single, -1
+	}
+	idx := p.router.AcquireForRequest(seriesNum)
+	if idx < 0 || idx >= len(p.posters) || p.posters[idx] == nil {
+		return p.single, -1
+	}
+	return p.posters[idx], idx
+}
+
+func (p *endpointPicker) release(idx int) {
+	if p.router != nil && idx >= 0 {
+		p.router.ReleaseIndex(idx)
+	}
+}
+
 func runRouterReplaySeriesLoop(
 	benchCtx context.Context,
 	cfg AutoBenchmarkConfig,
 	st *autoState,
 	rdw *requestDataWriter,
 	queue *routerReplayStream,
-	endpointOverride string,
+	picker endpointPicker,
 	docs string,
 	updateSnap func(*autoState),
 	gate *concurrencyGate,
@@ -490,7 +533,7 @@ func runRouterReplaySeriesLoop(
 		}
 		seriesNum := idx + 1
 		runRouterReplaySession(benchCtx, cfg, st, rdw,
-			sess, seriesNum, endpointOverride, reqTimeout, docs, gate)
+			sess, seriesNum, picker, reqTimeout, docs, gate)
 		// Session slot retired — drop its active-dataset snapshot.
 		st.datasetTracker.Reset(seriesNum)
 		st.seriesReplayCompleted.Add(1)
@@ -520,7 +563,7 @@ func runRouterReplaySession(
 	rdw *requestDataWriter,
 	sess RouterReplaySession,
 	seriesNum int,
-	endpointOverride string,
+	picker endpointPicker,
 	reqTimeout time.Duration,
 	docs string,
 	gate *concurrencyGate,
@@ -571,7 +614,7 @@ func runRouterReplaySession(
 				return
 			}
 			runRouterReplayInstance(benchCtx, cfg, st, rdw,
-				sess.SessionID, seriesNum, inst, endpointOverride, reqTimeout, docs, requestDone, gate)
+				sess.SessionID, seriesNum, inst, picker, reqTimeout, docs, requestDone, gate)
 		}()
 	}
 	wg.Wait()
@@ -615,7 +658,7 @@ func runRouterReplayInstance(
 	sessionID string,
 	seriesNum int,
 	inst RouterReplayInstance,
-	endpointOverride string,
+	picker endpointPicker,
 	reqTimeout time.Duration,
 	docs string,
 	requestDone map[uint64]chan struct{},
@@ -633,35 +676,27 @@ func runRouterReplayInstance(
 	if !cfg.ReplayNoStamp {
 		replayRunID = cfg.RunID
 	}
-	poster, err := newReplayPoster(cfg.Model, config.GetAPIKeys(), endpointOverride, replayRunID, cfg.DryRun, cfg.DryRunColdTPS, cfg.DryRunWarmTPS, cfg.DryRunOutputTPS, st.estimator)
+	// With a multi-endpoint spec the posters were built once per series loop and
+	// live on the picker; this per-instance poster is only the single-endpoint
+	// fallback. err is still checked so a bad model spec fails the same way.
+	poster, err := newReplayPoster(cfg.Model, config.GetAPIKeys(), "", replayRunID, cfg.DryRun, cfg.DryRunColdTPS, cfg.DryRunWarmTPS, cfg.DryRunOutputTPS, st.estimator)
 	if err == nil {
 		poster.outputRatio = cfg.ReplayOutputRatio
 		poster.forceOutput = cfg.ReplayForceOutput
 		// UUID cache-coherency injection (--replay-inject-uuids, router
-		// path). sessionIdx == seriesNum-1: every instance of a session
-		// shares the session's seriesNum, so every instance's poster picks
-		// the SAME session's turn-UUID assignment. uuidEnabled stays false
-		// (and buildInjection nil) whenever the flag is off, or this
-		// session's index fell outside the precomputed array (see the
-		// sizing note on AutoBenchmarkConfig.replayUUIDSets) — degrading
-		// gracefully to "no injection" for that session rather than
-		// panicking. turnHashes/hashToTurn are session-global (every
-		// instance of the session sees the SAME turn numbering, even though
-		// any one instance's requests typically only surface its own
-		// subset of turns) — built once here rather than per request.
+		// path). All UUID state set here is GLOBAL and READ-ONLY — the same
+		// cfg.replayUUIDSets/replaySessionTurnHashes/replayUUIDOwner refs get
+		// set on every poster in the run (see also the picker pool in
+		// auto.go), so a poster shared across sessions under multi-endpoint
+		// routing is safe: buildInjection derives the per-session view
+		// (which sessionIdx, which turn hashes) from these globals per call
+		// rather than from any state cached on the poster itself.
 		if cfg.ReplayInjectUUIDs {
 			poster.uuidEnabled = true
-			poster.sessionIdx = seriesNum - 1
 			poster.allUUIDSets = cfg.replayUUIDSets
+			poster.sessionTurnHashes = cfg.replaySessionTurnHashes
 			poster.owner = cfg.replayUUIDOwner
 			poster.reciteEveryRequest = cfg.ReplayReciteEveryRequest
-			if poster.sessionIdx >= 0 && poster.sessionIdx < len(cfg.replaySessionTurnHashes) {
-				poster.turnHashes = cfg.replaySessionTurnHashes[poster.sessionIdx]
-				poster.hashToTurn = make(map[string]int, len(poster.turnHashes))
-				for t, h := range poster.turnHashes {
-					poster.hashToTurn[h] = t
-				}
-			}
 		}
 	}
 	if err != nil {
@@ -723,11 +758,27 @@ func runRouterReplayInstance(
 
 		reqCtx, reqCancel := context.WithTimeout(ctx, reqTimeout)
 		var metrics RequestMetrics
-		if poster.dryRun {
-			metrics = poster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest)
-		} else {
-			metrics = poster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest)
+		// Per-request endpoint selection: prefer this series' home endpoint,
+		// fail over only if it is overloaded. The slot is held for exactly this
+		// request, so the counter tracks concurrent requests — the same thing
+		// the server's capacity limit counts.
+		reqPoster, epIdx := picker.acquire(seriesNum)
+		if reqPoster == nil {
+			reqPoster = poster
 		}
+		// reqPoster may come from the picker's shared per-endpoint pool
+		// (built once in auto.go and reused by every series that lands on
+		// that endpoint) rather than this instance's own `poster`. No
+		// per-session copy-across is needed: every poster's UUID fields are
+		// global/read-only (set identically on construction — see auto.go
+		// and above), and do()/dryDo() derive this call's sessionIdx from
+		// seriesNum directly, so a shared poster safely serves any session.
+		if reqPoster.dryRun {
+			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest)
+		} else {
+			metrics = reqPoster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest)
+		}
+		picker.release(epIdx)
 		reqCancel()
 		gate.Release()
 

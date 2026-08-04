@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -185,6 +186,72 @@ assert(adtAt(adt, 59999).v === 100, "holds until next sample");
 assert(adtAt(adt, 60001).v === 200 && adtAt(adt, 60001).s === 2, "latest at-or-before");
 assert(adtAt(adt, 1e12).v === 300, "after last => last");
 assert(fmtTokens(1234567) === "1.2M" && fmtTokens(999) === "999", "fmtTokens");
+assert(fmtMs(0) === "-" && fmtMs(-1) === "-", "no latency reads as '-', never 0ms");
+assert(fmtMs(150) === "150ms" && fmtMs(999) === "999ms", "sub-second stays in ms");
+assert(fmtMs(1000) === "1.00s" && fmtMs(2940) === "2.94s", "second and over switches to s");
+// percentileSorted matches percentile()'s nearest-rank definition, without
+// copying or re-sorting -- the summary sorts once and reads both p50 and p95.
+{
+  const raw = [5, 1, 4, 2, 3];
+  const srt = Float64Array.from(raw).sort();
+  [0.5, 0.95, 0.0, 1.0].forEach(p => {
+    assert(percentileSorted(srt, p) === percentile(raw, p),
+      "percentileSorted agrees with percentile at p=" + p);
+  });
+  assert(percentileSorted([], 0.5) === 0 && percentileSorted(null, 0.5) === 0, "empty => 0");
+  assert(percentileSorted(Float64Array.from([7]), 0.95) === 7, "single sample");
+}
+
+// adtWindow / adtWindowMax: the active-dataset band is re-framed by zoom, so
+// the scale and the "last dataset size" label must come from the window, not
+// the whole run.
+assert(adtWindow(null, 0, 1e9).length === 0 && adtWindow([], 0, 1e9).length === 0, "empty adt => no points");
+{
+  const all = adtWindow(adt, 0, 1e9);
+  assert(all.length === 3 && adtWindowMax(all) === 300, "full range keeps every sample, max 300");
+}
+{
+  // Window strictly inside the run: the sample at-or-before tMin carries in,
+  // so the line starts at the level actually in force at tMin.
+  const w = adtWindow(adt, 70000, 130000);
+  assert(w.length === 2, "carry-in + in-window sample, got " + w.length);
+  assert(w[0].t === 60000 && w[0].v === 200, "carry-in is the last sample at/before tMin");
+  assert(w[1].v === 300, "in-window sample follows");
+  assert(adtWindowMax(w) === 300, "window max is 300, not the run max");
+}
+{
+  // A window entirely between two samples still describes a level.
+  const w = adtWindow(adt, 70000, 90000);
+  assert(w.length === 1 && w[0].v === 200, "gap window carries the standing level");
+  assert(adtWindowMax(w) === 200, "gap window scale is the carried level");
+}
+{
+  // A window that ends before the peak must NOT be scaled by the peak --
+  // this is the reported bug: zooming early flattened the line against 300.
+  const w = adtWindow(adt, 0, 60000);
+  assert(w.length === 2 && adtWindowMax(w) === 200, "early window scale is 200, got " + adtWindowMax(w));
+  assert(w[w.length - 1].v === 200, "last-in-window is 200, not the run's final 300");
+}
+assert(adtWindow(adt, -1e9, -1000).length === 0, "window entirely before the run => no points");
+
+// adtWindowRange: BOTH ends come from the window. A 0-anchored axis renders a
+// narrow window (a level that moved 200 -> 300) as a flat line glued to the
+// band top; anchoring at the window minimum spends the band on the variation.
+assert(adtWindowRange([]) === null && adtWindowRange([[]]) === null, "no points => no range");
+{
+  const r = adtWindowRange([adtWindow(adt, 0, 1e9)]);
+  assert(r.lo === 100 && r.hi === 300, "full range is 100-300, got " + JSON.stringify(r));
+}
+{
+  const r = adtWindowRange([adtWindow(adt, 70000, 130000)]);
+  assert(r.lo === 200 && r.hi === 300, "zoomed range floor lifts to 200, got " + JSON.stringify(r));
+}
+{
+  // Shared across bands so arms stay comparable to each other.
+  const other = [{t: 0, v: 50, s: 1}, {t: 60000, v: 900, s: 2}];
+  const r = adtWindowRange([adtWindow(adt, 0, 1e9), adtWindow(other, 0, 1e9)]);
+  assert(r.lo === 50 && r.hi === 900, "range spans every band, got " + JSON.stringify(r));
+}
 
 // Absolute band scaling: the max is shared ACROSS series in a report (a
 // 50k-peak series next to a 1M-peak series must NOT be per-series
@@ -384,6 +451,7 @@ __el("selectAll"); __el("deselectAll"); __el("seriesFilter");
 const document = {
   getElementById: id => __el(id),
   createElement: () => __el("dyn" + Math.random()),
+  createTextNode: text => ({ nodeType: 3, textContent: String(text) }),
   querySelector: () => __el("controls"),
 };
 const window = {
@@ -657,5 +725,984 @@ func TestGenerateVisualizationMergedCarriesSamples(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"mix":`) {
 		t.Errorf("merged report missing cache-mix overlay data")
+	}
+}
+
+// TestSummaryPanelJS runs the emitted report under the DOM stub and asserts
+// every cell of the per-variant summary panel against hand-computed values.
+// The panel is the header's headline claim about a run, so its arithmetic
+// gets pinned exactly rather than smoke-tested:
+//
+//	4 requests at t = 0/10/20/30s, the last one an error.
+//	prompt tokens (in + ca, net-of-cache contract) = 3*500 + 1000 = 2500
+//	output tokens = 3*50 + 100 = 250
+//	completed (non-error) = 3
+//	rate denominator = first->last record extent = 30s
+//	  => in/s = 2500/30 = 83.3 -> "83"; out/s = 250/30 = 8.3 -> "8"
+//	errors per 1k = 1/4 * 1000 = "250.0"
+//
+// Volumes deliberately include the errored request (a failed request still
+// cost its prompt), which is why its 1000/100 tokens are in the totals.
+func TestSummaryPanelJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS summary test skipped")
+	}
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	model := "dynamic/http://localhost:8000/v1,type=openai_vllm,alias=sumfix"
+	var records []requestDataRecord
+	for i := 0; i < 4; i++ {
+		st := base.Add(time.Duration(i) * 10 * time.Second)
+		r := requestDataRecord{
+			StartTime: st, EndTime: st.Add(2 * time.Second),
+			TTFT: 150, ResponseMs: 2000, Model: model,
+			SeriesNum: 1, RequestNum: i + 1,
+			InputTokens: 100, CachedTokens: 400, OutputTokens: 50,
+		}
+		if i == 3 {
+			r.IsError = true
+			r.InputTokens, r.CachedTokens, r.OutputTokens = 200, 800, 100
+		}
+		records = append(records, r)
+	}
+	writeMixedJSONL(t, dir, "a", records, nil)
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+// sumCells is [variantIndex][metricIndex] -- variants are rows.
+function expect(si, mi, want, label) {
+  const got = sumCells[si][mi].textContent;
+  assert(got === want, label + ": want " + JSON.stringify(want) + ", got " + JSON.stringify(got));
+}
+assert(SUMMARY_METRICS.length === 8, "eight metric columns, got " + SUMMARY_METRICS.length);
+assert(sumCells.length === DATA.length && sumCells[0].length === 8, "one row per variant, eight cells each");
+assert(sumRows.length === DATA.length, "one <tr> per variant");
+expect(0, 0, "2.5k", "input tokens");
+expect(0, 1, "250",  "output tokens");
+expect(0, 2, "3",    "completed requests");
+expect(0, 3, "83",   "avg input/s");
+expect(0, 4, "8",    "avg output/s");
+expect(0, 5, "150ms","ttft p50");
+expect(0, 6, "150ms","ttft p95");
+expect(0, 7, "250.0","errors per 1k");
+// TTFT percentiles are backed by the non-error requests only: the errored
+// 4th row must not count even though it carries a ttft.
+assert(sumCells[0][5].title.indexOf("3 non-error requests") === 0, "ttft sample count, got " + sumCells[0][5].title);
+assert(document.getElementById("sumRange").textContent === "full run (30s)",
+  "range label, got " + JSON.stringify(document.getElementById("sumRange").textContent));
+
+// The cached split rides along as a hover on the input row:
+// in = 3*100 + 200 = 500 uncached, ca = 3*400 + 800 = 2000 server-cached,
+// 2000/2500 = 80% cached.
+const tip = sumCells[0][0].title || "";
+assert(tip.indexOf("500 uncached") >= 0 && tip.indexOf("2.0k server-cached") >= 0 && tip.indexOf("80.0% cached") >= 0,
+  "input-row cached breakdown, got " + JSON.stringify(tip));
+
+// Zooming reprices every cell: clip to [0, 10s] and only the first two
+// requests remain (2 x 500 prompt, 2 x 50 out, 0 errors, 10s extent).
+viewTMin = globalTMin; viewTMax = globalTMin + 10000;
+draw();
+expect(0, 0, "1.0k", "zoomed input tokens");
+expect(0, 1, "100",  "zoomed output tokens");
+expect(0, 2, "2",    "zoomed completed requests");
+expect(0, 3, "100",  "zoomed avg input/s");
+expect(0, 4, "10",   "zoomed avg output/s");
+expect(0, 5, "150ms","zoomed ttft p50");
+expect(0, 6, "150ms","zoomed ttft p95");
+expect(0, 7, "0.0",  "zoomed errors per 1k");
+assert(document.getElementById("sumRange").textContent === "0s – 10s",
+  "zoomed range label, got " + JSON.stringify(document.getElementById("sumRange").textContent));
+
+// The context filter feeds the panel too: min above the fixture's ctx keeps
+// only the errored row (ctx 1000), so completed drops to 0 and the error
+// rate saturates.
+viewTMin = globalTMin; viewTMax = globalTMax;
+applyCtxFilter(600, 0);
+expect(0, 2, "0",      "ctx-filtered completed requests");
+expect(0, 7, "1000.0", "ctx-filtered errors per 1k");
+// No completed request in the view => the percentiles read "-", never "0ms".
+expect(0, 5, "-", "ctx-filtered ttft p50 has no sample");
+expect(0, 6, "-", "ctx-filtered ttft p95 has no sample");
+applyCtxFilter(0, 0);
+expect(0, 2, "3", "reset restores completed requests");
+
+// Collapsing a panel hands its height to the chart and must not disturb the
+// numbers: the toggle re-runs resize() + draw().
+const hBefore = H;
+(__listeners["controlsToggle:click"] || []).forEach(fn => fn());
+assert(document.getElementById("controlsPanel").className.indexOf("collapsed") >= 0, "controls panel collapses");
+assert(H >= hBefore, "collapsing controls does not shrink the canvas");
+expect(0, 2, "3", "numbers survive a collapse");
+(__listeners["controlsToggle:click"] || []).forEach(fn => fn());
+assert(document.getElementById("controlsPanel").className.indexOf("collapsed") < 0, "controls panel expands again");
+
+// Clicking a summary row toggles that variant, same as its legend entry.
+sumRows[0].onclick();
+assert(hiddenSeries.has(0), "row click hides the variant");
+sumRows[0].onclick();
+assert(!hiddenSeries.has(0), "row click shows it again");
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "summary_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node summary test failed: %v\n%s", err, out)
+	}
+}
+
+// TestActiveDatasetReframesOnZoomJS pins the fix for a band that described the
+// whole run regardless of zoom: the active-dataset line was scaled against the
+// run's peak and labelled with the run's final sample, so zooming into a
+// stretch where the dataset was small flattened the line onto the band floor
+// and reported a size that was never in force there.
+//
+// benchFixtureData samples the dataset at t = 0/60/120s with 4k/8k/12k tokens.
+func TestActiveDatasetReframesOnZoomJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS active-dataset test skipped")
+	}
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	rec, smp := benchFixtureData("adtzoom", base)
+	writeMixedJSONL(t, dir, "a", rec, smp)
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+document.getElementById("showCacheMix").checked = true;
+const band = () => cacheMixLayout().bands[0];
+
+// Whole run: scale spans the run and the last sample is the final one.
+viewTMin = globalTMin; viewTMax = globalTMax;
+let L = cacheMixLayout();
+assert(band().adtRange.lo === 4000 && band().adtRange.hi === 12000,
+  "full view scale is 4000-12000, got " + JSON.stringify(band().adtRange));
+let pts = band().adtPts;
+assert(pts[pts.length - 1].v === 12000, "full view last dataset size is 12000");
+
+// Zoom to the first minute: the 12k peak is outside the view, so the scale,
+// its floor, and the reported size all drop to what the window holds.
+viewTMin = globalTMin; viewTMax = globalTMin + 60000;
+L = cacheMixLayout();
+assert(band().adtRange.lo === 4000 && band().adtRange.hi === 8000,
+  "zoomed scale re-frames to 4000-8000, got " + JSON.stringify(band().adtRange));
+pts = band().adtPts;
+assert(pts[pts.length - 1].v === 8000, "zoomed last dataset size is 8000, got " + pts[pts.length - 1].v);
+assert(pts[0].v === 4000, "zoomed window starts at the 4000 sample");
+
+// The band's full height is spent on the window: its extremes land on the
+// band edges (modulo the 2px inset), NOT squashed against a 0-anchored top.
+{
+  const b = band();
+  const yLo = adtY(4000, b.adtRange, b.yTop, b.bandH);
+  const yHi = adtY(8000, b.adtRange, b.yTop, b.bandH);
+  assert(Math.abs(yLo - (b.yTop + b.bandH - 2)) < 0.01, "window min sits at the band floor, got " + yLo);
+  assert(Math.abs(yHi - (b.yTop + 2)) < 0.01, "window max sits at the band top, got " + yHi);
+  // Against the old 0-anchored axis both would have crowded the upper third.
+  assert(yLo - yHi > b.bandH * 0.8, "the window spans nearly the whole band");
+}
+
+// A window falling between two samples still describes the standing level
+// (carry-in), rather than emptying the band. A flat range draws mid-band
+// instead of dividing by zero.
+viewTMin = globalTMin + 70000; viewTMax = globalTMin + 90000;
+L = cacheMixLayout();
+pts = band().adtPts;
+assert(pts.length === 1 && pts[0].v === 8000, "gap window carries the standing 8000 level");
+assert(band().adtRange.lo === 8000 && band().adtRange.hi === 8000, "gap window range is flat at the carried level");
+{
+  const b = band();
+  const y = adtY(8000, b.adtRange, b.yTop, b.bandH);
+  assert(Math.abs(y - (b.yTop + b.bandH / 2)) < 0.01, "flat range draws mid-band, got " + y);
+  assert(isFinite(y), "flat range must not divide by zero");
+}
+
+// Bands are scaled INDEPENDENTLY: an arm sitting at a different level must
+// still spend its full band on its own variation, not a slice of the union.
+viewTMin = globalTMin; viewTMax = globalTMax;
+{
+  const L2 = cacheMixLayout();
+  L2.bands.forEach(b => {
+    const vs = b.adtPts.map(p => p.v);
+    assert(b.adtRange.lo === Math.min.apply(null, vs) && b.adtRange.hi === Math.max.apply(null, vs),
+      b.s.name + ": range comes from its OWN points, got " + JSON.stringify(b.adtRange));
+    const ys = b.adtPts.map(p => adtY(p.v, b.adtRange, b.yTop, b.bandH));
+    const spread = Math.max.apply(null, ys) - Math.min.apply(null, ys);
+    assert(spread > b.bandH * 0.9, b.s.name + ": line spans its full band, got " + spread + "/" + b.bandH);
+  });
+}
+
+// The whole thing still renders at every zoom without throwing.
+[[globalTMin, globalTMax], [globalTMin, globalTMin + 60000], [globalTMin + 70000, globalTMin + 90000]].forEach(([a, c]) => {
+  viewTMin = a; viewTMax = c;
+  draw();
+});
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "adt_zoom_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node active-dataset test failed: %v\n%s", err, out)
+	}
+}
+
+// TestNoDatasetAxisRowsJS pins the removal of the per-tick "ds:<size>" axis
+// rows. They cost one row of bottom margin per visible sampled series — 140px
+// of chart height on a 10-variant report — to repeat, in near-identical
+// numbers across every tick, what the band label and band hover already state
+// exactly. Enabling the cache-mix overlay must no longer grow the bottom
+// margin at all; only "Show X-axis values" may.
+func TestNoDatasetAxisRowsJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS axis-row test skipped")
+	}
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	for _, alias := range []string{"armA", "armB", "armC"} {
+		rec, smp := benchFixtureData(alias, base)
+		writeMixedJSONL(t, dir, alias, rec, smp)
+	}
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	if strings.Contains(html, `"ds:"`) {
+		t.Errorf("generated report still emits the ds: axis-row label")
+	}
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+assert(DATA.length === 3 && DATA.every(s => s.adt && s.adt.length), "3 sampled series in the fixture");
+const mix = document.getElementById("showCacheMix"), xax = document.getElementById("showXAxisValues");
+
+// The cache-mix overlay must not buy any bottom margin.
+mix.checked = false; xax.checked = false;
+const bare = calcBottomMargin();
+mix.checked = true;
+assert(calcBottomMargin() === bare, "cache-mix overlay must not grow the bottom margin (got " +
+  calcBottomMargin() + " vs " + bare + ")");
+
+// The x-axis values toggle still buys one row per visible series, and that
+// remains the ONLY thing that does.
+xax.checked = true;
+const withRows = calcBottomMargin();
+assert(withRows === bare + 3 * 14, "x-axis values add one row per series, got " + withRows);
+mix.checked = false;
+assert(calcBottomMargin() === withRows, "rows come from the x-axis toggle alone");
+
+// Chart height actually reclaims the space: overlay on, axis values off.
+mix.checked = true; xax.checked = false;
+resize(); draw();
+const tallPlotH = plotH;
+xax.checked = true;
+resize(); draw();
+assert(plotH < tallPlotH, "axis rows still cost plot height when explicitly enabled");
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "axis_rows_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node axis-row test failed: %v\n%s", err, out)
+	}
+}
+
+// TestCacheMixDefaultBySeriesCountJS pins the overlay's default state to the
+// report's series count. Every sampled series claims its own band off the top
+// of the plot (collectively up to 60% of plot height), so on a wide sweep the
+// bands both squeeze the latency chart and get too thin to read individually.
+// Four arms or fewer -- the common A/B/C/D comparison -- still open with the
+// overlay on; anything wider opens on the chart, one click from the overlay.
+func TestCacheMixDefaultBySeriesCountJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS cache-mix default test skipped")
+	}
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name   string
+		series int
+		wantOn bool
+	}{
+		{"one series", 1, true},
+		{"at the threshold", 4, true},
+		{"one past the threshold", 5, false},
+		{"wide sweep", 10, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for i := 0; i < tc.series; i++ {
+				alias := fmt.Sprintf("arm%02d", i)
+				rec, smp := benchFixtureData(alias, base)
+				writeMixedJSONL(t, dir, alias, rec, smp)
+			}
+			htmlPath, err := GenerateVisualization(dir, 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := os.ReadFile(htmlPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			html := string(b)
+			start := strings.Index(html, "<script>")
+			end := strings.Index(html, "</script>")
+			if start < 0 || end < 0 {
+				t.Fatal("script block not found")
+			}
+			script := html[start+len("<script>") : end]
+
+			// The stub pre-creates #showCacheMix as checked, so a report that
+			// never touched the property would read as "on" -- clear it first
+			// so the assertion can only pass if the report set it itself.
+			probe := fmt.Sprintf(`
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+assert(DATA.length === %d, "fixture has %d series, got " + DATA.length);
+assert(HAS_CACHE_MIX, "fixture carries metrics samples");
+const want = %t;
+assert(document.getElementById("showCacheMix").checked === want,
+  "%d series => overlay default " + want + ", got " + document.getElementById("showCacheMix").checked);
+assert(cacheMixEnabled() === want, "cacheMixEnabled agrees with the checkbox");
+// Whatever the default, the toggle still works in both directions.
+document.getElementById("showCacheMix").checked = !want;
+assert(cacheMixEnabled() === !want, "toggle flips the overlay");
+draw();
+document.getElementById("showCacheMix").checked = want;
+draw();
+console.log("ALL_OK");
+`, tc.series, tc.series, tc.wantOn, tc.series)
+
+			stub := strings.Replace(reportDOMStub,
+				`__el("showCacheMix", { checked: true });`,
+				`__el("showCacheMix", { checked: false });`, 1)
+			if stub == reportDOMStub {
+				t.Fatal("could not neutralise the stub's pre-checked showCacheMix")
+			}
+			jsPath := filepath.Join(dir, "cachemix_default_test.js")
+			if err := os.WriteFile(jsPath, []byte(stub+"\n"+script+"\n"+probe), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+			if err != nil || !strings.Contains(string(out), "ALL_OK") {
+				t.Fatalf("node cache-mix default test failed: %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+// TestDragZoomPrecisionJS pins the drag-to-zoom selection to the pixels
+// actually dragged. unmapX is relative to the CURRENT view, so assigning
+// viewTMin before resolving the far edge made the second unmapX resolve
+// against the half-updated view: the start was right, the end landed far too
+// late, and the dragged region ended up at the front of a much wider window.
+// A narrow drag at position f produced a span of ~f*(1-f) of the run instead
+// of the width dragged -- e.g. a 2.5% drag mid-run opened a ~25% window, so
+// the selection filled only the first tenth of it.
+//
+// The test drags several windows, including two successive zooms, and asserts
+// the resulting view matches the pixel range to within a pixel's worth of time.
+func TestDragZoomPrecisionJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS drag-zoom test skipped")
+	}
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	rec, smp := benchFixtureData("dragzoom", base)
+	writeMixedJSONL(t, dir, "a", rec, smp)
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+const down = (__listeners["chart:mousedown"] || [])[0];
+const move = (__listeners["chart:mousemove"] || [])[0];
+const up   = (__listeners["chart:mouseup"] || [])[0];
+assert(down && move && up, "drag listeners registered");
+
+// Drag between two fractions of the plot width and assert the resulting view
+// is exactly the time range those pixels denoted in the PRE-drag view.
+function dragFrac(f1, f2, label) {
+  const t0 = viewTMin, t1 = viewTMax, span = t1 - t0;
+  const px = f => margin.left + f * plotW;
+  const wantMin = t0 + f1 * span;
+  const wantMax = t0 + f2 * span;
+  down({ clientX: px(f1), clientY: margin.top + 10 });
+  move({ clientX: px((f1 + f2) / 2), clientY: margin.top + 10 });
+  move({ clientX: px(f2), clientY: margin.top + 10 });
+  up({ clientX: px(f2), clientY: margin.top + 10 });
+  // One pixel's worth of the pre-drag span is the achievable precision.
+  const tol = span / plotW;
+  assert(Math.abs(viewTMin - wantMin) <= tol,
+    label + ": start off by " + (viewTMin - wantMin) + "ms (tol " + tol + ")");
+  assert(Math.abs(viewTMax - wantMax) <= tol,
+    label + ": end off by " + (viewTMax - wantMax) + "ms (tol " + tol + ")");
+  // The dragged region must FILL the new view, not sit at the front of it.
+  const got = viewTMax - viewTMin, want = wantMax - wantMin;
+  assert(Math.abs(got - want) <= 2 * tol,
+    label + ": span " + got + "ms, want " + want + "ms (" + (100 * want / got).toFixed(1) + "% of view)");
+}
+function reset() { viewTMin = globalTMin; viewTMax = globalTMax; recalcYMax(); draw(); }
+
+reset(); dragFrac(0.40, 0.60, "mid-run half-width");
+// The reported case: a narrow drag mid-run. Previously opened a ~25% window
+// with the selection filling only its first tenth.
+reset(); dragFrac(0.475, 0.500, "narrow drag mid-run");
+reset(); dragFrac(0.05, 0.10, "narrow drag near the start");
+reset(); dragFrac(0.90, 0.95, "narrow drag near the end");
+reset(); dragFrac(0.0, 1.0, "full-width drag is a no-op zoom");
+// Dragging right-to-left selects the same window.
+reset();
+{
+  const t0 = viewTMin, span = viewTMax - viewTMin, px = f => margin.left + f * plotW;
+  down({ clientX: px(0.7), clientY: margin.top + 10 });
+  move({ clientX: px(0.3), clientY: margin.top + 10 });
+  up({ clientX: px(0.3), clientY: margin.top + 10 });
+  const tol = span / plotW;
+  assert(Math.abs(viewTMin - (t0 + 0.3 * span)) <= tol, "backwards drag start");
+  assert(Math.abs(viewTMax - (t0 + 0.7 * span)) <= tol, "backwards drag end");
+}
+// Zooming twice compounds correctly -- the second drag is relative to the
+// first result, which is where the half-updated view did the most damage.
+reset();
+dragFrac(0.20, 0.80, "first zoom");
+dragFrac(0.25, 0.50, "second zoom inside the first");
+// A click (under the 5px threshold) must not zoom at all.
+reset();
+{
+  const before = [viewTMin, viewTMax];
+  down({ clientX: margin.left + 100, clientY: margin.top + 10 });
+  up({ clientX: margin.left + 102, clientY: margin.top + 10 });
+  assert(viewTMin === before[0] && viewTMax === before[1], "a 2px click must not zoom");
+}
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "drag_zoom_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node drag-zoom test failed: %v\n%s", err, out)
+	}
+}
+
+// TestRollingWindowPrecedenceJS pins where the rolling-percentile window size
+// comes from, most trustworthy first: the concurrency each arm RECORDED in its
+// run_params header, then the report-wide --concurrency the caller passed, then
+// a guess from the observed series count.
+//
+// The per-arm step is the point of recording params at all. A merged report
+// whose arms ran at different concurrency previously got one global number,
+// which smooths one arm correctly and the other wrongly with nothing on screen
+// saying so -- and that number had to be typed on the command line, where
+// forgetting it silently fell through to the guess.
+func TestRollingWindowPrecedenceJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS window-precedence test skipped")
+	}
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+
+	// armA records conc 28 + hot 4 => 32; armB records nothing (legacy).
+	writeArm := func(t *testing.T, dir, name string, params *AutoBenchmarkConfig) {
+		t.Helper()
+		rec, smp := benchFixtureData(name, base)
+		if params == nil {
+			writeMixedJSONL(t, dir, name, rec, smp)
+			return
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Create(filepath.Join(dir, name+".jsonl"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		enc := json.NewEncoder(f)
+		if err := enc.Encode(buildRunParams(*params, base)); err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range rec {
+			if err := enc.Encode(r); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, s := range smp {
+			if err := enc.Encode(s); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.Close()
+	}
+
+	run := func(t *testing.T, dir string, flagConc int, probe string) {
+		t.Helper()
+		htmlPath, err := GenerateVisualization(dir, flagConc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(htmlPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		html := string(b)
+		start := strings.Index(html, "<script>")
+		end := strings.Index(html, "</script>")
+		if start < 0 || end < 0 {
+			t.Fatal("script block not found")
+		}
+		script := html[start+len("<script>") : end]
+		jsPath := filepath.Join(dir, "window_test.js")
+		full := reportDOMStub + "\n" + script + "\n" +
+			"function assert(c,m){if(!c){console.error(\"FAIL: \"+m);process.exit(1);}}\n" +
+			probe + "\nconsole.log(\"ALL_OK\");\n"
+		if err := os.WriteFile(jsPath, []byte(full), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "ALL_OK") {
+			t.Fatalf("node window-precedence test failed: %v\n%s", err, out)
+		}
+	}
+
+	t.Run("recorded params win over the flag", func(t *testing.T) {
+		dir := t.TempDir()
+		writeArm(t, dir, "recorded", &AutoBenchmarkConfig{Concurrency: 28, HotSeriesConcurrency: 4, StartSeries: 512, MaxSeries: 512})
+		// A deliberately WRONG --concurrency: the data knows better.
+		run(t, dir, 7, `
+const s = DATA[0];
+assert(s.conc === 32, "recorded conc 28+hot 4 = 32, got " + s.conc);
+assert(s._winConc === 32, "window uses the recorded value, got " + s._winConc);
+assert(s._winSize === 96, "window = 32*3 = 96, got " + s._winSize);
+assert(s._winConcSource === "recorded", "source = recorded, got " + s._winConcSource);
+assert(document.getElementById("runparams").textContent.indexOf("conc=28") >= 0,
+  "header shows the recorded params, got " + document.getElementById("runparams").textContent);
+`)
+	})
+
+	t.Run("flag used when nothing recorded", func(t *testing.T) {
+		dir := t.TempDir()
+		writeArm(t, dir, "legacy", nil)
+		run(t, dir, 7, `
+const s = DATA[0];
+assert(!s.conc, "legacy arm carries no recorded conc, got " + s.conc);
+assert(s._winSize === 21, "window falls back to --concurrency 7*3 = 21, got " + s._winSize);
+assert(s._winConcSource === "--concurrency", "source = --concurrency, got " + s._winConcSource);
+// Nothing recorded => the line is hidden entirely rather than spending a
+// row of vertical space to say so; the per-row hover still carries provenance.
+assert(document.getElementById("runparams").style.display === "none",
+  "params line hidden when nothing was recorded, got " + document.getElementById("runparams").style.display);
+assert(!document.getElementById("runparams").textContent, "and carries no text");
+`)
+	})
+
+	t.Run("default survives huge series numbers", func(t *testing.T) {
+		// The case that motivated dropping the inference: a replay-shaped run
+		// whose series numbers climb far past the real in-flight concurrency.
+		dir := t.TempDir()
+		base2 := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+		var rec []requestDataRecord
+		for i := 0; i < 40; i++ {
+			st := base2.Add(time.Duration(i) * time.Second)
+			rec = append(rec, requestDataRecord{
+				StartTime: st, EndTime: st.Add(time.Second), TTFT: 150, ResponseMs: 900,
+				Model:     "dynamic/http://localhost:8000/v1,type=openai_vllm,alias=bigsn",
+				SeriesNum: 1000 + i*40, RequestNum: i + 1,
+				InputTokens: 100, CachedTokens: 400, OutputTokens: 50,
+			})
+		}
+		writeMixedJSONL(t, dir, "bigsn", rec, nil)
+		run(t, dir, 0, `
+const s = DATA[0];
+const maxSn = s.records.reduce((m, r) => Math.max(m, r.sn), 0);
+assert(maxSn >= 2500, "fixture really does have huge series numbers, got " + maxSn);
+assert(s._winSize === 96, "window stays at the default despite sn=" + maxSn + ", got " + s._winSize);
+`)
+	})
+
+	t.Run("fixed default when neither", func(t *testing.T) {
+		dir := t.TempDir()
+		writeArm(t, dir, "legacy", nil)
+		run(t, dir, 0, `
+const s = DATA[0];
+assert(s._winConcSource === "default", "source = default, got " + s._winConcSource);
+assert(DEFAULT_WINDOW_REQS === 96, "default window is 96 reqs, got " + DEFAULT_WINDOW_REQS);
+assert(s._winSize === 96, "window = the fixed default, got " + s._winSize);
+// The old series-count inference is gone: it scaled with series NUMBER, which
+// on a router replay climbs into the thousands as sessions recycle, yielding
+// windows of 3396/5358 requests on real 8h data.
+assert(s._winSize < 200, "window must not scale with series count, got " + s._winSize);
+`)
+	})
+
+	t.Run("per-arm windows in one report", func(t *testing.T) {
+		dir := t.TempDir()
+		writeArm(t, dir, "a_fast", &AutoBenchmarkConfig{Concurrency: 60, StartSeries: 512, MaxSeries: 512})
+		writeArm(t, dir, "b_slow", &AutoBenchmarkConfig{Concurrency: 28, HotSeriesConcurrency: 4, StartSeries: 512, MaxSeries: 512})
+		run(t, dir, 0, `
+const by = {};
+DATA.forEach(s => { by[s.name] = s; });
+const names = Object.keys(by);
+assert(names.length === 2, "two arms, got " + names);
+const fast = DATA.find(s => s.conc === 60), slow = DATA.find(s => s.conc === 32);
+assert(fast && slow, "each arm keeps its OWN recorded concurrency: " + DATA.map(s => s.conc).join(","));
+assert(fast._winSize === 180 && slow._winSize === 96,
+  "windows sized per arm, got " + fast._winSize + " / " + slow._winSize);
+assert(document.getElementById("runparams").textContent.indexOf("differ per variant") >= 0,
+  "header flags that the arms are not the same shape, got " + document.getElementById("runparams").textContent);
+`)
+	})
+}
+
+// TestBaselineRatiosJS pins the ratio-to-hbm column behaviour. These reports
+// almost always compare an offload arm against a no-offload "hbm" control, and
+// the question asked of them -- how much better or worse than hbm? -- was
+// previously answered by dividing two numbers by hand.
+//
+// Baseline detection reuses classifyAlias, the same rule that sorts hbm arms
+// first, so the naming convention lives in one place.
+func TestBaselineRatiosJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS baseline-ratio test skipped")
+	}
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+
+	// Two arms whose first->last extent is the SAME 36s -- the rate columns
+	// divide by each arm's own extent, so unequal extents would make the rate
+	// ratio disagree with the volume ratio for reasons unrelated to this
+	// feature. hbm does 4 requests of 500 prompt tokens, weka 12 of the same:
+	// exactly 300%, the figure in the report this was asked for. TTFT is
+	// deliberately inverted (weka faster) so the lower-is-better direction
+	// gets exercised too.
+	arm := func(alias string, n int, ttft float64) []requestDataRecord {
+		model := "dynamic/http://localhost:8000/v1,type=openai_vllm,alias=" + alias
+		var out []requestDataRecord
+		for i := 0; i < n; i++ {
+			st := base.Add(time.Duration(i) * (36 * time.Second / time.Duration(n-1)))
+			out = append(out, requestDataRecord{
+				StartTime: st, EndTime: st.Add(time.Second),
+				TTFT: ttft, ResponseMs: 900, Model: model,
+				SeriesNum: 1, RequestNum: i + 1,
+				InputTokens: 100, CachedTokens: 400, OutputTokens: 50,
+			})
+		}
+		return out
+	}
+
+	dir := t.TempDir()
+	writeMixedJSONL(t, dir, "hbm-c28", arm("hbm-c28", 4, 4000), nil)
+	writeMixedJSONL(t, dir, "weka-c28", arm("weka-c28", 12, 1000), nil)
+
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+// classifyAlias sorts hbm first, so the baseline is row 0 here -- but the
+// index is resolved by classification, not by position.
+assert(BASELINE_INDEX === 0, "hbm arm is the baseline, got index " + BASELINE_INDEX);
+assert(classifyAlias(getAlias(DATA[BASELINE_INDEX].name)) === "gpu", "baseline classifies as an hbm/gpu arm");
+
+const other = 1 - BASELINE_INDEX;
+function ratio(si, key) {
+  const mi = SUMMARY_METRICS.findIndex(m => m.key === key);
+  return sumRatios[si][mi].textContent;
+}
+function value(si, key) {
+  const mi = SUMMARY_METRICS.findIndex(m => m.key === key);
+  return sumCells[si][mi].textContent;
+}
+
+// The baseline row itself carries no ratios -- it IS 100% by definition.
+SUMMARY_METRICS.forEach(m => {
+  assert(ratio(BASELINE_INDEX, m.key) === "", "baseline row shows no ratio for " + m.key);
+});
+
+// 12 requests vs 4, same tokens each, same 40s span => 300% on every volume
+// and rate metric.
+["in", "out", "reqs", "inrate", "outrate"].forEach(k => {
+  assert(ratio(other, k) === "300%", k + " ratio = 300%, got " + ratio(other, k) + " (value " + value(other, k) + ")");
+});
+// Lower-is-better metrics ratio the same way: 1000ms against 4000ms = 25%.
+assert(ratio(other, "ttft50") === "25%", "ttft50 ratio = 25%, got " + ratio(other, "ttft50"));
+
+// Tint follows the DIRECTION of improvement, not the size of the number:
+// 300% more tokens is good, 300% more latency would not be.
+const mIn = SUMMARY_METRICS.findIndex(m => m.key === "in");
+const mT = SUMMARY_METRICS.findIndex(m => m.key === "ttft50");
+assert(sumRatios[other][mIn].className.indexOf("up") >= 0, "more input tokens tints as better");
+assert(sumRatios[other][mT].className.indexOf("up") >= 0, "less latency tints as better, got " + sumRatios[other][mT].className);
+
+// The value text stays the datum alone -- the ratio lives in its own span, so
+// nothing downstream has to parse "3.6B300%".
+assert(value(other, "in") === "6.0k", "value cell holds only the value, got " + value(other, "in"));
+
+// The ratio renders on its own line beneath the value, so the value column
+// stays aligned under its header. The second line is reserved only when a
+// baseline exists, and the (empty) baseline row reserves it too, keeping every
+// row the same height.
+assert(document.getElementById("summaryTable").className.indexOf("has-ratios") >= 0,
+  "table opts into the two-line cell layout, got " + document.getElementById("summaryTable").className);
+
+// Ratios track the selected window like every other figure. The two arms
+// pace differently, so the zoomed ratio is NOT 300% -- compute what the window
+// actually holds and require the cell to agree with it.
+viewTMin = globalTMin; viewTMax = globalTMin + 20000;
+draw();
+const inWin = si => DATA[si].records.filter(r => r.t >= viewTMin && r.t <= viewTMax && !r.err).length;
+const want = Math.round(inWin(other) / inWin(BASELINE_INDEX) * 100) + "%";
+assert(want !== "300%", "the zoomed window really does change the ratio");
+assert(ratio(other, "reqs") === want, "zoomed reqs ratio = " + want + ", got " + ratio(other, "reqs"));
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "baseline_ratio_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node baseline-ratio test failed: %v\n%s", err, out)
+	}
+}
+
+// TestNoBaselineNoRatiosJS: without an hbm arm — or with only one variant —
+// there is nothing to be a percentage OF, and the report must not invent one.
+func TestNoBaselineNoRatiosJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS no-baseline test skipped")
+	}
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+
+	check := func(t *testing.T, dir string) {
+		t.Helper()
+		htmlPath, err := GenerateVisualization(dir, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(htmlPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		html := string(b)
+		s, e := strings.Index(html, "<script>"), strings.Index(html, "</script>")
+		probe := `
+function assert(c, m) { if (!c) { console.error("FAIL: " + m); process.exit(1); } }
+assert(BASELINE_INDEX === -1, "no baseline, got index " + BASELINE_INDEX);
+sumRatios.forEach((row, si) => row.forEach((el, mi) =>
+  assert(el.textContent === "", "no ratio anywhere (row " + si + " col " + mi + " = " + el.textContent + ")")));
+// ...and no reserved second line either: without a baseline that would spend a
+// row of height per variant to display nothing.
+assert(document.getElementById("summaryTable").className.indexOf("has-ratios") < 0,
+  "no baseline => no reserved ratio line, got " + document.getElementById("summaryTable").className);
+console.log("ALL_OK");
+`
+		jsPath := filepath.Join(dir, "nobaseline_test.js")
+		if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+html[s+len("<script>"):e]+"\n"+probe), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "ALL_OK") {
+			t.Fatalf("node no-baseline test failed: %v\n%s", err, out)
+		}
+	}
+
+	t.Run("two arms, neither is hbm", func(t *testing.T) {
+		dir := t.TempDir()
+		for _, a := range []string{"weka-rdma", "dram1t"} {
+			rec, _ := benchFixtureData(a, base)
+			writeMixedJSONL(t, dir, a, rec, nil)
+		}
+		check(t, dir)
+	})
+
+	t.Run("single hbm arm has nothing to compare", func(t *testing.T) {
+		dir := t.TempDir()
+		rec, _ := benchFixtureData("hbm-solo", base)
+		writeMixedJSONL(t, dir, "hbm-solo", rec, nil)
+		check(t, dir)
+	})
+}
+
+// TestRequestHoverTokensJS pins the per-request token breakdown. Toggling "Show
+// Requests" exposes latency outliers, but a slow request is a different problem
+// depending on whether it carried an enormous prompt, missed the cache, or
+// generated a long completion — none of which the tooltip used to say.
+func TestRequestHoverTokensJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS request-hover test skipped")
+	}
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	model := "dynamic/http://localhost:8000/v1,type=openai_vllm,alias=hovertok"
+	var rec []requestDataRecord
+	// Nine ordinary requests at 500-token context, then one outlier: 20x the
+	// context, almost none of it cached, and slow — the shape being diagnosed.
+	for i := 0; i < 9; i++ {
+		st := base.Add(time.Duration(i) * 10 * time.Second)
+		rec = append(rec, requestDataRecord{
+			StartTime: st, EndTime: st.Add(time.Second),
+			TTFT: 150, ResponseMs: 900, Model: model,
+			SeriesNum: 1, RequestNum: i + 1,
+			InputTokens: 100, CachedTokens: 400, OutputTokens: 50,
+		})
+	}
+	outlier := base.Add(90 * time.Second)
+	rec = append(rec, requestDataRecord{
+		StartTime: outlier, EndTime: outlier.Add(40 * time.Second),
+		TTFT: 30000, ResponseMs: 40000, Model: model,
+		SeriesNum: 1, RequestNum: 10,
+		InputTokens: 9000, CachedTokens: 1000, OutputTokens: 2500,
+	})
+	writeMixedJSONL(t, dir, "hovertok", rec, nil)
+
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+// The breakdown only reaches the user with request dots drawn, which is the
+// mode the outliers are spotted in.
+document.getElementById("showDots").checked = true;
+draw();
+const mm = (__listeners["chart:mousemove"] || [])[0];
+const tip = document.getElementById("tooltip");
+const s = DATA[0];
+
+function hoverRequest(rn) {
+  const r = s._view.find(x => x.rn === rn);
+  assert(r, "fixture has request " + rn);
+  tip.innerHTML = ""; tip.style.display = "none";
+  mm({ clientX: mapX(r.t), clientY: mapY(r.resp) });
+  assert(tip.style.display === "block", "req " + rn + ": tooltip shown");
+  return tip.innerHTML;
+}
+
+// The outlier: 9k uncached + 1k cached = 10k prompt, only 10% cached, and 20x
+// the 500-token median context — every clause of "why was this slow".
+const out = hoverRequest(10);
+assert(out.indexOf("Input: 10.0k tok") >= 0, "prompt = uncached + cached = 10k: " + out);
+assert(out.indexOf("cached: 1.0k") >= 0, "cached input shown: " + out);
+assert(out.indexOf("(10.0%)") >= 0, "cached share shown: " + out);
+assert(out.indexOf("uncached: 9.0k") >= 0, "uncached input shown: " + out);
+assert(out.indexOf("Output: 2.5k tok") >= 0, "output shown: " + out);
+assert(out.indexOf("20.0x median ctx") >= 0, "context vs the series median shown: " + out);
+// The identity and latency lines it already carried must survive.
+assert(out.indexOf("series 1, req 10") >= 0, "identity kept: " + out);
+assert(out.indexOf("Response: 40000.0 ms") >= 0, "response time kept: " + out);
+
+// An ordinary request reads as ordinary: 80% cached, 1.0x the median.
+const ord = hoverRequest(3);
+assert(ord.indexOf("Input: 500 tok") >= 0, "ordinary prompt: " + ord);
+assert(ord.indexOf("(80.0%)") >= 0, "ordinary cached share: " + ord);
+assert(ord.indexOf("1.0x median ctx") >= 0, "ordinary ctx vs median: " + ord);
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "hover_tokens_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node request-hover test failed: %v\n%s", err, out)
 	}
 }
