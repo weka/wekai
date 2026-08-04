@@ -217,13 +217,11 @@ func (p *Policy) Stats() map[string][2]int64 { return p.store.stats() }
 // both cache-aware policies so the two report this the same way; each collects
 // its own fracs slice from whatever candidates had a computable prediction
 // (total > 0) during its own query loop, in every branch — not just the one
-// that ends up winning — so the gauges reflect what the fleet looked like for
-// this request, independent of which way the decision went.
+// that ends up winning — so the histograms reflect what the fleet looked like
+// for this request, independent of which way the decision went.
 //
-// A no-op on an empty slice (no candidate had a queryable trie yet) rather
-// than zeroing the gauges: a cold fleet should leave the last real reading
-// visible, not report a coincidental zero indistinguishable from "every
-// candidate scored 0".
+// A no-op on an empty slice (no candidate had a queryable trie yet): nothing
+// happened this request, so there is nothing to Observe.
 func publishPredictionStats(fracs []float64) {
 	if len(fracs) == 0 {
 		return
@@ -238,9 +236,9 @@ func publishPredictionStats(fracs []float64) {
 			min = f
 		}
 	}
-	metrics.CachePredictionAvg.Set(sum / float64(len(fracs)))
-	metrics.CachePredictionMax.Set(max)
-	metrics.CachePredictionMin.Set(min)
+	metrics.CachePredictionAvg.Observe(sum / float64(len(fracs)))
+	metrics.CachePredictionMax.Observe(max)
+	metrics.CachePredictionMin.Observe(min)
 }
 
 // trieStore is the per-backend-trie bookkeeping shared by every cache-aware

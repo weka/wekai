@@ -283,6 +283,10 @@ func TestThresholdPublishesPredictionStats(t *testing.T) {
 		p.AddBackend(b)
 	}
 
+	avgSumBefore, avgCountBefore := histogramSumCount(t, metrics.CachePredictionAvg)
+	maxSumBefore, maxCountBefore := histogramSumCount(t, metrics.CachePredictionMax)
+	minSumBefore, minCountBefore := histogramSumCount(t, metrics.CachePredictionMin)
+
 	u := units(1, 2, 3, 4)
 	p.Commit(bs[0], req(u))           // full match: frac 1.0
 	p.Commit(bs[1], req(units(1, 2))) // half match: frac 0.5
@@ -292,13 +296,13 @@ func TestThresholdPublishesPredictionStats(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if avg := testutil.ToFloat64(metrics.CachePredictionAvg); avg != 0.5 {
-		t.Errorf("avg = %v, want 0.5 ((1.0+0.5+0.0)/3)", avg)
+	if sum, count := histogramSumCount(t, metrics.CachePredictionAvg); count != avgCountBefore+1 || sum != avgSumBefore+0.5 {
+		t.Errorf("avg histogram: sum=%v count=%v, want sum=%v count=%v ((1.0+0.5+0.0)/3)", sum, count, avgSumBefore+0.5, avgCountBefore+1)
 	}
-	if max := testutil.ToFloat64(metrics.CachePredictionMax); max != 1.0 {
-		t.Errorf("max = %v, want 1.0", max)
+	if sum, count := histogramSumCount(t, metrics.CachePredictionMax); count != maxCountBefore+1 || sum != maxSumBefore+1.0 {
+		t.Errorf("max histogram: sum=%v count=%v, want sum=%v count=%v", sum, count, maxSumBefore+1.0, maxCountBefore+1)
 	}
-	if min := testutil.ToFloat64(metrics.CachePredictionMin); min != 0.0 {
-		t.Errorf("min = %v, want 0.0", min)
+	if sum, count := histogramSumCount(t, metrics.CachePredictionMin); count != minCountBefore+1 || sum != minSumBefore+0.0 {
+		t.Errorf("min histogram: sum=%v count=%v, want sum=%v count=%v", sum, count, minSumBefore+0.0, minCountBefore+1)
 	}
 }
