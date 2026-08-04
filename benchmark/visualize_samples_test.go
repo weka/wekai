@@ -185,6 +185,56 @@ assert(adtAt(adt, 59999).v === 100, "holds until next sample");
 assert(adtAt(adt, 60001).v === 200 && adtAt(adt, 60001).s === 2, "latest at-or-before");
 assert(adtAt(adt, 1e12).v === 300, "after last => last");
 assert(fmtTokens(1234567) === "1.2M" && fmtTokens(999) === "999", "fmtTokens");
+// adtWindow / adtWindowMax: the active-dataset band is re-framed by zoom, so
+// the scale and the "last dataset size" label must come from the window, not
+// the whole run.
+assert(adtWindow(null, 0, 1e9).length === 0 && adtWindow([], 0, 1e9).length === 0, "empty adt => no points");
+{
+  const all = adtWindow(adt, 0, 1e9);
+  assert(all.length === 3 && adtWindowMax(all) === 300, "full range keeps every sample, max 300");
+}
+{
+  // Window strictly inside the run: the sample at-or-before tMin carries in,
+  // so the line starts at the level actually in force at tMin.
+  const w = adtWindow(adt, 70000, 130000);
+  assert(w.length === 2, "carry-in + in-window sample, got " + w.length);
+  assert(w[0].t === 60000 && w[0].v === 200, "carry-in is the last sample at/before tMin");
+  assert(w[1].v === 300, "in-window sample follows");
+  assert(adtWindowMax(w) === 300, "window max is 300, not the run max");
+}
+{
+  // A window entirely between two samples still describes a level.
+  const w = adtWindow(adt, 70000, 90000);
+  assert(w.length === 1 && w[0].v === 200, "gap window carries the standing level");
+  assert(adtWindowMax(w) === 200, "gap window scale is the carried level");
+}
+{
+  // A window that ends before the peak must NOT be scaled by the peak --
+  // this is the reported bug: zooming early flattened the line against 300.
+  const w = adtWindow(adt, 0, 60000);
+  assert(w.length === 2 && adtWindowMax(w) === 200, "early window scale is 200, got " + adtWindowMax(w));
+  assert(w[w.length - 1].v === 200, "last-in-window is 200, not the run's final 300");
+}
+assert(adtWindow(adt, -1e9, -1000).length === 0, "window entirely before the run => no points");
+
+// adtWindowRange: BOTH ends come from the window. A 0-anchored axis renders a
+// narrow window (a level that moved 200 -> 300) as a flat line glued to the
+// band top; anchoring at the window minimum spends the band on the variation.
+assert(adtWindowRange([]) === null && adtWindowRange([[]]) === null, "no points => no range");
+{
+  const r = adtWindowRange([adtWindow(adt, 0, 1e9)]);
+  assert(r.lo === 100 && r.hi === 300, "full range is 100-300, got " + JSON.stringify(r));
+}
+{
+  const r = adtWindowRange([adtWindow(adt, 70000, 130000)]);
+  assert(r.lo === 200 && r.hi === 300, "zoomed range floor lifts to 200, got " + JSON.stringify(r));
+}
+{
+  // Shared across bands so arms stay comparable to each other.
+  const other = [{t: 0, v: 50, s: 1}, {t: 60000, v: 900, s: 2}];
+  const r = adtWindowRange([adtWindow(adt, 0, 1e9), adtWindow(other, 0, 1e9)]);
+  assert(r.lo === 50 && r.hi === 900, "range spans every band, got " + JSON.stringify(r));
+}
 
 // Absolute band scaling: the max is shared ACROSS series in a report (a
 // 50k-peak series next to a 1M-peak series must NOT be per-series
@@ -657,6 +707,121 @@ func TestGenerateVisualizationMergedCarriesSamples(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"mix":`) {
 		t.Errorf("merged report missing cache-mix overlay data")
+	}
+}
+
+// TestActiveDatasetReframesOnZoomJS pins the fix for a band that described the
+// whole run regardless of zoom: the active-dataset line was scaled against the
+// run's peak and labelled with the run's final sample, so zooming into a
+// stretch where the dataset was small flattened the line onto the band floor
+// and reported a size that was never in force there.
+//
+// benchFixtureData samples the dataset at t = 0/60/120s with 4k/8k/12k tokens.
+func TestActiveDatasetReframesOnZoomJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS active-dataset test skipped")
+	}
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	rec, smp := benchFixtureData("adtzoom", base)
+	writeMixedJSONL(t, dir, "a", rec, smp)
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+document.getElementById("showCacheMix").checked = true;
+const band = () => cacheMixLayout().bands[0];
+
+// Whole run: scale spans the run and the last sample is the final one.
+viewTMin = globalTMin; viewTMax = globalTMax;
+let L = cacheMixLayout();
+assert(band().adtRange.lo === 4000 && band().adtRange.hi === 12000,
+  "full view scale is 4000-12000, got " + JSON.stringify(band().adtRange));
+let pts = band().adtPts;
+assert(pts[pts.length - 1].v === 12000, "full view last dataset size is 12000");
+
+// Zoom to the first minute: the 12k peak is outside the view, so the scale,
+// its floor, and the reported size all drop to what the window holds.
+viewTMin = globalTMin; viewTMax = globalTMin + 60000;
+L = cacheMixLayout();
+assert(band().adtRange.lo === 4000 && band().adtRange.hi === 8000,
+  "zoomed scale re-frames to 4000-8000, got " + JSON.stringify(band().adtRange));
+pts = band().adtPts;
+assert(pts[pts.length - 1].v === 8000, "zoomed last dataset size is 8000, got " + pts[pts.length - 1].v);
+assert(pts[0].v === 4000, "zoomed window starts at the 4000 sample");
+
+// The band's full height is spent on the window: its extremes land on the
+// band edges (modulo the 2px inset), NOT squashed against a 0-anchored top.
+{
+  const b = band();
+  const yLo = adtY(4000, b.adtRange, b.yTop, b.bandH);
+  const yHi = adtY(8000, b.adtRange, b.yTop, b.bandH);
+  assert(Math.abs(yLo - (b.yTop + b.bandH - 2)) < 0.01, "window min sits at the band floor, got " + yLo);
+  assert(Math.abs(yHi - (b.yTop + 2)) < 0.01, "window max sits at the band top, got " + yHi);
+  // Against the old 0-anchored axis both would have crowded the upper third.
+  assert(yLo - yHi > b.bandH * 0.8, "the window spans nearly the whole band");
+}
+
+// A window falling between two samples still describes the standing level
+// (carry-in), rather than emptying the band. A flat range draws mid-band
+// instead of dividing by zero.
+viewTMin = globalTMin + 70000; viewTMax = globalTMin + 90000;
+L = cacheMixLayout();
+pts = band().adtPts;
+assert(pts.length === 1 && pts[0].v === 8000, "gap window carries the standing 8000 level");
+assert(band().adtRange.lo === 8000 && band().adtRange.hi === 8000, "gap window range is flat at the carried level");
+{
+  const b = band();
+  const y = adtY(8000, b.adtRange, b.yTop, b.bandH);
+  assert(Math.abs(y - (b.yTop + b.bandH / 2)) < 0.01, "flat range draws mid-band, got " + y);
+  assert(isFinite(y), "flat range must not divide by zero");
+}
+
+// Bands are scaled INDEPENDENTLY: an arm sitting at a different level must
+// still spend its full band on its own variation, not a slice of the union.
+viewTMin = globalTMin; viewTMax = globalTMax;
+{
+  const L2 = cacheMixLayout();
+  L2.bands.forEach(b => {
+    const vs = b.adtPts.map(p => p.v);
+    assert(b.adtRange.lo === Math.min.apply(null, vs) && b.adtRange.hi === Math.max.apply(null, vs),
+      b.s.name + ": range comes from its OWN points, got " + JSON.stringify(b.adtRange));
+    const ys = b.adtPts.map(p => adtY(p.v, b.adtRange, b.yTop, b.bandH));
+    const spread = Math.max.apply(null, ys) - Math.min.apply(null, ys);
+    assert(spread > b.bandH * 0.9, b.s.name + ": line spans its full band, got " + spread + "/" + b.bandH);
+  });
+}
+
+// The whole thing still renders at every zoom without throwing.
+[[globalTMin, globalTMax], [globalTMin, globalTMin + 60000], [globalTMin + 70000, globalTMin + 90000]].forEach(([a, c]) => {
+  viewTMin = a; viewTMax = c;
+  draw();
+});
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "adt_zoom_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node active-dataset test failed: %v\n%s", err, out)
 	}
 }
 

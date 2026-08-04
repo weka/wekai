@@ -1127,6 +1127,52 @@ function adtAt(adt, t) {
   return found;
 }
 
+// adtWindow returns the active-dataset samples that describe [tMin, tMax]:
+// every sample inside the window, PLUS the last one at or before tMin. That
+// carry-in point is what makes a zoomed band correct — the dataset size is a
+// level that persists between samples, so a window whose first sample lands
+// well inside it (or which contains no sample at all) would otherwise start
+// from the wrong value, or render nothing. The carry-in keeps its real t;
+// callers clamp x to the band edge when drawing.
+function adtWindow(adt, tMin, tMax) {
+  if (!adt || !adt.length) return [];
+  const out = [];
+  let carry = null;
+  for (let i = 0; i < adt.length; i++) {
+    const p = adt[i];
+    if (p.t < tMin) { carry = p; continue; }
+    if (p.t > tMax) break;
+    out.push(p);
+  }
+  if (carry) out.unshift(carry);
+  return out;
+}
+
+// adtWindowMax is the largest dataset size observed over adtWindow's points.
+function adtWindowMax(pts) {
+  let mx = 0;
+  (pts || []).forEach(p => { if (p.v > mx) mx = p.v; });
+  return mx;
+}
+
+// adtWindowRange is the [min, max] the active-dataset line is drawn against —
+// BOTH ends taken from the window, which is what makes a zoom legible. The
+// dataset is a slowly-growing level, so over a narrow window it might move
+// 33.2M -> 35.3M: against a 0-anchored axis that is a flat trace glued to the
+// band top, saying nothing about the shape the zoom was meant to reveal.
+// Anchoring at the window minimum spends the whole band on the variation
+// actually present. Over the full run the minimum is near 0 anyway, so the
+// familiar 0-to-peak reading is unchanged. null when there is nothing to draw.
+function adtWindowRange(ptsPerBand) {
+  let lo = Infinity, hi = -Infinity;
+  (ptsPerBand || []).forEach(pts => (pts || []).forEach(p => {
+    if (p.v < lo) lo = p.v;
+    if (p.v > hi) hi = p.v;
+  }));
+  if (!isFinite(lo) || !isFinite(hi)) return null;
+  return { lo, hi };
+}
+
 // mixTotalMax returns the maximum per-interval TOTAL ingested delta
 // (compute+local+external) across every series in the report — the single
 // shared scale for all bands, deliberately NOT per-series: a series peaking
@@ -1261,17 +1307,40 @@ function cacheMixLayout() {
     bandH = Math.max(24, Math.floor(plotH * 0.6 / bands.length));
   }
   bands.forEach((b, bi) => { b.yTop = margin.top + bi * bandH; b.bandH = bandH; });
-  let adtMax = 0;
-  bands.forEach(b => (b.s.adt || []).forEach(p => { if (p.v > adtMax) adtMax = p.v; }));
-  return { bands, adtMax };
+  // Active-dataset scale is re-framed to the CURRENT view, not the whole run,
+  // and stays shared across bands so series remain comparable to each other
+  // within that view. Each band caches its own windowed points so drawCacheMix
+  // and the label don't re-walk the samples.
+  // Each band gets its OWN window range. Unlike the cache-mix stack (which
+  // shares MIX_TOTAL_MAX so a quiet arm renders visibly quiet), the bands are
+  // stacked rows with no common axis line drawn between them — you can't read
+  // relative height across them by eye anyway, so a shared scale bought no
+  // comparability while costing every band most of its height: two arms whose
+  // datasets sit at different levels each get squeezed into their own slice of
+  // the union. Per-band, each line spends the full band on its own variation,
+  // and the printed "scale lo-hi" carries the absolute levels.
+  bands.forEach(b => {
+    b.adtPts = adtWindow(b.s.adt, viewTMin, viewTMax);
+    b.adtRange = adtWindowRange([b.adtPts]);
+  });
+  return { bands };
+}
+
+// adtY maps a dataset size onto its band. A 2px inset keeps the extremes off
+// the band border, and a flat window (lo === hi, e.g. a single carried-in
+// sample) draws down the middle rather than dividing by zero.
+function adtY(v, range, yTop, bandH) {
+  const inset = 2;
+  const h = Math.max(bandH - inset * 2, 1);
+  if (!range || range.hi <= range.lo) return yTop + bandH / 2;
+  const frac = (v - range.lo) / (range.hi - range.lo);
+  return yTop + inset + (1 - Math.min(Math.max(frac, 0), 1)) * h;
 }
 
 function drawCacheMix() {
   const layout = cacheMixLayout();
   if (!layout) return;
-  const adtMax = layout.adtMax;
-
-  layout.bands.forEach(({ s, yTop, bandH }) => {
+  layout.bands.forEach(({ s, yTop, bandH, adtPts, adtRange }) => {
     // Solid-black backdrop, band-area only: fills pop against it, and
     // unfilled (black) band space still reads as "low ingest".
     ctx.fillStyle = "#000";
@@ -1303,19 +1372,26 @@ function drawCacheMix() {
     });
     ctx.globalAlpha = 1;
 
-    // Active-dataset line: 0 at band bottom, shared adtMax at band top.
-    // Thin off-white — the muted fills leave it plenty of contrast.
-    if (adtMax > 0 && s.adt && s.adt.length > 1) {
+    // Active-dataset line, drawn against this band's own windowed range: the
+    // window minimum at the band floor, its maximum at the band top. Only the
+    // windowed points are drawn, and x is clamped to the band so the carry-in
+    // sample (which sits before viewTMin) anchors the line at the left edge
+    // instead of painting across the y-axis margin.
+    if (adtRange && adtPts && adtPts.length) {
       ctx.strokeStyle = ADT_LINE_COLOR;
       ctx.lineWidth = 1;
       ctx.globalAlpha = 0.85;
       ctx.beginPath();
       let started = false;
-      s.adt.forEach(p => {
-        const x = mapX(p.t);
-        const y = yTop + bandH - (p.v / adtMax) * bandH;
+      adtPts.forEach(p => {
+        const x = Math.min(Math.max(mapX(p.t), margin.left), margin.left + plotW);
+        const y = adtY(p.v, adtRange, yTop, bandH);
         if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       });
+      // A single windowed sample is a flat level across the view, not a dot.
+      if (adtPts.length === 1) {
+        ctx.lineTo(margin.left + plotW, adtY(adtPts[0].v, adtRange, yTop, bandH));
+      }
       ctx.stroke();
       ctx.globalAlpha = 1;
     }
@@ -1329,12 +1405,15 @@ function drawCacheMix() {
     ctx.textBaseline = "top";
     ctx.fillStyle = "#C79FF1"; // purple-accented label per brand guidance
     ctx.fillText(s.name + " cache mix (peak " + fmtTokens(MIX_TOTAL_MAX) + " tok/min)", margin.left + 4, yTop + 3);
-    if (s.adt && s.adt.length) {
-      const last = s.adt[s.adt.length - 1];
+    // Label reports the LAST dataset size within the view and the view's own
+    // scale — both re-framed by zoom, so the band always describes what is
+    // actually on screen rather than the end state of the whole run.
+    if (adtPts && adtPts.length) {
+      const last = adtPts[adtPts.length - 1];
       ctx.fillStyle = ADT_LINE_COLOR;
       ctx.textAlign = "right";
-      ctx.fillText("active dataset (tokens): " + fmtTokens(last.v) +
-        " | " + last.s + " series | scale 0-" + fmtTokens(adtMax),
+      ctx.fillText("last dataset size (tokens): " + fmtTokens(last.v) +
+        " | " + last.s + " series | scale " + fmtTokens(adtRange.lo) + "-" + fmtTokens(adtRange.hi),
         margin.left + plotW - 4, yTop + 3);
       ctx.textAlign = "left";
     }
