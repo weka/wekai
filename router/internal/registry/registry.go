@@ -42,6 +42,37 @@ func (s *Snapshot) Available() []*Backend {
 	return out
 }
 
+// LoadStats summarizes NormalizedLoad across available backends, for the
+// router_worker_load_{avg,max,min} gauges. Computed over Available() rather
+// than every registered backend, for the same reason the spill guard in
+// policy/cache does: an unhealthy or draining backend can be sitting on a
+// large stale in-flight count, and folding it in would make the fleet look
+// permanently imbalanced regardless of how the healthy set is actually doing.
+//
+// n is the number of backends the stats were computed over; callers should
+// treat avg/max/min as meaningless when n == 0 rather than plot a
+// coincidental zero.
+func (s *Snapshot) LoadStats() (avg, max, min float64, n int) {
+	avail := s.Available()
+	if len(avail) == 0 {
+		return 0, 0, 0, 0
+	}
+	max = avail[0].NormalizedLoad()
+	min = max
+	sum := 0.0
+	for _, b := range avail {
+		l := b.NormalizedLoad()
+		sum += l
+		if l > max {
+			max = l
+		}
+		if l < min {
+			min = l
+		}
+	}
+	return sum / float64(len(avail)), max, min, len(avail)
+}
+
 // Registry is the single source of truth for backend membership.
 type Registry struct {
 	clk clock.Clock

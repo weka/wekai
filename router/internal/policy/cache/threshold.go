@@ -91,6 +91,7 @@ func (p *ThresholdPolicy) Select(ctx context.Context, cands []*registry.Backend,
 	// No routable prefix: decline rather than guess (CU-11).
 	if len(rr.Units) == 0 {
 		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "no_units").Inc()
+		metrics.RouteDecisions.WithLabelValues("load").Inc()
 		return p.fallback.Select(ctx, cands, rr)
 	}
 
@@ -111,16 +112,24 @@ func (p *ThresholdPolicy) Select(ctx context.Context, cands []*registry.Backend,
 	case 0:
 		// A completely new prompt: no affinity signal at all, defer to load.
 		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "no_candidates").Inc()
+		metrics.RouteDecisions.WithLabelValues("load").Inc()
 		return p.fallback.Select(ctx, cands, rr)
 	case 1:
 		if hot[0].Inflight() < p.cfg.MaxPending {
+			metrics.RouteDecisions.WithLabelValues("cache").Inc()
 			return hot[0], nil
 		}
 		// The lone candidate is too busy: ignore cache for this request
 		// entirely rather than pile more work onto it.
 		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "pending_exceeded").Inc()
+		metrics.RouteDecisions.WithLabelValues("load").Inc()
 		return p.fallback.Select(ctx, cands, rr)
 	default:
+		// Still a cache decision: membership in `hot` is what cache affinity
+		// decided, and least-outstanding here is only the tie-break among
+		// those candidates, not a fallback (no PolicyFallbacks — this is the
+		// designed multi-candidate branch, not a decline).
+		metrics.RouteDecisions.WithLabelValues("cache").Inc()
 		return policy.LeastOutstanding{}.Select(ctx, hot, rr)
 	}
 }

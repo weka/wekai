@@ -187,6 +187,28 @@ func run(args []string) error {
 		}()
 	}
 
+	// Publish fleet-wide load stats on the health interval, regardless of
+	// policy: router_worker_load_{avg,max,min} answer "how balanced is the
+	// fleet right now" without a PromQL aggregation over per-backend series.
+	go func() {
+		t := clk.NewTicker(cfg.HealthInterval.D())
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C():
+				avg, max, min, n := rtr.Snapshot().LoadStats()
+				if n == 0 {
+					continue
+				}
+				metrics.WorkerLoadAvg.Set(avg)
+				metrics.WorkerLoadMax.Set(max)
+				metrics.WorkerLoadMin.Set(min)
+			}
+		}
+	}()
+
 	// Metrics on a separate listener; never reachable on the inference mux
 	// (GW-13).
 	metricsSrv := &http.Server{

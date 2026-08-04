@@ -177,6 +177,7 @@ func (p *Proxy) Serve(
 		}
 
 		metrics.PolicySelections.WithLabelValues(sel.Name(), b.URL).Inc()
+		recordRouteDecision(sel)
 		res.Backend = b
 		res.Attempts++
 
@@ -203,6 +204,29 @@ func (p *Proxy) Serve(
 		res.Err = errNoBackend
 	}
 	return res
+}
+
+// recordRouteDecision classifies a successful selection into
+// router_route_decisions_total's "cache" / "load" / "other" enum.
+//
+// A cache-affinity policy (identified structurally, by implementing
+// policy.Committer, rather than by name — the same test gateway.go already
+// uses to wire Commit) is per-request ambiguous: it may return its own
+// affinity pick, or it may internally decline and delegate to a load policy.
+// Only the policy itself knows which happened for a given call, so it
+// self-instruments "cache" or "load" from inside its own Select rather than
+// here. Every other policy's kind is fully determined by its Name(), so this
+// classifies those directly and leaves cache policies alone to avoid double
+// counting.
+func recordRouteDecision(sel Selector) {
+	if _, isCache := sel.(policy.Committer); isCache {
+		return
+	}
+	kind := "load"
+	if sel.Name() == "round-robin" || sel.Name() == "random" {
+		kind = "other"
+	}
+	metrics.RouteDecisions.WithLabelValues(kind).Inc()
 }
 
 type attemptOut struct {
