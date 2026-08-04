@@ -337,3 +337,42 @@ func TestMergeCarriesRunParams(t *testing.T) {
 		t.Error("merged report must carry BOTH arms' concurrency, not one global value")
 	}
 }
+
+// TestRatioTintSpecificity guards a regression the JS tests structurally cannot
+// see: the up/down tint is applied as a CLASS, so a node DOM stub happily
+// reports it present while the rendered page shows grey. Moving the ratio onto
+// its own line introduced `#summaryTable.has-ratios .sum-ratio { color: ... }`
+// (1 id + 2 classes), which out-specified the bare `.sum-ratio.up` (2 classes)
+// and silently killed every tint.
+//
+// So assert on the stylesheet: both tint rules must carry the same
+// id-qualified prefix as the rule that sets the default colour.
+func TestRatioTintSpecificity(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	rec, _ := benchFixtureData("tint", base)
+	writeMixedJSONL(t, dir, "tint", rec, nil)
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(b)
+	for _, want := range []string{
+		"#summaryTable.has-ratios .sum-ratio.up { color: #6BE0A0; }",
+		"#summaryTable.has-ratios .sum-ratio.down { color: #FF8569; }",
+	} {
+		if !strings.Contains(css, want) {
+			t.Errorf("tint rule missing or under-specified; want exactly:\n  %s", want)
+		}
+	}
+	// A bare `.sum-ratio.up { ... }` would lose to the .has-ratios default.
+	for _, bad := range []string{"\n  .sum-ratio.up {", "\n  .sum-ratio.down {"} {
+		if strings.Contains(css, bad) {
+			t.Errorf("found an under-specified tint rule %q — it will be overridden by the .has-ratios colour", strings.TrimSpace(bad))
+		}
+	}
+}

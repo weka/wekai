@@ -442,7 +442,24 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   #summaryTable tbody tr { cursor: pointer; }
   #summaryTable tbody tr:hover td, #summaryTable tbody tr:hover .vcol { background: #1E2429; }
   #summaryTable tbody tr.row-hidden { opacity: 0.32; }
-  #summaryTable td.err-hot { color: #FF6B6B; }
+  #summaryTable .err-hot { color: #FF6B6B; }
+  /* Ratio-to-baseline sits BELOW its value, right-aligned under it, so the
+     value column stays in one straight line under its header — inline, the
+     ratio pushed each value left by its own width and the numbers no longer
+     lined up. The row only exists when there IS a baseline (.has-ratios):
+     without one the spans are empty, and an unconditional reserved line would
+     spend a row of height per variant to show nothing. min-height keeps the
+     baseline's own (empty) row the same height as the rest. */
+  .sum-ratio { display: none; }
+  #summaryTable.has-ratios .sum-ratio { display: block; min-height: 1.05em; line-height: 1.05; color: #8a9096; font-size: 0.8em; }
+  /* Tint by DIRECTION of improvement, not size of number: 284% more tokens is
+     good, 19% of the baseline's TTFT is also good, and fewer errors is good —
+     so err/1k and both TTFTs are "down is better". These must out-specify the
+     .has-ratios rule above (1 id + 2 classes), or its grey wins and the tint
+     silently disappears. */
+  #summaryTable.has-ratios .sum-ratio.up { color: #6BE0A0; }
+  #summaryTable.has-ratios .sum-ratio.down { color: #FF8569; }
+  .sum-baseline { color: #8a9096; font-size: 0.8em; margin-left: 5px; }
   .summary-head { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; }
   .summary-head .legend-dot { flex: 0 0 auto; }
   .controls { margin-bottom: 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
@@ -1035,7 +1052,7 @@ function syncLegendVisuals() {
 
 // --- Summary panel: per-variant totals over the SELECTED timeframe ---
 // One ROW per variant, one column per metric: a report can carry ~10 arms but
-// the metric set is fixed at six, so growth is vertical and the pane scrolls
+// the metric set is fixed, so growth is vertical and the pane scrolls
 // down a stable set of columns rather than sideways past the labels.
 // Everything here honours the current view: the zoom window, the context
 // band, and the in-dataset series selection (via s._view) — so zooming into
@@ -1043,19 +1060,66 @@ function syncLegendVisuals() {
 // and only cell text is rewritten per draw, so a zoom drag never rebuilds DOM.
 // Headers are abbreviated to keep all eight columns inside the pane; each
 // carries the full wording as a hover title.
+// val is the raw number behind the formatted cell, used for the
+// ratio-to-baseline; better says which direction is an improvement, which
+// decides the ratio tint (more tokens is good, more latency is not).
 const SUMMARY_METRICS = [
-  { key: "in",      short: "Input",  label: "Input tokens (prompt = uncached + server-cached)", fmt: st => fmtTokens(st.prompt) },
-  { key: "out",     short: "Output", label: "Output tokens",            fmt: st => fmtTokens(st.outTok) },
-  { key: "reqs",    short: "Reqs",   label: "Completed (non-error) requests", fmt: st => st.ok.toLocaleString() },
-  { key: "inrate",  short: "In/s",   label: "Avg input tokens/s",       fmt: st => fmtTokens(st.prompt / st.spanSec) },
-  { key: "outrate", short: "Out/s",  label: "Avg output tokens/s",      fmt: st => fmtTokens(st.outTok / st.spanSec) },
-  { key: "ttft50",  short: "TTFT50", label: "TTFT p50 over the selected window (non-error requests)", fmt: st => fmtMs(st.ttft50) },
-  { key: "ttft95",  short: "TTFT95", label: "TTFT p95 over the selected window (non-error requests)", fmt: st => fmtMs(st.ttft95) },
-  { key: "err1k",   short: "Err/1k", label: "Errors per 1000 requests",  fmt: st => (st.total ? st.err / st.total * 1000 : 0).toFixed(1) },
+  { key: "in",      short: "Input",  label: "Input tokens (prompt = uncached + server-cached)", better: "up",
+    val: st => st.prompt,               fmt: st => fmtTokens(st.prompt) },
+  { key: "out",     short: "Output", label: "Output tokens", better: "up",
+    val: st => st.outTok,               fmt: st => fmtTokens(st.outTok) },
+  { key: "reqs",    short: "Reqs",   label: "Completed (non-error) requests", better: "up",
+    val: st => st.ok,                   fmt: st => st.ok.toLocaleString() },
+  { key: "inrate",  short: "In/s",   label: "Avg input tokens/s", better: "up",
+    val: st => st.prompt / st.spanSec,  fmt: st => fmtTokens(st.prompt / st.spanSec) },
+  { key: "outrate", short: "Out/s",  label: "Avg output tokens/s", better: "up",
+    val: st => st.outTok / st.spanSec,  fmt: st => fmtTokens(st.outTok / st.spanSec) },
+  { key: "ttft50",  short: "TTFT50", label: "TTFT p50 over the selected window (non-error requests)", better: "down",
+    val: st => st.ttft50,               fmt: st => fmtMs(st.ttft50) },
+  { key: "ttft95",  short: "TTFT95", label: "TTFT p95 over the selected window (non-error requests)", better: "down",
+    val: st => st.ttft95,               fmt: st => fmtMs(st.ttft95) },
+  { key: "err1k",   short: "Err/1k", label: "Errors per 1000 requests", better: "down",
+    val: st => st.total ? st.err / st.total * 1000 : 0,
+    fmt: st => (st.total ? st.err / st.total * 1000 : 0).toFixed(1) },
 ];
-const sumCells = []; // sumCells[seriesIndex][metricIndex] — mirrors the layout
+
+// --- Ratio to the HBM baseline ---
+// These reports almost always compare an offload arm against a no-offload
+// "hbm" control, and the question asked of them is "how much better/worse than
+// hbm?" -- previously answered by dividing two numbers by hand. When the report
+// contains an hbm arm AND at least one other, every other row carries each
+// metric as a percentage of hbm's. classifyAlias already recognises hbm arms
+// (it is what sorts them first), so the naming rule stays in one place.
+const BASELINE_INDEX = (function () {
+  if (DATA.length < 2) return -1;
+  for (let i = 0; i < DATA.length; i++) {
+    if (classifyAlias(getAlias(DATA[i].name)) === "gpu") return i;
+  }
+  return -1;
+})();
+
+// fmtRatio renders v as a percentage of base. "" when there is nothing to
+// compare against -- a zero baseline (no requests in the window, or a metric
+// the baseline never recorded) would otherwise divide to Infinity and read as
+// a real measurement.
+function fmtRatio(v, base) {
+  if (!(base > 0) || !isFinite(v) || v < 0) return "";
+  const pct = (v / base) * 100;
+  if (pct >= 10) return Math.round(pct) + "%";
+  if (pct > 0) return pct.toFixed(1) + "%";
+  return "0%";
+}
+// sumCells[seriesIndex][metricIndex] holds the VALUE span, not the <td>, so a
+// cell's text stays the datum alone; the ratio-to-baseline lives in its own
+// span alongside it.
+const sumCells = [];
+const sumRatios = [];
 const sumRows = [];
 (function buildSummary() {
+  const table = document.getElementById("summaryTable");
+  // Only reserve the second line per cell when there is something to compare
+  // against — see the .has-ratios rule.
+  if (table && BASELINE_INDEX >= 0) table.className = "has-ratios";
   const head = document.getElementById("sumHead");
   const vth = document.createElement("th");
   vth.className = "vcol";
@@ -1082,6 +1146,12 @@ const sumRows = [];
     nameText.textContent = s.name;
     wrap.appendChild(dot);
     wrap.appendChild(nameText);
+    if (i === BASELINE_INDEX) {
+      const chip = document.createElement("span");
+      chip.className = "sum-baseline";
+      chip.textContent = "(baseline)";
+      wrap.appendChild(chip);
+    }
     name.appendChild(wrap);
     // Hover carries the full name plus this arm's recorded workload shape and
     // where its smoothing window came from — the two things you need to know
@@ -1092,11 +1162,18 @@ const sumRows = [];
     bits.push("rolling window: " + (s._winSize || 0) + " reqs (" + s._winConcSource + ")");
     name.title = bits.join("\n");
     tr.appendChild(name);
-    const cells = [];
+    const cells = [], ratios = [];
     SUMMARY_METRICS.forEach(() => {
       const td = document.createElement("td");
+      const val = document.createElement("span");
+      val.className = "sum-val";
+      const ratio = document.createElement("span");
+      ratio.className = "sum-ratio";
+      td.appendChild(val);
+      td.appendChild(ratio);
       tr.appendChild(td);
-      cells.push(td);
+      cells.push(val);
+      ratios.push(ratio);
     });
     // A row IS a variant here, so it carries the same show/hide affordance as
     // the legend entry — with 10 arms the summary is where you're looking.
@@ -1106,6 +1183,7 @@ const sumRows = [];
       draw();
     };
     sumCells.push(cells);
+    sumRatios.push(ratios);
     sumRows.push(tr);
     body.appendChild(tr);
   });
@@ -1114,24 +1192,42 @@ const sumRows = [];
 // renderSummary repaints the panel from the per-series windowStats already
 // computed by updateInfo — no extra pass over the records.
 function renderSummary(perSeries) {
+  const baseStats = BASELINE_INDEX >= 0 ? perSeries[BASELINE_INDEX] : null;
   DATA.forEach((s, si) => {
     const st = perSeries[si];
     SUMMARY_METRICS.forEach((m, mi) => {
-      const td = sumCells[si][mi];
-      td.textContent = st ? m.fmt(st) : "-";
+      // sumCells holds the VALUE span (see buildSummary), not the <td>.
+      const valEl = sumCells[si][mi];
+      valEl.textContent = st ? m.fmt(st) : "-";
+      // Ratio to the hbm baseline, on every row but the baseline's own.
+      const rEl = sumRatios[si][mi];
+      let rText = "";
+      if (baseStats && st && si !== BASELINE_INDEX) {
+        rText = fmtRatio(m.val(st), m.val(baseStats));
+      }
+      rEl.textContent = rText;
+      if (rText) {
+        const ratio = m.val(st) / m.val(baseStats);
+        const good = m.better === "up" ? ratio > 1 : ratio < 1;
+        rEl.className = "sum-ratio " + (ratio === 1 ? "" : (good ? "up" : "down"));
+        rEl.title = m.short + " is " + rText + " of " + DATA[BASELINE_INDEX].name;
+      } else {
+        rEl.className = "sum-ratio";
+        rEl.title = "";
+      }
       // The cached share is what a KV-offload arm actually buys, so it rides
       // along as a hover on the input cell instead of costing a column.
       if (m.key === "in" && st) {
-        td.title = "prompt tokens = " + fmtTokens(st.inTok) + " uncached + " +
+        valEl.title = "prompt tokens = " + fmtTokens(st.inTok) + " uncached + " +
           fmtTokens(st.caTok) + " server-cached" +
           (st.prompt > 0 ? " (" + (st.caTok / st.prompt * 100).toFixed(1) + "% cached)" : "");
       }
       // Percentiles over a thin window are noise — say how many requests back
       // them rather than presenting 3 samples as a p95.
       if ((m.key === "ttft50" || m.key === "ttft95") && st) {
-        td.title = st.ttftN + " non-error requests reported a first token in this window";
+        valEl.title = st.ttftN + " non-error requests reported a first token in this window";
       }
-      if (m.key === "err1k") td.classList.toggle("err-hot", !!st && st.err > 0);
+      if (m.key === "err1k") valEl.classList.toggle("err-hot", !!st && st.err > 0);
     });
     if (sumRows[si]) sumRows[si].classList.toggle("row-hidden", hiddenSeries.has(si));
   });

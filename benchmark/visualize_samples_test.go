@@ -1423,3 +1423,187 @@ assert(document.getElementById("runparams").textContent.indexOf("differ per vari
 `)
 	})
 }
+
+// TestBaselineRatiosJS pins the ratio-to-hbm column behaviour. These reports
+// almost always compare an offload arm against a no-offload "hbm" control, and
+// the question asked of them -- how much better or worse than hbm? -- was
+// previously answered by dividing two numbers by hand.
+//
+// Baseline detection reuses classifyAlias, the same rule that sorts hbm arms
+// first, so the naming convention lives in one place.
+func TestBaselineRatiosJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS baseline-ratio test skipped")
+	}
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+
+	// Two arms whose first->last extent is the SAME 36s -- the rate columns
+	// divide by each arm's own extent, so unequal extents would make the rate
+	// ratio disagree with the volume ratio for reasons unrelated to this
+	// feature. hbm does 4 requests of 500 prompt tokens, weka 12 of the same:
+	// exactly 300%, the figure in the report this was asked for. TTFT is
+	// deliberately inverted (weka faster) so the lower-is-better direction
+	// gets exercised too.
+	arm := func(alias string, n int, ttft float64) []requestDataRecord {
+		model := "dynamic/http://localhost:8000/v1,type=openai_vllm,alias=" + alias
+		var out []requestDataRecord
+		for i := 0; i < n; i++ {
+			st := base.Add(time.Duration(i) * (36 * time.Second / time.Duration(n-1)))
+			out = append(out, requestDataRecord{
+				StartTime: st, EndTime: st.Add(time.Second),
+				TTFT: ttft, ResponseMs: 900, Model: model,
+				SeriesNum: 1, RequestNum: i + 1,
+				InputTokens: 100, CachedTokens: 400, OutputTokens: 50,
+			})
+		}
+		return out
+	}
+
+	dir := t.TempDir()
+	writeMixedJSONL(t, dir, "hbm-c28", arm("hbm-c28", 4, 4000), nil)
+	writeMixedJSONL(t, dir, "weka-c28", arm("weka-c28", 12, 1000), nil)
+
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+// classifyAlias sorts hbm first, so the baseline is row 0 here -- but the
+// index is resolved by classification, not by position.
+assert(BASELINE_INDEX === 0, "hbm arm is the baseline, got index " + BASELINE_INDEX);
+assert(classifyAlias(getAlias(DATA[BASELINE_INDEX].name)) === "gpu", "baseline classifies as an hbm/gpu arm");
+
+const other = 1 - BASELINE_INDEX;
+function ratio(si, key) {
+  const mi = SUMMARY_METRICS.findIndex(m => m.key === key);
+  return sumRatios[si][mi].textContent;
+}
+function value(si, key) {
+  const mi = SUMMARY_METRICS.findIndex(m => m.key === key);
+  return sumCells[si][mi].textContent;
+}
+
+// The baseline row itself carries no ratios -- it IS 100% by definition.
+SUMMARY_METRICS.forEach(m => {
+  assert(ratio(BASELINE_INDEX, m.key) === "", "baseline row shows no ratio for " + m.key);
+});
+
+// 12 requests vs 4, same tokens each, same 40s span => 300% on every volume
+// and rate metric.
+["in", "out", "reqs", "inrate", "outrate"].forEach(k => {
+  assert(ratio(other, k) === "300%", k + " ratio = 300%, got " + ratio(other, k) + " (value " + value(other, k) + ")");
+});
+// Lower-is-better metrics ratio the same way: 1000ms against 4000ms = 25%.
+assert(ratio(other, "ttft50") === "25%", "ttft50 ratio = 25%, got " + ratio(other, "ttft50"));
+
+// Tint follows the DIRECTION of improvement, not the size of the number:
+// 300% more tokens is good, 300% more latency would not be.
+const mIn = SUMMARY_METRICS.findIndex(m => m.key === "in");
+const mT = SUMMARY_METRICS.findIndex(m => m.key === "ttft50");
+assert(sumRatios[other][mIn].className.indexOf("up") >= 0, "more input tokens tints as better");
+assert(sumRatios[other][mT].className.indexOf("up") >= 0, "less latency tints as better, got " + sumRatios[other][mT].className);
+
+// The value text stays the datum alone -- the ratio lives in its own span, so
+// nothing downstream has to parse "3.6B300%".
+assert(value(other, "in") === "6.0k", "value cell holds only the value, got " + value(other, "in"));
+
+// The ratio renders on its own line beneath the value, so the value column
+// stays aligned under its header. The second line is reserved only when a
+// baseline exists, and the (empty) baseline row reserves it too, keeping every
+// row the same height.
+assert(document.getElementById("summaryTable").className.indexOf("has-ratios") >= 0,
+  "table opts into the two-line cell layout, got " + document.getElementById("summaryTable").className);
+
+// Ratios track the selected window like every other figure. The two arms
+// pace differently, so the zoomed ratio is NOT 300% -- compute what the window
+// actually holds and require the cell to agree with it.
+viewTMin = globalTMin; viewTMax = globalTMin + 20000;
+draw();
+const inWin = si => DATA[si].records.filter(r => r.t >= viewTMin && r.t <= viewTMax && !r.err).length;
+const want = Math.round(inWin(other) / inWin(BASELINE_INDEX) * 100) + "%";
+assert(want !== "300%", "the zoomed window really does change the ratio");
+assert(ratio(other, "reqs") === want, "zoomed reqs ratio = " + want + ", got " + ratio(other, "reqs"));
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "baseline_ratio_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node baseline-ratio test failed: %v\n%s", err, out)
+	}
+}
+
+// TestNoBaselineNoRatiosJS: without an hbm arm — or with only one variant —
+// there is nothing to be a percentage OF, and the report must not invent one.
+func TestNoBaselineNoRatiosJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS no-baseline test skipped")
+	}
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+
+	check := func(t *testing.T, dir string) {
+		t.Helper()
+		htmlPath, err := GenerateVisualization(dir, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(htmlPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		html := string(b)
+		s, e := strings.Index(html, "<script>"), strings.Index(html, "</script>")
+		probe := `
+function assert(c, m) { if (!c) { console.error("FAIL: " + m); process.exit(1); } }
+assert(BASELINE_INDEX === -1, "no baseline, got index " + BASELINE_INDEX);
+sumRatios.forEach((row, si) => row.forEach((el, mi) =>
+  assert(el.textContent === "", "no ratio anywhere (row " + si + " col " + mi + " = " + el.textContent + ")")));
+// ...and no reserved second line either: without a baseline that would spend a
+// row of height per variant to display nothing.
+assert(document.getElementById("summaryTable").className.indexOf("has-ratios") < 0,
+  "no baseline => no reserved ratio line, got " + document.getElementById("summaryTable").className);
+console.log("ALL_OK");
+`
+		jsPath := filepath.Join(dir, "nobaseline_test.js")
+		if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+html[s+len("<script>"):e]+"\n"+probe), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "ALL_OK") {
+			t.Fatalf("node no-baseline test failed: %v\n%s", err, out)
+		}
+	}
+
+	t.Run("two arms, neither is hbm", func(t *testing.T) {
+		dir := t.TempDir()
+		for _, a := range []string{"weka-rdma", "dram1t"} {
+			rec, _ := benchFixtureData(a, base)
+			writeMixedJSONL(t, dir, a, rec, nil)
+		}
+		check(t, dir)
+	})
+
+	t.Run("single hbm arm has nothing to compare", func(t *testing.T) {
+		dir := t.TempDir()
+		rec, _ := benchFixtureData("hbm-solo", base)
+		writeMixedJSONL(t, dir, "hbm-solo", rec, nil)
+		check(t, dir)
+	})
+}
