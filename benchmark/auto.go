@@ -1367,6 +1367,18 @@ func runSingleModelBenchmark(
 		cfg.HotSeriesConcurrency = cfg.StartSeries
 	}
 
+	// Header row describing the run, written once ahead of the request rows.
+	// Deliberately emitted HERE rather than where the writer is opened: the
+	// block above clamps and defaults cfg, and the file must record what the
+	// run actually used, not what the caller typed. Readers key off
+	// record_type, so this is additive — older tooling skips it as an unknown
+	// type and reads the request rows exactly as before.
+	if rdw != nil {
+		if err := rdw.writeAny(buildRunParams(cfg, startTime)); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to write run params: %v\n", err)
+		}
+	}
+
 	display := newDisplayState()
 
 	// sendSnap forwards a display snapshot to the orchestrator non-blocking.

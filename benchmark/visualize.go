@@ -148,6 +148,48 @@ type seriesData struct {
 	Records []vizRecord        `json:"records"`
 	Mix     []vizSampleSegment `json:"mix,omitempty"`
 	Adt     []vizAdtPoint      `json:"adt,omitempty"`
+	// Conc is the request concurrency this arm ran at, taken from its
+	// run_params header. 0 for a file written before run_params existed (or a
+	// hill-climber run that never pinned one), in which case the report falls
+	// back to the report-wide CONCURRENCY and then to deriving a window from
+	// the observed series count — exactly the pre-run_params behaviour.
+	Conc int `json:"conc,omitempty"`
+	// Params is the recorded run configuration, rendered in the report so a
+	// reader can see the workload shape without a side file. Omitted entirely
+	// for legacy data.
+	Params *vizRunParams `json:"params,omitempty"`
+}
+
+// vizRunParams is the subset of runParamsRecord the report displays. Kept
+// separate from runParamsRecord so adding a recorded field doesn't silently
+// grow every embedded report by a column nobody asked for.
+type vizRunParams struct {
+	Summary     string `json:"summary"`
+	Concurrency int    `json:"concurrency,omitempty"`
+	HotConc     int    `json:"hot,omitempty"`
+	MaxSeries   int    `json:"maxSeries,omitempty"`
+	StartSeries int    `json:"startSeries,omitempty"`
+	Timeout     string `json:"timeout,omitempty"`
+	Total       int    `json:"total,omitempty"`
+	Dataset     string `json:"dataset,omitempty"`
+	ReplayFile  string `json:"replayFile,omitempty"`
+	RunID       string `json:"runId,omitempty"`
+}
+
+// buildVizRunParams projects a recorded header into its report form.
+func buildVizRunParams(p runParamsRecord) *vizRunParams {
+	return &vizRunParams{
+		Summary:     p.summaryLine(),
+		Concurrency: p.Concurrency,
+		HotConc:     p.HotSeriesConcurrency,
+		MaxSeries:   p.MaxSeries,
+		StartSeries: p.StartSeries,
+		Timeout:     p.Timeout,
+		Total:       p.TotalRequests,
+		Dataset:     p.FromDataset,
+		ReplayFile:  p.RouterReplayFile,
+		RunID:       p.RunID,
+	}
 }
 
 // generateVisualization is the implementation behind GenerateVisualization.
@@ -171,7 +213,7 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 	var allSeries []seriesData
 	for _, f := range files {
 		name := strings.TrimSuffix(filepath.Base(f), ".jsonl")
-		records, samples, err := readJSONLFile(f)
+		records, samples, params, hasParams, err := readJSONLFileWithParams(f)
 		if err != nil {
 			return "", fmt.Errorf("read %s: %w", f, err)
 		}
@@ -212,7 +254,12 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 			})
 		}
 		mix, adt := buildSampleViz(samples)
-		allSeries = append(allSeries, seriesData{Name: name, T0: t0, Records: vr, Mix: mix, Adt: adt})
+		sd := seriesData{Name: name, T0: t0, Records: vr, Mix: mix, Adt: adt}
+		if hasParams {
+			sd.Conc = params.effectiveConcurrency()
+			sd.Params = buildVizRunParams(params)
+		}
+		allSeries = append(allSeries, sd)
 	}
 
 	seriesJSON, err := json.Marshal(allSeries)
@@ -260,20 +307,36 @@ func resolveRecordsAlias(records []requestDataRecord) string {
 	return ""
 }
 
-// readJSONLFile reads a request-data JSONL file, routing lines by their
-// record_type: absent/empty = a request row (legacy files predate the field),
-// "vllm_metrics_sample" = a metrics sample. Unknown record types and
-// malformed lines are skipped — a new record type must never corrupt request
-// parsing (unmarshalling a sample into requestDataRecord would otherwise
-// "succeed" as an all-zero phantom request).
+// readJSONLFile reads a request-data JSONL file, discarding any run-params
+// header. Callers that can make use of the recorded run parameters should use
+// readJSONLFileWithParams instead.
 func readJSONLFile(path string) ([]requestDataRecord, []vllmMetricsSample, error) {
+	records, samples, _, _, err := readJSONLFileWithParams(path)
+	return records, samples, err
+}
+
+// readJSONLFileWithParams reads a request-data JSONL file, routing lines by
+// their record_type: absent/empty = a request row (legacy files predate the
+// field), "vllm_metrics_sample" = a metrics sample, "run_params" = the header
+// describing the run. Unknown record types and malformed lines are skipped — a
+// new record type must never corrupt request parsing (unmarshalling a sample
+// into requestDataRecord would otherwise "succeed" as an all-zero phantom
+// request), which is also what lets a file written by a NEWER wekai stay
+// readable by an older one.
+//
+// hasParams is false for every file written before run_params existed; callers
+// must keep working in that case rather than treating the zero record as a run
+// that was configured with zeroes.
+func readJSONLFileWithParams(path string) ([]requestDataRecord, []vllmMetricsSample, runParamsRecord, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, runParamsRecord{}, false, err
 	}
 	defer f.Close()
 	var records []requestDataRecord
 	var samples []vllmMetricsSample
+	var params runParamsRecord
+	var hasParams bool
 	sc := bufio.NewScanner(f)
 	// 64 MiB cap: reqdata rows embed full prompts; 300k-token contexts exceed 1 MiB.
 	sc.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
@@ -297,9 +360,15 @@ func readJSONLFile(path string) ([]requestDataRecord, []vllmMetricsSample, error
 				continue
 			}
 			samples = append(samples, s)
+		case recordTypeRunParams:
+			// First header wins: a merged per-source JSONL can concatenate
+			// files, and the first one describes the run the rows came from.
+			if p, ok := parseRunParams(sc.Bytes()); ok && !hasParams {
+				params, hasParams = p, true
+			}
 		}
 	}
-	return records, samples, sc.Err()
+	return records, samples, params, hasParams, sc.Err()
 }
 
 // nextVersionedPath returns a path like dir/report.html, dir/report_v2.html, etc.
@@ -419,6 +488,7 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 <div id="header">
 <h1>Benchmark Request Timeline</h1>
 <div class="info" id="info"></div>
+<div class="info" id="runparams"></div>
 <div class="topgrid">
   <div class="panel" id="controlsPanel">
     <div class="panel-title">Controls<span class="spacer"></span><button class="panel-toggle" id="controlsToggle" title="Collapse">&minus;</button></div>
@@ -514,6 +584,19 @@ RAW_DATA.forEach(s => {
 
 const CONCURRENCY = {{.Concurrency}};
 
+// DEFAULT_WINDOW_REQS is the rolling-percentile window used when neither the
+// data nor the caller says what concurrency the run held — 96 requests, i.e.
+// the 3x window of a c28 + 4-hot run, the shape most of these reports have.
+//
+// This replaces deriving the window from the observed series count. That
+// inference was catastrophically wrong for router-replay runs, where series
+// NUMBERS keep climbing as sessions recycle: an 8h replay reached max series
+// num ~1100-1800, so the window came out at 3396 and 5358 requests — a
+// percentile line smoothed over a 35x-too-wide window, silently. A fixed
+// default that is merely approximate beats an inference that is off by orders
+// of magnitude, and recorded run params make it moot for new data.
+const DEFAULT_WINDOW_REQS = 96;
+
 // --- Sorting: gpu first, dram second, weka last, others alphabetically ---
 function getAlias(name) {
   const m = name.match(/alias[_=]([a-zA-Z0-9_-]+)/i);
@@ -593,8 +676,16 @@ function computeDerived(s) {
   });
   const sorted = view.filter(r => !r.err).slice().sort((a, b) => a.t - b.t);
   s._sorted = sorted;
-  const maxSn = sorted.reduce((mx, r) => Math.max(mx, r.sn), 1);
-  const winSize = CONCURRENCY > 0 ? CONCURRENCY * 3 : Math.max(maxSn * 3, 10);
+  // Rolling-percentile window, in requests. Precedence, most trustworthy
+  // first: the concurrency this arm RECORDED in its run_params header, then
+  // the report-wide --concurrency the caller passed, then DEFAULT_WINDOW_REQS.
+  // The per-arm value matters in a merged report whose arms ran at different
+  // concurrency — one global number smooths one arm correctly and the other
+  // wrongly, with nothing on screen saying so.
+  const seriesConc = s.conc > 0 ? s.conc : CONCURRENCY;
+  const winSize = seriesConc > 0 ? seriesConc * 3 : DEFAULT_WINDOW_REQS;
+  s._winConcSource = s.conc > 0 ? "recorded" : (CONCURRENCY > 0 ? "--concurrency" : "default");
+  s._winConc = seriesConc;
   s._winSize = winSize;
   // Plotted lines: rolling-window percentiles. Response = p50 only; TTFT =
   // p50 and p95 (dash pattern encodes the percentile, color the series).
@@ -992,7 +1083,14 @@ const sumRows = [];
     wrap.appendChild(dot);
     wrap.appendChild(nameText);
     name.appendChild(wrap);
-    name.title = s.name;
+    // Hover carries the full name plus this arm's recorded workload shape and
+    // where its smoothing window came from — the two things you need to know
+    // before comparing this row against another.
+    const bits = [s.name];
+    const ps = paramsSummaryFor(s);
+    if (ps) bits.push("params: " + ps);
+    bits.push("rolling window: " + (s._winSize || 0) + " reqs (" + s._winConcSource + ")");
+    name.title = bits.join("\n");
     tr.appendChild(name);
     const cells = [];
     SUMMARY_METRICS.forEach(() => {
@@ -1046,6 +1144,38 @@ function renderSummary(perSeries) {
       : "full run (" + off(globalTMax) + ")";
   }
 }
+
+// --- Recorded run parameters ---
+// Runs written by a wekai that records run_params carry their own workload
+// shape (concurrency, hot pool, series, timeout, source). Reports built from
+// older data simply have none, and everything below degrades to the previous
+// behaviour rather than inventing values.
+function paramsSummaryFor(s) {
+  return s.params && s.params.summary ? s.params.summary : "";
+}
+(function renderRunParams() {
+  const el = document.getElementById("runparams");
+  if (!el) return;
+  const summaries = DATA.map(paramsSummaryFor);
+  const withParams = summaries.filter(x => x);
+  if (!withParams.length) {
+    // Nothing recorded: spend no vertical space saying so. The line would
+    // carry no information beyond its own absence, and the chart wants the
+    // pixels. Provenance isn't lost — every summary row's hover still states
+    // the window size and where it came from.
+    el.style.display = "none";
+    return;
+  }
+  const distinct = Array.from(new Set(withParams));
+  if (distinct.length === 1 && withParams.length === DATA.length) {
+    el.textContent = "run params: " + distinct[0];
+  } else {
+    // Arms that don't share a workload shape aren't directly comparable; say
+    // it here rather than letting the reader assume they are.
+    el.textContent = "run params differ per variant (" + withParams.length + "/" + DATA.length +
+      " recorded) — hover a summary row";
+  }
+})();
 
 // Panel collapse: hand the panel's vertical space back to the chart. resize()
 // measures #header, so hiding a body immediately grows the canvas.

@@ -85,7 +85,7 @@ type BenchmarkAutoOptions struct {
 
 // BenchmarkVisualizeOptions contains options for the benchmark visualize subcommand
 type BenchmarkVisualizeOptions struct {
-	Concurrency int    `long:"concurrency" description:"Concurrency used during benchmark (for moving average window size = concurrency*3)" default:"0"`
+	Concurrency int    `long:"concurrency" description:"Override the concurrency used for the moving-average window (window = concurrency*3). Normally unnecessary: runs record their own concurrency in the reqdata JSONL and each arm is sized from its own. Use only for data recorded before run params were saved, or to force a different smoothing window." default:"0"`
 	MaxElapsed  string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
 	Args        struct {
 		Dir string `positional-arg-name:"directory" description:"Directory containing .jsonl request data files" required:"yes"`
@@ -96,7 +96,7 @@ type BenchmarkVisualizeOptions struct {
 type BenchmarkVisualizeMergeOptions struct {
 	All         bool   `long:"all" description:"Treat the first argument as a parent directory and include all subdirectories"`
 	Output      string `long:"output" short:"o" description:"Output directory for merged results (default: auto-generated next to input)"`
-	Concurrency int    `long:"concurrency" description:"Concurrency used during benchmark (for moving average window size = concurrency*3)" default:"0"`
+	Concurrency int    `long:"concurrency" description:"Override the concurrency used for the moving-average window (window = concurrency*3). Normally unnecessary: runs record their own concurrency in the reqdata JSONL and each arm is sized from its own. Use only for data recorded before run params were saved, or to force a different smoothing window." default:"0"`
 	Labels      string `long:"labels" description:"Comma-separated labels for each input directory, in positional order (overrides auto-detected model aliases / directory names). Count must exactly match the number of directories (post --all expansion)."`
 	MaxElapsed  string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
 	Args        struct {

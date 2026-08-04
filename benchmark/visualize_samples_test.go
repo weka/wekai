@@ -1255,3 +1255,171 @@ console.log("ALL_OK");
 		t.Fatalf("node drag-zoom test failed: %v\n%s", err, out)
 	}
 }
+
+// TestRollingWindowPrecedenceJS pins where the rolling-percentile window size
+// comes from, most trustworthy first: the concurrency each arm RECORDED in its
+// run_params header, then the report-wide --concurrency the caller passed, then
+// a guess from the observed series count.
+//
+// The per-arm step is the point of recording params at all. A merged report
+// whose arms ran at different concurrency previously got one global number,
+// which smooths one arm correctly and the other wrongly with nothing on screen
+// saying so -- and that number had to be typed on the command line, where
+// forgetting it silently fell through to the guess.
+func TestRollingWindowPrecedenceJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS window-precedence test skipped")
+	}
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+
+	// armA records conc 28 + hot 4 => 32; armB records nothing (legacy).
+	writeArm := func(t *testing.T, dir, name string, params *AutoBenchmarkConfig) {
+		t.Helper()
+		rec, smp := benchFixtureData(name, base)
+		if params == nil {
+			writeMixedJSONL(t, dir, name, rec, smp)
+			return
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Create(filepath.Join(dir, name+".jsonl"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		enc := json.NewEncoder(f)
+		if err := enc.Encode(buildRunParams(*params, base)); err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range rec {
+			if err := enc.Encode(r); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, s := range smp {
+			if err := enc.Encode(s); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.Close()
+	}
+
+	run := func(t *testing.T, dir string, flagConc int, probe string) {
+		t.Helper()
+		htmlPath, err := GenerateVisualization(dir, flagConc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(htmlPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		html := string(b)
+		start := strings.Index(html, "<script>")
+		end := strings.Index(html, "</script>")
+		if start < 0 || end < 0 {
+			t.Fatal("script block not found")
+		}
+		script := html[start+len("<script>") : end]
+		jsPath := filepath.Join(dir, "window_test.js")
+		full := reportDOMStub + "\n" + script + "\n" +
+			"function assert(c,m){if(!c){console.error(\"FAIL: \"+m);process.exit(1);}}\n" +
+			probe + "\nconsole.log(\"ALL_OK\");\n"
+		if err := os.WriteFile(jsPath, []byte(full), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "ALL_OK") {
+			t.Fatalf("node window-precedence test failed: %v\n%s", err, out)
+		}
+	}
+
+	t.Run("recorded params win over the flag", func(t *testing.T) {
+		dir := t.TempDir()
+		writeArm(t, dir, "recorded", &AutoBenchmarkConfig{Concurrency: 28, HotSeriesConcurrency: 4, StartSeries: 512, MaxSeries: 512})
+		// A deliberately WRONG --concurrency: the data knows better.
+		run(t, dir, 7, `
+const s = DATA[0];
+assert(s.conc === 32, "recorded conc 28+hot 4 = 32, got " + s.conc);
+assert(s._winConc === 32, "window uses the recorded value, got " + s._winConc);
+assert(s._winSize === 96, "window = 32*3 = 96, got " + s._winSize);
+assert(s._winConcSource === "recorded", "source = recorded, got " + s._winConcSource);
+assert(document.getElementById("runparams").textContent.indexOf("conc=28") >= 0,
+  "header shows the recorded params, got " + document.getElementById("runparams").textContent);
+`)
+	})
+
+	t.Run("flag used when nothing recorded", func(t *testing.T) {
+		dir := t.TempDir()
+		writeArm(t, dir, "legacy", nil)
+		run(t, dir, 7, `
+const s = DATA[0];
+assert(!s.conc, "legacy arm carries no recorded conc, got " + s.conc);
+assert(s._winSize === 21, "window falls back to --concurrency 7*3 = 21, got " + s._winSize);
+assert(s._winConcSource === "--concurrency", "source = --concurrency, got " + s._winConcSource);
+// Nothing recorded => the line is hidden entirely rather than spending a
+// row of vertical space to say so; the per-row hover still carries provenance.
+assert(document.getElementById("runparams").style.display === "none",
+  "params line hidden when nothing was recorded, got " + document.getElementById("runparams").style.display);
+assert(!document.getElementById("runparams").textContent, "and carries no text");
+`)
+	})
+
+	t.Run("default survives huge series numbers", func(t *testing.T) {
+		// The case that motivated dropping the inference: a replay-shaped run
+		// whose series numbers climb far past the real in-flight concurrency.
+		dir := t.TempDir()
+		base2 := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+		var rec []requestDataRecord
+		for i := 0; i < 40; i++ {
+			st := base2.Add(time.Duration(i) * time.Second)
+			rec = append(rec, requestDataRecord{
+				StartTime: st, EndTime: st.Add(time.Second), TTFT: 150, ResponseMs: 900,
+				Model:     "dynamic/http://localhost:8000/v1,type=openai_vllm,alias=bigsn",
+				SeriesNum: 1000 + i*40, RequestNum: i + 1,
+				InputTokens: 100, CachedTokens: 400, OutputTokens: 50,
+			})
+		}
+		writeMixedJSONL(t, dir, "bigsn", rec, nil)
+		run(t, dir, 0, `
+const s = DATA[0];
+const maxSn = s.records.reduce((m, r) => Math.max(m, r.sn), 0);
+assert(maxSn >= 2500, "fixture really does have huge series numbers, got " + maxSn);
+assert(s._winSize === 96, "window stays at the default despite sn=" + maxSn + ", got " + s._winSize);
+`)
+	})
+
+	t.Run("fixed default when neither", func(t *testing.T) {
+		dir := t.TempDir()
+		writeArm(t, dir, "legacy", nil)
+		run(t, dir, 0, `
+const s = DATA[0];
+assert(s._winConcSource === "default", "source = default, got " + s._winConcSource);
+assert(DEFAULT_WINDOW_REQS === 96, "default window is 96 reqs, got " + DEFAULT_WINDOW_REQS);
+assert(s._winSize === 96, "window = the fixed default, got " + s._winSize);
+// The old series-count inference is gone: it scaled with series NUMBER, which
+// on a router replay climbs into the thousands as sessions recycle, yielding
+// windows of 3396/5358 requests on real 8h data.
+assert(s._winSize < 200, "window must not scale with series count, got " + s._winSize);
+`)
+	})
+
+	t.Run("per-arm windows in one report", func(t *testing.T) {
+		dir := t.TempDir()
+		writeArm(t, dir, "a_fast", &AutoBenchmarkConfig{Concurrency: 60, StartSeries: 512, MaxSeries: 512})
+		writeArm(t, dir, "b_slow", &AutoBenchmarkConfig{Concurrency: 28, HotSeriesConcurrency: 4, StartSeries: 512, MaxSeries: 512})
+		run(t, dir, 0, `
+const by = {};
+DATA.forEach(s => { by[s.name] = s; });
+const names = Object.keys(by);
+assert(names.length === 2, "two arms, got " + names);
+const fast = DATA.find(s => s.conc === 60), slow = DATA.find(s => s.conc === 32);
+assert(fast && slow, "each arm keeps its OWN recorded concurrency: " + DATA.map(s => s.conc).join(","));
+assert(fast._winSize === 180 && slow._winSize === 96,
+  "windows sized per arm, got " + fast._winSize + " / " + slow._winSize);
+assert(document.getElementById("runparams").textContent.indexOf("differ per variant") >= 0,
+  "header flags that the arms are not the same shape, got " + document.getElementById("runparams").textContent);
+`)
+	})
+}
