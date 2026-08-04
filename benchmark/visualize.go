@@ -2229,15 +2229,28 @@ document.getElementById("resetZoom").addEventListener("click", () => {
 
 // Cache-mix toggle only exists when the dataset actually carries metrics
 // samples; old datasets render exactly as before.
+//
+// It starts ON only for a report of CACHE_MIX_DEFAULT_MAX_SERIES arms or
+// fewer. Every series claims its own band off the top of the plot (up to 60%
+// of plot height, split between them), so past a handful of arms the bands
+// squeeze the latency chart the report is actually named after, and each band
+// gets too thin to read. Small comparisons — the common case — still open with
+// the overlay visible; wide sweeps open on the chart and let you switch it on.
+const CACHE_MIX_DEFAULT_MAX_SERIES = 4;
+function cacheMixDefaultOn(seriesCount) { return seriesCount <= CACHE_MIX_DEFAULT_MAX_SERIES; }
 if (HAS_CACHE_MIX) {
   const lbl = document.createElement("label");
-  lbl.innerHTML = '<input type="checkbox" id="showCacheMix" checked> Show Cache Mix ' +
+  lbl.innerHTML = '<input type="checkbox" id="showCacheMix"> Show Cache Mix ' +
     '<span style="color:' + MIX_COMPUTE_COLOR + '">&#9632;</span>compute ' +
     '<span style="color:' + MIX_LOCAL_COLOR + '">&#9632;</span>local cache ' +
     '<span style="color:' + MIX_EXTERNAL_COLOR + '">&#9632;</span>external KV ' +
     '<span style="color:' + ADT_LINE_COLOR + '">&#8213;</span>active dataset (tokens)';
   document.querySelector(".controls").appendChild(lbl);
-  document.getElementById("showCacheMix").addEventListener("change", draw);
+  const cb = document.getElementById("showCacheMix");
+  // Set the property rather than baking "checked" into the markup: one source
+  // of truth for the default, and it survives the element already existing.
+  cb.checked = cacheMixDefaultOn(DATA.length);
+  cb.addEventListener("change", draw);
 }
 
 // Context-filter modal: the series selector — per-series rows with color

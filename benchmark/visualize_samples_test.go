@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1057,6 +1058,90 @@ console.log("ALL_OK");
 	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
 	if err != nil || !strings.Contains(string(out), "ALL_OK") {
 		t.Fatalf("node axis-row test failed: %v\n%s", err, out)
+	}
+}
+
+// TestCacheMixDefaultBySeriesCountJS pins the overlay's default state to the
+// report's series count. Every sampled series claims its own band off the top
+// of the plot (collectively up to 60% of plot height), so on a wide sweep the
+// bands both squeeze the latency chart and get too thin to read individually.
+// Four arms or fewer -- the common A/B/C/D comparison -- still open with the
+// overlay on; anything wider opens on the chart, one click from the overlay.
+func TestCacheMixDefaultBySeriesCountJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS cache-mix default test skipped")
+	}
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name   string
+		series int
+		wantOn bool
+	}{
+		{"one series", 1, true},
+		{"at the threshold", 4, true},
+		{"one past the threshold", 5, false},
+		{"wide sweep", 10, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for i := 0; i < tc.series; i++ {
+				alias := fmt.Sprintf("arm%02d", i)
+				rec, smp := benchFixtureData(alias, base)
+				writeMixedJSONL(t, dir, alias, rec, smp)
+			}
+			htmlPath, err := GenerateVisualization(dir, 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := os.ReadFile(htmlPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			html := string(b)
+			start := strings.Index(html, "<script>")
+			end := strings.Index(html, "</script>")
+			if start < 0 || end < 0 {
+				t.Fatal("script block not found")
+			}
+			script := html[start+len("<script>") : end]
+
+			// The stub pre-creates #showCacheMix as checked, so a report that
+			// never touched the property would read as "on" -- clear it first
+			// so the assertion can only pass if the report set it itself.
+			probe := fmt.Sprintf(`
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+assert(DATA.length === %d, "fixture has %d series, got " + DATA.length);
+assert(HAS_CACHE_MIX, "fixture carries metrics samples");
+const want = %t;
+assert(document.getElementById("showCacheMix").checked === want,
+  "%d series => overlay default " + want + ", got " + document.getElementById("showCacheMix").checked);
+assert(cacheMixEnabled() === want, "cacheMixEnabled agrees with the checkbox");
+// Whatever the default, the toggle still works in both directions.
+document.getElementById("showCacheMix").checked = !want;
+assert(cacheMixEnabled() === !want, "toggle flips the overlay");
+draw();
+document.getElementById("showCacheMix").checked = want;
+draw();
+console.log("ALL_OK");
+`, tc.series, tc.series, tc.wantOn, tc.series)
+
+			stub := strings.Replace(reportDOMStub,
+				`__el("showCacheMix", { checked: true });`,
+				`__el("showCacheMix", { checked: false });`, 1)
+			if stub == reportDOMStub {
+				t.Fatal("could not neutralise the stub's pre-checked showCacheMix")
+			}
+			jsPath := filepath.Join(dir, "cachemix_default_test.js")
+			if err := os.WriteFile(jsPath, []byte(stub+"\n"+script+"\n"+probe), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+			if err != nil || !strings.Contains(string(out), "ALL_OK") {
+				t.Fatalf("node cache-mix default test failed: %v\n%s", err, out)
+			}
+		})
 	}
 }
 
