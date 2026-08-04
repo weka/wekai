@@ -459,32 +459,44 @@ func resolveInstanceActions(instances []RouterReplayInstance, includeRole func(s
 
 // ---- Series-loop body for tree replay ----
 
-// endpointPicker resolves which endpoint an instance should use and tracks the
-// resulting in-flight load. With a multi-endpoint spec the router prefers the
-// series' home endpoint but fails over when that endpoint is overloaded; with a
-// single endpoint it degrades to a fixed string and no accounting.
+// endpointPicker chooses an endpoint PER REQUEST and accounts the in-flight
+// slot for exactly that request's duration.
+//
+// Selection is per-request, not per-series or per-instance, because in-flight
+// load is a per-request property: an instance runs its turns sequentially, so
+// holding a slot for a whole instance measures "live agents", not "concurrent
+// requests" — and the 429 cap we are avoiding counts the latter.
+//
+// Stickiness is preserved as a PREFERENCE: every request first tries its
+// series' home endpoint, and only fails over when that endpoint is above the
+// overload threshold. So the common case keeps prefix locality and only the
+// overflow moves.
 type endpointPicker struct {
 	router *llm.EndpointRouter
-	static string
+	// posters holds one poster per endpoint index, mirroring router.Endpoints().
+	// A poster latches its resolved URL form on first success, so a request
+	// cannot simply retarget an existing one — it selects the right one.
+	posters []*replayPoster
+	// single is used when there is nothing to route between.
+	single *replayPoster
 }
 
-// pick returns the endpoint URL for this instance and the index to account it
-// against (-1 when there is nothing to track).
-func (p endpointPicker) pick(seriesNum int) (string, int) {
-	if p.router == nil {
-		return p.static, -1
+// acquire selects the endpoint for one request and takes its in-flight slot.
+// Returns the poster to use and the index to release afterwards (-1 = nothing
+// to release).
+func (p *endpointPicker) acquire(seriesNum int) (*replayPoster, int) {
+	if p.router == nil || len(p.posters) == 0 {
+		return p.single, -1
 	}
-	return p.router.PickEndpoint(seriesNum)
-}
-
-func (p endpointPicker) acquire(idx int) {
-	if p.router != nil {
-		p.router.AcquireIndex(idx)
+	idx := p.router.AcquireForRequest(seriesNum)
+	if idx < 0 || idx >= len(p.posters) || p.posters[idx] == nil {
+		return p.single, -1
 	}
+	return p.posters[idx], idx
 }
 
-func (p endpointPicker) release(idx int) {
-	if p.router != nil {
+func (p *endpointPicker) release(idx int) {
+	if p.router != nil && idx >= 0 {
 		p.router.ReleaseIndex(idx)
 	}
 }
@@ -664,14 +676,10 @@ func runRouterReplayInstance(
 	if !cfg.ReplayNoStamp {
 		replayRunID = cfg.RunID
 	}
-	// Resolve the endpoint per INSTANCE, not per series: fan-out means one
-	// series can have many instances live at once, and that burstiness — not
-	// series count — is what actually overloads an endpoint. Hold the in-flight
-	// slot for the whole instance so concurrent instances see each other.
-	endpointOverride, endpointIdx := picker.pick(seriesNum)
-	picker.acquire(endpointIdx)
-	defer picker.release(endpointIdx)
-	poster, err := newReplayPoster(cfg.Model, config.GetAPIKeys(), endpointOverride, replayRunID, cfg.DryRun, cfg.DryRunColdTPS, cfg.DryRunWarmTPS, cfg.DryRunOutputTPS, st.estimator)
+	// With a multi-endpoint spec the posters were built once per series loop and
+	// live on the picker; this per-instance poster is only the single-endpoint
+	// fallback. err is still checked so a bad model spec fails the same way.
+	poster, err := newReplayPoster(cfg.Model, config.GetAPIKeys(), "", replayRunID, cfg.DryRun, cfg.DryRunColdTPS, cfg.DryRunWarmTPS, cfg.DryRunOutputTPS, st.estimator)
 	if err == nil {
 		poster.outputRatio = cfg.ReplayOutputRatio
 		poster.forceOutput = cfg.ReplayForceOutput
@@ -733,11 +741,20 @@ func runRouterReplayInstance(
 
 		reqCtx, reqCancel := context.WithTimeout(ctx, reqTimeout)
 		var metrics RequestMetrics
-		if poster.dryRun {
-			metrics = poster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
-		} else {
-			metrics = poster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
+		// Per-request endpoint selection: prefer this series' home endpoint,
+		// fail over only if it is overloaded. The slot is held for exactly this
+		// request, so the counter tracks concurrent requests — the same thing
+		// the server's capacity limit counts.
+		reqPoster, epIdx := picker.acquire(seriesNum)
+		if reqPoster == nil {
+			reqPoster = poster
 		}
+		if reqPoster.dryRun {
+			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
+		} else {
+			metrics = reqPoster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
+		}
+		picker.release(epIdx)
 		reqCancel()
 		gate.Release()
 

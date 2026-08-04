@@ -164,28 +164,68 @@ func (r *EndpointRouter) hashPick(skipped []int) int {
 // deterministically hash-selected alternative that is not. If every endpoint is
 // overloaded there is nowhere better to go, so it returns home and lets the
 // server queue or reject.
+//
+// This is the read-only form; concurrent callers can all observe the same
+// under-limit endpoint and pile onto it. Prefer AcquireForRequest, which makes
+// the decision and the accounting atomic.
 func (r *EndpointRouter) PickIndex(seriesNum int) int {
+	home := r.HomeIndexForSeries(seriesNum)
+	return r.pickLocked(home, func(i int) bool { return r.overloaded(i) })
+}
+
+// pickLocked walks home -> hash-selected alternatives until isOverloaded says
+// no. Returns home when everything is saturated.
+func (r *EndpointRouter) pickLocked(home int, isOverloaded func(int) bool) int {
 	n := len(r.endpoints)
 	if n == 0 {
 		return -1
 	}
-	home := r.HomeIndexForSeries(seriesNum)
-	if n == 1 || !r.overloaded(home) {
+	if n == 1 || !isOverloaded(home) {
 		return home
 	}
-
 	skipped := []int{home}
 	for len(skipped) < n {
 		cand := r.hashPick(skipped)
 		if cand < 0 {
 			break
 		}
-		if !r.overloaded(cand) {
+		if !isOverloaded(cand) {
 			return cand
 		}
 		skipped = append(skipped, cand)
 	}
 	return home
+}
+
+// AcquireForRequest picks an endpoint for ONE request and takes its in-flight
+// slot in the same critical section, so concurrent callers see each other's
+// increments. Without that atomicity a fan-out group — whose siblings share a
+// seriesNum and therefore a home endpoint — can have every sibling read
+// "under the limit" before any of them increments, and all land on the same
+// endpoint. That is exactly the burst this router exists to spread.
+//
+// The caller must call ReleaseIndex with the returned index once the request
+// completes. Returns -1 when there is nothing to route between.
+func (r *EndpointRouter) AcquireForRequest(seriesNum int) int {
+	if len(r.endpoints) <= 1 {
+		return -1
+	}
+	home := r.HomeIndexForSeries(seriesNum)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	idx := r.pickLocked(home, r.overloadedLocked)
+	if idx >= 0 {
+		r.inFlight[idx].Add(1)
+	}
+	return idx
+}
+
+// overloadedLocked is overloaded() for use inside the router mutex. The
+// counters are atomics, so the read itself needs no lock — holding the mutex is
+// what makes check-then-increment indivisible against other pickers.
+func (r *EndpointRouter) overloadedLocked(idx int) bool {
+	return r.overloaded(idx)
 }
 
 // PickEndpoint is PickIndex as a URL, with the index it resolved to. Returns
@@ -200,6 +240,11 @@ func (r *EndpointRouter) PickEndpoint(seriesNum int) (string, int) {
 		return "", -1
 	}
 	return r.endpoints[idx], idx
+}
+
+// Endpoints returns the routed endpoint URLs in index order.
+func (r *EndpointRouter) Endpoints() []string {
+	return append([]string(nil), r.endpoints...)
 }
 
 // AcquireIndex increments the in-flight counter for an endpoint index.

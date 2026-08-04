@@ -1,6 +1,9 @@
 package llm
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 func eps(n int) []string {
 	out := make([]string, n)
@@ -161,5 +164,64 @@ func TestThresholdIsConfigurable(t *testing.T) {
 	}
 	if r2.PickIndex(1) != home2 {
 		t.Fatal("threshold 3.0 should not have failed over at 49 in flight")
+	}
+}
+
+// AcquireForRequest must make check-and-increment indivisible. A fan-out group's
+// siblings share a seriesNum, so they share a home endpoint and all pick at once;
+// with a non-atomic check they would all read "under the limit" before any of
+// them incremented and pile onto the same endpoint. This is the regression test
+// for that: no endpoint may end up more than one over its limit.
+func TestAcquireForRequestSpreadsConcurrentBurst(t *testing.T) {
+	const n = 6
+	r := NewEndpointRouterWithFailover(eps(n), 192, 1.5) // fair share 32, limit 48
+
+	var wg sync.WaitGroup
+	const burst = 600 // far more than 6 * 48
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.AcquireForRequest(1) // every goroutine uses the SAME series
+		}()
+	}
+	wg.Wait()
+
+	got := r.InFlight()
+	var total int64
+	for _, v := range got {
+		total += v
+	}
+	if total != burst {
+		t.Fatalf("lost or double-counted acquisitions: total=%d want %d (%v)", total, burst, got)
+	}
+	// Everything saturates eventually (600 >> 6*48) and then falls back to home,
+	// but no endpoint should be starved: each must have taken real traffic.
+	for i, v := range got {
+		if v == 0 {
+			t.Fatalf("endpoint %d took no traffic at all: %v", i, got)
+		}
+	}
+}
+
+// Under a burst that fits, no endpoint should exceed limit+1 — one over is the
+// unavoidable case where the last acquirer takes it from limit to limit+1.
+func TestAcquireForRequestRespectsLimitUnderConcurrency(t *testing.T) {
+	const n = 6
+	r := NewEndpointRouterWithFailover(eps(n), 192, 1.5) // limit 48
+	var wg sync.WaitGroup
+	const burst = 200 // < 6*48, so a correct router keeps everyone under
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.AcquireForRequest(1)
+		}()
+	}
+	wg.Wait()
+	for i, v := range r.InFlight() {
+		if v > 49 {
+			t.Fatalf("endpoint %d overshot: %d in flight (limit 48), all=%v", i, v, r.InFlight())
+		}
 	}
 }
