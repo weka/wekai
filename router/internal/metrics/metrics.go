@@ -164,6 +164,33 @@ var (
 		Buckets: fractionBuckets,
 	})
 
+	// CachePrediction{Avg,Max,Min} summarize the predicted-hit-fraction spread
+	// across a single request's queried candidates — not the chosen backend's
+	// fraction alone (that's CachePredictedFraction above), but every
+	// candidate that had a computable prediction. Read alongside
+	// WorkerLoad{Avg,Max,Min}: correlating a high prediction spread against a
+	// spike in worker_load_max is exactly how you'd tell whether cache
+	// affinity is buying anything or just riding along with load.
+	//
+	// Snapshot-per-request gauges, like WorkerLoad*: the latest request's
+	// values, not a rolling window. Set on every Select call that reaches the
+	// per-candidate query loop, in both cache-aware policies, regardless of
+	// which branch the decision ultimately takes.
+	CachePredictionAvg = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "router_cache_prediction_avg",
+		Help: "Average predicted-hit fraction across a request's queried candidates.",
+	})
+
+	CachePredictionMax = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "router_cache_prediction_max",
+		Help: "Maximum predicted-hit fraction across a request's queried candidates.",
+	})
+
+	CachePredictionMin = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "router_cache_prediction_min",
+		Help: "Minimum predicted-hit fraction across a request's queried candidates.",
+	})
+
 	CacheObservedFraction = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "router_cache_observed_fraction",
 		Help:    "Observed cached fraction from the worker's usage.prompt_tokens_details.cached_tokens.",
@@ -211,6 +238,7 @@ func All() []prometheus.Collector {
 		UpstreamErrors, RetriesTotal, StreamAborted, PanicsTotal, ClientDisconnects,
 		LoadAccountingErrors, DiscoveryConflicts,
 		CachePredictedFraction, CacheObservedFraction, CacheEntries, CacheTokens,
+		CachePredictionAvg, CachePredictionMax, CachePredictionMin,
 		RequestsShed, observedShadow,
 	}
 }

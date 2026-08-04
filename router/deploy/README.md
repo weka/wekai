@@ -138,6 +138,16 @@ The metric worth alerting on is `router_load_accounting_errors_total`. It must
 stay at zero: any non-zero value means the in-flight accounting invariant is
 broken, which is the defect this rewrite exists to fix.
 
+Cache-affinity and load-balance quality are tracked by
+`router_worker_load_{avg,max,min}` (fleet load spread across available
+backends), `router_cache_prediction_{avg,max,min}` (predicted-hit-fraction
+spread across a request's queried candidates), and
+`router_route_decisions_total{decision="cache"|"load"|"other"}` (how
+selections are actually being made). `router/deploy/watch-metrics.sh` polls
+these from the command line; the "wllm-router — Cache & Load Routing" row in
+`wllm`'s `grafana/dashboard.json` (the same dashboard the vLLM workers report
+into) graphs them over time alongside worker-side stats.
+
 ## Local run
 
 ```bash

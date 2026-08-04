@@ -141,12 +141,14 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	// anything, or every model converges to every request.
 	var best *registry.Backend
 	bestFrac := 0.0
+	fracs := make([]float64, 0, len(cands))
 	for _, c := range cands {
 		cached, total := p.trieFor(c.URL).Query(rr.Units)
 		if total == 0 {
 			continue
 		}
 		frac := float64(cached) / float64(total)
+		fracs = append(fracs, frac)
 		switch {
 		case frac > bestFrac+tieEpsilon:
 			best, bestFrac = c, frac
@@ -168,6 +170,8 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 			}
 		}
 	}
+
+	publishPredictionStats(fracs)
 
 	if best == nil || bestFrac < p.cfg.CacheThreshold {
 		// Not enough affinity to be worth overriding load balance. Falling back to
@@ -207,6 +211,37 @@ func (p *Policy) PublishGauges() {
 
 // Stats reports per-backend model size, for metrics.
 func (p *Policy) Stats() map[string][2]int64 { return p.store.stats() }
+
+// publishPredictionStats records the spread of a single request's per-candidate
+// predicted-hit fractions into router_cache_prediction_{avg,max,min}. Shared by
+// both cache-aware policies so the two report this the same way; each collects
+// its own fracs slice from whatever candidates had a computable prediction
+// (total > 0) during its own query loop, in every branch — not just the one
+// that ends up winning — so the gauges reflect what the fleet looked like for
+// this request, independent of which way the decision went.
+//
+// A no-op on an empty slice (no candidate had a queryable trie yet) rather
+// than zeroing the gauges: a cold fleet should leave the last real reading
+// visible, not report a coincidental zero indistinguishable from "every
+// candidate scored 0".
+func publishPredictionStats(fracs []float64) {
+	if len(fracs) == 0 {
+		return
+	}
+	sum, max, min := 0.0, fracs[0], fracs[0]
+	for _, f := range fracs {
+		sum += f
+		if f > max {
+			max = f
+		}
+		if f < min {
+			min = f
+		}
+	}
+	metrics.CachePredictionAvg.Set(sum / float64(len(fracs)))
+	metrics.CachePredictionMax.Set(max)
+	metrics.CachePredictionMin.Set(min)
+}
 
 // trieStore is the per-backend-trie bookkeeping shared by every cache-aware
 // policy in this package: creation on add, discard on drop (CACHE-10), reset

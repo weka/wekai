@@ -273,3 +273,32 @@ func TestThresholdRouteDecisionClassification(t *testing.T) {
 		t.Errorf("cache = %v, want %v after a multi-candidate selection", got, cacheBefore2+1)
 	}
 }
+
+// router_cache_prediction_{avg,max,min} must reflect every queried
+// candidate's fraction for the request just served, not just the winner's.
+func TestThresholdPublishesPredictionStats(t *testing.T) {
+	bs := backends(t, 3)
+	p := cachepolicy.NewThreshold(cachepolicy.DefaultThresholdConfig(), policy.LeastOutstanding{})
+	for _, b := range bs {
+		p.AddBackend(b)
+	}
+
+	u := units(1, 2, 3, 4)
+	p.Commit(bs[0], req(u))           // full match: frac 1.0
+	p.Commit(bs[1], req(units(1, 2))) // half match: frac 0.5
+	// bs[2]: no commit, frac 0.0
+
+	if _, err := p.Select(context.Background(), bs, req(u)); err != nil {
+		t.Fatal(err)
+	}
+
+	if avg := testutil.ToFloat64(metrics.CachePredictionAvg); avg != 0.5 {
+		t.Errorf("avg = %v, want 0.5 ((1.0+0.5+0.0)/3)", avg)
+	}
+	if max := testutil.ToFloat64(metrics.CachePredictionMax); max != 1.0 {
+		t.Errorf("max = %v, want 1.0", max)
+	}
+	if min := testutil.ToFloat64(metrics.CachePredictionMin); min != 0.0 {
+		t.Errorf("min = %v, want 0.0", min)
+	}
+}
