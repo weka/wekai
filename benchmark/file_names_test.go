@@ -190,3 +190,62 @@ func TestNoSaveRequestDataDirSkipsWriters(t *testing.T) {
 		t.Errorf("want the pre-existing no-model error, got: %v", err)
 	}
 }
+
+// TestRequestDataLandsInRunDir pins WHERE the JSONL is written. Opening the
+// writers before the per-run subdirectory was created left every file at the
+// --save-request-data root while the run directory the log announced stayed
+// empty — and the auto-generated report reads that same (empty) directory, so
+// a run produced neither data in the announced place nor a report.
+func TestRequestDataLandsInRunDir(t *testing.T) {
+	base := t.TempDir()
+	cfg := AutoBenchmarkConfig{
+		// Unreachable on purpose: this test is about file placement, which is
+		// decided before any request is issued.
+		Model:              "dynamic/http://127.0.0.1:1/v1,type=openai_vllm,alias=rundir",
+		SaveRequestDataDir: base,
+		Timeout:            2 * time.Second,
+		RequestTimeout:     time.Second,
+		Concurrency:        1,
+		MaxSeries:          1,
+		StartSeries:        1,
+		Total:              1,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = RunAutoBenchmark(ctx, cfg) // the run itself is expected to get nowhere
+
+	// Nothing may be written at the base: that is the bug this guards.
+	if stray, _ := filepath.Glob(filepath.Join(base, "*.jsonl")); len(stray) > 0 {
+		t.Errorf("JSONL written to the --save-request-data root instead of the run dir: %v", stray)
+	}
+
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runDirs []string
+	for _, e := range entries {
+		if e.IsDir() {
+			runDirs = append(runDirs, e.Name())
+		}
+	}
+	if len(runDirs) != 1 {
+		t.Fatalf("want exactly one timestamped run dir, got %v", runDirs)
+	}
+	if !autoRunDirRe.MatchString(runDirs[0]) {
+		t.Errorf("run dir %q is not the expected timestamp form", runDirs[0])
+	}
+	// The JSONL belongs inside it. It exists even for a run that never got a
+	// response, because the writer is opened (and its run_params header
+	// written) before any request is issued.
+	inside, err := filepath.Glob(filepath.Join(base, runDirs[0], "*.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inside) != 1 {
+		t.Fatalf("want one JSONL inside the run dir, got %v", inside)
+	}
+	if !strings.Contains(filepath.Base(inside[0]), "rundir") {
+		t.Errorf("file should still be identifiable by alias: %q", filepath.Base(inside[0]))
+	}
+}

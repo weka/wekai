@@ -2447,13 +2447,25 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		return fmt.Errorf("no model specified")
 	}
 
-	// Open the per-request JSONL writers BEFORE any work starts, and fail the
-	// run if any cannot be opened. --save-request-data means the data IS the
-	// deliverable: a run that quietly produces none has wasted its entire
-	// duration, and the failure is only noticed afterwards. Opening here costs
-	// nothing and turns hours of loss into an immediate error.
+	// Per-run subdirectory, then the per-request JSONL writers — in that order,
+	// and both BEFORE any work starts.
+	//
+	// Order matters: the writers must open against the run directory, not the
+	// base path. Creating them first left every file at the PVC root while the
+	// announced run directory stayed empty, which also broke the report step
+	// below (it reads cfg.SaveRequestDataDir).
+	//
+	// Opening here at all is what makes --save-request-data fail fast: the data
+	// IS the deliverable, so a run that quietly produces none has wasted its
+	// entire duration, and the failure is only noticed afterwards.
 	writers := make([]*requestDataWriter, len(models))
 	if cfg.SaveRequestDataDir != "" {
+		runDir := fmt.Sprintf("%s/%s", cfg.SaveRequestDataDir, time.Now().UTC().Format("2006-01-02T15-04-05Z"))
+		if err := os.MkdirAll(runDir, 0755); err != nil {
+			return fmt.Errorf("--save-request-data: create run directory: %w", err)
+		}
+		cfg.SaveRequestDataDir = runDir
+		fmt.Printf("Request data will be saved to: %s\n", runDir)
 		for i, model := range models {
 			w, err := newRequestDataWriter(cfg.SaveRequestDataDir, model, time.Now())
 			if err != nil {
@@ -2580,16 +2592,6 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		fmt.Printf("Header: %d sessions / %d instances / %d requests / %d fan-out turns / max fan-out %d\n\n",
 			hdr.Summary.Sessions, hdr.Summary.Instances, hdr.Summary.Requests,
 			hdr.Summary.FanOutTurns, hdr.Summary.MaxFanOutInOneTurn)
-	}
-
-	// Create per-run subdirectory for request data if configured.
-	if cfg.SaveRequestDataDir != "" {
-		runDir := fmt.Sprintf("%s/%s", cfg.SaveRequestDataDir, time.Now().UTC().Format("2006-01-02T15-04-05Z"))
-		if err := os.MkdirAll(runDir, 0755); err != nil {
-			return fmt.Errorf("create run directory: %w", err)
-		}
-		cfg.SaveRequestDataDir = runDir
-		fmt.Printf("Request data will be saved to: %s\n", runDir)
 	}
 
 	// Cancellable context for all benchmark goroutines.
