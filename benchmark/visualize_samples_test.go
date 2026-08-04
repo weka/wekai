@@ -659,3 +659,114 @@ func TestGenerateVisualizationMergedCarriesSamples(t *testing.T) {
 		t.Errorf("merged report missing cache-mix overlay data")
 	}
 }
+
+// TestDragZoomPrecisionJS pins the drag-to-zoom selection to the pixels
+// actually dragged. unmapX is relative to the CURRENT view, so assigning
+// viewTMin before resolving the far edge made the second unmapX resolve
+// against the half-updated view: the start was right, the end landed far too
+// late, and the dragged region ended up at the front of a much wider window.
+// A narrow drag at position f produced a span of ~f*(1-f) of the run instead
+// of the width dragged -- e.g. a 2.5% drag mid-run opened a ~25% window, so
+// the selection filled only the first tenth of it.
+//
+// The test drags several windows, including two successive zooms, and asserts
+// the resulting view matches the pixel range to within a pixel's worth of time.
+func TestDragZoomPrecisionJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS drag-zoom test skipped")
+	}
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	rec, smp := benchFixtureData("dragzoom", base)
+	writeMixedJSONL(t, dir, "a", rec, smp)
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	start := strings.Index(html, "<script>")
+	end := strings.Index(html, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("script block not found")
+	}
+	script := html[start+len("<script>") : end]
+
+	probe := `
+function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+const down = (__listeners["chart:mousedown"] || [])[0];
+const move = (__listeners["chart:mousemove"] || [])[0];
+const up   = (__listeners["chart:mouseup"] || [])[0];
+assert(down && move && up, "drag listeners registered");
+
+// Drag between two fractions of the plot width and assert the resulting view
+// is exactly the time range those pixels denoted in the PRE-drag view.
+function dragFrac(f1, f2, label) {
+  const t0 = viewTMin, t1 = viewTMax, span = t1 - t0;
+  const px = f => margin.left + f * plotW;
+  const wantMin = t0 + f1 * span;
+  const wantMax = t0 + f2 * span;
+  down({ clientX: px(f1), clientY: margin.top + 10 });
+  move({ clientX: px((f1 + f2) / 2), clientY: margin.top + 10 });
+  move({ clientX: px(f2), clientY: margin.top + 10 });
+  up({ clientX: px(f2), clientY: margin.top + 10 });
+  // One pixel's worth of the pre-drag span is the achievable precision.
+  const tol = span / plotW;
+  assert(Math.abs(viewTMin - wantMin) <= tol,
+    label + ": start off by " + (viewTMin - wantMin) + "ms (tol " + tol + ")");
+  assert(Math.abs(viewTMax - wantMax) <= tol,
+    label + ": end off by " + (viewTMax - wantMax) + "ms (tol " + tol + ")");
+  // The dragged region must FILL the new view, not sit at the front of it.
+  const got = viewTMax - viewTMin, want = wantMax - wantMin;
+  assert(Math.abs(got - want) <= 2 * tol,
+    label + ": span " + got + "ms, want " + want + "ms (" + (100 * want / got).toFixed(1) + "% of view)");
+}
+function reset() { viewTMin = globalTMin; viewTMax = globalTMax; recalcYMax(); draw(); }
+
+reset(); dragFrac(0.40, 0.60, "mid-run half-width");
+// The reported case: a narrow drag mid-run. Previously opened a ~25% window
+// with the selection filling only its first tenth.
+reset(); dragFrac(0.475, 0.500, "narrow drag mid-run");
+reset(); dragFrac(0.05, 0.10, "narrow drag near the start");
+reset(); dragFrac(0.90, 0.95, "narrow drag near the end");
+reset(); dragFrac(0.0, 1.0, "full-width drag is a no-op zoom");
+// Dragging right-to-left selects the same window.
+reset();
+{
+  const t0 = viewTMin, span = viewTMax - viewTMin, px = f => margin.left + f * plotW;
+  down({ clientX: px(0.7), clientY: margin.top + 10 });
+  move({ clientX: px(0.3), clientY: margin.top + 10 });
+  up({ clientX: px(0.3), clientY: margin.top + 10 });
+  const tol = span / plotW;
+  assert(Math.abs(viewTMin - (t0 + 0.3 * span)) <= tol, "backwards drag start");
+  assert(Math.abs(viewTMax - (t0 + 0.7 * span)) <= tol, "backwards drag end");
+}
+// Zooming twice compounds correctly -- the second drag is relative to the
+// first result, which is where the half-updated view did the most damage.
+reset();
+dragFrac(0.20, 0.80, "first zoom");
+dragFrac(0.25, 0.50, "second zoom inside the first");
+// A click (under the 5px threshold) must not zoom at all.
+reset();
+{
+  const before = [viewTMin, viewTMax];
+  down({ clientX: margin.left + 100, clientY: margin.top + 10 });
+  up({ clientX: margin.left + 102, clientY: margin.top + 10 });
+  assert(viewTMin === before[0] && viewTMax === before[1], "a 2px click must not zoom");
+}
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "drag_zoom_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node drag-zoom test failed: %v\n%s", err, out)
+	}
+}

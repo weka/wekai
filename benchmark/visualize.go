@@ -1866,8 +1866,16 @@ canvas.addEventListener("mouseup", e => {
   // Only zoom if dragged at least 5 pixels
   if (maxPx - minPx < 5) { draw(); return; }
 
-  viewTMin = unmapX(minPx);
-  viewTMax = unmapX(maxPx);
+  // Resolve BOTH edges against the pre-zoom view before mutating either.
+  // unmapX is relative to the current viewTMin/viewTMax, so assigning
+  // viewTMin first made the second call resolve against the new view: the
+  // start was right but the end landed far too late, leaving the dragged
+  // region at the front of a much wider window (a narrow drag at position f
+  // yielded a span of ~f*(1-f) of the run instead of the width dragged).
+  const tMin = unmapX(minPx);
+  const tMax = unmapX(maxPx);
+  viewTMin = tMin;
+  viewTMax = tMax;
   recalcYMax();
   draw();
 });
