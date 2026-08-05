@@ -1,0 +1,82 @@
+# wllm-router — Kubernetes-ready container image, built from the wekai module.
+#
+# The router shares github.com/weka/wekai/kvcache with the benchmark tooling, so
+# it lives in this module rather than its own. It stays a SEPARATE binary
+# (./router/cmd/wllm-router) rather than a `wekai` subcommand: the container then
+# holds only router code, which keeps the image small and the attack surface
+# narrow, and keeps client-go out of the CLI everyone builds locally.
+#
+#   docker build -f Dockerfile.wllm-router -t wllm-router:dev .
+
+# --- build ---------------------------------------------------------------------
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG BUILDARCH
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
+
+WORKDIR /src
+
+# Resolve dependencies from the module cache rather than the vendor tree: vendor/
+# is 80+ MB and would dominate the build context for no benefit. .dockerignore
+# excludes it, which is why -mod=mod is required here.
+ENV GOFLAGS=-mod=mod
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+# Only what the router binary needs. Copying the whole module would drag the
+# benchmark, chart and tools trees in and invalidate the layer cache on every
+# unrelated change to them.
+COPY kvcache ./kvcache
+COPY router ./router
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath \
+      -ldflags="-s -w \
+        -X main.version=${VERSION} \
+        -X main.commit=${COMMIT} \
+        -X main.date=${BUILD_DATE}" \
+      -o /out/wllm-router ./router/cmd/wllm-router
+
+# Fail the build rather than ship an image whose binary cannot start. Only
+# runnable when the target arch matches the builder's: this stage runs on
+# BUILDPLATFORM, so asserting unconditionally would break every cross-compile.
+RUN if [ "${TARGETOS}" = "linux" ] && [ "${TARGETARCH}" = "${BUILDARCH}" ]; then \
+      /out/wllm-router -version; \
+    else \
+      echo "skipping smoke check: cross-compiled ${TARGETOS}/${TARGETARCH} on ${BUILDARCH}"; \
+    fi
+
+# --- runtime -------------------------------------------------------------------
+# static-debian12 has no shell, no libc and no package manager, so there is
+# nothing to exec into. The :nonroot tag runs as uid 65532.
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/wllm-router /usr/local/bin/wllm-router
+
+# 8080 inference, 29000 metrics. The metrics listener defaults to loopback and
+# must be bound explicitly to be scrapable from outside the pod.
+EXPOSE 8080 29000
+
+USER nonroot:nonroot
+
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="wllm-router" \
+      org.opencontainers.image.description="OpenAI-compatible routing gateway for vLLM fleets" \
+      org.opencontainers.image.source="https://github.com/weka/wekai" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+ENTRYPOINT ["/usr/local/bin/wllm-router"]

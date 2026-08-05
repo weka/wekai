@@ -2,222 +2,106 @@ package benchmark
 
 // Prefix-cache simulation and content-level warm estimation.
 //
-// Two uses:
+// The engine itself now lives in github.com/weka/wekai/kvcache, shared with the
+// router. What remains here are thin adapters that keep this package's existing
+// signatures — []string hashes and []int tokens — so every call site and test in
+// benchmark is unchanged.
 //
-//  1. Offline replay analysis (SimulateReplayCache): feeds a sorted slice of
-//     RouterReplayRequest entries into a fresh prefixTrie using per-block
-//     hashes and token counts. Mirrors the approach used by `wekai router
-//     analyze` (simulateCache) so simulated and ground-truth ratios are
-//     directly comparable.
+// Extracting it was the point: the router needs the same prefix-matching and
+// token-crediting logic, and a second copy would have drifted. The router's needs
+// differ in two ways the shared type absorbs — it queries without mutating, and
+// it is bounded because a real vLLM node evicts. A zero kvcache.Config means
+// unbounded, which is exactly the infinite-cache model this simulator wants, so
+// behaviour here is unchanged by the move.
 //
-//  2. Live content-level estimation (cacheEstimator): used across all
-//     benchmark modes (synthetic, --step growth, router-replay). Chunks raw
-//     prompt bytes into fixed-size windows, hashes each window, and walks the
-//     same trie machinery to estimate what fraction of each request's prompt
-//     was already seen — driving the cold/warm token split without relying on
-//     the structurally-biased per-series first-request bucketing.
+// Two uses remain:
+//
+//  1. Offline replay analysis (SimulateReplayCache), mirroring
+//     `wekai router analyze` so simulated and ground-truth ratios stay
+//     comparable.
+//  2. Live content-level estimation (cacheEstimator) across all benchmark modes.
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"sync"
-	"sync/atomic"
+	"github.com/weka/wekai/kvcache"
 )
 
-// prefixTrie is a concurrent trie of message-hash sequences. Each node stores
-// the estimated token count of the message that created it. Insertions and
-// lookups run under a single mutex — lock contention is negligible next to HTTP
-// round-trips so a sharded design is not worth the complexity.
-type prefixTrie struct {
-	mu   sync.Mutex
-	root *trieNode
+// promptChunkBytes is the granularity at which prompts are segmented for the
+// prefix estimate (~256 estimated tokens per chunk).
+const promptChunkBytes = kvcache.DefaultChunkBytes
 
-	// Aggregate totals (atomic so snapshot reads don't need the trie mutex).
-	cachedTokens atomic.Int64
-	totalTokens  atomic.Int64
+// prefixTrie adapts kvcache.Trie to this package's string-hash interface.
+type prefixTrie struct{ t *kvcache.Trie }
 
-	// nodeCount is incremented on each novel tail node insertion (atomic).
-	nodeCount atomic.Int64
-}
-
-type trieNode struct {
-	children map[string]*trieNode
-	// tokens is the estimated token count for the MESSAGE whose hash produced
-	// this node — i.e., the delta this turn's message adds to the prefix. Used
-	// when the walking LCP treats this node as "cached".
-	tokens int
-}
-
+// newPrefixTrie builds an UNBOUNDED trie: the simulator measures how much reuse
+// a workload contains, which is a property of an infinite cache. A router uses
+// kvcache.RouterConfig() instead.
 func newPrefixTrie() *prefixTrie {
-	return &prefixTrie{root: &trieNode{children: map[string]*trieNode{}}}
+	return &prefixTrie{t: kvcache.New(kvcache.Config{})}
 }
 
-// RecordAndCount walks the trie with `hashes` to find the longest matching
-// prefix, credits `tokens[i]` for matched messages as cached, inserts any
-// novel tail, and returns (cachedThisCall, totalThisCall).
+// RecordAndCount walks the matching prefix, credits matched messages as cached,
+// inserts the novel tail, and returns (cachedThisCall, totalThisCall).
 //
-// Callers pass the full sequence of messages that went into the request —
-// system + every prior turn + the current user turn. After the server
-// responds, the caller should call RecordAndCount AGAIN with the extended
-// sequence (…, server-assistant-message) so future requests can LCP-match
-// against it. That second call will normally credit all prior messages as
-// cached plus add one novel tail node; its returned "cached" value is not
-// meaningful for the current request (which already paid for prefill) and
-// can be ignored, but the insertion side-effect matters.
-func (t *prefixTrie) RecordAndCount(hashes []string, tokens []int) (int, int) {
-	if len(hashes) == 0 {
-		return 0, 0
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	node := t.root
-	cached := 0
-	i := 0
-	// Walk matching prefix.
-	for ; i < len(hashes); i++ {
-		child, ok := node.children[hashes[i]]
-		if !ok {
-			break
-		}
-		cached += child.tokens
-		node = child
-	}
-	// Insert novel tail.
-	for ; i < len(hashes); i++ {
-		child := &trieNode{children: map[string]*trieNode{}, tokens: tokens[i]}
-		node.children[hashes[i]] = child
-		t.nodeCount.Add(1)
-		node = child
-	}
-
-	total := 0
-	for _, tk := range tokens {
-		total += tk
-	}
-	return cached, total
+// Callers pass the full message sequence — system plus every prior turn plus the
+// current one. After the server responds, call again with the extended sequence
+// so later requests can match against it; that second call's "cached" value is
+// not meaningful for the current request but its insertion side-effect is.
+func (p *prefixTrie) RecordAndCount(hashes []string, tokens []int) (int, int) {
+	return p.t.RecordAndCount(kvcache.UnitsFromLabels(hashes, tokens))
 }
 
-// ObserveRequest records what a single request would have paid for against
-// an infinite perfect prefix cache. Updates aggregate counters used by the
-// global ratio; does not insert anything new into the trie (call
-// RecordAndCount for that).
-func (t *prefixTrie) ObserveRequest(cached, total int) {
-	if total <= 0 {
-		return
-	}
-	t.cachedTokens.Add(int64(cached))
-	t.totalTokens.Add(int64(total))
-}
+// ObserveRequest accumulates one request into the aggregate ratio without
+// inserting anything.
+func (p *prefixTrie) ObserveRequest(cached, total int) { p.t.Observe(cached, total) }
 
-// Ratio returns cached/total over all observed requests. 0 if nothing observed.
-func (t *prefixTrie) Ratio() float64 {
-	total := t.totalTokens.Load()
-	if total <= 0 {
-		return 0
-	}
-	return float64(t.cachedTokens.Load()) / float64(total)
-}
+// Ratio is cached/total over all observed requests, 0 if none.
+func (p *prefixTrie) Ratio() float64 { return p.t.Ratio() }
 
-// hashMessage produces a stable short hash for a (role, content) pair. 16
-// hex chars = 64 bits, plenty of separation for the trie key and keeps the
-// node map memory footprint small.
+// hashMessage produces a stable short hash for a (role, content) pair.
 func hashMessage(role, content string) string {
-	h := sha256.New()
-	h.Write([]byte(role))
-	h.Write([]byte{0})
-	h.Write([]byte(content))
-	sum := h.Sum(nil)
-	return hex.EncodeToString(sum[:8])
+	return kvcache.HexHash(kvcache.HashContent(role, []byte(content)))
 }
 
-// estimateTokens is the standard 4-bytes-per-token heuristic, clamped to at
-// least 1 for non-empty content. This is deliberately crude: the simulator
-// measures relative prefix-cache efficiency, not exact billing numbers.
-func estimateTokens(content string) int {
-	if len(content) == 0 {
-		return 0
-	}
-	n := len(content) / 4
-	if n < 1 {
-		n = 1
-	}
-	return n
-}
+// estimateTokens is the 4-bytes-per-token heuristic, clamped to 1 for non-empty
+// content. Deliberately crude: this measures relative prefix efficiency, not
+// billing.
+func estimateTokens(content string) int { return int(kvcache.EstimateTokens(len(content))) }
 
-// promptChunkBytes is the granularity at which synthetic prompts are segmented
-// for the prefix-trie warm estimate (~256 tokens per chunk). Smaller = finer
-// reuse detection at higher trie memory/CPU cost.
-const promptChunkBytes = 1024
-
-// chunkPromptPrefixN splits a raw prompt string into fixed-size byte windows of
-// chunkBytes and returns per-chunk hashes plus token estimates, suitable for
-// prefixTrie.RecordAndCount. Two prompts that share a leading byte-prefix yield
-// identical leading chunk hashes, so the trie credits the shared prefix as
-// cached and the divergent tail as novel — i.e. the client-side estimate of
-// "what fraction of this prompt was repeated", including the partial reuse that
-// --step prompt growth produces.
+// chunkPromptPrefixN splits a prompt into fixed byte windows, returning per-chunk
+// hashes and token estimates. Two prompts sharing a leading byte prefix yield
+// identical leading hashes, so the trie credits the shared prefix as cached and
+// the divergent tail as novel.
 func chunkPromptPrefixN(prompt string, chunkBytes int) (hashes []string, tokens []int) {
-	for i := 0; i < len(prompt); i += chunkBytes {
-		end := i + chunkBytes
-		if end > len(prompt) {
-			end = len(prompt)
-		}
-		chunk := prompt[i:end]
-		hashes = append(hashes, hashMessage("chunk", chunk))
-		tokens = append(tokens, estimateTokens(chunk))
+	for _, u := range kvcache.ChunkContent("chunk", []byte(prompt), chunkBytes) {
+		hashes = append(hashes, kvcache.HexHash(u.Hash))
+		tokens = append(tokens, int(u.Tokens))
 	}
 	return
 }
 
-// chunkPromptPrefix is a backward-compatible wrapper that uses the default
-// promptChunkBytes chunk size.
+// chunkPromptPrefix uses the default chunk size.
 func chunkPromptPrefix(prompt string) (hashes []string, tokens []int) {
 	return chunkPromptPrefixN(prompt, promptChunkBytes)
 }
 
-// cacheEstimator wraps a prefixTrie with a configurable chunk size and provides
-// a series-agnostic interface for estimating prompt cache reuse from raw content bytes.
-type cacheEstimator struct {
-	trie       *prefixTrie
-	chunkBytes int
-}
+// cacheEstimator estimates prompt reuse from raw content bytes.
+type cacheEstimator struct{ e *kvcache.Estimator }
 
 func newCacheEstimator(chunkBytes int) *cacheEstimator {
-	if chunkBytes <= 0 {
-		chunkBytes = promptChunkBytes
-	}
-	return &cacheEstimator{trie: newPrefixTrie(), chunkBytes: chunkBytes}
+	return &cacheEstimator{e: kvcache.NewEstimator(chunkBytes, kvcache.Config{})}
 }
 
-// Observe hashes content into byte windows, walks/extends the trie, updates
-// aggregate counters, and returns this request's cached/total byte ratio in
-// [0,1]. Series-agnostic: it sees only content bytes.
-func (e *cacheEstimator) Observe(content string) float64 {
-	h, tk := chunkPromptPrefixN(content, e.chunkBytes)
-	cached, total := e.trie.RecordAndCount(h, tk)
-	e.trie.ObserveRequest(cached, total)
-	if total <= 0 {
-		return 0
-	}
-	return float64(cached) / float64(total)
-}
+// Observe returns this request's cached fraction in [0,1] and extends the trie.
+func (c *cacheEstimator) Observe(content string) float64 { return c.e.Observe(content) }
 
-// Insert extends the trie with content (e.g. request+response) so future
-// requests can match against it; the per-request ratio is not meaningful here.
-func (e *cacheEstimator) Insert(content string) {
-	h, tk := chunkPromptPrefixN(content, e.chunkBytes)
-	e.trie.RecordAndCount(h, tk)
-}
+// Insert extends the trie so later requests can match; the ratio is not
+// meaningful for this call.
+func (c *cacheEstimator) Insert(content string) { c.e.Insert(content) }
 
-func (e *cacheEstimator) Ratio() float64 {
-	return e.trie.Ratio()
-}
+func (c *cacheEstimator) Ratio() float64 { return c.e.Ratio() }
 
-// Nodes returns the total number of trie nodes created (O(1)).
-func (e *cacheEstimator) Nodes() int {
-	return int(e.trie.nodeCount.Load())
-}
+// Nodes is the total trie nodes created, O(1).
+func (c *cacheEstimator) Nodes() int { return c.e.Nodes() }
 
 // ReplayCacheReport is the output of SimulateReplayCache — simulated and
 // ground-truth cache-hit ratios for a set of replay requests.
