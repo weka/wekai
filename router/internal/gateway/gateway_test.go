@@ -293,6 +293,95 @@ func TestAllowlistSegmentBoundary(t *testing.T) {
 	}
 }
 
+// AUTH-8 (withdrawn) pins what an EMPTY allowlist does, because the requirements
+// once demanded the opposite and the comments claimed the opposite was shipped.
+//
+// Empty means "serve every path", and auth still guards every path. That is v1's
+// behaviour. The withdrawn requirement's premise was that empty-means-allow-all
+// "turns a config typo into an open router"; the second half of this test is what
+// makes that false — with no allowlist at all, an uncredentialed request to a
+// normal inference path is still 401, not 200.
+func TestEmptyAllowlistServesAllPathsUnderAuth(t *testing.T) {
+	h := newHarness(t, 1, func(c *config.Config) {
+		c.APIKey = "secret"
+		c.PathAllowlist = nil // the case under test
+	})
+
+	// Reachable: no 404 from the allowlist, because there is no allowlist.
+	resp := h.post(t, "/v1/chat/completions", `{"model":"m"}`,
+		map[string]string{"Authorization": "Bearer secret"})
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		t.Error("empty allowlist 404'd a path; empty must serve everything")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("authorized request = %d, want 200", resp.StatusCode)
+	}
+
+	// Still guarded: an empty allowlist exempts nothing from auth.
+	un := h.post(t, "/v1/chat/completions", `{"model":"m"}`, nil)
+	defer un.Body.Close()
+	if un.StatusCode != http.StatusUnauthorized {
+		t.Errorf("uncredentialed request with empty allowlist = %d, want 401 — "+
+			"an absent allowlist must not disable auth", un.StatusCode)
+	}
+}
+
+// AUTH-11: the allowlist must not be able to exempt an admin endpoint from auth.
+//
+// Listing an admin path is the adversarial case: it makes the path reachable, and
+// the requirement is that reachable still means authenticated. Unlisted admin
+// paths 404 instead, which is the other half.
+func TestAdminNotExemptibleByAllowlist(t *testing.T) {
+	h := newHarness(t, 1, func(c *config.Config) {
+		c.APIKey = "secret"
+		// Deliberately list an admin path and a mutating one.
+		c.PathAllowlist = []string{"/get_loads", "/add_worker"}
+	})
+
+	get := func(path string, hdr map[string]string) int {
+		req, err := http.NewRequest(http.MethodGet, h.srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := h.srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := get("/get_loads", nil); code != http.StatusUnauthorized {
+		t.Errorf("allowlisted GET /get_loads without credential = %d, want 401 — "+
+			"the allowlist must not exempt admin from auth", code)
+	}
+	if code := get("/get_loads", map[string]string{"Authorization": "Bearer secret"}); code != http.StatusOK {
+		t.Errorf("allowlisted GET /get_loads with credential = %d, want 200", code)
+	}
+
+	// POST /add_worker is listed, so it is reachable; without a credential it must
+	// still be refused before it can mutate the registry.
+	before := len(h.reg.Snapshot().Backends)
+	aw := h.post(t, "/add_worker?url=http://evil.invalid:8000", "", nil)
+	defer aw.Body.Close()
+	if aw.StatusCode != http.StatusUnauthorized {
+		t.Errorf("allowlisted POST /add_worker without credential = %d, want 401", aw.StatusCode)
+	}
+	if after := len(h.reg.Snapshot().Backends); after != before {
+		t.Errorf("registry changed from %d to %d backends on an unauthenticated "+
+			"add_worker", before, after)
+	}
+
+	// An admin path left off the allowlist is not reachable at all.
+	if code := get("/workers", map[string]string{"Authorization": "Bearer secret"}); code != http.StatusNotFound {
+		t.Errorf("unlisted GET /workers with valid credential = %d, want 404", code)
+	}
+}
+
 // AUTH-5: GET /liveness is the one public endpoint, even with auth and an
 // allowlist configured, so a kubelet httpGet probe still works.
 func TestLivenessIsPublic(t *testing.T) {

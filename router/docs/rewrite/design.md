@@ -918,7 +918,7 @@ The catch-all (`OQ-1`, default off) is registered as the `"/"` pattern *inside* 
 
 Two separate `http.Server`s carry reduced chains: the metrics listener (`127.0.0.1:29000`, `GW-13`, not reachable from the inference mux because it is a distinct `ServeMux` on a distinct socket), and the optional admin listener (`GW-12`, default same-listener).
 
-Auth details worth stating: `subtle.ConstantTimeCompare` on equal-length padded buffers (`AUTH-1`, `SEC-1`); allowlist matching on segment boundaries with an explicit trailing-`/` subtree rule, so `/v1/mod` never matches `/v1/models` (`AUTH-7`, `AUTH-N3`); **empty allowlist means no exemptions** (`AUTH-8`, `AUTH-N2`); admin paths checked against a hard-coded set *before* the allowlist so no config can exempt them (`AUTH-11`); no credential material in any log field, not even a prefix (`AUTH-10`).
+Auth details worth stating: `subtle.ConstantTimeCompare` on equal-length padded buffers (`AUTH-1`, `SEC-1`); allowlist matching on segment boundaries with an explicit trailing-`/` subtree rule, so `/v1/mod` never matches `/v1/models` (`AUTH-7`, `AUTH-N3`); **empty allowlist serves all paths, with auth still applied to all paths** — v1's semantics, kept because the allowlist gates reachability while auth gates access and the two are independent (`AUTH-8` withdrawn; see the requirements row); admin paths need no hard-coded set to satisfy `AUTH-11`, because the allowlist has no power to exempt anything from auth — listing an admin path makes it reachable but never unauthenticated, and leaving it unlisted 404s it; no credential material in any log field, not even a prefix (`AUTH-10`).
 
 ### E.2 Routing-text / prefix-unit extraction without deserialization
 
@@ -1158,7 +1158,7 @@ func TestCorePackagesDoNotImportDialects(t *testing.T) {
 |---|---|
 | `testutil/mockvllm` | `AC-0.1` |
 | `clock` | `AC-0.2` |
-| `gateway` | `TestPreflightSucceedsWithAuthEnabled` (`GW-N3`), `TestCatchAllBodyLimitReturns413WithBoundedRSS` (`GW-N1`), `TestCatchAllRequestIsAccessLogged` (`GW-N2`), `TestAllowlistSegmentBoundary_V1ModVsV1Models` (`AUTH-N3`), `TestEmptyAllowlistDenies` (`AUTH-N2`), `TestAdminNotExemptibleByAllowlist` (`AUTH-11`), `TestWorkerReceivesNoClientCredential` (`AUTH-N4`), `TestExactlyOneAuthCallSite` (`AUTH-N1`), `TestSecondDialectRegistersWithoutCoreChanges` (`API-3`), `TestDialectMatrix_InboundXBackend` (`API-7`) |
+| `gateway` | `TestPreflightSucceedsWithAuthEnabled` (`GW-N3`), `TestCatchAllBodyLimitReturns413WithBoundedRSS` (`GW-N1`), `TestCatchAllRequestIsAccessLogged` (`GW-N2`), `TestAllowlistSegmentBoundary_V1ModVsV1Models` (`AUTH-N3`), `TestEmptyAllowlistServesAllPathsUnderAuth` (`AUTH-8` withdrawn), `TestAdminNotExemptibleByAllowlist` (`AUTH-11`), `TestWorkerReceivesNoClientCredential` (`AUTH-N4`), `TestExactlyOneAuthCallSite` (`AUTH-N1`), `TestSecondDialectRegistersWithoutCoreChanges` (`API-3`), `TestDialectMatrix_InboundXBackend` (`API-7`) |
 | `jsonscan` | `FuzzScannerAgreesWithEncodingJSON`, `BenchmarkExtract32KiB` (0 allocs) |
 | `registry` | `TestCanonicalizationTable` (`WRK-1`), `TestRegisterTwiceYieldsOneEntryInAllIndices` (`WRK-N2`), `TestSnapshotOrderStableOver1000Mutations` (`WRK-N1`), `TestStaticWinsOverDiscovered` (`HIER-19`), `TestDrainHoldsInFlightStreamToCompletion` (`WRK-6`) |
 | `lease` | **`TestLeasePropertyAllCountersReturnToZero`** — see below (`LB-7`) |

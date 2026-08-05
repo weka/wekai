@@ -145,7 +145,7 @@ The v2 design treats load accounting as a **single, symmetric, RAII-style lifecy
 | **AUTH-5** | MUST | `GET /liveness` MUST be public. No other endpoint is public by default. |
 | **AUTH-6** | SHOULD | `GET /readiness` and `GET /metrics` SHOULD be public when bound to a non-public interface; configurable. |
 | **AUTH-7** | MUST | A path allowlist MUST be supported and MUST match on **segment boundaries only**. `/v1/models` MUST NOT be matched by an allowlist entry of `/v1/mod`. A trailing `/` denotes a subtree (`/v1/` allows `/v1/anything`). |
-| **AUTH-8** | MUST | An **empty** allowlist MUST mean "no path exemptions" (deny-by-default), not "allow all". This is a deliberate, breaking inversion of v1 semantics and MUST be called out in release notes. |
+| **AUTH-8** | ~~MUST~~ **WITHDRAWN** | Originally: an empty allowlist MUST mean deny-by-default, "a deliberate, breaking inversion of v1 semantics". **Not implemented, and the requirement is withdrawn rather than outstanding.** Its premise — that empty-means-allow-all "turns a config typo into an open router" (AUTH-N2) — does not hold: the allowlist gates *reachability*, auth gates *access*, and they are independent. An empty or mistyped allowlist widens the served surface but leaves every path behind auth. Deny-by-default would also mean an unset variable serves nothing at all, kubelet probes included, so the chart default would have to re-list the probes to boot. Shipped behaviour is v1's: empty serves all paths, auth applies to all paths. **Do not put an inversion in the release notes.** |
 | **AUTH-9** | MUST | The router MUST NOT forward the client's inbound `Authorization` or `X-Api-Key` header to workers. Upstream credentials, if any, are separately configured (SEC-4). |
 | **AUTH-10** | MUST | Auth failures MUST NOT log the presented credential, in whole or in prefix/suffix form. |
 | **AUTH-11** | MUST | Admin endpoints (GW-11) MUST require auth even when a path allowlist is configured; the allowlist MUST NOT be able to exempt them. |
@@ -154,7 +154,7 @@ The v2 design treats load accounting as a **single, symmetric, RAII-style lifecy
 ### Must not regress into
 
 - **AUTH-N1:** Double enforcement — a global middleware *plus* an explicit call in ~28 handlers. One of them will drift.
-- **AUTH-N2:** Empty-allowlist-means-allow-all, which turns a config typo into an open router.
+- **AUTH-N2:** ~~Empty-allowlist-means-allow-all, which turns a config typo into an open router.~~ **Retracted with AUTH-8** — it does not turn a typo into an open router, because auth is enforced independently of the allowlist. The real regression to guard is an allowlist that is *silently inactive*, e.g. because the environment variable was renamed away from what the deployment sets.
 - **AUTH-N3:** Prefix matching that permits `/v1/modelsXXX` or similar boundary escapes.
 - **AUTH-N4:** Verbatim forwarding of the client's `Authorization` header to backend workers (credential leakage into the worker fleet and its logs).
 - **AUTH-N5:** Auth ordered outside CORS, breaking preflight.
