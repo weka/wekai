@@ -96,8 +96,13 @@ func (p *ThresholdPolicy) Select(ctx context.Context, cands []*registry.Backend,
 	}
 
 	// Query every candidate. Read-only: considering a backend must not teach
-	// it anything, or every model converges to every request.
+	// it anything, or every model converges to every request. hotFrac is kept
+	// aligned with hot by index so that whichever candidate is eventually
+	// selected, its own predicted fraction (not some other candidate's, and
+	// not an average across ones that were never going to be picked) is what
+	// gets recorded into CachePredictedFraction below.
 	var hot []*registry.Backend
+	var hotFrac []float64
 	fracs := make([]float64, 0, len(cands))
 	for _, c := range cands {
 		cached, total := p.store.get(c.URL).Query(rr.Units)
@@ -108,6 +113,7 @@ func (p *ThresholdPolicy) Select(ctx context.Context, cands []*registry.Backend,
 		fracs = append(fracs, frac)
 		if frac > p.cfg.CacheThreshold {
 			hot = append(hot, c)
+			hotFrac = append(hotFrac, frac)
 		}
 	}
 	publishPredictionStats(fracs)
@@ -121,6 +127,7 @@ func (p *ThresholdPolicy) Select(ctx context.Context, cands []*registry.Backend,
 	case 1:
 		if hot[0].Inflight() < p.cfg.MaxPending {
 			metrics.RouteDecisions.WithLabelValues("cache").Inc()
+			metrics.CachePredictedFraction.Observe(hotFrac[0])
 			return hot[0], nil
 		}
 		// The lone candidate is too busy: ignore cache for this request
@@ -134,7 +141,16 @@ func (p *ThresholdPolicy) Select(ctx context.Context, cands []*registry.Backend,
 		// those candidates, not a fallback (no PolicyFallbacks — this is the
 		// designed multi-candidate branch, not a decline).
 		metrics.RouteDecisions.WithLabelValues("cache").Inc()
-		return policy.LeastOutstanding{}.Select(ctx, hot, rr)
+		winner, err := policy.LeastOutstanding{}.Select(ctx, hot, rr)
+		if err == nil && winner != nil {
+			for i, c := range hot {
+				if c == winner {
+					metrics.CachePredictedFraction.Observe(hotFrac[i])
+					break
+				}
+			}
+		}
+		return winner, err
 	}
 }
 
