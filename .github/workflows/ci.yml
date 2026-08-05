@@ -1,0 +1,75 @@
+name: ci
+
+# Pre-merge verification. Until now the only Go gate in this repo was the
+# `go test ./...` step inside release.yml, which runs on push to main — i.e.
+# AFTER a merge. Nothing checked a pull request, so a change could only be found
+# to be broken once it was already on the default branch and a release was being
+# cut from it.
+#
+# `make verify` is the single definition of "this is good": gofmt, go vet, and the
+# full suite under the race detector. release.yml keeps its own lighter `make test`
+# so a formatting slip cannot block a release.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # The fuzz job below is gated on these two. Without them declared here it could
+  # never run — a job whose condition no trigger can satisfy is dead config.
+  schedule:
+    - cron: "17 3 * * 1" # Mondays, 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Supersede in-flight runs for the same ref; a stale PR run has no value.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # vendor/ is not committed, so the module cache is the source of truth and
+      # -mod=mod applies. Downloading up front keeps the failure attributable if
+      # the proxy is unreachable, rather than surfacing inside a test run.
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify (gofmt, vet, tests with -race)
+        run: make verify
+
+  # The router's JSON scanner parses untrusted request bodies, and its seed corpus
+  # already found a remote DoS: a 15-byte body looped forever with unbounded
+  # allocation. The seeds under testdata/fuzz run as ordinary tests in `make
+  # verify`; this job spends real cycles looking for the next one. Scheduled rather
+  # than per-PR because it is time-boxed exploration, not a correctness gate.
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Fuzz the JSON scanner
+        run: make fuzz FUZZTIME=10m
+      - name: Upload any crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: router/internal/jsonscan/testdata/fuzz/
+          if-no-files-found: ignore
