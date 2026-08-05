@@ -98,15 +98,19 @@ func (p *ThresholdPolicy) Select(ctx context.Context, cands []*registry.Backend,
 	// Query every candidate. Read-only: considering a backend must not teach
 	// it anything, or every model converges to every request.
 	var hot []*registry.Backend
+	fracs := make([]float64, 0, len(cands))
 	for _, c := range cands {
 		cached, total := p.store.get(c.URL).Query(rr.Units)
 		if total == 0 {
 			continue
 		}
-		if float64(cached)/float64(total) > p.cfg.CacheThreshold {
+		frac := float64(cached) / float64(total)
+		fracs = append(fracs, frac)
+		if frac > p.cfg.CacheThreshold {
 			hot = append(hot, c)
 		}
 	}
+	publishPredictionStats(fracs)
 
 	switch len(hot) {
 	case 0:
