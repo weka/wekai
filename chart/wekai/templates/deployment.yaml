@@ -92,11 +92,11 @@ spec:
                 --dry-run-output-tps={{ .Values.replay.dryRunOutputTPS | int64 }} \
                 {{- end }}
                 {{- end }}
-                --save-request-data={{ .Values.resultsMountPath }}
+                --save-request-data={{ include "wekai.results.dataPath" . }}
 
               echo "+ $*"
               "$@" || echo "wekai benchmark auto exited with status $?"
-              echo "Benchmark finished. Sleeping so results under {{ .Values.resultsMountPath }} stay explorable (kubectl exec/cp); delete the pod to rerun."
+              echo "Benchmark finished. Sleeping so results under {{ include "wekai.results.dataPath" . }} stay explorable (kubectl exec/cp); delete the pod to rerun."
               sleep infinity
           {{- if .Values.llmApiKeySecretName }}
           envFrom:

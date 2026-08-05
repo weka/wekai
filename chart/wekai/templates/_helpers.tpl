@@ -56,6 +56,41 @@ true
 {{- end }}
 
 {{/*
+wekai.results.dataPath — where --save-request-data points, i.e.
+resultsMountPath joined with resultsSubPath. wekai creates its own
+<run-timestamp>/ directory beneath this.
+
+The subdirectory exists because the same PVC is normally shared across
+purposes, and writing run directories straight at the volume root mixes them
+in with everything else already there. The whole volume is still mounted at
+resultsMountPath (deliberately NOT a volumeMount subPath), so the rest of the
+PVC stays visible for kubectl exec/cp — only what wekai WRITES is namespaced.
+
+resultsSubPath is overridable. An EXPLICIT empty value writes straight to the
+volume root (the pre-existing flat layout); a value that is absent or null
+falls back to the default rather than the root, so a values file that never
+mentions the key still gets the namespaced layout. Helm's `default` collapses
+nil and "" into one case, which is exactly the distinction that matters here —
+hence the kindIs "invalid" test.
+*/}}
+{{- define "wekai.results.subPath" -}}
+{{- if kindIs "invalid" .Values.resultsSubPath -}}
+wekai-requests-data
+{{- else -}}
+{{- trimAll "/" (toString .Values.resultsSubPath) -}}
+{{- end -}}
+{{- end }}
+
+{{- define "wekai.results.dataPath" -}}
+{{- $sub := include "wekai.results.subPath" . -}}
+{{- if $sub -}}
+{{- printf "%s/%s" (trimSuffix "/" .Values.resultsMountPath) $sub -}}
+{{- else -}}
+{{- .Values.resultsMountPath -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 wekai.results.claimName — the PVC to mount at resultsMountPath. Empty means
 no PVC at all, i.e. an ephemeral emptyDir.
 */}}

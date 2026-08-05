@@ -65,8 +65,10 @@ llmApiKeySecretName: ""   # K8s secret with LLM API key env vars (OPENAI_API_KEY
 
 # ── Results ─────────────────────────────────────────────────────────────────
 # Per-request JSONL data + the auto-generated report.html are ALWAYS saved
-# (--save-request-data) under resultsMountPath/<run-timestamp>/. That is not
-# configurable; the only choice is what storage backs that path:
+# (--save-request-data) under
+# resultsMountPath/resultsSubPath/<run-timestamp>/. Saving is not
+# configurable; the only choices are where under the volume it lands and what
+# storage backs it:
 #
 #   nothing set               ephemeral emptyDir — results go away with the pod
 #   resultsClaim=<pvc-name>   mount a PVC you already created (nothing else needed)
@@ -76,6 +78,20 @@ llmApiKeySecretName: ""   # K8s secret with LLM API key env vars (OPENAI_API_KEY
 # explore/extract results (kubectl exec / kubectl cp); delete the pod to have
 # the Deployment restart the benchmark — the volume survives that either way.
 resultsMountPath: /results
+
+# Subdirectory of resultsMountPath that wekai writes into, so run directories
+# don't land loose at the volume root — the same PVC is usually shared across
+# purposes. The whole volume stays mounted at resultsMountPath (this is NOT a
+# volumeMount subPath), so everything else on it remains visible to
+# kubectl exec/cp; only what wekai writes is namespaced.
+#
+#   default          /results/wekai-requests-data/<run-timestamp>/
+#   ""               /results/<run-timestamp>/   — flat, at the volume root
+#   some/other/dir   /results/some/other/dir/<run-timestamp>/
+#
+# Setting it to an EXPLICIT empty string is what selects the flat layout;
+# leaving it out (or null) keeps the default.
+resultsSubPath: wekai-requests-data
 
 # Mount an existing PVC. The only value needed to persist results onto storage
 # you already manage; storageClassName/storageSize/createResultsClaim are all

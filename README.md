@@ -309,8 +309,9 @@ the benchmark completes (or fails) the pod sleeps forever so results stay
 explorable via `kubectl exec`/`kubectl cp`; delete the pod and the
 Deployment restarts the benchmark. Per-request JSONL data plus an
 auto-generated `report.html` visualization are always written under
-`resultsMountPath/<run-timestamp>/` (`--save-request-data`); the only
-choice is what storage backs that path — see below. The chart is
+`resultsMountPath/resultsSubPath/<run-timestamp>/` (`--save-request-data`);
+the only choices are where under the volume they land and what storage
+backs it — see below. The chart is
 deliberately minimal: the only value most installs
 need to set is `endpoint`, the target model server; everything else has a
 working default (all sessions replayed by 256 parallel series workers at
@@ -339,7 +340,8 @@ fixed concurrency 28 with a 4-worker hot pool).
 | `llmApiKeySecretName` | `""` | K8s secret with LLM API-key env vars (for endpoints that need auth) |
 | `resultsClaim` | `""` | Mount an existing PVC at `resultsMountPath` — the one value needed to persist results (see below) |
 | `createResultsClaim` / `storageSize` / `storageClassName` | `false` / `10Gi` / `""` | Have the chart provision the PVC instead |
-| `resultsMountPath` | `/results` | Where results are written inside the pod |
+| `resultsMountPath` | `/results` | Where the results volume is mounted inside the pod |
+| `resultsSubPath` | `wekai-requests-data` | Subdirectory of `resultsMountPath` that wekai writes into, so run directories don't land loose at the root of a shared PVC. Set to `""` to write at the root |
 | `nodeSelector` / `tolerations` | `{}` / `[]` | Standard pod scheduling — keep the load generator off the inference nodes it measures, or tolerate a tainted pool to reach them |
 | `resources` | requests 8Gi / 4 CPU, no limits | Pod resources. Limits are omitted deliberately — CPU throttling on the load generator would show up as inflated TTFT in the results |
 
@@ -348,14 +350,34 @@ Authoritative list with inline docs: `chart/wekai/values.yaml`
 
 ### Where results are stored
 
-Results are *always* written to `resultsMountPath`. The only decision is
-what backs it:
+Results are *always* written, to
+`resultsMountPath/resultsSubPath/<run-timestamp>/`. Two independent
+decisions: what backs the path, and where under it the run lands.
+
+What backs it:
 
 | | |
 |---|---|
 | nothing set | ephemeral `emptyDir` — results go away with the pod |
 | `--set resultsClaim=<pvc-name>` | mounts a PVC you already created; no other value required |
 | `--set createResultsClaim=true` | chart provisions `<release>-results` (`storageSize`, `storageClassName` apply) |
+
+Where under it:
+
+| | |
+|---|---|
+| default | `/results/wekai-requests-data/<run-timestamp>/` |
+| `--set resultsSubPath=""` | `/results/<run-timestamp>/` — flat, at the volume root |
+| `--set resultsSubPath=some/dir` | `/results/some/dir/<run-timestamp>/` |
+
+The subdirectory exists because a results PVC is usually shared across
+purposes, and run directories at the volume root mix in with whatever else
+is already there. The *whole* volume is still mounted at
+`resultsMountPath` (this is not a volumeMount `subPath`), so everything
+else on the PVC stays reachable via `kubectl exec`/`kubectl cp` — only
+what wekai writes is namespaced. Leaving `resultsSubPath` unset keeps the
+default; setting it to an explicit empty string is what selects the flat
+layout.
 
 ```
 helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai --version <vX> \
