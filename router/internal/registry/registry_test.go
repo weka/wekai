@@ -315,3 +315,69 @@ func TestAvailableExcludesOpenCircuitWithoutConsumingProbes(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadStatsNoAvailableBackendsIsZero(t *testing.T) {
+	r := registry.New(registry.Options{})
+	if _, err := r.Add(registry.Spec{URL: "http://a:8000"}); err != nil {
+		t.Fatal(err)
+	}
+	// Left Unknown: not Available().
+	avg, max, min, n := r.Snapshot().LoadStats()
+	if n != 0 || avg != 0 || max != 0 || min != 0 {
+		t.Fatalf("LoadStats() = (%v, %v, %v, %v), want all zero with no available backends", avg, max, min, n)
+	}
+}
+
+func TestLoadStatsAvgMaxMin(t *testing.T) {
+	r := registry.New(registry.Options{})
+	loads := []int64{2, 4, 6} // capacity 1 each, so NormalizedLoad == Inflight
+	for i, l := range loads {
+		b, err := r.Add(registry.Spec{URL: fmt.Sprintf("http://w%d:8000", i), Capacity: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.SetHealth(registry.Healthy)
+		b.AddInflight(l)
+	}
+	avg, max, min, n := r.Snapshot().LoadStats()
+	if n != 3 {
+		t.Fatalf("n = %d, want 3", n)
+	}
+	if avg != 4 {
+		t.Errorf("avg = %v, want 4", avg)
+	}
+	if max != 6 {
+		t.Errorf("max = %v, want 6", max)
+	}
+	if min != 2 {
+		t.Errorf("min = %v, want 2", min)
+	}
+}
+
+// A backend outside Available() (unhealthy, holding a large stale load) must
+// not skew the stats — same invariant as the cache policy's spill guard
+// (CACHE-N4/LB-N7), just for a gauge instead of a routing decision.
+func TestLoadStatsExcludesUnavailableBackends(t *testing.T) {
+	r := registry.New(registry.Options{})
+	healthy, err := r.Add(registry.Spec{URL: "http://a:8000", Capacity: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy.SetHealth(registry.Healthy)
+	healthy.AddInflight(3)
+
+	stale, err := r.Add(registry.Spec{URL: "http://b:8000", Capacity: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetHealth(registry.Unhealthy)
+	stale.AddInflight(500)
+
+	avg, max, min, n := r.Snapshot().LoadStats()
+	if n != 1 {
+		t.Fatalf("n = %d, want 1 (only the healthy backend)", n)
+	}
+	if avg != 3 || max != 3 || min != 3 {
+		t.Errorf("avg/max/min = %v/%v/%v, want all 3 (unhealthy backend's 500 must not leak in)", avg, max, min)
+	}
+}

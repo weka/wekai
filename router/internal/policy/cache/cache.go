@@ -109,6 +109,7 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	// than guess. The policy must never fail a request (CU-11).
 	if len(rr.Units) == 0 {
 		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "no_units").Inc()
+		metrics.RouteDecisions.WithLabelValues("load").Inc()
 		return p.fallback.Select(ctx, cands, rr)
 	}
 
@@ -132,6 +133,7 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	if maxLoad-minLoad > p.cfg.BalanceAbsThreshold &&
 		float64(maxLoad) > float64(minLoad)*p.cfg.BalanceRelThreshold {
 		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "imbalanced").Inc()
+		metrics.RouteDecisions.WithLabelValues("load").Inc()
 		return p.fallback.Select(ctx, cands, rr)
 	}
 
@@ -173,9 +175,11 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 		// returned the first minimum, so on a cold fleet every request piled onto
 		// candidate 0 until it crossed the imbalance threshold.
 		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "below_threshold").Inc()
+		metrics.RouteDecisions.WithLabelValues("load").Inc()
 		return p.fallback.Select(ctx, cands, rr)
 	}
 	metrics.CachePredictedFraction.Observe(bestFrac)
+	metrics.RouteDecisions.WithLabelValues("cache").Inc()
 	return best, nil
 }
 

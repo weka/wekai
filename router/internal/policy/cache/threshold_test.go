@@ -4,6 +4,9 @@ import (
 	"context"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/policy"
 	cachepolicy "github.com/weka/wekai/router/internal/policy/cache"
 )
@@ -206,5 +209,67 @@ func TestThresholdFlushClearsAllModels(t *testing.T) {
 		if st[0] != 0 {
 			t.Errorf("%s still holds %d nodes after Flush", url, st[0])
 		}
+	}
+}
+
+// router_route_decisions_total must reflect which branch of the decision tree
+// actually chose the backend, not just that a selection happened.
+func TestThresholdRouteDecisionClassification(t *testing.T) {
+	cacheBefore := testutil.ToFloat64(metrics.RouteDecisions.WithLabelValues("cache"))
+	loadBefore := testutil.ToFloat64(metrics.RouteDecisions.WithLabelValues("load"))
+
+	p := cachepolicy.NewThreshold(cachepolicy.DefaultThresholdConfig(), policy.LeastOutstanding{})
+	bs := backends(t, 3)
+	for _, b := range bs {
+		p.AddBackend(b)
+	}
+
+	// Zero candidates clear the threshold: "load".
+	if _, err := p.Select(context.Background(), bs, req(units(1, 2, 3, 4))); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.ToFloat64(metrics.RouteDecisions.WithLabelValues("load")); got != loadBefore+1 {
+		t.Errorf("load = %v, want %v after a no-candidate selection", got, loadBefore+1)
+	}
+
+	// Exactly one candidate, under the pending limit: "cache".
+	u := units(5, 6, 7, 8)
+	p.Commit(bs[0], req(u))
+	if _, err := p.Select(context.Background(), bs, req(u)); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.ToFloat64(metrics.RouteDecisions.WithLabelValues("cache")); got != cacheBefore+1 {
+		t.Errorf("cache = %v, want %v after a sole-candidate cache hit", got, cacheBefore+1)
+	}
+
+	// Exactly one candidate, over the pending limit: falls back to "load".
+	cfg := cachepolicy.DefaultThresholdConfig()
+	cfg.MaxPending = 1
+	p2 := cachepolicy.NewThreshold(cfg, policy.LeastOutstanding{})
+	for _, b := range bs {
+		p2.AddBackend(b)
+	}
+	u2 := units(9, 10, 11, 12)
+	p2.Commit(bs[0], req(u2))
+	bs[0].AddInflight(1)
+	loadBefore2 := testutil.ToFloat64(metrics.RouteDecisions.WithLabelValues("load"))
+	if _, err := p2.Select(context.Background(), bs, req(u2)); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.ToFloat64(metrics.RouteDecisions.WithLabelValues("load")); got != loadBefore2+1 {
+		t.Errorf("load = %v, want %v after a pending-exceeded selection", got, loadBefore2+1)
+	}
+
+	// Multiple candidates: still "cache", even though the tie-break mechanism
+	// is least-outstanding.
+	cacheBefore2 := testutil.ToFloat64(metrics.RouteDecisions.WithLabelValues("cache"))
+	u3 := units(13, 14, 15, 16)
+	p.Commit(bs[1], req(u3))
+	p.Commit(bs[2], req(u3))
+	if _, err := p.Select(context.Background(), bs, req(u3)); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.ToFloat64(metrics.RouteDecisions.WithLabelValues("cache")); got != cacheBefore2+1 {
+		t.Errorf("cache = %v, want %v after a multi-candidate selection", got, cacheBefore2+1)
 	}
 }

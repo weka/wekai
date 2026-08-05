@@ -83,6 +83,40 @@ var (
 		Help: "Times a policy declined and delegated to the fallback policy.",
 	}, []string{"policy", "reason"})
 
+	// RouteDecisions classifies every selection that reached an attempt by the
+	// mechanism that actually chose the backend: "cache" (prefix affinity
+	// decided, whether alone or as the tie-break among several cache
+	// candidates), "load" (least-outstanding decided — either because that is
+	// the configured policy, or because a cache policy declined and fell back),
+	// or "other" (round-robin/random). A closed three-value enum, so this is
+	// cheap to keep forever (API-14).
+	RouteDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_route_decisions_total",
+		Help: "Selections classified by decision mechanism: cache, load, or other.",
+	}, []string{"decision"})
+
+	// Fleet load. Cache policies already expose per-backend inflight via
+	// BackendInflight; these three summarize it so a dashboard doesn't need a
+	// PromQL aggregation just to see whether the fleet is balanced. Computed
+	// over Available() backends only — the same set policies actually choose
+	// among — so one dead/draining backend holding stale load can't skew it
+	// (the same v1 defect class as CACHE-N4/LB-N7, just for a gauge instead of
+	// a routing guard).
+	WorkerLoadAvg = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "router_worker_load_avg",
+		Help: "Average NormalizedLoad (in-flight / capacity) across available backends.",
+	})
+
+	WorkerLoadMax = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "router_worker_load_max",
+		Help: "Maximum NormalizedLoad across available backends.",
+	})
+
+	WorkerLoadMin = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "router_worker_load_min",
+		Help: "Minimum NormalizedLoad across available backends.",
+	})
+
 	// Upstream and reliability.
 	UpstreamErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_upstream_errors_total",
@@ -172,7 +206,8 @@ func All() []prometheus.Collector {
 		RequestsTotal, RequestDuration, TimeToFirstByte,
 		BackendInflight, BackendHealth, BackendsTotal,
 		CircuitState, CircuitTransitions,
-		RoutingDecisionDuration, PolicySelections, PolicyFallbacks,
+		RoutingDecisionDuration, PolicySelections, PolicyFallbacks, RouteDecisions,
+		WorkerLoadAvg, WorkerLoadMax, WorkerLoadMin,
 		UpstreamErrors, RetriesTotal, StreamAborted, PanicsTotal, ClientDisconnects,
 		LoadAccountingErrors, DiscoveryConflicts,
 		CachePredictedFraction, CacheObservedFraction, CacheEntries, CacheTokens,
