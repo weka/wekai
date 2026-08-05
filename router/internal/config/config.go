@@ -43,9 +43,14 @@ type Config struct {
 	// authenticates clients TO us and is never forwarded (AUTH-9).
 	UpstreamCredential string `json:"-"`
 
-	// PathAllowlist is a strict allowlist. An EMPTY list means no exemptions,
-	// which is a deliberate inversion of v1's "empty means allow everything" —
-	// there, a config typo silently opened the router (AUTH-8, AUTH-N2).
+	// PathAllowlist gates which paths are served at all, and is orthogonal to auth:
+	// a listed path still requires a credential, and an unlisted path 404s even for
+	// a caller holding a valid key. Set via FORWARD_PATH_ALLOWLIST (v1's name).
+	//
+	// An empty list serves every path, with auth still applied to every path — the
+	// same semantics as v1. Note this does NOT implement AUTH-8, which asked for
+	// empty to mean deny-by-default; see the AUTH-8 row in docs/rewrite for why
+	// that was not adopted.
 	PathAllowlist []string `json:"path_allowlist"`
 	CORSOrigins   []string `json:"cors_origins"`
 
@@ -284,7 +289,14 @@ func applyEnv(cfg *Config, getenv func(string) string) {
 			cfg.Backends = append(cfg.Backends, Backend{URL: u})
 		}
 	}
-	if v := strings.TrimSpace(getenv("WLLM_PATH_ALLOWLIST")); v != "" {
+	// FORWARD_PATH_ALLOWLIST, not WLLM_PATH_ALLOWLIST: this deliberately breaks the
+	// WLLM_ prefix to keep v1's name. The migration is "swap the image, keep the
+	// env", and under a renamed variable the allowlist would simply be off — every
+	// path served instead of the listed few, with nothing in the logs to say so.
+	// Auth still applies, so it is a wider surface rather than an open router, but
+	// silence is the problem. Matching v1 costs a prefix; not matching costs a
+	// misconfiguration nobody sees.
+	if v := strings.TrimSpace(getenv("FORWARD_PATH_ALLOWLIST")); v != "" {
 		cfg.PathAllowlist = splitList(v)
 	}
 	if v := strings.TrimSpace(getenv("WLLM_CORS_ORIGINS")); v != "" {

@@ -369,8 +369,8 @@ func (s *Server) isPublicProbe(r *http.Request) bool {
 // path-segment child. So /v1/responses admits /v1/responses/abc but rejects
 // /v1/responses_evil, and /v1/mod never matches /v1/models (AUTH-7, AUTH-N3).
 //
-// An empty allowlist means NO exemptions, i.e. everything is subject to auth —
-// the inverse of v1, where empty meant allow-all and a typo opened the router.
+// An empty allowlist serves every path, with auth still applied to every path, so
+// this matches v1 rather than inverting it (see config.PathAllowlist re: AUTH-8).
 func (s *Server) pathAllowed(r *http.Request) bool {
 	if len(s.cfg.PathAllowlist) == 0 {
 		return true // no restriction configured; auth still applies
