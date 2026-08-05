@@ -306,3 +306,41 @@ func TestThresholdPublishesPredictionStats(t *testing.T) {
 		t.Errorf("min histogram: sum=%v count=%v, want sum=%v count=%v", sum, count, minSumBefore+0.0, minCountBefore+1)
 	}
 }
+
+// router_cache_predicted_fraction must record the WINNING candidate's own
+// predicted fraction, not hot[0]'s or an average across the hot set. All
+// three backends clear the threshold with distinct fracs (0.6/0.8/1.0); load
+// is set up so least-outstanding must pick bs[1] specifically (the middle
+// one, not the first or the strongest match), so a bug that recorded hot[0]
+// or the max/average instead of the actual winner would be caught.
+func TestThresholdRecordsTheWinnersOwnPredictedFraction(t *testing.T) {
+	bs := backends(t, 3)
+	p := cachepolicy.NewThreshold(cachepolicy.DefaultThresholdConfig(), policy.LeastOutstanding{})
+	for _, b := range bs {
+		p.AddBackend(b)
+	}
+
+	u := units(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)                  // 10 units, 100 tokens each -> total 1000
+	p.Commit(bs[0], req(units(1, 2, 3, 4, 5, 6)))              // 6/10 = 0.6
+	p.Commit(bs[1], req(units(1, 2, 3, 4, 5, 6, 7, 8)))        // 8/10 = 0.8
+	p.Commit(bs[2], req(units(1, 2, 3, 4, 5, 6, 7, 8, 9, 10))) // 10/10 = 1.0
+
+	// bs[1] must win on load alone: it's neither the first nor the best match.
+	bs[0].AddInflight(5)
+	bs[2].AddInflight(5)
+
+	sumBefore, countBefore := histogramSumCount(t, metrics.CachePredictedFraction)
+
+	got, err := p.Select(context.Background(), bs, req(u))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != bs[1] {
+		t.Fatalf("selected %s, want bs[1] (the least loaded of the hot set)", got.URL)
+	}
+
+	if sum, count := histogramSumCount(t, metrics.CachePredictedFraction); count != countBefore+1 || sum != sumBefore+0.8 {
+		t.Errorf("CachePredictedFraction: sum=%v count=%v, want sum=%v count=%v (bs[1]'s own 0.8 match, not bs[0]'s 0.6 or bs[2]'s 1.0)",
+			sum, count, sumBefore+0.8, countBefore+1)
+	}
+}
