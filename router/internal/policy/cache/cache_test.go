@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
 	"github.com/weka/wekai/kvcache"
 	"github.com/weka/wekai/router/internal/policy"
 	cachepolicy "github.com/weka/wekai/router/internal/policy/cache"
@@ -36,6 +39,19 @@ func units(hashes ...uint64) []kvcache.Unit {
 
 func req(u []kvcache.Unit) *policy.RoutingRequest {
 	return &policy.RoutingRequest{RouteClass: "chat", DialectID: "openai", Units: u}
+}
+
+// histogramSumCount reads a Histogram's cumulative _sum/_count. Histograms
+// only accumulate (Observe never overwrites), and these are shared
+// package-level collectors across every test in the package, so callers
+// compare deltas rather than absolute values.
+func histogramSumCount(t *testing.T, h prometheus.Histogram) (sum float64, count uint64) {
+	t.Helper()
+	var m dto.Metric
+	if err := h.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetHistogram().GetSampleSum(), m.GetHistogram().GetSampleCount()
 }
 
 func TestRoutesToTheBackendHoldingThePrefix(t *testing.T) {

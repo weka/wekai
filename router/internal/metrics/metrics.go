@@ -172,23 +172,29 @@ var (
 	// spike in worker_load_max is exactly how you'd tell whether cache
 	// affinity is buying anything or just riding along with load.
 	//
-	// Snapshot-per-request gauges, like WorkerLoad*: the latest request's
-	// values, not a rolling window. Set on every Select call that reaches the
-	// per-candidate query loop, in both cache-aware policies, regardless of
-	// which branch the decision ultimately takes.
-	CachePredictionAvg = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "router_cache_prediction_avg",
-		Help: "Average predicted-hit fraction across a request's queried candidates.",
+	// Histograms, not gauges: a gauge here would be overwritten by every
+	// concurrent request's Observe, so a scrape would sample whichever
+	// request happened to finish last — one random data point per scrape
+	// interval, not a trend (this is exactly what v1's gauge version did,
+	// and it read as noise at any real concurrency). _sum/_count let a query
+	// compute a genuine rate()-windowed mean across every request in the
+	// window instead of stroboscopically sampling one of them.
+	CachePredictionAvg = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "router_cache_prediction_avg",
+		Help:    "Average predicted-hit fraction across a request's queried candidates.",
+		Buckets: fractionBuckets,
 	})
 
-	CachePredictionMax = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "router_cache_prediction_max",
-		Help: "Maximum predicted-hit fraction across a request's queried candidates.",
+	CachePredictionMax = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "router_cache_prediction_max",
+		Help:    "Maximum predicted-hit fraction across a request's queried candidates.",
+		Buckets: fractionBuckets,
 	})
 
-	CachePredictionMin = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "router_cache_prediction_min",
-		Help: "Minimum predicted-hit fraction across a request's queried candidates.",
+	CachePredictionMin = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "router_cache_prediction_min",
+		Help:    "Minimum predicted-hit fraction across a request's queried candidates.",
+		Buckets: fractionBuckets,
 	})
 
 	CacheObservedFraction = prometheus.NewHistogram(prometheus.HistogramOpts{

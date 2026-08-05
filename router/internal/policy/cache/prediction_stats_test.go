@@ -3,35 +3,51 @@ package cache
 import (
 	"testing"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/weka/wekai/router/internal/metrics"
 )
 
+// histogramSumCount reads a Histogram's cumulative _sum/_count. Histograms
+// only accumulate (Observe never overwrites), and these are shared
+// package-level collectors across every test in the package, so callers
+// compare deltas rather than absolute values.
+func histogramSumCount(t *testing.T, h prometheus.Histogram) (sum float64, count uint64) {
+	t.Helper()
+	var m dto.Metric
+	if err := h.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetHistogram().GetSampleSum(), m.GetHistogram().GetSampleCount()
+}
+
 func TestPublishPredictionStatsComputesAvgMaxMin(t *testing.T) {
+	avgSumBefore, avgCountBefore := histogramSumCount(t, metrics.CachePredictionAvg)
+	maxSumBefore, maxCountBefore := histogramSumCount(t, metrics.CachePredictionMax)
+	minSumBefore, minCountBefore := histogramSumCount(t, metrics.CachePredictionMin)
+
 	publishPredictionStats([]float64{1.0, 0.5, 0.0})
 
-	if avg := testutil.ToFloat64(metrics.CachePredictionAvg); avg != 0.5 {
-		t.Errorf("avg = %v, want 0.5", avg)
+	if sum, count := histogramSumCount(t, metrics.CachePredictionAvg); count != avgCountBefore+1 || sum != avgSumBefore+0.5 {
+		t.Errorf("avg histogram: sum=%v count=%v, want sum=%v count=%v", sum, count, avgSumBefore+0.5, avgCountBefore+1)
 	}
-	if max := testutil.ToFloat64(metrics.CachePredictionMax); max != 1.0 {
-		t.Errorf("max = %v, want 1.0", max)
+	if sum, count := histogramSumCount(t, metrics.CachePredictionMax); count != maxCountBefore+1 || sum != maxSumBefore+1.0 {
+		t.Errorf("max histogram: sum=%v count=%v, want sum=%v count=%v", sum, count, maxSumBefore+1.0, maxCountBefore+1)
 	}
-	if min := testutil.ToFloat64(metrics.CachePredictionMin); min != 0.0 {
-		t.Errorf("min = %v, want 0.0", min)
+	if sum, count := histogramSumCount(t, metrics.CachePredictionMin); count != minCountBefore+1 || sum != minSumBefore+0.0 {
+		t.Errorf("min histogram: sum=%v count=%v, want sum=%v count=%v", sum, count, minSumBefore+0.0, minCountBefore+1)
 	}
 }
 
-// A cold call with nothing computable must leave the last real reading in
-// place, not report a coincidental zero indistinguishable from "every
-// candidate scored 0".
+// A cold call with nothing computable must Observe nothing at all — no
+// misleading zero recorded into the distribution.
 func TestPublishPredictionStatsNoopOnEmpty(t *testing.T) {
-	publishPredictionStats([]float64{0.7, 0.3})
-	before := testutil.ToFloat64(metrics.CachePredictionAvg)
+	_, countBefore := histogramSumCount(t, metrics.CachePredictionAvg)
 
 	publishPredictionStats(nil)
 
-	if after := testutil.ToFloat64(metrics.CachePredictionAvg); after != before {
-		t.Errorf("avg changed from %v to %v on an empty slice; want unchanged", before, after)
+	if _, count := histogramSumCount(t, metrics.CachePredictionAvg); count != countBefore {
+		t.Errorf("count changed from %v to %v on an empty slice; want unchanged", countBefore, count)
 	}
 }
