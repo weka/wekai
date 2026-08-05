@@ -195,11 +195,11 @@ func TestLabelsAndAnnotationsAreHonoured(t *testing.T) {
 	defer cancel()
 
 	b := reg.Snapshot().Backends[0]
-	if b.Kind != registry.KindRouter {
-		t.Errorf("kind = %v, want router", b.Kind)
+	if b.Kind() != registry.KindRouter {
+		t.Errorf("kind = %v, want router", b.Kind())
 	}
-	if b.Model != "llama-3-70b" {
-		t.Errorf("model = %q", b.Model)
+	if b.Model() != "llama-3-70b" {
+		t.Errorf("model = %q", b.Model())
 	}
 	if b.Capacity() != 40 {
 		t.Errorf("capacity = %d, want 40 from the annotation", b.Capacity())
@@ -249,8 +249,8 @@ func TestStaticBackendSurvivesDiscovery(t *testing.T) {
 	if !slices.Equal(conflicts, []string{"http://10.0.0.1:8000"}) {
 		t.Fatalf("conflicts = %v, want the static URL reported", conflicts)
 	}
-	if st.Model != "pinned" {
-		t.Errorf("static backend was overwritten: model = %q", st.Model)
+	if st.Model() != "pinned" {
+		t.Errorf("static backend was overwritten: model = %q", st.Model())
 	}
 
 	// A later pass that omits it must not drain it either.

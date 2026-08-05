@@ -115,21 +115,23 @@ func (r *Registry) Add(spec Spec) (*Backend, error) {
 		if existing.Prov == ProvStatic && spec.Prov == ProvDiscovered {
 			return existing, ErrStaticConflict
 		}
-		existing.Kind = spec.Kind
-		existing.Model = spec.Model
-		existing.Locality = spec.Locality
+		existing.SetKind(spec.Kind)
+		existing.SetModel(spec.Model)
+		existing.SetLocality(spec.Locality)
 		existing.SetCapacity(spec.Capacity)
 		existing.draining.Store(false) // re-adding cancels a pending drain
 		return existing, nil
 	}
 
 	b := &Backend{
-		URL: canon, Kind: spec.Kind, DialectID: spec.DialectID,
+		URL: canon, DialectID: spec.DialectID,
 		HealthMod: spec.Health, Prov: spec.Prov,
-		Model: spec.Model, Locality: spec.Locality,
 		CB:            circuit.New(r.cbc, r.clk),
 		InflightGauge: r.newGauge(canon),
 	}
+	b.SetKind(spec.Kind)
+	b.SetModel(spec.Model)
+	b.SetLocality(spec.Locality)
 	b.SetCapacity(spec.Capacity)
 	// Unknown, not Healthy: a backend is not routable until its first
 	// successful health check, so discovery cannot send traffic to a pod that

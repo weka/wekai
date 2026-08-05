@@ -210,7 +210,7 @@ func (s *Server) handleListWorkers(w http.ResponseWriter, r *http.Request) {
 	out := make([]workerView, 0, len(snap.Backends))
 	for _, b := range snap.Backends {
 		out = append(out, workerView{
-			URL: b.URL, Kind: b.Kind.String(), Dialect: b.DialectID,
+			URL: b.URL, Kind: b.Kind().String(), Dialect: b.DialectID,
 			Health: b.Health().String(), Circuit: b.CB.State().String(),
 			Inflight: b.Inflight(), Capacity: b.Capacity(),
 			Load: b.NormalizedLoad(), Draining: b.Draining(),

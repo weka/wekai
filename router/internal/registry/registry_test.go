@@ -256,8 +256,8 @@ func TestStaticWinsOverDiscovered(t *testing.T) {
 	if !slices.Equal(conflicts, []string{"http://pinned:8000"}) {
 		t.Fatalf("conflicts = %v, want [http://pinned:8000]", conflicts)
 	}
-	if st.Model != "static-model" {
-		t.Errorf("static backend overwritten: model = %q", st.Model)
+	if st.Model() != "static-model" {
+		t.Errorf("static backend overwritten: model = %q", st.Model())
 	}
 	if st.Prov != registry.ProvStatic {
 		t.Errorf("provenance changed to %v", st.Prov)
