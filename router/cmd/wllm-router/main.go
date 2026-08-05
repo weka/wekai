@@ -232,7 +232,16 @@ func run(args []string) error {
 	return nil
 }
 
-func buildPolicy(cfg config.Config) (proxy.Selector, *cachepolicy.Policy, error) {
+// cacheLifecycle is implemented by every cache-aware policy so the registry
+// can drive per-backend model lifecycle without main knowing which cache
+// policy (if any) is active.
+type cacheLifecycle interface {
+	AddBackend(*registry.Backend)
+	DropBackend(*registry.Backend)
+	PublishGauges()
+}
+
+func buildPolicy(cfg config.Config) (proxy.Selector, cacheLifecycle, error) {
 	switch cfg.Policy {
 	case "least-outstanding":
 		return policy.LeastOutstanding{}, nil, nil
@@ -247,6 +256,19 @@ func buildPolicy(cfg config.Config) (proxy.Selector, *cachepolicy.Policy, error)
 			CacheThreshold:      cfg.Cache.CacheThreshold,
 			BalanceAbsThreshold: cfg.Cache.BalanceAbsThreshold,
 			BalanceRelThreshold: cfg.Cache.BalanceRelThreshold,
+			Trie: kvcache.Config{
+				MaxNodes:  cfg.Cache.MaxNodes,
+				MaxTokens: cfg.Cache.MaxTokens,
+			},
+		}, policy.LeastOutstanding{})
+		return p, p, nil
+	case "prefix-cache-candidates":
+		// Filters candidates to those predicted to hold the prefix, then picks
+		// among that filtered set rather than a single best-scoring backend;
+		// see ThresholdPolicy's doc comment for the full decision tree.
+		p := cachepolicy.NewThreshold(cachepolicy.ThresholdConfig{
+			CacheThreshold: cfg.Cache.CacheThreshold,
+			MaxPending:     cfg.Cache.BalanceAbsThreshold,
 			Trie: kvcache.Config{
 				MaxNodes:  cfg.Cache.MaxNodes,
 				MaxTokens: cfg.Cache.MaxTokens,
