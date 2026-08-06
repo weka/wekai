@@ -188,7 +188,7 @@ func TestChatCompletions_429PastMaxConcurrency(t *testing.T) {
 // content deltas, a final chunk carrying usage (because
 // stream_options.include_usage was set), and a terminal [DONE] marker.
 func TestChatCompletions_Streaming(t *testing.T) {
-	ts, _ := newTestServer(t, Config{DefaultMaxTokens: 3, DecodePerToken: time.Millisecond})
+	ts, _ := newTestServer(t, Config{DefaultMaxTokens: 3, OutputTPS: 1000}) // 1ms/token
 	prompt := strings.Repeat("stream me please ", 50)
 
 	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",

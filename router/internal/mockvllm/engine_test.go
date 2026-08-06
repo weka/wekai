@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // repeatWord returns a prompt of n space-separated copies of word, long
@@ -268,17 +269,51 @@ func TestEngine_MaxTokensOrDefault(t *testing.T) {
 	}
 }
 
-func TestEngine_LatencyCountsOnlyUncachedPrefill(t *testing.T) {
+// TestEngine_LatencyChargesColdCachedAndOutputSeparately is the rate-based
+// replacement for the old per-token-duration model: cold (uncached) prompt
+// tokens, cached prompt tokens, and output tokens are each charged at their
+// own configurable rate, calibratable against a real fleet's measured
+// throughput. "want" mirrors tokensAtRate's exact float64 formula and
+// Duration-then-sum order so this stays an exact equality, not an epsilon
+// comparison.
+func TestEngine_LatencyChargesColdCachedAndOutputSeparately(t *testing.T) {
 	e := NewEngine(Config{
-		BaseLatency:     0,
-		PrefillPerToken: 1_000_000, // 1ms/token in nanoseconds
-		DecodePerToken:  2_000_000, // 2ms/token
+		BaseLatency:    0,
+		ColdInputTPS:   1000, // 1ms/token
+		CachedInputTPS: 2000, // 0.5ms/token
+		OutputTPS:      500,  // 2ms/token
 	})
-	ttft, total := e.Latency(40, 100, 10) // 60 uncached, 10 output
-	if want := 60 * 1_000_000; int64(ttft) != int64(want) {
-		t.Fatalf("ttft = %v, want %dns", ttft, want)
+	ttft, total := e.Latency(40, 100, 10) // 40 cached, 60 uncached, 10 output
+
+	wantTTFT := time.Duration(60.0/1000*float64(time.Second)) + time.Duration(40.0/2000*float64(time.Second))
+	if ttft != wantTTFT {
+		t.Fatalf("ttft = %v, want %v", ttft, wantTTFT)
 	}
-	if want := int64(ttft) + 10*2_000_000; int64(total) != want {
-		t.Fatalf("total = %v, want %dns", total, want)
+	wantTotal := wantTTFT + time.Duration(10.0/500*float64(time.Second))
+	if total != wantTotal {
+		t.Fatalf("total = %v, want %v", total, wantTotal)
+	}
+}
+
+// TestEngine_CachedTokensAreNotFree guards the model change anton asked for:
+// previously a cache hit contributed zero latency; now it's charged at
+// CachedInputTPS (still normally far cheaper than ColdInputTPS, but never
+// literally free), matching a real cache read having some cost.
+func TestEngine_CachedTokensAreNotFree(t *testing.T) {
+	e := NewEngine(Config{CachedInputTPS: 1000})
+	ttft, _ := e.Latency(100, 100, 0) // fully cached, zero uncached
+	if ttft <= 0 {
+		t.Fatalf("a fully cached request should still cost time at CachedInputTPS, got ttft=%v", ttft)
+	}
+}
+
+// TestEngine_ZeroRateIsInstant confirms the escape hatch a fast test suite
+// needs: an unset (zero) rate contributes no time for that term, so
+// Config{} stays instant by default.
+func TestEngine_ZeroRateIsInstant(t *testing.T) {
+	e := NewEngine(Config{})
+	ttft, total := e.Latency(0, 100, 50)
+	if ttft != 0 || total != 0 {
+		t.Fatalf("zero-rate Config should be instant, got ttft=%v total=%v", ttft, total)
 	}
 }

@@ -62,12 +62,24 @@ type Config struct {
 	// router/internal/circuit and router/internal/proxy).
 	MaxConcurrency int
 
-	// Latency model: ttft = BaseLatency + uncachedPromptTokens*PrefillPerToken;
-	// total = ttft + outputTokens*DecodePerToken. Any knob left at 0 contributes
-	// nothing, so the default Config is instant.
-	BaseLatency     time.Duration
-	PrefillPerToken time.Duration
-	DecodePerToken  time.Duration
+	// Latency model, expressed as TOKEN RATES rather than per-token
+	// durations — this is what lets a run be calibrated against a real vLLM
+	// fleet: read the fleet's actual prefill/decode throughput (or a
+	// reasonable estimate of it) and set these directly, in the same units.
+	//
+	//	ttft   = BaseLatency + uncachedPromptTokens/ColdInputTPS + cachedPromptTokens/CachedInputTPS
+	//	total  = ttft + outputTokens/OutputTPS
+	//
+	// Cached tokens are NOT free: a cache hit still costs something (a KV
+	// read, a network hop for an offloaded tier, etc.) — only recompute is
+	// skipped — so CachedInputTPS is normally set far higher than
+	// ColdInputTPS rather than left at zero. Any rate left at 0 contributes
+	// no time for that term (division only happens when the rate is
+	// positive), so the default Config is instant except for BaseLatency.
+	BaseLatency    time.Duration
+	ColdInputTPS   float64 // tokens/sec, UNCACHED prompt tokens (prefill)
+	CachedInputTPS float64 // tokens/sec, CACHED prompt tokens (cache read)
+	OutputTPS      float64 // tokens/sec, decode — also paces SSE chunk spacing
 
 	// DefaultMaxTokens is the completion length used when a request omits
 	// max_tokens (or sends <= 0).
@@ -76,8 +88,11 @@ type Config struct {
 
 // DefaultConfig returns sane, non-instant defaults: 16-token blocks, 100k
 // blocks (matches kvcache.RouterConfig's node bound), 64-way concurrency, and
-// a latency model in the same ballpark as a mid-size dense model on modern
-// GPUs (order-of-magnitude only — tune via flags for a specific scenario).
+// token rates anton specified as giving a good-enough comparison against a
+// real fleet (50k tok/s cold prefill, 1M tok/s cached-token read, 500 tok/s
+// decode per request) — order-of-magnitude starting points, meant to be
+// overridden with rates read off (or estimated from) the real fleet being
+// compared against.
 func DefaultConfig() Config {
 	return Config{
 		ModelID:          "mock-vllm",
@@ -85,8 +100,9 @@ func DefaultConfig() Config {
 		BlockCapacity:    100_000,
 		MaxConcurrency:   64,
 		BaseLatency:      20 * time.Millisecond,
-		PrefillPerToken:  200 * time.Microsecond,
-		DecodePerToken:   20 * time.Millisecond,
+		ColdInputTPS:     50_000,
+		CachedInputTPS:   1_000_000,
+		OutputTPS:        500,
 		DefaultMaxTokens: 128,
 	}
 }
@@ -209,17 +225,35 @@ func (e *Engine) Admit(units []kvcache.Unit) (release func(), cached, total int,
 	}, cached, total, true
 }
 
-// Latency computes TTFT (prefill of the UNCACHED portion only, matching real
-// vLLM where cached blocks skip recompute) and total request duration
-// (TTFT + decode of the output tokens).
+// Latency computes TTFT (BaseLatency plus the uncached portion charged at
+// ColdInputTPS and the cached portion charged at CachedInputTPS — a cache hit
+// still costs a KV read, it just isn't full recompute) and total request
+// duration (TTFT plus the output charged at OutputTPS).
 func (e *Engine) Latency(cachedTokens, totalTokens, outputTokens int) (ttft, total time.Duration) {
 	uncached := totalTokens - cachedTokens
 	if uncached < 0 {
 		uncached = 0
 	}
-	ttft = e.cfg.BaseLatency + time.Duration(uncached)*e.cfg.PrefillPerToken
-	total = ttft + time.Duration(outputTokens)*e.cfg.DecodePerToken
+	ttft = e.cfg.BaseLatency + tokensAtRate(uncached, e.cfg.ColdInputTPS) + tokensAtRate(cachedTokens, e.cfg.CachedInputTPS)
+	total = ttft + tokensAtRate(outputTokens, e.cfg.OutputTPS)
 	return ttft, total
+}
+
+// OutputTokenInterval is the per-token duration OutputTPS implies, for a
+// caller (SSE streaming) that needs to space out individual chunks rather
+// than compute one lump duration.
+func (e *Engine) OutputTokenInterval() time.Duration {
+	return tokensAtRate(1, e.cfg.OutputTPS)
+}
+
+// tokensAtRate is how long n tokens take at tps tokens/sec. A non-positive
+// rate or count contributes zero duration, so an unset rate is "instant" for
+// that term rather than a division by zero.
+func tokensAtRate(n int, tps float64) time.Duration {
+	if n <= 0 || tps <= 0 {
+		return 0
+	}
+	return time.Duration(float64(n) / tps * float64(time.Second))
 }
 
 // RecordOutput accounts generated tokens into the aggregate counters. Called

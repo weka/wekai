@@ -8,9 +8,10 @@ import (
 )
 
 // This file implements minimal OpenAI-compatible SSE streaming: a role-only
-// opening delta, one content delta per synthetic output token (paced by the
-// engine's decode-per-token latency, after an initial TTFT delay standing in
-// for prefill), a closing delta carrying finish_reason (and usage, iff the
+// opening delta, one content delta per synthetic output token (paced by
+// OutputTokenInterval, the per-token duration Engine.Config.OutputTPS
+// implies, after an initial TTFT delay standing in for prefill), a closing
+// delta carrying finish_reason (and usage, iff the
 // request set stream_options.include_usage — matching real vLLM, which omits
 // usage on streamed responses unless asked), and the terminal "data: [DONE]"
 // marker. This exact shape is what
@@ -81,7 +82,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatComp
 		Choices: []chatChoice{{Index: 0, Delta: &chatMsgOut{Role: "assistant"}, FinishReason: roleFinish}},
 	})
 
-	perToken := s.engine.Config().DecodePerToken
+	perToken := s.engine.OutputTokenInterval()
 	tokens := syntheticTokens(maxTok)
 	generated := 0
 	for _, tok := range tokens {
@@ -123,7 +124,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, req co
 		return
 	}
 
-	perToken := s.engine.Config().DecodePerToken
+	perToken := s.engine.OutputTokenInterval()
 	tokens := syntheticTokens(maxTok)
 	generated := 0
 	for _, tok := range tokens {
