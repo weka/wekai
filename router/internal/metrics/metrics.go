@@ -218,6 +218,26 @@ var (
 		Help: "Requests rejected with 503 because the router was at its concurrency cap.",
 	})
 
+	// SaturationRejects counts the DISTINCT 429 shed: every healthy backend was
+	// at its router-enforced --max-node-concurrency cap. Kept separate from
+	// RequestsShed (the router's OWN body-limit 503) because they are different
+	// conditions with different fixes — one says "the router itself is full",
+	// the other says "every backend is".
+	SaturationRejects = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "router_saturation_rejects_total",
+		Help: "Requests rejected with 429 because every healthy backend was at its router-enforced max-node-concurrency cap.",
+	})
+
+	// BackendCapExceeded is the per-backend occurrence counter for the same
+	// condition: incremented once per candidate-selection pass for each
+	// backend excluded for being at or above max-node-concurrency, so an
+	// operator can see WHICH backend is saturating, not just that the fleet as
+	// a whole is.
+	BackendCapExceeded = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_backend_cap_exceeded_total",
+		Help: "Times a backend was excluded from candidate selection for being at or above --max-node-concurrency.",
+	}, []string{"backend"})
+
 	// Discovery.
 	DiscoveryConflicts = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_discovery_conflicts_total",
@@ -245,7 +265,7 @@ func All() []prometheus.Collector {
 		LoadAccountingErrors, DiscoveryConflicts,
 		CachePredictedFraction, CacheObservedFraction, CacheEntries, CacheTokens,
 		CachePredictionAvg, CachePredictionMax, CachePredictionMin,
-		RequestsShed, observedShadow,
+		RequestsShed, SaturationRejects, BackendCapExceeded, observedShadow,
 	}
 }
 

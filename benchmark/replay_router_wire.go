@@ -41,7 +41,7 @@ const verboseOutputInstruction = "Provide a thorough, detailed response and keep
 // as possible. Returns the marshaled JSON bytes and the canonical text
 // string (all synthesized content concatenated in generation order) for
 // feeding into the content-level cache estimator.
-func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool) ([]byte, string, error) {
+func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool, charsPerToken float64) ([]byte, string, error) {
 	body := map[string]interface{}{
 		"model":      modelName,
 		"max_tokens": pickMaxTokens(req, outputRatio),
@@ -62,7 +62,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 
 	var systemArr []map[string]interface{}
 	if len(req.SystemBlocks) > 0 {
-		systemArr = buildSystem(effectiveSystemBlocks(req.SystemBlocks), docs)
+		systemArr = buildSystem(effectiveSystemBlocks(req.SystemBlocks), docs, charsPerToken)
 	}
 	if runID != "" {
 		stamp := map[string]interface{}{
@@ -81,10 +81,10 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 		body["system"] = systemArr
 	}
 	if req.Tools != nil && req.Tools.Count > 0 {
-		body["tools"] = buildTools(req.Tools, docs)
+		body["tools"] = buildTools(req.Tools, docs, charsPerToken)
 	}
 	if len(req.Messages) > 0 {
-		body["messages"] = buildMessages(req.Messages, docs)
+		body["messages"] = buildMessages(req.Messages, docs, charsPerToken)
 	}
 
 	// Collect canonical text for the cache estimator.
@@ -93,7 +93,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 		canonical.WriteString(fmt.Sprintf("<ignore>RUN_GUID: %s</ignore>", runID))
 	}
 	for _, b := range effectiveSystemBlocks(req.SystemBlocks) {
-		canonical.WriteString(synthText(b.Hash, b.Bytes, docs))
+		canonical.WriteString(synthText(b.Hash, sizeBudget(b.Bytes, b.Tokens, charsPerToken), docs))
 	}
 	if req.Tools != nil && req.Tools.Count > 0 {
 		n := req.Tools.Count
@@ -102,7 +102,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 		}
 		const perToolOverhead = 120
 		totalOverhead := perToolOverhead * n
-		descBudget := req.Tools.Bytes - totalOverhead
+		descBudget := sizeBudget(req.Tools.Bytes, req.Tools.Tokens, charsPerToken) - totalOverhead
 		if descBudget < n*4 {
 			descBudget = n * 4
 		}
@@ -112,7 +112,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 		}
 	}
 	for _, m := range req.Messages {
-		blocks := buildMessageContent(m, docs)
+		blocks := buildMessageContent(m, docs, charsPerToken)
 		for _, blk := range blocks {
 			if t, ok := blk["text"]; ok {
 				canonical.WriteString(fmt.Sprintf("%v", t))
@@ -179,14 +179,15 @@ func effectiveSystemBlocks(blocks []RouterReplaySystemBlock) []RouterReplaySyste
 }
 
 // buildSystem rebuilds the system array as a list of text blocks sized to
-// match each original system block's bytes. cache_control is preserved
-// when present so the server caches at the same boundaries.
-func buildSystem(blocks []RouterReplaySystemBlock, docs string) []map[string]interface{} {
+// match each original system block's bytes (or, with charsPerToken > 0, its
+// captured token count). cache_control is preserved when present so the
+// server caches at the same boundaries.
+func buildSystem(blocks []RouterReplaySystemBlock, docs string, charsPerToken float64) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(blocks))
 	for _, b := range blocks {
 		entry := map[string]interface{}{
 			"type": "text",
-			"text": synthText(b.Hash, b.Bytes, docs),
+			"text": synthText(b.Hash, sizeBudget(b.Bytes, b.Tokens, charsPerToken), docs),
 		}
 		if b.CacheControl != "" {
 			entry["cache_control"] = map[string]string{"type": b.CacheControl}
@@ -197,10 +198,11 @@ func buildSystem(blocks []RouterReplaySystemBlock, docs string) []map[string]int
 }
 
 // buildTools rebuilds an Anthropic tools array of Count entries that
-// canonically marshals to approximately the original Bytes. Each tool has
+// canonically marshals to approximately the original Bytes (or, with
+// charsPerToken > 0, sized off the captured Tokens instead). Each tool has
 // a stable name derived from the tools.hash + its index, and a description
 // padded with docs to round out the total size.
-func buildTools(spec *RouterReplayToolsSpec, docs string) []map[string]interface{} {
+func buildTools(spec *RouterReplayToolsSpec, docs string, charsPerToken float64) []map[string]interface{} {
 	n := spec.Count
 	if n <= 0 {
 		n = 1
@@ -210,7 +212,7 @@ func buildTools(spec *RouterReplayToolsSpec, docs string) []map[string]interface
 	// padding distributed evenly.
 	const perToolOverhead = 120
 	totalOverhead := perToolOverhead * n
-	descBudget := spec.Bytes - totalOverhead
+	descBudget := sizeBudget(spec.Bytes, spec.Tokens, charsPerToken) - totalOverhead
 	if descBudget < n*4 {
 		descBudget = n * 4
 	}
@@ -235,10 +237,10 @@ func buildTools(spec *RouterReplayToolsSpec, docs string) []map[string]interface
 // share of the message's total Bytes. For tool_use and tool_result blocks
 // we preserve the original ids verbatim so the conversation maintains a
 // valid reference graph that matches what the original capture sent.
-func buildMessages(msgs []RouterReplayMessage, docs string) []map[string]interface{} {
+func buildMessages(msgs []RouterReplayMessage, docs string, charsPerToken float64) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(msgs))
 	for _, m := range msgs {
-		content := buildMessageContent(m, docs)
+		content := buildMessageContent(m, docs, charsPerToken)
 		entry := map[string]interface{}{
 			"role":    roleOrUser(m.Role),
 			"content": content,
@@ -268,14 +270,14 @@ func roleOrUser(role string) string {
 // block_types lists the kinds in order; we use tool_use_ids and
 // tool_result_ids to populate ids on the matching blocks (in order of
 // appearance in block_types).
-func buildMessageContent(m RouterReplayMessage, docs string) []map[string]interface{} {
+func buildMessageContent(m RouterReplayMessage, docs string, charsPerToken float64) []map[string]interface{} {
 	nText := 0
 	for _, t := range m.BlockTypes {
 		if t == "text" {
 			nText++
 		}
 	}
-	textBudget := m.Bytes
+	textBudget := sizeBudget(m.Bytes, m.Tokens, charsPerToken)
 	if textBudget < 0 {
 		textBudget = 0
 	}
@@ -392,6 +394,21 @@ func synthText(seed string, n int, docs string) string {
 	return b.String()[:n]
 }
 
+// sizeBudget picks the byte budget for a content-sizing site. By default
+// (charsPerToken == 0, or the block carries no captured Tokens count) it
+// falls back to the capture's raw byte count — byte-faithful sizing.
+// With --replay-chars-per-token set and tokens > 0, it instead returns
+// round(tokens * charsPerToken): the serving tokenizer's count on synthetic
+// text runs ~3-4 chars/token, so byte-faithful replay bodies under-tokenize
+// relative to the original (production) capture; sizing off the captured
+// token count lands the replay's token count near the original's.
+func sizeBudget(bytes int, tokens int, charsPerToken float64) int {
+	if charsPerToken > 0 && tokens > 0 {
+		return int(math.Round(float64(tokens) * charsPerToken))
+	}
+	return bytes
+}
+
 func hashOffset(seed string, mod int) int {
 	if mod <= 0 {
 		return 0
@@ -410,14 +427,14 @@ func shortHashHex(seed string) string {
 // sized to approximately spec.Bytes, mirroring buildTools but using the
 // OpenAI {"type":"function","function":{...}} wrapper shape (~150 bytes/tool
 // overhead vs ~120 for Anthropic).
-func buildOpenAITools(spec *RouterReplayToolsSpec, docs string) []map[string]interface{} {
+func buildOpenAITools(spec *RouterReplayToolsSpec, docs string, charsPerToken float64) []map[string]interface{} {
 	n := spec.Count
 	if n <= 0 {
 		n = 1
 	}
 	const perToolOverhead = 150
 	totalOverhead := perToolOverhead * n
-	descBudget := spec.Bytes - totalOverhead
+	descBudget := sizeBudget(spec.Bytes, spec.Tokens, charsPerToken) - totalOverhead
 	if descBudget < n*4 {
 		descBudget = n * 4
 	}
@@ -460,7 +477,7 @@ func buildOpenAITools(spec *RouterReplayToolsSpec, docs string) []map[string]int
 //   - Anthropic-specific fields (top_k, thinking) are dropped.
 //   - Stream options with include_usage are set so we get token counts in
 //     the final SSE chunk.
-func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool) ([]byte, string, error) {
+func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool, charsPerToken float64) ([]byte, string, error) {
 	body := map[string]interface{}{
 		"model":      modelName,
 		"max_tokens": pickMaxTokens(req, outputRatio),
@@ -483,7 +500,7 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 
 	// System blocks become system-role messages at the front of the array.
 	if len(req.SystemBlocks) > 0 {
-		sysBlocks := buildSystem(effectiveSystemBlocks(req.SystemBlocks), docs)
+		sysBlocks := buildSystem(effectiveSystemBlocks(req.SystemBlocks), docs, charsPerToken)
 		for _, b := range sysBlocks {
 			text := ""
 			if t, ok := b["text"]; ok {
@@ -524,13 +541,13 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 	// each block and join them with newlines, and log a one-time warning so
 	// the operator knows tool fidelity is lost.
 	if len(req.Messages) > 0 {
-		openaiMsgs := buildOpenAIMessages(req.Messages, docs)
+		openaiMsgs := buildOpenAIMessages(req.Messages, docs, charsPerToken)
 		messages = append(messages, openaiMsgs...)
 	}
 
 	body["messages"] = messages
 	if req.Tools != nil && req.Tools.Count > 0 {
-		body["tools"] = buildOpenAITools(req.Tools, docs)
+		body["tools"] = buildOpenAITools(req.Tools, docs, charsPerToken)
 	}
 
 	// Collect canonical text for the cache estimator (system blocks + messages).
@@ -539,10 +556,10 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		canonical.WriteString(fmt.Sprintf("<ignore>RUN_GUID: %s</ignore>", runID))
 	}
 	for _, b := range effectiveSystemBlocks(req.SystemBlocks) {
-		canonical.WriteString(synthText(b.Hash, b.Bytes, docs))
+		canonical.WriteString(synthText(b.Hash, sizeBudget(b.Bytes, b.Tokens, charsPerToken), docs))
 	}
 	for _, m := range req.Messages {
-		blocks := buildMessageContent(m, docs)
+		blocks := buildMessageContent(m, docs, charsPerToken)
 		for _, blk := range blocks {
 			if t, ok := blk["text"]; ok {
 				canonical.WriteString(fmt.Sprintf("%v", t))
@@ -564,12 +581,12 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 // messages. tool_use blocks become tool_calls on the assistant message;
 // tool_result blocks become separate role="tool" messages. Orphaned
 // tool_result blocks (no matching prior tool_call) are folded into user text.
-func buildOpenAIMessages(msgs []RouterReplayMessage, docs string) []map[string]interface{} {
+func buildOpenAIMessages(msgs []RouterReplayMessage, docs string, charsPerToken float64) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(msgs))
 	seenToolCallIDs := map[string]bool{}
 
 	for _, m := range msgs {
-		blocks := buildMessageContent(m, docs)
+		blocks := buildMessageContent(m, docs, charsPerToken)
 		role := roleOrUser(m.Role)
 
 		if role == "assistant" {

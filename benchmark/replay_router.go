@@ -672,6 +672,17 @@ func runRouterReplayInstance(
 		}
 	}()
 
+	// Exit BEFORE model discovery when the run is already over. At
+	// end-of-run (--total reached, timeout) the teardown sweeps close
+	// done-channels en masse, unblocking hundreds of descendant instances
+	// at once; without this check each of them fired a discovery GET
+	// first, the simultaneous burst shed off the router's concurrency
+	// limiter as mass 503s, and every failed instance recorded one error
+	// per unfired request — thousands of phantom errors at teardown.
+	if ctx.Err() != nil || (cfg.Total > 0 && st.totalEmitted.Load() >= int64(cfg.Total)) {
+		return
+	}
+
 	replayRunID := ""
 	if !cfg.ReplayNoStamp {
 		replayRunID = cfg.RunID
@@ -683,6 +694,12 @@ func runRouterReplayInstance(
 	if err == nil {
 		poster.outputRatio = cfg.ReplayOutputRatio
 		poster.forceOutput = cfg.ReplayForceOutput
+		// Same wiring as the multi-endpoint picker path (auto.go): without
+		// these, --limit-context and --replay-chars-per-token are silent
+		// no-ops in the single-endpoint case — which was every golden run
+		// until it was caught on 2026-08-06.
+		poster.limitContext = cfg.LimitContext
+		poster.replayCharsPerToken = cfg.ReplayCharsPerToken
 	}
 	if err != nil {
 		// Configuration error — record one error per request in this
@@ -758,6 +775,30 @@ func runRouterReplayInstance(
 		reqCancel()
 		gate.Release()
 
+		if metrics.Error != nil && ctx.Err() != nil {
+			// Run shutdown aborted this in-flight request (timeout or
+			// --total cancellation) — a termination artifact, not a
+			// serving failure. Don't record it as an error.
+			return
+		}
+
+		if metrics.Skipped || isContextOverflow(metrics.Error) {
+			// The session outgrew the context budget — caught by the
+			// --limit-context estimate (Skipped) or by the server's
+			// context-length 400. Prompts only grow within a session, so
+			// every later turn would overflow too: retire the instance
+			// (neither completed nor error). The deferred sweep closes the
+			// remaining done-channels so descendants unblock.
+			//
+			// Give the emission budget back: a skip consumed a totalEmitted
+			// slot but will never complete, and the --total terminator
+			// waits on COMPLETED — without this the emission gate closes at
+			// --total emitted while completions can never reach it, and the
+			// run hangs drained forever.
+			st.totalEmitted.Add(-1)
+			return
+		}
+
 		if ch, ok := requestDone[req.RequestID]; ok {
 			closeOnce(ch)
 		}
@@ -765,6 +806,14 @@ func runRouterReplayInstance(
 		recordReplayRequest(cfg, st, rdw, metrics, isFirstRequest, &coldStartTTFT)
 		isFirstRequest = false
 	}
+}
+
+// isContextOverflow reports whether err is a server-side context-length
+// rejection (vLLM's 400 "This model's maximum context length is N tokens").
+// Only this specific 400 retires a replay instance — transient errors
+// (5xx, timeouts) must keep counting as errors.
+func isContextOverflow(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "maximum context length")
 }
 
 // closeOnce closes ch unless already closed. Each replay request's done

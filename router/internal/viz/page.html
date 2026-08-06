@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Router KV Map</title>
+<style>
+:root{
+  color-scheme: dark;
+  --plane:#0d0d0d; --surface:#1a1a19; --surface-2:#151514;
+  --ink:#ffffff; --ink-2:#c3c2b7; --muted:#898781;
+  --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
+  --good:#0ca30c; --warn:#fab219; --crit:#d03b3b;
+  --font: system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--plane);color:var(--ink);font-family:var(--font)}
+body{font-size:13px;line-height:1.45}
+.wrap{max-width:1680px;margin:0 auto;padding:14px 16px 40px}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding-bottom:10px;border-bottom:1px solid var(--border)}
+h1{font-size:15px;margin:0;font-weight:650;letter-spacing:-0.01em}
+h1 span{color:var(--muted);font-weight:400}
+.spacer{flex:1}
+.status{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);display:flex;align-items:center;gap:6px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--good);display:inline-block}
+.dot.stale{background:var(--crit)}
+.ctlbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.ctlbar label{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+.ctlbar input{width:64px;font-family:var(--mono);font-size:12px;color:var(--ink);
+  background:var(--surface-2);border:1px solid var(--border);border-radius:5px;padding:4px 6px}
+.ctlbar input::placeholder{color:var(--muted)}
+.ctlbar button{font-family:var(--font);font-size:11px;font-weight:600;color:var(--ink-2);
+  background:var(--surface-2);border:1px solid var(--border);border-radius:5px;padding:4px 8px;cursor:pointer}
+.ctlbar button:hover{background:#232322;color:var(--ink)}
+.policy-banner{background:rgba(208,59,59,0.12);border:1px solid rgba(208,59,59,0.35);color:#ef8a8a;
+  border-radius:8px;padding:12px 14px;margin:12px 0;font-size:12.5px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:9px;margin:12px 0}
+.tile{background:var(--surface-2);border:1px solid var(--border);border-radius:7px;padding:8px 10px}
+.tile .v{font-family:var(--mono);font-size:17px;font-weight:600;letter-spacing:-0.01em}
+.tile .k{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:600;margin-top:3px}
+.tile .v.good{color:#4fc74f} .tile .v.warn{color:var(--warn)} .tile .v.crit{color:#ef8a8a}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:11px 13px 13px;margin-top:12px}
+.panel h2{font-size:11px;margin:0 0 2px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-weight:650}
+.panel .note{font-size:11px;color:var(--muted);margin:0 0 9px}
+.empty{color:var(--muted);font-size:12.5px;padding:18px 4px}
+.backends{display:flex;flex-wrap:wrap;gap:8px 16px;margin:0 0 10px;font-family:var(--mono);font-size:11px;color:var(--ink-2)}
+.backends .b{display:flex;align-items:center;gap:5px}
+.hdot{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
+.hdot.up{background:var(--good)} .hdot.down{background:var(--crit)} .hdot.unk{background:var(--muted)}
+#treewrap{overflow:auto;max-height:560px;border-radius:6px;background:var(--surface-2);border:1px solid var(--border)}
+#tree{display:block}
+.tlabel{font-family:var(--mono);font-size:10px;fill:var(--ink-2)}
+.tsub{font-family:var(--mono);font-size:9px;fill:var(--muted)}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--ink-2);margin-top:10px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
+.trunc{font-size:11px;color:var(--warn);margin-top:8px}
+footer{font-size:10.5px;color:var(--muted);margin-top:14px;font-family:var(--mono)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Router KV Map <span>— live prefix-cache tree</span></h1>
+  <div class="spacer"></div>
+  <div class="ctlbar">
+    <label>rows <input type="number" id="ctl-rows" placeholder="all" min="1"></label>
+    <label>children/node <input type="number" id="ctl-children" placeholder="all" min="1"></label>
+    <label>depth <input type="number" id="ctl-depth" placeholder="all" min="1"></label>
+    <button id="ctl-clear" type="button">show all</button>
+  </div>
+  <div class="status"><span class="dot" id="conn-dot"></span><span id="conn-text">connecting…</span></div>
+</header>
+
+<div class="policy-banner" id="policy-banner" style="display:none">
+  router is not running a cache-aware policy — no KV map available
+</div>
+
+<div class="tiles" id="tiles"></div>
+
+<div class="panel" id="tree-panel">
+  <h2>Prefix tree · block placement</h2>
+  <p class="note">Radix-compressed view of the fleet's MERGED prefix cache — one box per run of blocks
+    that no session's request diverges from. A prefix shared by more than one backend appears ONCE, as a
+    common ancestor box; sessions branch below it wherever their content actually diverges. The small
+    squares on the right of a box show which backends currently hold that run. Shows the WHOLE tree by
+    default — use the controls above to cap rows, children per node, or depth if it's too much to read.</p>
+  <div class="backends" id="backends"></div>
+  <div id="treewrap"><div class="empty" id="tree-empty">Waiting for data…</div><svg id="tree"></svg></div>
+  <div class="legend">
+    <span><i style="background:var(--good)"></i>backend holds this run</span>
+    <span><i style="background:var(--grid)"></i>does not</span>
+    <span style="color:var(--muted)">box shade intensity ∝ fraction of the fleet holding it · <b style="font-family:var(--mono)">×N</b> = backend count · <b style="font-family:var(--mono)">·k</b> = blocks in this row · <b style="font-family:var(--mono)">dN</b> = block depth from root (through the end of this row) · <b style="font-family:var(--mono)">⊂N</b> = total blocks in this row's subtree, including itself</span>
+  </div>
+  <div class="trunc" id="trunc-note" style="display:none"></div>
+</div>
+
+<footer id="foot"></footer>
+
+</div>
+
+<script>
+"use strict";
+const POLL_MS = 1000;
+const $ = id => document.getElementById(id);
+
+// dataURL is rebuilt from the UI controls on every poll — NOT from this
+// page's own URL/query string. Configuration lives in the UI, full stop: an
+// empty control means that dimension is unlimited, which is also the
+// default state on load (every input starts empty), so the very first
+// render shows the entire tree with no interaction required.
+function dataURL(){
+  const params = new URLSearchParams();
+  const rows = $('ctl-rows').value.trim();
+  const children = $('ctl-children').value.trim();
+  const depth = $('ctl-depth').value.trim();
+  if (rows) params.set('limit', rows);
+  if (children) params.set('max_children', children);
+  if (depth) params.set('max_depth', depth);
+  const base = location.pathname.replace(/\/+$/, '') + '/data';
+  const qs = params.toString();
+  return qs ? (base + '?' + qs) : base;
+}
+
+function fmtPct(x){ return (x*100).toFixed(0) + '%'; }
+function fmtTime(iso){
+  try { return new Date(iso).toLocaleTimeString(); } catch(e) { return iso; }
+}
+function copiesClass(avg){
+  // anton's target: duplication should stay CLOSE to 1.0 (~105%) — a
+  // cache-aware router keeping most content on one backend, not scattered.
+  if (avg <= 1.2) return 'good';
+  if (avg <= 2.0) return 'warn';
+  return 'crit';
+}
+function healthClass(b){
+  if (typeof b.healthy !== 'boolean') return 'unk';
+  return b.healthy ? 'up' : 'down';
+}
+
+function renderTiles(snap){
+  const backends = snap.backends || [];
+  const tree = snap.tree || [];
+  const tiles = [
+    ['backends', String(backends.length), ''],
+    ['avg copies / block', fmtPct(snap.avg_copies || 0), copiesClass(snap.avg_copies || 0)],
+    ['tree rows shown', String(tree.length), ''],
+    ['rows shown / total', (snap.nodes_shown||0) + ' / ' + (snap.nodes_total||0),
+      snap.truncated ? 'warn' : ''],
+  ];
+  $('tiles').innerHTML = tiles.map(([k,v,c]) =>
+    '<div class="tile"><div class="v ' + c + '">' + v + '</div><div class="k">' + k + '</div></div>'
+  ).join('');
+}
+
+// renderPolicyBanner replaces the old "policy" stat tile, which never
+// changed once prefix-cache-aware routing was always on: with only a
+// binary active/inactive state and no live-updating value, a whole tile
+// was more real estate than the fact deserved. When there's no cache-aware
+// policy at all (round-robin/least-outstanding, or the metrics listener
+// serving a router with none configured), the tiles and tree panel below
+// have nothing meaningful to show either — no backends, no tree, no
+// avg-copies — so this banner takes their place entirely rather than
+// sitting above a row of zeros.
+function renderPolicyBanner(snap){
+  const active = !!snap.policy_active;
+  $('policy-banner').style.display = active ? 'none' : '';
+  $('tiles').style.display = active ? '' : 'none';
+  $('tree-panel').style.display = active ? '' : 'none';
+}
+
+function renderBackendsHeader(backends){
+  if (!backends.length){ $('backends').innerHTML = ''; return; }
+  $('backends').innerHTML = backends.map(b =>
+    '<span class="b"><span class="hdot ' + healthClass(b) + '"></span>' +
+    (b.url||'(unknown)') + ' <span style="color:var(--muted)">inflight ' + (b.inflight||0) +
+    ' · ' + (b.nodes||0) + ' blk</span></span>'
+  ).join('');
+}
+
+// place() is a direct port of the reference's tree layout algorithm: a leaf
+// gets the next sequential row slot; a parent is centered on the average of
+// its children's slots. Returns per-node y "slot" (not pixels yet) and the
+// total slot count (row count) used to size the SVG.
+function layout(tree){
+  const ys = new Array(tree.length).fill(0);
+  let yc = 0;
+  function place(i){
+    const kids = tree[i].children || [];
+    if (!kids.length){ ys[i] = yc++; return ys[i]; }
+    let sum = 0;
+    for (const k of kids) sum += place(k);
+    ys[i] = sum / kids.length;
+    return ys[i];
+  }
+  for (let i = 0; i < tree.length; i++) if (tree[i].parent === -1) place(i);
+  return { ys, rowCount: yc };
+}
+
+// renderTree does the actual O(n) SVG rebuild (one string built, one
+// innerHTML set — never per-node DOM calls, so this stays O(n) even for a
+// large unlimited tree). The caller (poll, below) only invokes this when
+// the tree payload actually changed since the last successful poll, so an
+// idle fleet doesn't pay this cost every second for nothing.
+function renderTree(snap){
+  const tree = snap.tree || [];
+  const backends = snap.backends || [];
+  const svg = $('tree');
+
+  // The !policy_active case is now handled entirely by the policy banner
+  // (renderPolicyBanner), which hides this whole panel — so by the time
+  // renderTree runs, a policy is always active; what's left to distinguish
+  // is only "active but nothing to show yet" (no backends / no requests).
+  if (backends.length === 0){
+    $('tree-empty').textContent = 'No backends known to the cache policy yet.';
+    $('tree-empty').style.display = '';
+    svg.innerHTML = ''; svg.removeAttribute('width'); svg.removeAttribute('height');
+    return;
+  }
+  if (tree.length === 0){
+    $('tree-empty').textContent = 'Policy is active, but no requests have built a prefix tree yet.';
+    $('tree-empty').style.display = '';
+    svg.innerHTML = ''; svg.removeAttribute('width'); svg.removeAttribute('height');
+    return;
+  }
+  $('tree-empty').style.display = 'none';
+
+  // Sizing mirrors the reference: node box width grows with how many
+  // backend-presence squares must fit on its right edge, plus reserved
+  // slots for the "d N" block-depth and "⊂N" subtree-blocks badges just
+  // left of those squares (two distinct badges, side by side).
+  const sq = backends.length > 10 ? 4 : 6, gap = backends.length > 10 ? 1 : 2;
+  const marksW = backends.length * (sq + gap);
+  const badgeW = 68; // two badge slots, ~34px each
+  const NW = Math.max(190, marksW + badgeW + 118), GAPX = 24, RH = 30;
+  const labelChars = Math.max(4, Math.floor((NW - 7 - marksW - badgeW - 34) / 6));
+
+  const { ys, rowCount } = layout(tree);
+  const maxDepth = Math.max(0, ...tree.map(v => v.depth));
+  const W = (maxDepth + 1) * (NW + GAPX) + 16, H = Math.max(110, rowCount * RH + 24);
+  svg.setAttribute('width', W);
+  svg.setAttribute('height', H);
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+
+  const px = v => 10 + v.depth * (NW + GAPX);
+  const py = i => 14 + ys[i] * RH;
+
+  let s = '';
+  // Connectors first, so node boxes draw on top of the curves.
+  tree.forEach((v, i) => {
+    if (v.parent < 0) return;
+    const x1 = px(tree[v.parent]) + NW, y1 = py(v.parent) + 11, x2 = px(v), y2 = py(i) + 11, m = (x1 + x2) / 2;
+    s += '<path d="M' + x1 + ',' + y1 + ' C' + m + ',' + y1 + ' ' + m + ',' + y2 + ' ' + x2 + ',' + y2 +
+         '" fill="none" stroke="#383835" stroke-width="1.2"/>';
+  });
+  tree.forEach((v, i) => {
+    const x = px(v), y = py(i);
+    const n = (v.present || []).filter(Boolean).length;
+    const frac = n / Math.max(1, backends.length);
+    s += '<rect x="' + x + '" y="' + y + '" width="' + NW + '" height="22" rx="5" ' +
+         'fill="rgba(12,163,12,' + (0.08 + 0.32 * frac).toFixed(3) + ')" stroke="rgba(255,255,255,0.10)"/>';
+    let lbl = v.hash.slice(0, 10) + '·' + v.run_len;
+    if (lbl.length > labelChars) lbl = v.hash.slice(0, Math.max(2, labelChars - String(v.run_len).length - 2)) + '…·' + v.run_len;
+    s += '<text class="tlabel" x="' + (x + 7) + '" y="' + (y + 15) + '">' + lbl + '</text>';
+    const sx = x + NW - 26 - marksW;
+    // Two distinct badges just left of the presence squares: "d N" is this
+    // row's END-of-run depth in real blocks from the root (a 12-block run
+    // advances depth by 12, not by 1), "⊂N" is the total real blocks in
+    // this row's subtree including itself — different questions, kept as
+    // two separate labels rather than merged so neither is ambiguous.
+    // Distinct from the "×N" backend-copies marker at the far right below.
+    s += '<text class="tsub" x="' + (sx - 6 - 34) + '" y="' + (y + 15) + '" text-anchor="end">d' + (v.block_depth || v.run_len) + '</text>';
+    s += '<text class="tsub" x="' + (sx - 6) + '" y="' + (y + 15) + '" text-anchor="end">⊂' + (v.subtree_blocks || v.run_len) + '</text>';
+    for (let k = 0; k < backends.length; k++){
+      const on = !!(v.present && v.present[k]);
+      const title = (backends[k].url || '') + (on ? ' — present' : ' — absent');
+      s += '<rect x="' + (sx + k * (sq + gap)) + '" y="' + (y + 8) + '" width="' + sq + '" height="' + sq +
+           '" rx="1.4" fill="' + (on ? '#0ca30c' : '#2c2c2a') + '"><title>' + title.replace(/"/g,'&quot;') + '</title></rect>';
+    }
+    s += '<text class="tsub" x="' + (x + NW - 7) + '" y="' + (y + 15) + '" text-anchor="end">×' + n + '</text>';
+  });
+  svg.innerHTML = s;
+}
+
+let lastOkAt = 0;
+function setConn(ok){
+  const dot = $('conn-dot'), txt = $('conn-text');
+  if (ok){
+    lastOkAt = Date.now();
+    dot.className = 'dot';
+    txt.textContent = 'live · updated ' + new Date().toLocaleTimeString();
+  } else {
+    dot.className = 'dot stale';
+    const secs = lastOkAt ? Math.round((Date.now()-lastOkAt)/1000) : null;
+    txt.textContent = secs === null ? 'connecting…' : ('disconnected · last update ' + secs + 's ago');
+  }
+}
+
+function renderTruncNote(snap){
+  const t = $('trunc-note');
+  if (snap.truncated){
+    t.style.display = '';
+    t.textContent = 'Showing ' + snap.nodes_shown + ' of ' + snap.nodes_total +
+      ' known tree rows — reduced by the rows/children/depth controls above.';
+  } else {
+    t.style.display = 'none';
+  }
+}
+
+// Single-timer polling: pollTimer always holds at most one pending
+// setTimeout. schedulePoll cancels any pending one before arming a new
+// one, so a control change that wants an immediate re-fetch (schedulePoll(0))
+// can never leave a second, duplicate chain of timers running alongside the
+// regular ~1s cadence — without this a control change would silently double
+// (then triple, ...) the effective poll rate over time.
+let pollTimer = null;
+function schedulePoll(delay){
+  if (pollTimer !== null) clearTimeout(pollTimer);
+  pollTimer = setTimeout(runPoll, delay);
+}
+
+let lastTreeJSON = null;
+async function runPoll(){
+  try {
+    const url = dataURL();
+    const resp = await fetch(url, {cache:'no-store'});
+    if (!resp.ok) throw new Error('status ' + resp.status);
+    const snap = await resp.json();
+    renderPolicyBanner(snap);
+    renderTiles(snap);
+    renderBackendsHeader(snap.backends || []);
+    // Only pay for the O(n) SVG rebuild when the tree actually changed —
+    // an idle fleet's repeated identical snapshot shouldn't churn the DOM
+    // every second. Tiles/backends/footer above are cheap enough to just
+    // always refresh (and their "as of" timestamp should move regardless).
+    const treeJSON = JSON.stringify(snap.tree || []);
+    if (treeJSON !== lastTreeJSON){
+      lastTreeJSON = treeJSON;
+      renderTree(snap);
+    }
+    renderTruncNote(snap);
+    $('foot').textContent = 'snapshot generated ' + fmtTime(snap.generated_at) + ' · polling ' + url + ' every ' + POLL_MS + 'ms';
+    setConn(true);
+  } catch (e) {
+    setConn(false);
+  } finally {
+    schedulePoll(POLL_MS);
+  }
+}
+
+['ctl-rows', 'ctl-children', 'ctl-depth'].forEach(id => {
+  $(id).addEventListener('change', () => schedulePoll(0));
+});
+$('ctl-clear').addEventListener('click', () => {
+  ['ctl-rows', 'ctl-children', 'ctl-depth'].forEach(id => { $(id).value = ''; });
+  schedulePoll(0);
+});
+
+schedulePoll(0);
+</script>
+</body>
+</html>

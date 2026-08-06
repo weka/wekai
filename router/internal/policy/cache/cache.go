@@ -35,6 +35,7 @@ import (
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/policy"
 	"github.com/weka/wekai/router/internal/registry"
+	"github.com/weka/wekai/router/internal/viz"
 )
 
 // tieEpsilon is the band within which two matched fractions count as equal.
@@ -89,11 +90,11 @@ func New(cfg Config, fallback policy.Policy) *Policy {
 func (p *Policy) Name() string { return "prefix-cache-aware" }
 
 // AddBackend creates a model for a backend. Wired to the registry's add hook.
-func (p *Policy) AddBackend(b *registry.Backend) { p.store.add(b.URL) }
+func (p *Policy) AddBackend(b *registry.Backend) { p.store.add(b) }
 
 // DropBackend discards a backend's model. Its prefixes are NOT reassigned to any
 // other backend: nothing else has served them (CACHE-10).
-func (p *Policy) DropBackend(b *registry.Backend) { p.store.drop(b.URL) }
+func (p *Policy) DropBackend(b *registry.Backend) { p.store.drop(b) }
 
 // Flush clears every model. Backs POST /flush_cache; touches nothing else.
 func (p *Policy) Flush() { p.store.flush() }
@@ -212,6 +213,11 @@ func (p *Policy) PublishGauges() {
 // Stats reports per-backend model size, for metrics.
 func (p *Policy) Stats() map[string][2]int64 { return p.store.stats() }
 
+// Snapshot implements viz.DataSource for the live KV block map at
+// /router-viz — see snapshot.go for the implementation shared with
+// ThresholdPolicy.
+func (p *Policy) Snapshot(opts viz.SnapshotOptions) viz.Snapshot { return p.store.snapshot(opts) }
+
 // publishPredictionStats records the spread of a single request's per-candidate
 // predicted-hit fractions into router_cache_prediction_{avg,max,min}. Shared by
 // both cache-aware policies so the two report this the same way; each collects
@@ -246,27 +252,34 @@ func publishPredictionStats(fracs []float64) {
 // on flush, lazy get, and size reporting. The scoring/selection algorithm on
 // top of it is what actually differs between policies.
 type trieStore struct {
-	mu    sync.RWMutex
-	cfg   kvcache.Config
-	tries map[string]*kvcache.Trie // by canonical backend URL
+	mu       sync.RWMutex
+	cfg      kvcache.Config
+	tries    map[string]*kvcache.Trie     // by canonical backend URL
+	backends map[string]*registry.Backend // same key set as tries, best-effort (see add)
 }
 
 func newTrieStore(cfg kvcache.Config) *trieStore {
-	return &trieStore{cfg: cfg, tries: map[string]*kvcache.Trie{}}
+	return &trieStore{cfg: cfg, tries: map[string]*kvcache.Trie{}, backends: map[string]*registry.Backend{}}
 }
 
-func (s *trieStore) add(url string) {
+// add takes the whole *registry.Backend, not just its URL, so trieStore can
+// report health/inflight for the viz snapshot alongside the trie it already
+// tracked — additive: nothing that only needs the trie (get, stats, flush)
+// changed.
+func (s *trieStore) add(b *registry.Backend) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.tries[url]; !ok {
-		s.tries[url] = kvcache.New(s.cfg)
+	if _, ok := s.tries[b.URL]; !ok {
+		s.tries[b.URL] = kvcache.New(s.cfg)
 	}
+	s.backends[b.URL] = b
 }
 
-func (s *trieStore) drop(url string) {
+func (s *trieStore) drop(b *registry.Backend) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.tries, url)
+	delete(s.tries, b.URL)
+	delete(s.backends, b.URL)
 }
 
 func (s *trieStore) flush() {

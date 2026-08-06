@@ -61,6 +61,15 @@ type replayPoster struct {
 	// newReplayPoster, to avoid touching its many existing call sites.
 	outputRatio float64
 	forceOutput bool
+	// limitContext: skip requests whose capture-recorded prompt tokens exceed it
+	// (chars~=tokens*4 convention). 0 = off.
+	limitContext int
+	// replayCharsPerToken: --replay-chars-per-token. When > 0, synthesized
+	// replay content is sized off each block's captured Tokens count
+	// (tokens * replayCharsPerToken chars) instead of its captured Bytes
+	// count, so the serving tokenizer's counts land near the original
+	// capture's. 0 = byte-faithful sizing (default).
+	replayCharsPerToken float64
 }
 
 func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string, runID string, dryRun bool, coldTPS, warmTPS, outputTPS int, estimator *cacheEstimator) (*replayPoster, error) {
@@ -119,7 +128,7 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 
 	model := dyn.Model
 	if model == "" && !dryRun {
-		discovered, derr := discoverModelName(base)
+		discovered, derr := cachedDiscoverModelName(base)
 		if derr != nil {
 			return nil, fmt.Errorf("model=... not set in %q and model discovery from %s failed: %w", modelSpec, base, derr)
 		}
@@ -149,8 +158,32 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 
 var (
 	discoveredOnceMu sync.Mutex
-	discoveredOnce   = map[string]bool{} // base -> printed-already
+	discoveredOnce   = map[string]bool{}   // base -> printed-already
+	discoveredModel  = map[string]string{} // base -> model id (discovery cache)
 )
+
+// cachedDiscoverModelName memoizes discoverModelName per base URL. Every
+// series instance builds its own poster; without this cache each retired or
+// spawned instance fired its own /v1/models GET, and a fast series churn
+// (e.g. --limit-context retiring oversized sessions with no HTTP) flooded
+// the router with hundreds of concurrent discovery calls at startup,
+// shedding 503s off its request-cap and cascading into per-request errors.
+func cachedDiscoverModelName(base string) (string, error) {
+	discoveredOnceMu.Lock()
+	if m, ok := discoveredModel[base]; ok {
+		discoveredOnceMu.Unlock()
+		return m, nil
+	}
+	discoveredOnceMu.Unlock()
+	m, err := discoverModelName(base)
+	if err != nil {
+		return "", err
+	}
+	discoveredOnceMu.Lock()
+	discoveredModel[base] = m
+	discoveredOnceMu.Unlock()
+	return m, nil
+}
 
 // logDiscoveredModelOnce prints the auto-discovered model name once per
 // endpoint per process. Each agent instance creates its own replayPoster,
@@ -304,9 +337,18 @@ func (p *replayPoster) do(
 	var err error
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	default:
-		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
+	}
+	// --limit-context uses the capture's production-measured token counts
+	// (usage.input_tokens + cache read/creation), not a chars heuristic:
+	// the replay data records the real prompt size of every request.
+	if p.limitContext > 0 {
+		promptTokens := req.InputTokens + req.CacheReadTokens + req.CacheCreationTokens
+		if promptTokens > p.limitContext {
+			return RequestMetrics{Skipped: true}
+		}
 	}
 	if err != nil {
 		return RequestMetrics{
@@ -709,9 +751,9 @@ func (p *replayPoster) dryDo(
 	var canonical string
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	default:
-		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	}
 	var ratio float64
 	if p.estimator != nil {

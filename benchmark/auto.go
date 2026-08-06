@@ -79,10 +79,17 @@ type AutoBenchmarkConfig struct {
 	// conversation from the dataset instead of running the synthetic request
 	// loop. The synthetic --step / --shared-prefix-per-series / --docs-dir
 	// knobs are ignored in this mode.
-	FromDataset     string // short name, e.g. "hermes-lambda"
-	ReplaySeries    int    // number of conversations to replay (0 = whole dataset)
-	ReplayNoStamp   bool   // when true, skip the per-run <ignore>RUN_GUID</ignore> prefix injection (default is to stamp so each run starts with a pristine server prefix cache while still permitting within-run cross-series cache hits)
-	AbortOnCollapse bool   // when true, abort if windowed cache hit rate < 50% for 2 minutes (legacy collapse detector, off by default — fires spuriously on legitimate low-reuse workloads)
+	FromDataset  string // short name, e.g. "hermes-lambda"
+	ReplaySeries int    // number of conversations to replay (0 = whole dataset)
+	LimitContext int    // --limit-context: skip requests over N tokens (~N*4 chars); 0=off
+	// ReplayCharsPerToken: --replay-chars-per-token. When > 0, synthesized
+	// replay content is sized off each block's captured Tokens count
+	// (tokens * ReplayCharsPerToken chars) instead of its captured Bytes
+	// count, so the serving tokenizer's counts land near the original
+	// capture's. 0 = byte-faithful sizing (default).
+	ReplayCharsPerToken float64
+	ReplayNoStamp       bool // when true, skip the per-run <ignore>RUN_GUID</ignore> prefix injection (default is to stamp so each run starts with a pristine server prefix cache while still permitting within-run cross-series cache hits)
+	AbortOnCollapse     bool // when true, abort if windowed cache hit rate < 50% for 2 minutes (legacy collapse detector, off by default — fires spuriously on legitimate low-reuse workloads)
 	// ReplayStopAtLowConcurrency terminates the run when the queue is drained
 	// AND active worker count < desired concurrency — a long-tail cutoff so
 	// throughput numbers reflect steady-state behavior rather than the slow
@@ -1596,6 +1603,8 @@ func runSingleModelBenchmark(
 				break
 			}
 			pp.outputRatio = cfg.ReplayOutputRatio
+			pp.limitContext = cfg.LimitContext
+			pp.replayCharsPerToken = cfg.ReplayCharsPerToken
 			pp.forceOutput = cfg.ReplayForceOutput
 			posters[i] = pp
 		}

@@ -1,6 +1,6 @@
 // Package kvcache models what prefix of a request a KV cache has already seen.
 //
-// It is the single implementation shared by two consumers with genuinely
+// It is the single implementation shared by three consumers with genuinely
 // different needs:
 //
 //   - benchmark, offline and single-cache: walk the trie, credit the matched
@@ -12,9 +12,28 @@
 //     record the answer against exactly one backend. It must be bounded, because
 //     a real vLLM node evicts under memory pressure and an unbounded model grows
 //     without limit while drifting optimistic.
+//   - a live server that actually ADMITS requests (router/internal/mockvllm today;
+//     conceivably a real one later): needs everything the router's model needs,
+//     PLUS the guarantee that a block cannot be evicted out from under a request
+//     that is still in flight. RecordAndPin/Unpin cover this — see their docs.
 //
-// Both are served by one type. A zero Config means unbounded — the simulator's
-// semantics — so the offline path behaves exactly as it did before extraction.
+// All three are served by one type. A zero Config means unbounded — the
+// simulator's semantics — so the offline path behaves exactly as it did before
+// extraction.
+//
+// # Eviction is pluggable in spirit, not (yet) in code
+//
+// evictLocked below is LRU-among-unpinned-leaves. The router is expected to move
+// to TTL/tail eviction instead (the current LRU is considered a defect there),
+// while a live server wants LRU-among-unpinned to stay — those are legitimately
+// different policies for different consumers of the same tree. Pinning is
+// deliberately orthogonal to which discipline runs: a pinned node is pulled out
+// of the eviction candidate set entirely (see pinChain/unpinChain), so it is
+// protected under LRU today and would be equally protected under a future
+// TTL-ordered candidate set without any change to the pinning code. Swapping the
+// discipline itself (replacing evictLocked's LRU-tail walk with a TTL-tail walk)
+// is intentionally NOT done here — that is the router's change to make, on its
+// own schedule, against its own consumer.
 //
 // # What this is not
 //
@@ -172,9 +191,16 @@ type node struct {
 	parent *node
 	kids   []*node
 
-	// Intrusive LRU links. ONLY leaves are in the list; see evictLocked.
+	// Intrusive LRU links. ONLY UNPINNED leaves are in the list; see
+	// evictLocked and pinChain/unpinChain.
 	prev, next *node
 	inLRU      bool
+
+	// pins counts in-flight requests currently holding this node (see
+	// RecordAndPin/Unpin). A node with pins > 0 is never in the LRU list,
+	// regardless of whether it is a leaf, so evictLocked's "the tail is
+	// always evictable" invariant needs no change to respect pinning.
+	pins int32
 }
 
 func (n *node) find(key uint64) *node {
@@ -221,12 +247,13 @@ func (n *node) removeKid(key uint64) {
 type Trie struct {
 	cfg Config
 
-	mu         sync.RWMutex
-	root       node
-	head, tail *node // head = most recently used; leaves only
-	nodes      int64
-	tokens     int64
-	anomalies  int64
+	mu          sync.RWMutex
+	root        node
+	head, tail  *node // head = most recently used; unpinned leaves only
+	nodes       int64
+	tokens      int64
+	anomalies   int64
+	pinnedNodes int64 // nodes currently protected from eviction by >=1 Pin
 
 	// Aggregates across observed requests, for the offline hit ratio. Atomic so a
 	// snapshot read needs no lock.
@@ -315,6 +342,130 @@ func (t *Trie) RecordAndCount(units []Unit) (cached, total int) {
 	return cached, total
 }
 
+// Pin is a handle to one admitted request's reserved chain of blocks — both
+// the reused prefix and any newly inserted tail — held for as long as the
+// request is in flight so eviction cannot reclaim something it still needs.
+// This is vLLM's real behavior: a running sequence's KV blocks are
+// reference-counted and unevictable until the sequence finishes. Call Unpin
+// exactly once, whatever the outcome (success, error, or client
+// disconnect), or the blocks leak as permanently unevictable.
+type Pin struct{ leaf *node }
+
+// RecordAndPin is RecordAndCount plus pinning: it walks the matched prefix,
+// credits it, inserts the novel tail (evicting unpinned LRU blocks if
+// bounded — pinned blocks are never eviction candidates, see pinChain), and
+// pins every node on the resulting root-to-leaf chain.
+//
+// Use this instead of RecordAndCount for any caller that has a real
+// in-flight request to protect (RecordAndCount itself stays as-is: the
+// offline simulator never has anything "in flight" to protect, since it
+// processes one request fully before starting the next). Use this instead of
+// Commit for the same reason the router doesn't use RecordAndCount: Commit is
+// a fire-and-forget record of service, with nothing held afterward for a
+// caller to release.
+func (t *Trie) RecordAndPin(units []Unit) (cached, total int, pin *Pin) {
+	for i := range units {
+		total += int(units[i].Tokens)
+	}
+	if len(units) == 0 {
+		return 0, 0, &Pin{}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	n := &t.root
+	i := 0
+	for ; i < len(units); i++ {
+		c := n.find(units[i].Hash)
+		if c == nil {
+			break
+		}
+		cached += int(units[i].Tokens)
+		n = c
+	}
+	leaf := t.insertFrom(n, units, i)
+	t.pinChain(leaf)
+	return cached, total, &Pin{leaf: leaf}
+}
+
+// Unpin releases a Pin. Any of its blocks no longer held by another
+// in-flight request's Pin become eviction candidates again, and a bounded
+// trie takes the opportunity to catch up on any eviction that pinning had
+// deferred.
+func (t *Trie) Unpin(p *Pin) {
+	if p == nil || p.leaf == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.unpinChain(p.leaf)
+	if t.cfg.Bounded() {
+		t.evictLocked(t.cfg.EvictBudget)
+	}
+}
+
+// PinnedNodes reports how many nodes are currently protected from eviction by
+// at least one held Pin.
+func (t *Trie) PinnedNodes() int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.pinnedNodes
+}
+
+// Chain is one root-to-leaf path through the trie: the ordered sequence of
+// block hashes (and their estimated token counts) from the root to a single
+// leaf, i.e. everything one session/request currently has resident, in the
+// order it was requested.
+type Chain struct {
+	Hashes []uint64
+	Tokens []int32
+}
+
+// Chains enumerates up to limit root-to-leaf paths (limit<=0 means
+// unlimited) for read-only introspection — a live visualization, an
+// operator debugging a fleet, anything that wants to SEE what's resident
+// rather than query a specific prefix. Nothing in routing or the cache
+// estimator uses this; Query/Commit/RecordAndCount/RecordAndPin remain the
+// only mutating or decision-making entry points.
+//
+// Returns the chains found (capped at limit) and totalLeaves, the true
+// total the trie holds regardless of the cap, so a caller that truncates
+// can report how much was left out rather than truncating silently.
+//
+// Pure: RLock only, no mutation, no LRU movement, no pin/counter changes.
+// The walk always visits every node to compute an accurate totalLeaves —
+// for a router-scale trie (tens of thousands of nodes) that is a real but
+// bounded cost, acceptable for an introspection endpoint polled at human
+// (~1/sec) rates; short-circuiting once limit chains are found while still
+// counting the rest cheaply would need a separate leaf-count fast path if
+// this is ever called at higher frequency or against a much larger trie.
+func (t *Trie) Chains(limit int) (chains []Chain, totalLeaves int) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	var walk func(n *node, hashes []uint64, tokens []int32)
+	walk = func(n *node, hashes []uint64, tokens []int32) {
+		if len(n.kids) == 0 {
+			if n == &t.root {
+				return // an entirely empty trie: the root itself is not a chain
+			}
+			totalLeaves++
+			if limit <= 0 || len(chains) < limit {
+				chains = append(chains, Chain{
+					Hashes: append([]uint64(nil), hashes...),
+					Tokens: append([]int32(nil), tokens...),
+				})
+			}
+			return
+		}
+		for _, c := range n.kids {
+			walk(c, append(hashes, c.key), append(tokens, c.tokens))
+		}
+	}
+	walk(&t.root, nil, nil)
+	return chains, totalLeaves
+}
+
 func (t *Trie) commitLocked(units []Unit) {
 	n := &t.root
 	i := 0
@@ -331,8 +482,12 @@ func (t *Trie) commitLocked(units []Unit) {
 	t.insertFrom(n, units, i)
 }
 
-// insertFrom appends the novel tail starting at units[i] and evicts if bounded.
-func (t *Trie) insertFrom(n *node, units []Unit, i int) {
+// insertFrom appends the novel tail starting at units[i], evicts if bounded,
+// and returns the final node reached (n itself, if the tail was empty). The
+// return value lets a caller that needs the whole chain — pinChain, in
+// particular — find it without re-walking; every existing caller is free to
+// ignore it, so this is additive.
+func (t *Trie) insertFrom(n *node, units []Unit, i int) *node {
 	inserted := 0
 	for ; i < len(units); i++ {
 		n = t.insertLocked(n, units[i])
@@ -344,6 +499,7 @@ func (t *Trie) insertFrom(n *node, units []Unit, i int) {
 		// caps become advisory rather than real.
 		t.evictLocked(inserted + t.cfg.EvictBudget)
 	}
+	return n
 }
 
 func (t *Trie) insertLocked(parent *node, u Unit) *node {
@@ -383,10 +539,17 @@ func (t *Trie) evictLocked(budget int) {
 		t.lruRemove(v)
 		t.nodes--
 		t.tokens -= int64(v.tokens)
-		if p != &t.root && len(p.kids) == 0 {
+		if p != &t.root && len(p.kids) == 0 && p.pins == 0 {
 			// The parent just became a leaf. It goes to the TAIL, not the front: a
 			// prefix whose whole subtree has gone should be reclaimed promptly, not
 			// treated as freshly used.
+			//
+			// The pins==0 guard matters: p can be a DIFFERENT in-flight request's
+			// leaf (that request's chain ends exactly here, while v was a longer,
+			// already-finished request's now-evicted continuation). A pinned p must
+			// stay out of the LRU list no matter how it lost its children — pinChain
+			// already removed it when it was first pinned, and unpinChain is the
+			// only path allowed to put it back.
 			t.lruPushBack(p)
 		}
 		budget--
@@ -447,6 +610,45 @@ func (t *Trie) lruMoveToFront(n *node) {
 	t.lruPushFront(n)
 }
 
+// pinChain walks leaf up to (excluding) the root, incrementing each node's
+// pin count and pulling any that just became pinned (0 -> 1) out of the LRU
+// list. Ancestors reached this way include both the request's reused prefix
+// and its newly inserted tail — the whole chain a real sequence would hold —
+// which is why this must be called with the node insertFrom returned, not
+// just the tail.
+func (t *Trie) pinChain(leaf *node) {
+	for n := leaf; n != nil && n != &t.root; n = n.parent {
+		if n.pins == 0 {
+			if n.inLRU {
+				t.lruRemove(n)
+			}
+			t.pinnedNodes++
+		}
+		n.pins++
+	}
+}
+
+// unpinChain is pinChain's inverse: decrements each node's pin count and, for
+// any that just became unpinned (1 -> 0) AND are still a leaf, returns them
+// to the LRU as most-recently-used (they were, after all, just released from
+// active use). A node that gained children while pinned (another request's
+// chain grew through it) is correctly left out of the LRU here too — the
+// same invariant insertLocked maintains for any other interior node.
+func (t *Trie) unpinChain(leaf *node) {
+	for n := leaf; n != nil && n != &t.root; n = n.parent {
+		if n.pins == 0 {
+			continue // defensive: guards against an unpaired Unpin, not expected in normal use
+		}
+		n.pins--
+		if n.pins == 0 {
+			t.pinnedNodes--
+			if len(n.kids) == 0 {
+				t.lruPushFront(n)
+			}
+		}
+	}
+}
+
 // Observe accumulates one request's outcome into the aggregate ratio. It inserts
 // nothing; use RecordAndCount or Commit for that.
 func (t *Trie) Observe(cached, total int) {
@@ -467,6 +669,14 @@ func (t *Trie) Ratio() float64 {
 }
 
 // Reset clears the model. It does not clear the observed aggregates.
+//
+// Caution for a caller that also pins (router/internal/mockvllm; the router
+// itself never does, so this is currently unreachable): Reset does not know
+// about outstanding Pins and does not force-unpin them. A later Unpin against
+// a Pin issued before Reset walks nodes that are now orphaned — detached from
+// the fresh root — so it neither corrupts the reset tree nor panics, but it
+// silently decrements pinnedNodes for blocks that were already discarded.
+// Don't call Reset while requests holding Pins are in flight.
 func (t *Trie) Reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()

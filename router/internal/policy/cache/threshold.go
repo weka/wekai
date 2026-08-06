@@ -7,6 +7,7 @@ import (
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/policy"
 	"github.com/weka/wekai/router/internal/registry"
+	"github.com/weka/wekai/router/internal/viz"
 )
 
 // ThresholdConfig configures ThresholdPolicy.
@@ -63,16 +64,22 @@ func NewThreshold(cfg ThresholdConfig, fallback policy.Policy) *ThresholdPolicy 
 func (p *ThresholdPolicy) Name() string { return "prefix-cache-candidates" }
 
 // AddBackend creates a model for a backend. Wired to the registry's add hook.
-func (p *ThresholdPolicy) AddBackend(b *registry.Backend) { p.store.add(b.URL) }
+func (p *ThresholdPolicy) AddBackend(b *registry.Backend) { p.store.add(b) }
 
 // DropBackend discards a backend's model (CACHE-10).
-func (p *ThresholdPolicy) DropBackend(b *registry.Backend) { p.store.drop(b.URL) }
+func (p *ThresholdPolicy) DropBackend(b *registry.Backend) { p.store.drop(b) }
 
 // Flush clears every model. Backs POST /flush_cache; touches nothing else.
 func (p *ThresholdPolicy) Flush() { p.store.flush() }
 
 // Stats reports per-backend model size, for metrics.
 func (p *ThresholdPolicy) Stats() map[string][2]int64 { return p.store.stats() }
+
+// Snapshot implements viz.DataSource for the live KV block map at
+// /router-viz — see snapshot.go for the implementation shared with Policy.
+func (p *ThresholdPolicy) Snapshot(opts viz.SnapshotOptions) viz.Snapshot {
+	return p.store.snapshot(opts)
+}
 
 // PublishGauges exports per-backend model size on the health interval.
 func (p *ThresholdPolicy) PublishGauges() {
