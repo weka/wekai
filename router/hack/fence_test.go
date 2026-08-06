@@ -170,11 +170,20 @@ func exempted(lines []string, i int) bool {
 // TestNoArgvDump guards CFG-N2. v1 printed `DEBUG: Raw args: {:?}` to stdout
 // before logging was configured, dumping the full command line — including any
 // secret passed as a flag — with no way to suppress it by log level.
+// argvReaders are the cmd/*/main.go files allowed to reference os.Args at
+// all — each is a real CLI entry point that legitimately parses its own
+// flags from it. Anything else touching os.Args is exactly the v1 pattern
+// this fence guards against.
+var argvReaders = map[string]bool{
+	"cmd/wllm-router/main.go": true, // main legitimately reads os.Args to parse them
+	"cmd/mock-vllm/main.go":   true, // same pattern: main() -> run(os.Args[1:]) -> flag.FlagSet
+}
+
 func TestNoArgvDump(t *testing.T) {
 	root := repoRoot(t)
 	for _, rel := range goFiles(t, root, false) {
-		if filepath.ToSlash(rel) == "cmd/wllm-router/main.go" {
-			continue // main legitimately reads os.Args to parse them
+		if argvReaders[filepath.ToSlash(rel)] {
+			continue
 		}
 		src, err := os.ReadFile(filepath.Join(root, rel))
 		if err != nil {

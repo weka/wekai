@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/weka/wekai/kvcache"
 )
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -20,32 +22,36 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// admitOrReject reserves a concurrency slot or writes a 429 and records the
-// rejection. Callers must invoke the returned release exactly once when ok.
-func (s *Server) admitOrReject(w http.ResponseWriter) (release func(), ok bool) {
-	release, ok = s.engine.Admit()
+// admitOrReject tokenizes the prompt, then makes the single admission
+// decision: reserve a concurrency slot AND pin those blocks together (see
+// Engine.Admit). On rejection it writes the 429 and records it; nothing was
+// touched in the cache model for a rejected request, matching a real 429
+// where the backend did no prefill and cached nothing. Callers must invoke
+// the returned release exactly once when ok.
+func (s *Server) admitOrReject(w http.ResponseWriter, units []kvcache.Unit) (release func(), cached, total int, ok bool) {
+	release, cached, total, ok = s.engine.Admit(units)
 	if !ok {
 		writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
 			"server is at max concurrency; retry")
 		s.coll.observe("rejected", 0, 0, 0)
 	}
-	return release, ok
+	return release, cached, total, ok
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	release, ok := s.admitOrReject(w)
-	if !ok {
-		return
-	}
-	defer release()
-
 	var req chatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed JSON body: "+err.Error())
 		return
 	}
 
-	cached, total := s.engine.Serve(s.engine.Tokenize(string(req.promptBytes())))
+	units := s.engine.Tokenize(string(req.promptBytes()))
+	release, cached, total, ok := s.admitOrReject(w, units)
+	if !ok {
+		return
+	}
+	defer release()
+
 	maxTok := s.engine.MaxTokensOrDefault(req.MaxTokens)
 	ttft, totalDur := s.engine.Latency(cached, total, maxTok)
 	modelID := s.engine.Config().ModelID
@@ -64,8 +70,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	finish := "stop"
 	u := buildUsage(total, cached, maxTok)
 	writeJSON(w, http.StatusOK, chatCompletionResponse{
-		ID:      s.newID("chatcmpl"),
-		Object:  "chat.completion",
+		ID:     s.newID("chatcmpl"),
+		Object: "chat.completion",
+		//clockexempt: cosmetic OpenAI wire-format timestamp, not a routing or timing decision
 		Created: time.Now().Unix(),
 		Model:   modelID,
 		Choices: []chatChoice{{
@@ -80,19 +87,19 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
-	release, ok := s.admitOrReject(w)
-	if !ok {
-		return
-	}
-	defer release()
-
 	var req completionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed JSON body: "+err.Error())
 		return
 	}
 
-	cached, total := s.engine.Serve(s.engine.Tokenize(req.promptText()))
+	units := s.engine.Tokenize(req.promptText())
+	release, cached, total, ok := s.admitOrReject(w, units)
+	if !ok {
+		return
+	}
+	defer release()
+
 	maxTok := s.engine.MaxTokensOrDefault(req.MaxTokens)
 	ttft, totalDur := s.engine.Latency(cached, total, maxTok)
 	modelID := s.engine.Config().ModelID
@@ -111,8 +118,9 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	finish := "stop"
 	u := buildUsage(total, cached, maxTok)
 	writeJSON(w, http.StatusOK, completionResponse{
-		ID:      s.newID("cmpl"),
-		Object:  "text_completion",
+		ID:     s.newID("cmpl"),
+		Object: "text_completion",
+		//clockexempt: cosmetic OpenAI wire-format timestamp, not a routing or timing decision
 		Created: time.Now().Unix(),
 		Model:   modelID,
 		Choices: []completionChoice{{Index: 0, Text: text, FinishReason: &finish}},

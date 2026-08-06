@@ -16,6 +16,18 @@
 // predicted-vs-observed signal (router_cache_predicted_fraction vs.
 // router_cache_observed_fraction) instead of a hand-rolled second model that
 // could drift from the router's own assumptions.
+//
+// Block/prefix accounting (splitting, chain hashing, prefix-hit counting,
+// the parent-linked tree) lives entirely in kvcache and is shared verbatim —
+// nothing here reimplements it. The one place this engine's needs diverge
+// from the router's is eviction: a live server actually admits requests, so
+// its blocks must be PINNED for as long as a request holding them is in
+// flight (kvcache.Trie.RecordAndPin/Unpin), with LRU eviction applying only
+// to unpinned blocks. The router's own trie never pins (Query/Commit only)
+// and is expected to move from its current LRU to TTL/tail eviction — a
+// different discipline for a different consumer of the same core, which is
+// exactly what pinning was designed to stay orthogonal to (see the "Eviction
+// is pluggable in spirit" note in kvcache's package doc).
 package mockvllm
 
 import (
@@ -146,37 +158,55 @@ func (e *Engine) Tokenize(prompt string) []kvcache.Unit {
 	return kvcache.ChunkContent("prompt", []byte(prompt), e.cfg.blockSizeBytes())
 }
 
-// Admit reserves one concurrency slot. ok is false when the server is at
-// MaxConcurrency, and the caller must respond 429 without calling the
-// returned (nil) release. When ok is true, release MUST be called exactly
-// once to free the slot.
-func (e *Engine) Admit() (release func(), ok bool) {
-	if e.cfg.MaxConcurrency <= 0 {
-		e.inflight.Add(1)
-		e.admitted.Add(1)
-		return func() { e.inflight.Add(-1) }, true
-	}
-	n := e.inflight.Add(1)
-	if n > int64(e.cfg.MaxConcurrency) {
-		e.inflight.Add(-1)
-		e.rejected.Add(1)
-		return nil, false
-	}
-	e.admitted.Add(1)
-	return func() { e.inflight.Add(-1) }, true
+// Query reports how much of units this cache currently holds, WITHOUT
+// admitting, pinning, inserting, or otherwise mutating anything — a pure
+// peek, for callers (tests, observability) that want to check residency
+// without pretending to serve a request. Real request handling must go
+// through Admit, not this.
+func (e *Engine) Query(units []kvcache.Unit) (cached, total int) {
+	return e.trie.Query(units)
 }
 
-// Serve is the ground-truth cache lookup+insert for one request: it walks the
-// matched prefix, credits it, inserts the novel tail (evicting LRU blocks if
-// bounded), and returns (cached, total) estimated tokens — exactly the
-// numbers a real vLLM worker would report via
-// usage.prompt_tokens_details.cached_tokens and usage.prompt_tokens.
-func (e *Engine) Serve(units []kvcache.Unit) (cached, total int) {
-	cached, total = e.trie.RecordAndCount(units)
+// Admit is the single admission decision for a request: it reserves a
+// concurrency slot AND pins the request's blocks in the same step, mirroring
+// what a real vLLM scheduler does — a sequence is admitted and its KV blocks
+// (both the reused warm prefix and the newly needed tail) are reference-
+// counted together, not as two independent steps. ok is false past
+// MaxConcurrency, and in that case NOTHING else happened: no cache credit,
+// no insertion, no pin — a 429'd request never touched KV state, exactly
+// like a request vLLM never scheduled. On success, release MUST be called
+// exactly once (success, error, or client disconnect) to free both the
+// concurrency slot and the block pin — see kvcache.Trie.Unpin.
+//
+// Eviction (when bounded) only ever removes UNPINNED blocks: an admitted
+// request's blocks cannot be evicted out from under it while it's in flight,
+// whether they were already warm or were just inserted for this request.
+// That guarantee lives in kvcache (pinChain/unpinChain via RecordAndPin/
+// Unpin) precisely so this engine and a future TTL-evicting router share the
+// exact same block-splitting/chain-hashing/prefix-hit-counting core; only the
+// eviction discipline differs (LRU-among-unpinned here, tail-TTL there).
+func (e *Engine) Admit(units []kvcache.Unit) (release func(), cached, total int, ok bool) {
+	if e.cfg.MaxConcurrency > 0 {
+		n := e.inflight.Add(1)
+		if n > int64(e.cfg.MaxConcurrency) {
+			e.inflight.Add(-1)
+			e.rejected.Add(1)
+			return nil, 0, 0, false
+		}
+	} else {
+		e.inflight.Add(1)
+	}
+	e.admitted.Add(1)
+
+	cached, total, pin := e.trie.RecordAndPin(units)
 	e.trie.Observe(cached, total)
 	e.promptToks.Add(int64(total))
 	e.cachedToks.Add(int64(cached))
-	return cached, total
+
+	return func() {
+		e.trie.Unpin(pin)
+		e.inflight.Add(-1)
+	}, cached, total, true
 }
 
 // Latency computes TTFT (prefill of the UNCACHED portion only, matching real
@@ -208,6 +238,7 @@ func (e *Engine) MaxTokensOrDefault(requested int) int {
 // Stats snapshots the live cache model and counters, for /metrics and /health.
 type Stats struct {
 	Nodes, Tokens, Anomalies     int64
+	PinnedNodes                  int64 // blocks currently held by an in-flight request's Pin
 	Inflight, Admitted, Rejected int64
 	PromptTokens, CachedTokens   int64
 	GeneratedTokens              int64
@@ -220,6 +251,7 @@ func (e *Engine) Stats() Stats {
 		Nodes:           nodes,
 		Tokens:          tokens,
 		Anomalies:       anomalies,
+		PinnedNodes:     e.trie.PinnedNodes(),
 		Inflight:        e.inflight.Load(),
 		Admitted:        e.admitted.Load(),
 		Rejected:        e.rejected.Load(),

@@ -68,6 +68,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatComp
 	ctx := r.Context()
 	flusher := startSSE(w)
 	id := s.newID("chatcmpl")
+	//clockexempt: cosmetic OpenAI wire-format timestamp, not a routing or timing decision
 	created := time.Now().Unix()
 
 	if !sleepCtx(ctx, ttft) {
@@ -115,6 +116,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, req co
 	ctx := r.Context()
 	flusher := startSSE(w)
 	id := s.newID("cmpl")
+	//clockexempt: cosmetic OpenAI wire-format timestamp, not a routing or timing decision
 	created := time.Now().Unix()
 
 	if !sleepCtx(ctx, ttft) {
