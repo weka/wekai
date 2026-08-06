@@ -2,14 +2,21 @@
 
 Two deliverables: a static Go binary and a Kubernetes-ready container image.
 
+**Migrating from the Rust vllm-router? Read [MIGRATION.md](../docs/MIGRATION.md)
+first.** Metric names, several endpoints, the probe configuration and the API
+key variable all changed, and the first three of those change without producing
+an error.
+
 ## Build
 
+All targets live in the repository-root `Makefile`; run them from the repo root.
+
 ```bash
-make -f Makefile.go.mk build          # ./wllm-router for the host platform
-make -f Makefile.go.mk image          # container image for the host platform
-make -f Makefile.go.mk image-multiarch  # linux/amd64 + linux/arm64, pushed
-make -f Makefile.go.mk image-size     # size against the NFR-8 budget
-make -f Makefile.go.mk verify         # lint + fences + full test suite
+make router-build            # ./wllm-router for the host platform
+make router-image            # container image for the host platform
+make router-image-multiarch  # linux/amd64 + linux/arm64, pushed
+make router-image-size       # uncompressed and compressed size
+make verify                  # gofmt + vet + full suite under -race
 ```
 
 Image characteristics, as verified:
