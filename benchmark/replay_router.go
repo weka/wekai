@@ -753,6 +753,10 @@ func runRouterReplayInstance(
 			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
 		} else {
 			metrics = reqPoster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
+			if metrics.Skipped {
+				// --limit-context filter: not sent — neither completed nor error.
+				continue
+			}
 		}
 		picker.release(epIdx)
 		reqCancel()

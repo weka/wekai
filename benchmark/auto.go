@@ -1907,9 +1907,6 @@ func runSingleModelBenchmark(
 						IsEmpty:              metrics.IsEmpty,
 						LocalCacheRatio:      ratio,
 					}
-					if rec.Skipped {
-						continue // --limit-context filter: neither completed nor error
-					}
 					if rec.IsError || rec.IsEmpty {
 						rec.PromptText = metrics.CachedPrompt
 						rec.Question = metrics.Question
