@@ -34,6 +34,8 @@ h1 span{color:var(--muted);font-weight:400}
 .ctlbar button{font-family:var(--font);font-size:11px;font-weight:600;color:var(--ink-2);
   background:var(--surface-2);border:1px solid var(--border);border-radius:5px;padding:4px 8px;cursor:pointer}
 .ctlbar button:hover{background:#232322;color:var(--ink)}
+.policy-banner{background:rgba(208,59,59,0.12);border:1px solid rgba(208,59,59,0.35);color:#ef8a8a;
+  border-radius:8px;padding:12px 14px;margin:12px 0;font-size:12.5px}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:9px;margin:12px 0}
 .tile{background:var(--surface-2);border:1px solid var(--border);border-radius:7px;padding:8px 10px}
 .tile .v{font-family:var(--mono);font-size:17px;font-weight:600;letter-spacing:-0.01em}
@@ -72,9 +74,13 @@ footer{font-size:10.5px;color:var(--muted);margin-top:14px;font-family:var(--mon
   <div class="status"><span class="dot" id="conn-dot"></span><span id="conn-text">connecting…</span></div>
 </header>
 
+<div class="policy-banner" id="policy-banner" style="display:none">
+  router is not running a cache-aware policy — no KV map available
+</div>
+
 <div class="tiles" id="tiles"></div>
 
-<div class="panel">
+<div class="panel" id="tree-panel">
   <h2>Prefix tree · block placement</h2>
   <p class="note">Radix-compressed view of the fleet's MERGED prefix cache — one box per run of blocks
     that no session's request diverges from. A prefix shared by more than one backend appears ONCE, as a
@@ -138,7 +144,6 @@ function renderTiles(snap){
   const backends = snap.backends || [];
   const tree = snap.tree || [];
   const tiles = [
-    ['policy', snap.policy_active ? 'active' : 'none', snap.policy_active ? 'good' : 'crit'],
     ['backends', String(backends.length), ''],
     ['avg copies / block', fmtPct(snap.avg_copies || 0), copiesClass(snap.avg_copies || 0)],
     ['tree rows shown', String(tree.length), ''],
@@ -148,6 +153,22 @@ function renderTiles(snap){
   $('tiles').innerHTML = tiles.map(([k,v,c]) =>
     '<div class="tile"><div class="v ' + c + '">' + v + '</div><div class="k">' + k + '</div></div>'
   ).join('');
+}
+
+// renderPolicyBanner replaces the old "policy" stat tile, which never
+// changed once prefix-cache-aware routing was always on: with only a
+// binary active/inactive state and no live-updating value, a whole tile
+// was more real estate than the fact deserved. When there's no cache-aware
+// policy at all (round-robin/least-outstanding, or the metrics listener
+// serving a router with none configured), the tiles and tree panel below
+// have nothing meaningful to show either — no backends, no tree, no
+// avg-copies — so this banner takes their place entirely rather than
+// sitting above a row of zeros.
+function renderPolicyBanner(snap){
+  const active = !!snap.policy_active;
+  $('policy-banner').style.display = active ? 'none' : '';
+  $('tiles').style.display = active ? '' : 'none';
+  $('tree-panel').style.display = active ? '' : 'none';
 }
 
 function renderBackendsHeader(backends){
@@ -188,12 +209,10 @@ function renderTree(snap){
   const backends = snap.backends || [];
   const svg = $('tree');
 
-  if (!snap.policy_active){
-    $('tree-empty').textContent = 'No cache-aware policy is active on this router — nothing to visualize.';
-    $('tree-empty').style.display = '';
-    svg.innerHTML = ''; svg.removeAttribute('width'); svg.removeAttribute('height');
-    return;
-  }
+  // The !policy_active case is now handled entirely by the policy banner
+  // (renderPolicyBanner), which hides this whole panel — so by the time
+  // renderTree runs, a policy is always active; what's left to distinguish
+  // is only "active but nothing to show yet" (no backends / no requests).
   if (backends.length === 0){
     $('tree-empty').textContent = 'No backends known to the cache policy yet.';
     $('tree-empty').style.display = '';
@@ -309,6 +328,7 @@ async function runPoll(){
     const resp = await fetch(url, {cache:'no-store'});
     if (!resp.ok) throw new Error('status ' + resp.status);
     const snap = await resp.json();
+    renderPolicyBanner(snap);
     renderTiles(snap);
     renderBackendsHeader(snap.backends || []);
     // Only pay for the O(n) SVG rebuild when the tree actually changed —

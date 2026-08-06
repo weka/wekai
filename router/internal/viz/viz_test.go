@@ -132,6 +132,51 @@ func TestPageHandler_HasUIControlsNotJustQueryParams(t *testing.T) {
 	}
 }
 
+// TestPageHandler_PolicyInactiveBannerReplacesTile is anton's ask: the old
+// "policy" stat tile was redundant (prefix-cache-aware is always on, so it
+// never changed) and is gone; in its place, a full-width banner explains
+// the policy_active=false case, taking over from the tiles/tree panel
+// (which have nothing meaningful to show without a policy either) rather
+// than sitting above a row of empty stats. Structural, like the other
+// PageHandler tests: httptest can't execute the JS, so this checks the
+// served source contains the banner element/text and no longer contains
+// the removed tile's label.
+func TestPageHandler_PolicyInactiveBannerReplacesTile(t *testing.T) {
+	ts := httptest.NewServer(viz.PageHandler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body := new(strings.Builder)
+	buf := make([]byte, 8192)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			body.Write(buf[:n])
+		}
+		if err != nil {
+			break
+		}
+	}
+	html := body.String()
+
+	if !strings.Contains(html, `id="policy-banner"`) {
+		t.Fatalf("page missing the #policy-banner element")
+	}
+	if !strings.Contains(html, "not running a cache-aware policy") {
+		t.Fatalf("page missing the policy-inactive banner text")
+	}
+	if !strings.Contains(html, "policy_active") {
+		t.Fatalf("page no longer reads policy_active from the snapshot")
+	}
+	if strings.Contains(html, "['policy',") {
+		t.Fatalf("the removed 'policy' stat tile is still being built")
+	}
+}
+
 func TestDataHandler_NilSourceReportsInactive(t *testing.T) {
 	ts := httptest.NewServer(viz.DataHandler(nil))
 	defer ts.Close()
