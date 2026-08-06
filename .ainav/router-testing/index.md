@@ -12,6 +12,62 @@ See [calibration.md](calibration.md) for tuning the mock's latency/tokenizer rat
 match a real fleet, and [replay-notes.md](replay-notes.md) for replay-v3 file mechanics
 and recent correctness fixes.
 
+## Validated Standard Recipe (routing-improvement work)
+
+The recommended, validated flow for evaluating a routing-policy change — everything
+below is one worked, known-good example of steps 1-5; read those for the explanation
+of each flag. 4 mock instances, `--max-node-concurrency 32` at the ROUTER (not on the
+mock instances — they keep their own `--max-concurrency 256`, matching a real backend's
+own admission limit; the per-node cap under test is a ROUTER-side concurrency lease,
+see step 3), client concurrency sized to the fleet's total node capacity
+(4 nodes × 32 = 128), ×10 calibrated rates (see
+[calibration.md](calibration.md#speedup-for-fast-iteration)), and a LONG run so the
+cache numbers are meaningful (see
+[calibration.md](calibration.md#depth-matters-run-length-changes-what-a-run-is-valid-evidence-for)).
+Total runtime ~6 minutes.
+
+```bash
+# 1. Build (once)
+go build -o /tmp/mock-vllm ./router/cmd/mock-vllm
+go build -o /tmp/wllm-router ./router/cmd/wllm-router
+go build -o /tmp/wekai-local .
+
+# 2. Fleet: 4 instances, ×10 aggregate rates, admission cap stays at the backend default
+/tmp/mock-vllm --instances 4 --base-port 9001 --model-id <model-id> \
+  --block-size-tokens 256 --block-capacity 7952 --max-concurrency 256 \
+  --chars-per-token 3.729 --output-kv-multiplier 1.0 \
+  --cold-input-tps 640000 --cached-input-tps 1330000 --output-tps 740 --base-latency 10ms
+
+# 3. Router: the per-node cap under test lives HERE, not on the mock instances
+/tmp/wllm-router \
+  --listen :8080 --metrics-listen 127.0.0.1:29000 \
+  --backends http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003,http://127.0.0.1:9004 \
+  --policy prefix-cache-aware --max-node-concurrency 32
+
+# 4. Readiness-gate (always — see below)
+until curl -sf http://127.0.0.1:8080/v1/models > /dev/null; do sleep 0.5; done
+
+# 5. Benchmark: concurrency = nodes x node-cap = 4x32 = 128; hot pool OFF for
+#    precise measurements; a LONG total for cache-realistic numbers
+/tmp/wekai-local benchmark auto \
+  --router-replay-file <replay.jsonl> \
+  --models "dynamic/http://127.0.0.1:8080/v1,type=openai_vllm,alias=<run-name>" \
+  --concurrency 128 --series 256 --hot-series-concurrency 0 \
+  --limit-context 140000 --print-errors-threshold=1s --total 30000 \
+  [--save-request-data <dir>]
+```
+
+- **Viz is PER ROUTER INSTANCE.** `/router-viz` lives on the metrics listener above
+  (`127.0.0.1:29000` here). Running a second router for A/B on the same machine: give
+  it its own `--metrics-listen` (conventionally `127.0.0.1:29001`) as well as its own
+  `--listen`, so both KV maps stay independently reachable.
+- **The drain tail is normal, not a hang.** Real captures include requests with
+  `max_tokens` up to ~32k; at ×10 (output 740 tok/s) one of those alone takes ~43s to
+  decode. Near the end of a run, once the replay queue has emptied, the last few
+  giant-decode requests dominate: `active` in the ledger sense drops and `in_flight`
+  can sit at a small number (heading to 0) for tens of seconds while those finish. Let
+  it drain — that is the run completing correctly, not stalling.
+
 ## 1. Build
 
 ```bash
@@ -99,6 +155,13 @@ reason to race it: always gate.
   --total 4800 \
   [--save-request-data <dir>]
 ```
+
+This particular sizing (`--total 4800`, `--concurrency 90`, hot pool on) is illustrative,
+not the validated one — it is a SHORT run: fine for a fast correctness/logic check, but
+its cache-hit numbers read optimistic (see
+[calibration.md](calibration.md#depth-matters-run-length-changes-what-a-run-is-valid-evidence-for)).
+For anything whose cache-hit numbers matter, use the
+[Validated Standard Recipe](#validated-standard-recipe-routing-improvement-work) above.
 
 - Point `--models` at the ROUTER's listen address (`:8080` above), not at any one
   backend — that's the whole point of the exercise.
