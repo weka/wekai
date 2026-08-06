@@ -694,6 +694,12 @@ func runRouterReplayInstance(
 	if err == nil {
 		poster.outputRatio = cfg.ReplayOutputRatio
 		poster.forceOutput = cfg.ReplayForceOutput
+		// Same wiring as the multi-endpoint picker path (auto.go): without
+		// these, --limit-context and --replay-chars-per-token are silent
+		// no-ops in the single-endpoint case — which was every golden run
+		// until it was caught on 2026-08-06.
+		poster.limitContext = cfg.LimitContext
+		poster.replayCharsPerToken = cfg.ReplayCharsPerToken
 	}
 	if err != nil {
 		// Configuration error — record one error per request in this
