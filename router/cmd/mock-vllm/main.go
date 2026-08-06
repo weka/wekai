@@ -21,12 +21,9 @@
 // used elsewhere in this module — real vLLM's actual tokenizer runs closer
 // to 2.9-3.4 chars/token on dense agentic content) and
 // --output-kv-multiplier (real vLLM writes decode KV into the same pool as
-// prompt KV, growing a running request's allocation throughout generation —
-// this mock ignored that until now. At admission, ceil(output_tokens*
-// multiplier/block-size-tokens) blocks are inserted AND PINNED alongside the
-// prompt, held for the request's whole simulated duration, then released
-// exactly like prompt blocks, after which they remain as ordinary evictable
-// cache).
+// prompt KV; this mock ignored that until now — a completed request appends
+// ceil(output_tokens*multiplier/block-size-tokens) blocks to its own chain,
+// occupying capacity and evictable exactly like prompt blocks).
 //
 // Run several independent instances (each with its own cache/counters) to
 // form a fleet, either as separate processes on separate ports:
@@ -85,7 +82,7 @@ func run(args []string) error {
 	coldInputTPS := fs.Float64("cold-input-tps", 50_000, "tokens/sec for UNCACHED prompt tokens (prefill). Set from the real fleet's measured/estimated prefill throughput")
 	cachedInputTPS := fs.Float64("cached-input-tps", 1_000_000, "tokens/sec for CACHED prompt tokens (cache read) — NOT free: only recompute is skipped, a cache hit still costs a KV read")
 	outputTPS := fs.Float64("output-tps", 500, "tokens/sec decode, per request — also paces SSE chunk spacing")
-	outputKVMultiplier := fs.Float64("output-kv-multiplier", 1.0, "models real vLLM writing decode KV into the same pool as prompt KV: at admission, ceil(output_tokens*multiplier/block-size-tokens) blocks are inserted and PINNED alongside the prompt for the request's whole simulated duration (in-flight capacity pressure, not just at completion), then released and left as ordinary evictable cache. 0 disables this (outputs stay invisible to the cache, the historical behavior)")
+	outputKVMultiplier := fs.Float64("output-kv-multiplier", 1.0, "models real vLLM writing decode KV into the same pool as prompt KV: on completion, ceil(output_tokens*multiplier/block-size-tokens) blocks are appended to the request's own chain, occupying capacity and evictable like prompt blocks. 0 disables this (outputs stay invisible to the cache, the historical behavior)")
 	logLevel := fs.String("log-level", "info", "debug, info, warn, or error")
 
 	if err := fs.Parse(args); err != nil {

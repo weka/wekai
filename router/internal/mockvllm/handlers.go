@@ -52,22 +52,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	// The completion text is fully deterministic given maxTok (nothing here
-	// actually generates tokens), so it — and therefore the output-KV
-	// blocks derived from it — can be pinned right alongside the prompt, at
-	// admission, before any simulated latency: real vLLM's decode grows a
-	// running request's allocation throughout generation, not only at
-	// completion. See Engine.PinOutputBlocks.
 	maxTok := s.engine.MaxTokensOrDefault(req.MaxTokens)
-	content := strings.Join(syntheticTokens(maxTok), " ")
-	releaseOutput := s.engine.PinOutputBlocks(units, maxTok, content)
-	defer releaseOutput()
-
 	ttft, totalDur := s.engine.Latency(cached, total, maxTok)
 	modelID := s.engine.Config().ModelID
 
 	if req.Stream {
-		s.streamChat(w, r, req, modelID, cached, total, maxTok, ttft)
+		s.streamChat(w, r, req, modelID, units, cached, total, maxTok, ttft)
 		return
 	}
 
@@ -76,6 +66,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	s.engine.RecordOutput(maxTok)
 
+	content := strings.Join(syntheticTokens(maxTok), " ")
+	s.engine.AppendOutputBlocks(units, maxTok, content)
 	finish := "stop"
 	u := buildUsage(total, cached, maxTok)
 	writeJSON(w, http.StatusOK, chatCompletionResponse{
@@ -110,15 +102,11 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	defer release()
 
 	maxTok := s.engine.MaxTokensOrDefault(req.MaxTokens)
-	text := strings.Join(syntheticTokens(maxTok), " ")
-	releaseOutput := s.engine.PinOutputBlocks(units, maxTok, text)
-	defer releaseOutput()
-
 	ttft, totalDur := s.engine.Latency(cached, total, maxTok)
 	modelID := s.engine.Config().ModelID
 
 	if req.Stream {
-		s.streamCompletion(w, r, req, modelID, cached, total, maxTok, ttft)
+		s.streamCompletion(w, r, req, modelID, units, cached, total, maxTok, ttft)
 		return
 	}
 
@@ -127,6 +115,8 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	s.engine.RecordOutput(maxTok)
 
+	text := strings.Join(syntheticTokens(maxTok), " ")
+	s.engine.AppendOutputBlocks(units, maxTok, text)
 	finish := "stop"
 	u := buildUsage(total, cached, maxTok)
 	writeJSON(w, http.StatusOK, completionResponse{
