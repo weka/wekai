@@ -412,6 +412,60 @@ func (t *Trie) PinnedNodes() int64 {
 	return t.pinnedNodes
 }
 
+// Chain is one root-to-leaf path through the trie: the ordered sequence of
+// block hashes (and their estimated token counts) from the root to a single
+// leaf, i.e. everything one session/request currently has resident, in the
+// order it was requested.
+type Chain struct {
+	Hashes []uint64
+	Tokens []int32
+}
+
+// Chains enumerates up to limit root-to-leaf paths (limit<=0 means
+// unlimited) for read-only introspection — a live visualization, an
+// operator debugging a fleet, anything that wants to SEE what's resident
+// rather than query a specific prefix. Nothing in routing or the cache
+// estimator uses this; Query/Commit/RecordAndCount/RecordAndPin remain the
+// only mutating or decision-making entry points.
+//
+// Returns the chains found (capped at limit) and totalLeaves, the true
+// total the trie holds regardless of the cap, so a caller that truncates
+// can report how much was left out rather than truncating silently.
+//
+// Pure: RLock only, no mutation, no LRU movement, no pin/counter changes.
+// The walk always visits every node to compute an accurate totalLeaves —
+// for a router-scale trie (tens of thousands of nodes) that is a real but
+// bounded cost, acceptable for an introspection endpoint polled at human
+// (~1/sec) rates; short-circuiting once limit chains are found while still
+// counting the rest cheaply would need a separate leaf-count fast path if
+// this is ever called at higher frequency or against a much larger trie.
+func (t *Trie) Chains(limit int) (chains []Chain, totalLeaves int) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	var walk func(n *node, hashes []uint64, tokens []int32)
+	walk = func(n *node, hashes []uint64, tokens []int32) {
+		if len(n.kids) == 0 {
+			if n == &t.root {
+				return // an entirely empty trie: the root itself is not a chain
+			}
+			totalLeaves++
+			if limit <= 0 || len(chains) < limit {
+				chains = append(chains, Chain{
+					Hashes: append([]uint64(nil), hashes...),
+					Tokens: append([]int32(nil), tokens...),
+				})
+			}
+			return
+		}
+		for _, c := range n.kids {
+			walk(c, append(hashes, c.key), append(tokens, c.tokens))
+		}
+	}
+	walk(&t.root, nil, nil)
+	return chains, totalLeaves
+}
+
 func (t *Trie) commitLocked(units []Unit) {
 	n := &t.root
 	i := 0

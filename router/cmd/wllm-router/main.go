@@ -28,6 +28,7 @@ import (
 	cachepolicy "github.com/weka/wekai/router/internal/policy/cache"
 	"github.com/weka/wekai/router/internal/proxy"
 	"github.com/weka/wekai/router/internal/registry"
+	"github.com/weka/wekai/router/internal/viz"
 )
 
 // Build metadata, injected with -ldflags at build time so the running image can
@@ -210,10 +211,19 @@ func run(args []string) error {
 	}()
 
 	// Metrics on a separate listener; never reachable on the inference mux
-	// (GW-13).
+	// (GW-13). Also carries the live KV block map at /router-viz — same
+	// listener, same "internal-only, never exposed on the inference path"
+	// posture, since it's diagnostic surface, not part of serving traffic.
+	// cachePol is nil for a non-cache policy (round-robin/least-outstanding);
+	// viz.DataHandler handles a nil DataSource by reporting
+	// policy_active:false rather than erroring.
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", metrics.Handler(reg))
+	metricsMux.HandleFunc("/router-viz", viz.PageHandler())
+	metricsMux.HandleFunc("/router-viz/data", viz.DataHandler(cachePol))
 	metricsSrv := &http.Server{
 		Addr:              cfg.MetricsListen,
-		Handler:           metrics.Handler(reg),
+		Handler:           metricsMux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
@@ -256,11 +266,15 @@ func run(args []string) error {
 
 // cacheLifecycle is implemented by every cache-aware policy so the registry
 // can drive per-backend model lifecycle without main knowing which cache
-// policy (if any) is active.
+// policy (if any) is active. It embeds viz.DataSource for the same reason:
+// the /router-viz wiring above needs a narrow interface, not the concrete
+// Policy/ThresholdPolicy type, and every cache-aware policy already has to
+// implement Snapshot to be usable here at all.
 type cacheLifecycle interface {
 	AddBackend(*registry.Backend)
 	DropBackend(*registry.Backend)
 	PublishGauges()
+	viz.DataSource
 }
 
 func buildPolicy(cfg config.Config) (proxy.Selector, cacheLifecycle, error) {

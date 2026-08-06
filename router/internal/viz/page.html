@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Router KV Map</title>
+<style>
+:root{
+  color-scheme: dark;
+  --plane:#0d0d0d; --surface:#1a1a19; --surface-2:#151514;
+  --ink:#ffffff; --ink-2:#c3c2b7; --muted:#898781;
+  --grid:#2c2c2a; --border:rgba(255,255,255,0.10);
+  --good:#0ca30c; --good-dim:#173617; --warn:#fab219; --crit:#d03b3b;
+  --font: system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--plane);color:var(--ink);font-family:var(--font)}
+body{font-size:13px;line-height:1.45}
+.wrap{max-width:1680px;margin:0 auto;padding:14px 16px 40px}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding-bottom:10px;border-bottom:1px solid var(--border)}
+h1{font-size:15px;margin:0;font-weight:650;letter-spacing:-0.01em}
+h1 span{color:var(--muted);font-weight:400}
+.spacer{flex:1}
+.status{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);display:flex;align-items:center;gap:6px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--good);display:inline-block}
+.dot.stale{background:var(--crit)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:9px;margin:12px 0}
+.tile{background:var(--surface-2);border:1px solid var(--border);border-radius:7px;padding:8px 10px}
+.tile .v{font-family:var(--mono);font-size:17px;font-weight:600;letter-spacing:-0.01em}
+.tile .k{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:600;margin-top:3px}
+.tile .v.good{color:#4fc74f} .tile .v.warn{color:var(--warn)} .tile .v.crit{color:#ef8a8a}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:11px 13px 13px;margin-top:12px}
+.panel h2{font-size:11px;margin:0 0 2px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-weight:650}
+.panel .note{font-size:11px;color:var(--muted);margin:0 0 9px}
+.empty{color:var(--muted);font-size:12.5px;padding:18px 4px}
+#maparea{overflow-x:auto;overflow-y:hidden;border-radius:6px}
+.row{display:flex;align-items:center;gap:10px;padding:3px 0;white-space:nowrap}
+.rowlabel{flex:0 0 auto;width:280px;font-family:var(--mono);font-size:11px;color:var(--ink-2);
+  display:flex;align-items:center;gap:6px;overflow:hidden;text-overflow:ellipsis}
+.rowlabel .url{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rowlabel .n{color:var(--muted);flex:0 0 auto}
+.hdot{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
+.hdot.up{background:var(--good)} .hdot.down{background:var(--crit)} .hdot.unk{background:var(--muted)}
+.squares{display:flex;gap:2px;padding:2px 0}
+.sq{width:10px;height:14px;border-radius:2px;flex:0 0 auto;background:var(--grid)}
+.sq.present{background:var(--good)}
+.sq.chainB{background:var(--grid);filter:brightness(1.35)}
+.sq.chainB.present{background:var(--good);filter:brightness(1.22)}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--ink-2);margin-top:10px}
+.legend i{display:inline-block;width:10px;height:12px;border-radius:2px;margin-right:5px;vertical-align:middle}
+.trunc{font-size:11px;color:var(--warn);margin-top:8px}
+footer{font-size:10.5px;color:var(--muted);margin-top:14px;font-family:var(--mono)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Router KV Map <span>— live prefix-cache block placement</span></h1>
+  <div class="spacer"></div>
+  <div class="status"><span class="dot" id="conn-dot"></span><span id="conn-text">connecting…</span></div>
+</header>
+
+<div class="tiles" id="tiles"></div>
+
+<div class="panel">
+  <h2>KV block map</h2>
+  <p class="note">One row per backend, one square per cache block, aligned by block identity across rows —
+    the same block held by more than one backend lines up in the same column on every row it's present in.
+    Blocks are grouped left-to-right by session (prefix chain), shaded in alternating bands, so one
+    session's blocks read as a contiguous run.</p>
+  <div id="maparea"><div class="empty" id="map-empty">Waiting for data…</div><div id="rows"></div></div>
+  <div class="legend">
+    <span><i style="background:var(--good)"></i>block present on this backend</span>
+    <span><i style="background:var(--grid)"></i>not present</span>
+    <span style="color:var(--muted)">alternating shade = session/chain boundary</span>
+  </div>
+  <div class="trunc" id="trunc-note" style="display:none"></div>
+</div>
+
+<footer id="foot"></footer>
+
+</div>
+
+<script>
+"use strict";
+// DATA_URL is derived from our own path, not hardcoded, so this page keeps
+// working unmodified if it's ever mounted under a different prefix.
+const DATA_URL = location.pathname.replace(/\/+$/, '') + '/data' + location.search;
+const POLL_MS = 1000;
+
+const $ = id => document.getElementById(id);
+
+function fmtPct(x){ return (x*100).toFixed(0) + '%'; }
+function fmtTime(iso){
+  try { return new Date(iso).toLocaleTimeString(); } catch(e) { return iso; }
+}
+
+function copiesClass(avg){
+  // anton's target: duplication should stay CLOSE to 1.0 (~105%) — a
+  // cache-aware router keeping most content on one backend, not scattered.
+  if (avg <= 1.2) return 'good';
+  if (avg <= 2.0) return 'warn';
+  return 'crit';
+}
+
+function renderTiles(snap){
+  const backends = snap.backends || [];
+  const tiles = [
+    ['policy', snap.policy_active ? 'active' : 'none', snap.policy_active ? 'good' : 'crit'],
+    ['backends', String(backends.length), ''],
+    ['avg copies / block', fmtPct(snap.avg_copies || 0), copiesClass(snap.avg_copies || 0)],
+    ['blocks shown', String((snap.blocks || []).length), ''],
+    ['chains shown', (snap.chains_shown||0) + ' / ' + (snap.chains_total||0),
+      snap.truncated ? 'warn' : ''],
+  ];
+  $('tiles').innerHTML = tiles.map(([k,v,c]) =>
+    '<div class="tile"><div class="v ' + c + '">' + v + '</div><div class="k">' + k + '</div></div>'
+  ).join('');
+}
+
+function healthClass(b){
+  if (typeof b.healthy !== 'boolean') return 'unk';
+  return b.healthy ? 'up' : 'down';
+}
+
+function renderMap(snap){
+  const blocks = snap.blocks || [];
+  const backends = snap.backends || [];
+
+  if (!snap.policy_active){
+    $('map-empty').textContent = 'No cache-aware policy is active on this router — nothing to visualize.';
+    $('map-empty').style.display = '';
+    $('rows').innerHTML = '';
+    return;
+  }
+  if (backends.length === 0){
+    $('map-empty').textContent = 'No backends known to the cache policy yet.';
+    $('map-empty').style.display = '';
+    $('rows').innerHTML = '';
+    return;
+  }
+  if (blocks.length === 0){
+    $('map-empty').textContent = 'Policy is active, but no requests have been cached yet.';
+    $('map-empty').style.display = '';
+    $('rows').innerHTML = '';
+    return;
+  }
+  $('map-empty').style.display = 'none';
+
+  // Alternate a shading band each time chain_id changes, so a session's
+  // blocks (already contiguous by construction) read as one visual run.
+  const bandOf = new Array(blocks.length);
+  let band = 0;
+  for (let i = 0; i < blocks.length; i++){
+    if (i > 0 && blocks[i].chain_id !== blocks[i-1].chain_id) band ^= 1;
+    bandOf[i] = band;
+  }
+
+  const rowsHtml = backends.map(b => {
+    const present = b.present || [];
+    const sq = blocks.map((blk, i) => {
+      const cls = 'sq' + (bandOf[i] ? ' chainB' : '') + (present[i] ? ' present' : '');
+      const title = 'hash ' + blk.hash + ' · chain ' + blk.chain_id + ' · pos ' + blk.pos +
+                    ' · ~' + blk.tokens + ' tok · ' + (present[i] ? 'PRESENT' : 'absent') +
+                    ' on ' + b.url;
+      return '<div class="' + cls + '" title="' + title.replace(/"/g,'&quot;') + '"></div>';
+    }).join('');
+    const label = (b.url || '(unknown)') + ' · ' + (b.nodes||0) + ' blk';
+    return '<div class="row">' +
+      '<div class="rowlabel"><span class="hdot ' + healthClass(b) + '"></span>' +
+      '<span class="url" title="' + (b.url||'').replace(/"/g,'&quot;') + '">' + (b.url||'(unknown)') + '</span>' +
+      '<span class="n">inflight ' + (b.inflight||0) + ' · ' + (b.nodes||0) + ' blk</span></div>' +
+      '<div class="squares">' + sq + '</div>' +
+      '</div>';
+  }).join('');
+  $('rows').innerHTML = rowsHtml;
+
+  const t = $('trunc-note');
+  if (snap.truncated){
+    t.style.display = '';
+    t.textContent = 'Showing ' + snap.chains_shown + ' of ' + snap.chains_total +
+      ' known chains (capped for display — add ?limit=N to /router-viz/data for more).';
+  } else {
+    t.style.display = 'none';
+  }
+}
+
+let lastOkAt = 0;
+function setConn(ok){
+  const dot = $('conn-dot'), txt = $('conn-text');
+  if (ok){
+    lastOkAt = Date.now();
+    dot.className = 'dot';
+    txt.textContent = 'live · updated ' + new Date().toLocaleTimeString();
+  } else {
+    dot.className = 'dot stale';
+    const secs = lastOkAt ? Math.round((Date.now()-lastOkAt)/1000) : null;
+    txt.textContent = secs === null ? 'connecting…' : ('disconnected · last update ' + secs + 's ago');
+  }
+}
+
+async function poll(){
+  try {
+    const resp = await fetch(DATA_URL, {cache:'no-store'});
+    if (!resp.ok) throw new Error('status ' + resp.status);
+    const snap = await resp.json();
+    renderTiles(snap);
+    renderMap(snap);
+    $('foot').textContent = 'snapshot generated ' + fmtTime(snap.generated_at) + ' · polling ' + DATA_URL + ' every ' + POLL_MS + 'ms';
+    setConn(true);
+  } catch (e) {
+    setConn(false);
+  } finally {
+    setTimeout(poll, POLL_MS);
+  }
+}
+
+poll();
+</script>
+</body>
+</html>
