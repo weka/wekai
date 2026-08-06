@@ -43,11 +43,11 @@ func TestOpenAIVsAnthropicBodySize(t *testing.T) {
 		Messages:     msgs,
 	}
 
-	anthBody, _, err := buildAnthropicMessagesBody(req, docs, "model-a", "", 0, false, 0)
+	anthBody, _, err := buildAnthropicMessagesBody(req, docs, "model-a", "", 0, false, replaySizer{})
 	if err != nil {
 		t.Fatalf("buildAnthropicMessagesBody: %v", err)
 	}
-	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model-a", "", 0, false, 0)
+	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model-a", "", 0, false, replaySizer{})
 	if err != nil {
 		t.Fatalf("buildOpenAIChatCompletionsBody: %v", err)
 	}
@@ -134,11 +134,11 @@ func TestOpenAIVsAnthropicBodySize(t *testing.T) {
 		sessCount++
 		for _, inst := range sess.Instances {
 			for _, r := range inst.Requests {
-				ab, _, err := buildAnthropicMessagesBody(r, docs, "model-a", "", 0, false, 0)
+				ab, _, err := buildAnthropicMessagesBody(r, docs, "model-a", "", 0, false, replaySizer{})
 				if err != nil {
 					continue
 				}
-				ob, _, err := buildOpenAIChatCompletionsBody(r, docs, "model-a", "", 0, false, 0)
+				ob, _, err := buildOpenAIChatCompletionsBody(r, docs, "model-a", "", 0, false, replaySizer{})
 				if err != nil {
 					continue
 				}
@@ -186,7 +186,7 @@ func TestOpenAIToolUseConversion(t *testing.T) {
 		},
 	}
 
-	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model-x", "", 0, false, 0)
+	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model-x", "", 0, false, replaySizer{})
 	if err != nil {
 		t.Fatalf("buildOpenAIChatCompletionsBody: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestOpenAIToolUseConversion(t *testing.T) {
 			},
 		},
 	}
-	orphanBody, _, err := buildOpenAIChatCompletionsBody(reqOrphan, docs, "model-x", "", 0, false, 0)
+	orphanBody, _, err := buildOpenAIChatCompletionsBody(reqOrphan, docs, "model-x", "", 0, false, replaySizer{})
 	if err != nil {
 		t.Fatalf("buildOpenAIChatCompletionsBody orphan: %v", err)
 	}
