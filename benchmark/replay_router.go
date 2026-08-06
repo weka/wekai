@@ -672,6 +672,17 @@ func runRouterReplayInstance(
 		}
 	}()
 
+	// Exit BEFORE model discovery when the run is already over. At
+	// end-of-run (--total reached, timeout) the teardown sweeps close
+	// done-channels en masse, unblocking hundreds of descendant instances
+	// at once; without this check each of them fired a discovery GET
+	// first, the simultaneous burst shed off the router's concurrency
+	// limiter as mass 503s, and every failed instance recorded one error
+	// per unfired request — thousands of phantom errors at teardown.
+	if ctx.Err() != nil || (cfg.Total > 0 && st.totalEmitted.Load() >= int64(cfg.Total)) {
+		return
+	}
+
 	replayRunID := ""
 	if !cfg.ReplayNoStamp {
 		replayRunID = cfg.RunID
@@ -757,6 +768,13 @@ func runRouterReplayInstance(
 		picker.release(epIdx)
 		reqCancel()
 		gate.Release()
+
+		if metrics.Error != nil && ctx.Err() != nil {
+			// Run shutdown aborted this in-flight request (timeout or
+			// --total cancellation) — a termination artifact, not a
+			// serving failure. Don't record it as an error.
+			return
+		}
 
 		if metrics.Skipped || isContextOverflow(metrics.Error) {
 			// The session outgrew the context budget — caught by the
