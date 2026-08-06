@@ -57,7 +57,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	modelID := s.engine.Config().ModelID
 
 	if req.Stream {
-		s.streamChat(w, r, req, modelID, cached, total, maxTok, ttft)
+		s.streamChat(w, r, req, modelID, units, cached, total, maxTok, ttft)
 		return
 	}
 
@@ -67,6 +67,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.engine.RecordOutput(maxTok)
 
 	content := strings.Join(syntheticTokens(maxTok), " ")
+	s.engine.AppendOutputBlocks(units, maxTok, content)
 	finish := "stop"
 	u := buildUsage(total, cached, maxTok)
 	writeJSON(w, http.StatusOK, chatCompletionResponse{
@@ -105,7 +106,7 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	modelID := s.engine.Config().ModelID
 
 	if req.Stream {
-		s.streamCompletion(w, r, req, modelID, cached, total, maxTok, ttft)
+		s.streamCompletion(w, r, req, modelID, units, cached, total, maxTok, ttft)
 		return
 	}
 
@@ -115,6 +116,7 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	s.engine.RecordOutput(maxTok)
 
 	text := strings.Join(syntheticTokens(maxTok), " ")
+	s.engine.AppendOutputBlocks(units, maxTok, text)
 	finish := "stop"
 	u := buildUsage(total, cached, maxTok)
 	writeJSON(w, http.StatusOK, completionResponse{

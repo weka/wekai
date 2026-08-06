@@ -255,6 +255,41 @@ func TestChatCompletions_Streaming(t *testing.T) {
 	}
 }
 
+// TestChatCompletions_CharsPerTokenAffectsUsage is GAP 1's end-to-end check:
+// the exact same prompt body posted to two servers differing only in
+// CharsPerToken must report proportionally different usage.prompt_tokens —
+// this is the field the router-replay comparison actually reads.
+func TestChatCompletions_CharsPerTokenAffectsUsage(t *testing.T) {
+	prompt := strings.Repeat("dense agentic content word ", 100)
+
+	post := func(cfg Config) int {
+		ts, _ := newTestServer(t, cfg)
+		resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+			bytes.NewReader(chatBody(t, prompt, false, false)))
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		defer resp.Body.Close()
+		var out struct {
+			Usage usage `json:"usage"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return out.Usage.PromptTokens
+	}
+
+	tokens40 := post(Config{CharsPerToken: 4.0})
+	tokens32 := post(Config{CharsPerToken: 3.2})
+
+	if tokens32 <= tokens40 {
+		t.Fatalf("usage.prompt_tokens at chars-per-token=3.2 should exceed 4.0 for the identical prompt: got %d vs %d", tokens32, tokens40)
+	}
+	if ratio := float64(tokens32) / float64(tokens40); ratio < 1.15 || ratio > 1.35 {
+		t.Fatalf("usage.prompt_tokens ratio = %v, want close to 4.0/3.2=1.25", ratio)
+	}
+}
+
 func TestMetricsEndpointServesPrometheusFormat(t *testing.T) {
 	ts, _ := newTestServer(t, Config{})
 	// Generate at least one data point.

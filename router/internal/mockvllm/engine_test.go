@@ -317,3 +317,160 @@ func TestEngine_ZeroRateIsInstant(t *testing.T) {
 		t.Fatalf("zero-rate Config should be instant, got ttft=%v total=%v", ttft, total)
 	}
 }
+
+// TestEngine_CharsPerTokenAffectsTokenAndBlockCounts is the calibration
+// property anton needs: the SAME byte content tokenized at a lower
+// chars-per-token ratio (closer to real vLLM's actual ~2.9-3.4 for dense
+// agentic text) must yield proportionally MORE tokens (and, since the byte
+// window per block shrinks too, more blocks) than the historical flat 4.0.
+func TestEngine_CharsPerTokenAffectsTokenAndBlockCounts(t *testing.T) {
+	body := repeatWord("x", 400) // ~799 bytes, fixed, used identically on both engines
+
+	e40 := NewEngine(Config{BlockSizeTokens: 16, CharsPerToken: 4.0})
+	_, total40 := serveOnce(e40, body)
+	nodes40, _, _ := e40.trie.Stats()
+
+	e32 := NewEngine(Config{BlockSizeTokens: 16, CharsPerToken: 3.2})
+	_, total32 := serveOnce(e32, body)
+	nodes32, _, _ := e32.trie.Stats()
+
+	if total32 <= total40 {
+		t.Fatalf("chars-per-token=3.2 should yield MORE tokens than 4.0 for identical content: got %d vs %d", total32, total40)
+	}
+	if ratio := float64(total32) / float64(total40); ratio < 1.15 || ratio > 1.35 {
+		t.Fatalf("token ratio = %v, want close to 4.0/3.2=1.25", ratio)
+	}
+	if nodes32 <= nodes40 {
+		t.Fatalf("chars-per-token=3.2 should yield MORE blocks than 4.0 for identical content (smaller byte window per block): got %d vs %d", nodes32, nodes40)
+	}
+}
+
+// TestEngine_CharsPerTokenBelowZeroFallsBackToDefault is the "invalid input,
+// not a meaningful off-switch" contract for CharsPerToken — unlike
+// OutputKVMultiplier, 0 or negative here isn't a deliberate escape hatch, it
+// falls back to the historical 4.0 ratio, same as an omitted CLI flag.
+func TestEngine_CharsPerTokenBelowZeroFallsBackToDefault(t *testing.T) {
+	body := repeatWord("x", 400)
+
+	eUnset := NewEngine(Config{BlockSizeTokens: 16})
+	eNegative := NewEngine(Config{BlockSizeTokens: 16, CharsPerToken: -1})
+	eExplicit4 := NewEngine(Config{BlockSizeTokens: 16, CharsPerToken: 4.0})
+
+	_, totalUnset := serveOnce(eUnset, body)
+	_, totalNegative := serveOnce(eNegative, body)
+	_, totalExplicit := serveOnce(eExplicit4, body)
+
+	if totalUnset != totalExplicit || totalNegative != totalExplicit {
+		t.Fatalf("unset/negative CharsPerToken should behave exactly like an explicit 4.0: unset=%d negative=%d explicit=%d",
+			totalUnset, totalNegative, totalExplicit)
+	}
+}
+
+// TestEngine_OutputKVMultiplierZeroDisablesModeling is the escape hatch:
+// today's/historical behavior, outputs stay entirely invisible to the cache.
+func TestEngine_OutputKVMultiplierZeroDisablesModeling(t *testing.T) {
+	e := NewEngine(Config{BlockSizeTokens: 16, OutputKVMultiplier: 0})
+	promptUnits := e.Tokenize("prompt text for the disabled case")
+	before, _, _ := e.trie.Stats()
+	e.AppendOutputBlocks(promptUnits, 100, "some reply content that would otherwise become blocks")
+	after, _, _ := e.trie.Stats()
+	if after != before {
+		t.Fatalf("OutputKVMultiplier=0 must be a no-op: nodes before=%d after=%d", before, after)
+	}
+}
+
+// TestEngine_OutputKVMultiplierScalesBlockCount checks the exact formula:
+// ceil(outputTokens * multiplier / BlockSizeTokens).
+func TestEngine_OutputKVMultiplierScalesBlockCount(t *testing.T) {
+	reply := "short reply" // count is formula-driven, not content-length-driven -- see AppendOutputBlocks's filler fallback
+
+	e1 := NewEngine(Config{BlockSizeTokens: 16, OutputKVMultiplier: 1.0})
+	e1.AppendOutputBlocks(nil, 64, reply)
+	if n, _, _ := e1.trie.Stats(); n != 4 { // ceil(64*1.0/16)
+		t.Fatalf("multiplier=1.0: nodes = %d, want 4", n)
+	}
+
+	e25 := NewEngine(Config{BlockSizeTokens: 16, OutputKVMultiplier: 2.5})
+	e25.AppendOutputBlocks(nil, 64, reply)
+	if n, _, _ := e25.trie.Stats(); n != 10 { // ceil(64*2.5/16)
+		t.Fatalf("multiplier=2.5: nodes = %d, want 10", n)
+	}
+}
+
+// TestEngine_OutputBlocksOccupyCapacityAndAreEvictable is GAP 2's primary
+// claim: appended output blocks are real trie nodes (occupy capacity) and
+// are NOT permanently pinned just because they came from output — once the
+// request completes and releases, heavy unrelated pressure against a tiny
+// cap must eventually be able to reclaim them, exactly like prompt blocks.
+func TestEngine_OutputBlocksOccupyCapacityAndAreEvictable(t *testing.T) {
+	e := NewEngine(Config{BlockSizeTokens: 16, BlockCapacity: 10, OutputKVMultiplier: 1.0})
+	promptUnits := e.Tokenize("short prompt for the output-kv capacity test")
+
+	release, _, _, ok := e.Admit(promptUnits)
+	if !ok {
+		t.Fatalf("admit failed")
+	}
+
+	before, _, _ := e.trie.Stats()
+	e.AppendOutputBlocks(promptUnits, 64, strings.Repeat("reply filler text ", 10))
+	after, _, _ := e.trie.Stats()
+	if after <= before {
+		t.Fatalf("AppendOutputBlocks should add nodes to the trie: before=%d after=%d", before, after)
+	}
+
+	// Immediately after completion, the request's own prefix must still be
+	// fully resident (it's the very content just inserted).
+	if c, tot := e.Query(promptUnits); c != tot {
+		t.Fatalf("expected the prompt prefix to be fully cached immediately after completion: cached=%d total=%d", c, tot)
+	}
+
+	release()
+
+	for i := 0; i < 500; i++ {
+		serveOnce(e, fmt.Sprintf("pressure-%d", i))
+	}
+	if c, tot := e.Query(promptUnits); c == tot {
+		t.Fatalf("expected this request's chain (including its output blocks) to eventually be evicted under a tiny cap, but it's still fully cached")
+	}
+}
+
+// TestEngine_OutputBlocksHitByFollowUpTurn is the achievable-alignment case
+// documented on AppendOutputBlocks: when the prompt ends exactly on a block
+// boundary and OutputKVMultiplier=1 with a response long enough to cover
+// every target block, a follow-up turn that embeds the exact same response
+// text (as chatCompletionRequest.promptBytes renders an assistant message)
+// hits MORE than just the original prompt — the output blocks aligned.
+func TestEngine_OutputBlocksHitByFollowUpTurn(t *testing.T) {
+	e := NewEngine(Config{BlockSizeTokens: 16, OutputKVMultiplier: 1.0})
+	blockBytes := e.cfg.blockSizeBytes()
+
+	// Build turn 1's prompt to land EXACTLY on a block boundary (4 blocks),
+	// so AppendOutputBlocks' fresh-continuation assumption holds exactly —
+	// the documented achievable case, not the documented limitation.
+	const prefix, suffix = "user:", "\n"
+	targetLen := blockBytes * 4
+	fillLen := targetLen - len(prefix) - len(suffix)
+	turn1Prompt := prefix + strings.Repeat("A", fillLen) + suffix
+	if len(turn1Prompt) != targetLen {
+		t.Fatalf("test setup: turn1Prompt length = %d, want exactly %d", len(turn1Prompt), targetLen)
+	}
+
+	promptUnits := chunkContent("prompt", []byte(turn1Prompt), blockBytes, e.cfg.CharsPerToken)
+	outputTokens := 80
+	reply := strings.Join(syntheticTokens(outputTokens), " ") // exactly what a real handler would generate
+
+	e.AppendOutputBlocks(promptUnits, outputTokens, reply)
+
+	turn2Prompt := turn1Prompt + "assistant:" + reply + "\n" + "user:" + "a new question\n"
+	turn2Units := chunkContent("prompt", []byte(turn2Prompt), blockBytes, e.cfg.CharsPerToken)
+
+	cached, total := e.Query(turn2Units)
+	if cached == 0 {
+		t.Fatalf("expected the follow-up turn to hit at least the turn-1 prompt prefix, cached=0 of %d", total)
+	}
+	_, promptOnlyTotal := e.Query(promptUnits)
+	if cached <= promptOnlyTotal {
+		t.Fatalf("expected the follow-up to hit MORE than just the original prompt (cached=%d, promptOnlyTotal=%d) — "+
+			"the output blocks should have aligned and been credited too", cached, promptOnlyTotal)
+	}
+}

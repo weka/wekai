@@ -32,6 +32,8 @@ package mockvllm
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -45,11 +47,23 @@ type Config struct {
 	ModelID string
 
 	// BlockSizeTokens is vLLM's block_size analog: the number of tokens per
-	// hashed cache block. Real vLLM defaults to 16. Converted internally to
-	// bytes via the repo-wide 4-bytes-per-token estimate (kvcache.EstimateTokens,
-	// also used by the benchmark's cache estimator) since nothing here runs a
+	// hashed cache block. Real vLLM defaults to 16. A block is still N
+	// tokens regardless of CharsPerToken below — only the byte WINDOW a
+	// block spans changes (N * CharsPerToken), since nothing here runs a
 	// real tokenizer.
 	BlockSizeTokens int
+
+	// CharsPerToken converts content bytes to estimated tokens EVERYWHERE
+	// this engine does that conversion: block segmentation for the trie,
+	// usage.prompt_tokens/cached_tokens, and (through those) the latency
+	// model's token counts. Deliberately NOT kvcache.EstimateTokens, which
+	// is fixed at 4.0 for every other consumer of the shared package (the
+	// router's own cache prediction, the benchmark's estimator) — real
+	// vLLM's actual tokenizer runs closer to 2.9-3.4 chars/token on dense
+	// agentic text, and this knob exists to be calibrated against a real
+	// fleet independently of kvcache's shared default. <= 0 falls back to
+	// 4.0 (today's historical behavior), same as an omitted CLI flag.
+	CharsPerToken float64
 
 	// BlockCapacity bounds the store in blocks (kvcache trie nodes — one node
 	// per block, so this maps directly to kvcache.Config.MaxNodes). 0 means
@@ -84,26 +98,43 @@ type Config struct {
 	// DefaultMaxTokens is the completion length used when a request omits
 	// max_tokens (or sends <= 0).
 	DefaultMaxTokens int
+
+	// OutputKVMultiplier models real vLLM's decode-KV behavior: generated
+	// tokens become cached blocks of the SAME sequence, written into the
+	// same pool prompt blocks occupy. On completion,
+	// ceil(outputTokens * OutputKVMultiplier / BlockSizeTokens) blocks are
+	// appended to the request's own chain — occupying capacity and
+	// evictable exactly like prompt blocks (see Engine.AppendOutputBlocks).
+	// The realistic default is 1.0 (DefaultConfig and the CLI flag both use
+	// it); 0 disables this entirely — outputs stay invisible to the cache,
+	// the historical behavior before this existed. Unlike CharsPerToken,
+	// 0 here is a meaningful, deliberate "off" state, not invalid input, so
+	// normalize does NOT default it away — same treatment as the
+	// zero-means-instant latency rates above.
+	OutputKVMultiplier float64
 }
 
 // DefaultConfig returns sane, non-instant defaults: 16-token blocks, 100k
-// blocks (matches kvcache.RouterConfig's node bound), 64-way concurrency, and
+// blocks (matches kvcache.RouterConfig's node bound), 64-way concurrency,
 // token rates anton specified as giving a good-enough comparison against a
 // real fleet (50k tok/s cold prefill, 1M tok/s cached-token read, 500 tok/s
 // decode per request) — order-of-magnitude starting points, meant to be
 // overridden with rates read off (or estimated from) the real fleet being
-// compared against.
+// compared against — plus the realistic tokenizer/output-KV defaults
+// (4.0 chars/token, 1.0x output-KV multiplier).
 func DefaultConfig() Config {
 	return Config{
-		ModelID:          "mock-vllm",
-		BlockSizeTokens:  16,
-		BlockCapacity:    100_000,
-		MaxConcurrency:   64,
-		BaseLatency:      20 * time.Millisecond,
-		ColdInputTPS:     50_000,
-		CachedInputTPS:   1_000_000,
-		OutputTPS:        500,
-		DefaultMaxTokens: 128,
+		ModelID:            "mock-vllm",
+		BlockSizeTokens:    16,
+		BlockCapacity:      100_000,
+		MaxConcurrency:     64,
+		BaseLatency:        20 * time.Millisecond,
+		ColdInputTPS:       50_000,
+		CachedInputTPS:     1_000_000,
+		OutputTPS:          500,
+		DefaultMaxTokens:   128,
+		CharsPerToken:      4.0,
+		OutputKVMultiplier: 1.0,
 	}
 }
 
@@ -118,16 +149,23 @@ func (c Config) normalize() Config {
 	if c.DefaultMaxTokens <= 0 {
 		c.DefaultMaxTokens = d.DefaultMaxTokens
 	}
+	if c.CharsPerToken <= 0 {
+		// Unlike OutputKVMultiplier, 0 chars/token is not a meaningful "off"
+		// state — it's invalid input, so it falls back to the default ratio
+		// exactly like an omitted CLI flag would.
+		c.CharsPerToken = d.CharsPerToken
+	}
 	// BlockCapacity, MaxConcurrency, and the latency knobs are legitimately
 	// zero-able (unbounded / instant), so they are NOT defaulted here.
 	return c
 }
 
-// blockSizeBytes converts BlockSizeTokens to the byte window kvcache.ChunkContent
-// expects, via the same 4-bytes-per-token heuristic used everywhere else in
-// this module (kvcache.EstimateTokens).
+// blockSizeBytes converts BlockSizeTokens to the byte window this engine's
+// own chunker (chunkContent, in tokenize.go) expects, via CharsPerToken —
+// NOT kvcache's fixed 4.0, so a block stays N tokens under whatever ratio
+// this engine was calibrated to.
 func (c Config) blockSizeBytes() int {
-	n := c.BlockSizeTokens * 4
+	n := int(float64(c.BlockSizeTokens) * c.CharsPerToken)
 	if n <= 0 {
 		n = 4
 	}
@@ -164,14 +202,16 @@ func NewEngine(cfg Config) *Engine {
 
 func (e *Engine) Config() Config { return e.cfg }
 
-// Tokenize chunks raw prompt bytes into vLLM-block-sized Units. Two prompts
-// sharing a leading byte run produce identical leading Units, which is what
-// lets the trie credit a shared prefix as cached — the same mechanism
-// kvcache's own doc describes as standing in for vLLM's parent-hash chaining:
-// a match requires the full ancestor chain, not just an equal leaf hash,
-// because the trie only walks into a child of the node that already matched.
+// Tokenize chunks raw prompt bytes into vLLM-block-sized Units, at this
+// engine's own CharsPerToken ratio (see tokenize.go for why that means a
+// local chunker rather than kvcache.ChunkContent). Two prompts sharing a
+// leading byte run produce identical leading Units, which is what lets the
+// trie credit a shared prefix as cached — the same mechanism kvcache's own
+// doc describes as standing in for vLLM's parent-hash chaining: a match
+// requires the full ancestor chain, not just an equal leaf hash, because the
+// trie only walks into a child of the node that already matched.
 func (e *Engine) Tokenize(prompt string) []kvcache.Unit {
-	return kvcache.ChunkContent("prompt", []byte(prompt), e.cfg.blockSizeBytes())
+	return chunkContent("prompt", []byte(prompt), e.cfg.blockSizeBytes(), e.cfg.CharsPerToken)
 }
 
 // Query reports how much of units this cache currently holds, WITHOUT
@@ -259,6 +299,86 @@ func tokensAtRate(n int, tps float64) time.Duration {
 // RecordOutput accounts generated tokens into the aggregate counters. Called
 // once the (synthetic) completion length for a request is known.
 func (e *Engine) RecordOutput(n int) { e.genToks.Add(int64(n)) }
+
+// AppendOutputBlocks models real vLLM's decode-KV behavior: generated
+// tokens become cached blocks of the SAME sequence, extending its trie
+// chain the same way prompt blocks did. Call once a response is fully
+// built (or as far as generation got before a client disconnect) — any
+// time after Admit, before release.
+//
+// numOutputBlocks = ceil(outputTokens * OutputKVMultiplier / BlockSizeTokens).
+// OutputKVMultiplier <= 0 disables this entirely: outputs stay invisible to
+// the cache, the historical behavior before this existed.
+//
+// Alignment with a real follow-up turn (whose own prompt would embed this
+// response's text back into its history) is best-effort, not a guarantee.
+// Each block's content is sliced from the ACTUAL response text at that
+// block's byte offset within "assistant:"+respContent+"\n" — the exact
+// byte form chatCompletionRequest.promptBytes gives an assistant message —
+// so at the realistic default (OutputKVMultiplier=1) with a response long
+// enough to cover every block, this hashes IDENTICALLY to what a real
+// follow-up's own chunker would produce for that text: the common,
+// realistic case this feature exists for. Two known limitations, both
+// accepted per design guidance rather than chased further:
+//
+//  1. If the response text is shorter than the target block count (a short
+//     reply, or a multiplier > 1 deliberately asking for more blocks than
+//     the literal text covers), the remaining blocks get deterministic
+//     synthetic filler instead. No real follow-up could hit these, but they
+//     still occupy pool capacity and are still evictable — the primary
+//     effect being modeled either way.
+//  2. These blocks are appended as a FRESH continuation after promptUnits'
+//     own chain, not merged into a partial last prompt block the way a
+//     byte-exact re-chunk of the whole prompt+reply from scratch would be.
+//     If the prompt's last block wasn't already full, the one block
+//     spanning that boundary won't hash identically to a real follow-up's
+//     version of it — only that single boundary block is affected.
+func (e *Engine) AppendOutputBlocks(promptUnits []kvcache.Unit, outputTokens int, respContent string) {
+	if e.cfg.OutputKVMultiplier <= 0 || outputTokens <= 0 {
+		return
+	}
+	numBlocks := int(math.Ceil(float64(outputTokens) * e.cfg.OutputKVMultiplier / float64(e.cfg.BlockSizeTokens)))
+	if numBlocks <= 0 {
+		return
+	}
+
+	blockBytes := e.cfg.blockSizeBytes()
+	replyBytes := []byte("assistant:" + respContent + "\n")
+
+	units := make([]kvcache.Unit, 0, len(promptUnits)+numBlocks)
+	units = append(units, promptUnits...)
+	for i := 0; i < numBlocks; i++ {
+		off := i * blockBytes
+		var chunk []byte
+		if off < len(replyBytes) {
+			end := off + blockBytes
+			if end > len(replyBytes) {
+				end = len(replyBytes)
+			}
+			chunk = append([]byte(nil), replyBytes[off:end]...)
+		}
+		if len(chunk) < blockBytes {
+			// Deterministic filler for whatever the real response text
+			// didn't cover: same request position, same block index, same
+			// filler bytes every time (never random), so repeating the
+			// exact same request twice still hits the exact same chain.
+			filler := fmt.Sprintf("\x02outkv:%d:need%d", i, blockBytes-len(chunk))
+			chunk = append(chunk, []byte(filler)...)
+			if len(chunk) > blockBytes {
+				chunk = chunk[:blockBytes]
+			}
+		}
+		tag := "\x01cont"
+		if len(units) == 0 {
+			tag = "prompt" // only reachable if promptUnits itself was empty
+		}
+		units = append(units, kvcache.Unit{
+			Hash:   kvcache.HashContent(tag, chunk),
+			Tokens: tokensForBytes(len(chunk), e.cfg.CharsPerToken),
+		})
+	}
+	e.trie.Commit(units)
+}
 
 // MaxTokensOrDefault resolves a request's requested output length, falling
 // back to DefaultMaxTokens for an absent or non-positive value.

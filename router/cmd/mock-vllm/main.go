@@ -15,6 +15,16 @@
 // so a run against this fleet is calibrated against the real one it's
 // standing in for, rather than an arbitrary latency shape.
 //
+// Two more calibration knobs close fidelity gaps found comparing a mock run
+// against a real fleet: --chars-per-token (the mock's own byte-to-token
+// ratio for every conversion it does, independent of kvcache's fixed 4.0
+// used elsewhere in this module — real vLLM's actual tokenizer runs closer
+// to 2.9-3.4 chars/token on dense agentic content) and
+// --output-kv-multiplier (real vLLM writes decode KV into the same pool as
+// prompt KV; this mock ignored that until now — a completed request appends
+// ceil(output_tokens*multiplier/block-size-tokens) blocks to its own chain,
+// occupying capacity and evictable exactly like prompt blocks).
+//
 // Run several independent instances (each with its own cache/counters) to
 // form a fleet, either as separate processes on separate ports:
 //
@@ -63,7 +73,8 @@ func run(args []string) error {
 	instances := fs.Int("instances", 1, "number of independent instances to run in this process, each with its own cache/counters, on consecutive ports starting at -base-port")
 	basePort := fs.Int("base-port", 9000, "starting port when -instances > 1")
 	modelID := fs.String("model-id", "mock-vllm", "model id reported by /v1/models and echoed in responses (same across all instances, matching a real fleet serving one model)")
-	blockSizeTokens := fs.Int("block-size-tokens", 16, "cache block size in tokens (vLLM's block_size analog; converted to bytes at 4 bytes/token)")
+	blockSizeTokens := fs.Int("block-size-tokens", 16, "cache block size in tokens (vLLM's block_size analog; converted to bytes at -chars-per-token)")
+	charsPerToken := fs.Float64("chars-per-token", 4.0, "bytes-to-tokens ratio used EVERYWHERE this engine converts content bytes to tokens: block segmentation, usage.prompt_tokens/cached_tokens, and (through those) the latency model's token counts. Real vLLM's actual tokenizer runs closer to 2.9-3.4 for dense agentic content; 4.0 matches this repo's historical flat estimate")
 	blockCapacity := fs.Int64("block-capacity", 100_000, "cache capacity in blocks; 0 = unbounded (never evicts). Set to match the real fleet's reported num_gpu_blocks per instance for a calibrated comparison")
 	maxConcurrency := fs.Int("max-concurrency", 64, "requests admitted at once before returning HTTP 429; 0 = unbounded")
 	defaultMaxTokens := fs.Int("default-max-tokens", 128, "completion length used when a request omits max_tokens")
@@ -71,6 +82,7 @@ func run(args []string) error {
 	coldInputTPS := fs.Float64("cold-input-tps", 50_000, "tokens/sec for UNCACHED prompt tokens (prefill). Set from the real fleet's measured/estimated prefill throughput")
 	cachedInputTPS := fs.Float64("cached-input-tps", 1_000_000, "tokens/sec for CACHED prompt tokens (cache read) — NOT free: only recompute is skipped, a cache hit still costs a KV read")
 	outputTPS := fs.Float64("output-tps", 500, "tokens/sec decode, per request — also paces SSE chunk spacing")
+	outputKVMultiplier := fs.Float64("output-kv-multiplier", 1.0, "models real vLLM writing decode KV into the same pool as prompt KV: on completion, ceil(output_tokens*multiplier/block-size-tokens) blocks are appended to the request's own chain, occupying capacity and evictable like prompt blocks. 0 disables this (outputs stay invisible to the cache, the historical behavior)")
 	logLevel := fs.String("log-level", "info", "debug, info, warn, or error")
 
 	if err := fs.Parse(args); err != nil {
@@ -87,15 +99,17 @@ func run(args []string) error {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
 
 	cfg := mockvllm.Config{
-		ModelID:          *modelID,
-		BlockSizeTokens:  *blockSizeTokens,
-		BlockCapacity:    *blockCapacity,
-		MaxConcurrency:   *maxConcurrency,
-		BaseLatency:      *baseLatency,
-		ColdInputTPS:     *coldInputTPS,
-		CachedInputTPS:   *cachedInputTPS,
-		OutputTPS:        *outputTPS,
-		DefaultMaxTokens: *defaultMaxTokens,
+		ModelID:            *modelID,
+		BlockSizeTokens:    *blockSizeTokens,
+		CharsPerToken:      *charsPerToken,
+		BlockCapacity:      *blockCapacity,
+		MaxConcurrency:     *maxConcurrency,
+		BaseLatency:        *baseLatency,
+		ColdInputTPS:       *coldInputTPS,
+		CachedInputTPS:     *cachedInputTPS,
+		OutputTPS:          *outputTPS,
+		OutputKVMultiplier: *outputKVMultiplier,
+		DefaultMaxTokens:   *defaultMaxTokens,
 	}
 
 	// -instances <= 1 (the default) uses -port exactly as before; only
@@ -127,9 +141,10 @@ func run(args []string) error {
 	for _, hs := range servers {
 		go func() {
 			log.Info("mock-vllm listening", "addr", hs.Addr, "model", cfg.ModelID,
-				"block_size_tokens", cfg.BlockSizeTokens, "block_capacity", cfg.BlockCapacity,
-				"max_concurrency", cfg.MaxConcurrency, "cold_input_tps", cfg.ColdInputTPS,
-				"cached_input_tps", cfg.CachedInputTPS, "output_tps", cfg.OutputTPS)
+				"block_size_tokens", cfg.BlockSizeTokens, "chars_per_token", cfg.CharsPerToken,
+				"block_capacity", cfg.BlockCapacity, "max_concurrency", cfg.MaxConcurrency,
+				"cold_input_tps", cfg.ColdInputTPS, "cached_input_tps", cfg.CachedInputTPS,
+				"output_tps", cfg.OutputTPS, "output_kv_multiplier", cfg.OutputKVMultiplier)
 			errCh <- hs.ListenAndServe()
 		}()
 	}
