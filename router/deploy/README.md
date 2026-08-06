@@ -182,6 +182,10 @@ into) graphs them over time alongside worker-side stats.
 ## Local run
 
 ```bash
-make -f Makefile.go.mk run   # against a backend at 127.0.0.1:8000
+make router-run   # against a backend at 127.0.0.1:8000
 ./wllm-router -version
 ```
+
+Other router targets from the repo root: `router-image-smoke` (build the image
+and check the binary reports its version), `router-manifests-validate`
+(server-side dry-run), `router-deploy` (apply rbac.yaml and deployment.yaml).
