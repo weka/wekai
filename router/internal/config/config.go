@@ -75,6 +75,19 @@ type Config struct {
 	StreamBufferBytes     int   `json:"stream_buffer_bytes"`
 	MaxInflightPerBackend int64 `json:"max_inflight_per_backend"`
 
+	// MaxNodeConcurrency approximates, AT THE ROUTER, the per-backend
+	// concurrency level at which vLLM itself would 429 — so a lower ceiling
+	// can be tested (e.g. 32 against a real fleet running
+	// WEKA_MAX_CONCURRENT_REQUESTS=48) without restarting any backend. 0
+	// disables this (today's behavior): a backend whose router-side in-flight
+	// lease count is >= this value is excluded from candidate selection for
+	// every policy alike, and if every healthy backend is at cap the router
+	// itself returns 429 rather than 503 (distinguishable from "no healthy
+	// backends" and from the existing router-wide MaxConcurrentRequests shed).
+	// Single-router deployment is assumed: the router's own lease count is
+	// authoritative only when it is the sole source of a backend's load.
+	MaxNodeConcurrency int64 `json:"max_node_concurrency"`
+
 	HealthInterval Duration `json:"health_interval"`
 	HealthTimeout  Duration `json:"health_timeout"`
 	HealthPath     string   `json:"health_path"`
@@ -206,6 +219,11 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	fs.Int64Var(&cfg.MaxBodyBytes, "max-body-bytes", cfg.MaxBodyBytes, "maximum request body size")
 	fs.IntVar(&cfg.MaxConcurrentRequests, "max-concurrent-requests", cfg.MaxConcurrentRequests, "in-flight request cap (0 disables)")
 	fs.IntVar(&cfg.MaxAttempts, "max-attempts", cfg.MaxAttempts, "total upstream attempts including the first")
+	fs.Int64Var(&cfg.MaxNodeConcurrency, "max-node-concurrency", cfg.MaxNodeConcurrency,
+		"per-backend concurrency cap enforced by the router (0 disables): approximates the level at which "+
+			"vLLM itself would 429, for testing a lower ceiling without restarting the backend. A backend at "+
+			"or above this many router-leased in-flight requests is excluded from candidate selection; if "+
+			"every healthy backend is at cap, the router returns 429 instead of 503")
 	fs.Var(&cfg.HealthInterval, "health-interval", "health check interval, e.g. 10s")
 	fs.Var(&cfg.HealthTimeout, "health-timeout", "per-check timeout, e.g. 5s")
 	fs.StringVar(&cfg.HealthPath, "health-path", cfg.HealthPath, "backend health endpoint path")
@@ -327,6 +345,9 @@ func (c Config) Validate() error {
 	}
 	if c.MaxAttempts < 1 {
 		errs = append(errs, errors.New("max_attempts must be >= 1"))
+	}
+	if c.MaxNodeConcurrency < 0 {
+		errs = append(errs, errors.New("max_node_concurrency must be >= 0 (0 disables the cap)"))
 	}
 	if c.StreamBufferBytes <= 0 {
 		errs = append(errs, errors.New("stream_buffer_bytes must be > 0"))

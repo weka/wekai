@@ -1052,3 +1052,314 @@ func TestObservedCacheFractionIsRecorded(t *testing.T) {
 			"prediction accuracy remains unmeasurable")
 	}
 }
+
+// TestMaxNodeConcurrencyRejects429WhenAllBackendsAtCap is anton's exact
+// scenario for --max-node-concurrency: with cap=1 and 2 backends, two
+// concurrent requests each land on a DIFFERENT backend (both are under cap
+// the instant each is admitted), a third request while both are held gets
+// 429 with Retry-After — distinguishable from the existing 503s: NOT
+// no_healthy_backends (every backend is healthy) and NOT the router-wide
+// MaxConcurrentRequests shed — and once one backend's request completes, the
+// next request is admitted again.
+func TestMaxNodeConcurrencyRejects429WhenAllBackendsAtCap(t *testing.T) {
+	h := newHarness(t, 2, func(c *config.Config) { c.MaxNodeConcurrency = 1 })
+
+	// Which backend a fresh, idle-tied request lands on is an intentionally
+	// unspecified 50/50 tie-break (policy.pickBest's reservoir sample over
+	// least-outstanding), so this test tracks "first"/"other" dynamically
+	// rather than assuming index 0 goes first.
+	release := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	entered := make(chan int, 2)
+	for i, w := range h.workers {
+		i := i
+		w.Behave(func(*http.Request) mockvllm.Script {
+			entered <- i
+			<-release[i]
+			return mockvllm.Script{Status: 200, Body: `{"ok":true}`}
+		})
+	}
+
+	shedBefore := testutil.ToFloat64(metrics.SaturationRejects)
+
+	// Admit the two "held" requests SEQUENTIALLY. Once the first is admitted,
+	// its backend is immediately AT cap, so the SECOND request is
+	// deterministically forced onto the OTHER backend by the cap filter
+	// itself — which is the exact mechanism under test, not an assumption
+	// about load-balance luck.
+	done := [2]chan *http.Response{make(chan *http.Response, 1), make(chan *http.Response, 1)}
+	go func() { done[0] <- h.post(t, "/v1/chat/completions", `{"model":"m"}`, nil) }()
+	first := <-entered
+
+	go func() { done[1] <- h.post(t, "/v1/chat/completions", `{"model":"m"}`, nil) }()
+	second := <-entered
+	if second == first {
+		t.Fatalf("expected the second held request to land on the OTHER backend (backend %d is "+
+			"now at cap=1), but it landed on the same backend again", first)
+	}
+	other := second
+
+	bFirst, ok := h.reg.Snapshot().Get(h.workers[first].URL())
+	if !ok {
+		t.Fatal("backend not found in registry")
+	}
+	bOther, ok := h.reg.Snapshot().Get(h.workers[other].URL())
+	if !ok {
+		t.Fatal("backend not found in registry")
+	}
+	capBeforeFirst := testutil.ToFloat64(metrics.BackendCapExceeded.WithLabelValues(bFirst.URL))
+	capBeforeOther := testutil.ToFloat64(metrics.BackendCapExceeded.WithLabelValues(bOther.URL))
+
+	// A third request now finds BOTH backends at cap: 429, not 503.
+	resp3 := h.post(t, "/v1/chat/completions", `{"model":"m"}`, nil)
+	body3, _ := io.ReadAll(resp3.Body)
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (body: %s)", resp3.StatusCode, body3)
+	}
+	if got := resp3.Header.Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want \"1\"", got)
+	}
+	var env struct {
+		Error struct{ Code string } `json:"error"`
+	}
+	_ = json.Unmarshal(body3, &env)
+	if env.Error.Code != "all_backends_at_capacity" {
+		t.Errorf("error code = %q, want all_backends_at_capacity (distinguishable from "+
+			"no_healthy_backends and router_at_capacity)", env.Error.Code)
+	}
+	if got := testutil.ToFloat64(metrics.SaturationRejects); got != shedBefore+1 {
+		t.Errorf("router_saturation_rejects_total went %v -> %v, want +1", shedBefore, got)
+	}
+	if got := testutil.ToFloat64(metrics.BackendCapExceeded.WithLabelValues(bFirst.URL)); got != capBeforeFirst+1 {
+		t.Errorf("router_backend_cap_exceeded_total{backend=%s} went %v -> %v, want +1", bFirst.URL, capBeforeFirst, got)
+	}
+	if got := testutil.ToFloat64(metrics.BackendCapExceeded.WithLabelValues(bOther.URL)); got != capBeforeOther+1 {
+		t.Errorf("router_backend_cap_exceeded_total{backend=%s} went %v -> %v, want +1", bOther.URL, capBeforeOther, got)
+	}
+
+	// Release the first held request; its lease frees up.
+	close(release[first])
+	r0 := <-done[0]
+	io.Copy(io.Discard, r0.Body)
+	r0.Body.Close()
+	if r0.StatusCode != http.StatusOK {
+		t.Fatalf("held request 0 status = %d, want 200", r0.StatusCode)
+	}
+
+	// The lease releases in a defer after ServeHTTP returns, which races the
+	// client goroutine reading the response — poll rather than assume.
+	deadline := time.Now().Add(2 * time.Second)
+	for bFirst.Inflight() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the released backend's lease never cleared after its request completed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// A new request must be admitted again, landing on the now-freed backend
+	// (the only one under cap). It gets a fresh Behave call, which hangs on
+	// the already-closed release channel and returns immediately.
+	resp4 := h.post(t, "/v1/chat/completions", `{"model":"m"}`, nil)
+	io.Copy(io.Discard, resp4.Body)
+	resp4.Body.Close()
+	if resp4.StatusCode != http.StatusOK {
+		t.Fatalf("status after a slot freed = %d, want 200 (admission should resume)", resp4.StatusCode)
+	}
+
+	close(release[other])
+	r1 := <-done[1]
+	io.Copy(io.Discard, r1.Body)
+	r1.Body.Close()
+
+	h.assertNoLeaks(t)
+}
+
+// TestMaxNodeConcurrencyExcludesAtCapBackendFromCacheAffinity is the
+// affinity-path half of "an at-cap backend is excluded from candidates":
+// the cache-aware policy would confidently pick the warm backend by
+// predicted-hit fraction, but once that backend is at its
+// --max-node-concurrency cap it must never appear in the candidate set
+// Select is even given, so the request falls to the cold backend instead.
+func TestMaxNodeConcurrencyExcludesAtCapBackendFromCacheAffinity(t *testing.T) {
+	lease.ResetAccountingErrors()
+	cfg := config.Default()
+	cfg.MaxAttempts = 1
+	cfg.MaxNodeConcurrency = 1
+
+	reg := registry.New(registry.Options{})
+	cp := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	var workers []*mockvllm.Worker
+	for i := 0; i < 2; i++ {
+		w := mockvllm.New()
+		t.Cleanup(w.Close)
+		workers = append(workers, w)
+		b, err := reg.Add(registry.Spec{URL: w.URL(), Capacity: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.SetHealth(registry.Healthy)
+		cp.AddBackend(b)
+	}
+	d := openai.New()
+	px := proxy.New(proxy.Config{MaxAttempts: cfg.MaxAttempts, StreamBufferBytes: cfg.StreamBufferBytes})
+	srv := httptest.NewServer(gateway.New(cfg, reg, cp, px, d))
+	defer srv.Close()
+
+	system := strings.Repeat("you are a helpful assistant. ", 200)
+	post := func(user string) *http.Response {
+		body := fmt.Sprintf(`{"model":"m","messages":[{"role":"system","content":%q},{"role":"user","content":%q}]}`,
+			system, user)
+		resp, err := srv.Client().Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// Warm one backend via a real, completed request sharing the system
+	// prompt.
+	r0 := post("turn 0")
+	io.Copy(io.Discard, r0.Body)
+	r0.Body.Close()
+	warm := 0
+	if workers[0].CallCount() == 0 {
+		warm = 1
+	}
+	cold := 1 - warm
+
+	// Hold the WARM backend at its cap=1 with a second request that shares
+	// the same system prompt — affinity should (and, per the base
+	// TestPrefixCacheAffinityEndToEnd, does) route it there too.
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	workers[warm].Behave(func(*http.Request) mockvllm.Script {
+		entered <- struct{}{}
+		<-release
+		return mockvllm.Script{Status: 200, Body: `{"ok":true}`}
+	})
+	go func() {
+		r := post("occupy the warm backend's only slot")
+		io.Copy(io.Discard, r.Body)
+		r.Body.Close()
+	}()
+	<-entered // warm backend now at Inflight()==1==cap
+
+	beforeCold := workers[cold].CallCount()
+	r2 := post("turn 1, sharing the same system prompt")
+	body2, _ := io.ReadAll(r2.Body)
+	r2.Body.Close()
+	if r2.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", r2.StatusCode, body2)
+	}
+	if got := workers[cold].CallCount(); got != beforeCold+1 {
+		t.Errorf("expected the warm-but-at-cap backend to be excluded from affinity selection so "+
+			"the request fell to the cold backend: cold backend call count = %d, want %d", got, beforeCold+1)
+	}
+
+	close(release)
+	if n := lease.AccountingErrors(); n != 0 {
+		t.Errorf("load accounting errors = %d", n)
+	}
+}
+
+// TestMaxNodeConcurrencyExcludesAtCapBackendFromFallback is the
+// fallback-path half: a request with no routable prefix at all makes the
+// cache-aware policy decline immediately and delegate to its fallback
+// (least-outstanding) — exercising the OTHER branch through which a
+// candidate could reach a backend — and the at-cap backend must be excluded
+// there too, not just in the affinity scorer.
+func TestMaxNodeConcurrencyExcludesAtCapBackendFromFallback(t *testing.T) {
+	lease.ResetAccountingErrors()
+	cfg := config.Default()
+	cfg.MaxAttempts = 1
+	cfg.MaxNodeConcurrency = 1
+
+	reg := registry.New(registry.Options{})
+	cp := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	var workers []*mockvllm.Worker
+	for i := 0; i < 2; i++ {
+		w := mockvllm.New()
+		t.Cleanup(w.Close)
+		workers = append(workers, w)
+		b, err := reg.Add(registry.Spec{URL: w.URL(), Capacity: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.SetHealth(registry.Healthy)
+		cp.AddBackend(b)
+	}
+
+	// Both workers start with a blocking Behave so whichever one the FIRST
+	// request lands on can be held — the tie-break among two idle backends is
+	// intentionally random (see the note in the ...RejectsWith429... test),
+	// so which index that is isn't known yet.
+	release := make(chan struct{})
+	entered := make(chan int, 2)
+	for i, w := range workers {
+		i := i
+		w.Behave(func(*http.Request) mockvllm.Script {
+			entered <- i
+			<-release
+			return mockvllm.Script{Status: 200, Body: `{"ok":true}`}
+		})
+	}
+
+	d := openai.New()
+	px := proxy.New(proxy.Config{MaxAttempts: cfg.MaxAttempts, StreamBufferBytes: cfg.StreamBufferBytes})
+	srv := httptest.NewServer(gateway.New(cfg, reg, cp, px, d))
+	defer srv.Close()
+
+	post := func() *http.Response {
+		resp, err := srv.Client().Post(srv.URL+"/v1/chat/completions",
+			"application/json", strings.NewReader(`{"model":"m"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// No messages/prompt/input at all -> ExtractUnits declines -> the cache
+	// policy's len(rr.Units)==0 branch fires immediately, so this request is
+	// decided by the FALLBACK (least-outstanding), never the affinity
+	// scorer.
+	go func() {
+		resp := post()
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+	held := <-entered // which backend the fallback picked, now at cap
+	other := 1 - held
+
+	heldBackend, ok := reg.Snapshot().Get(workers[held].URL())
+	if !ok {
+		t.Fatal("held backend not found in registry")
+	}
+
+	// The OTHER backend now answers normally: it must NOT share the held
+	// backend's release gate, or the assertion below would block forever
+	// waiting on a channel this test never closes for it.
+	workers[other].Behave(func(*http.Request) mockvllm.Script {
+		return mockvllm.Script{Status: 200, Body: `{"ok":true}`}
+	})
+
+	beforeOther := workers[other].CallCount()
+	resp2 := post()
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", resp2.StatusCode, body2)
+	}
+	if got := workers[other].CallCount(); got != beforeOther+1 {
+		t.Errorf("expected the at-cap backend to be excluded from the FALLBACK path so the "+
+			"request fell to the other backend: other backend call count = %d, want %d", got, beforeOther+1)
+	}
+	if got := heldBackend.Inflight(); got != 1 {
+		t.Errorf("held backend Inflight = %d, want 1 (unchanged) — a second request must "+
+			"not have been routed to an already-at-cap backend via the fallback path", got)
+	}
+
+	close(release)
+	if n := lease.AccountingErrors(); n != 0 {
+		t.Errorf("load accounting errors = %d", n)
+	}
+}
