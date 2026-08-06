@@ -112,7 +112,7 @@ func TestDataHandler_NilSourceReportsInactive(t *testing.T) {
 	if snap.PolicyActive {
 		t.Fatalf("PolicyActive = true with a nil DataSource, want false")
 	}
-	if len(snap.Backends) != 0 || len(snap.Blocks) != 0 {
+	if len(snap.Backends) != 0 || len(snap.Tree) != 0 {
 		t.Fatalf("expected an empty snapshot, got %+v", snap)
 	}
 }
@@ -122,16 +122,16 @@ func TestDataHandler_ServesJSONShape(t *testing.T) {
 	src := &fakeSource{snap: viz.Snapshot{
 		GeneratedAt:  time.Now(),
 		PolicyActive: true,
-		Blocks: []viz.BlockInfo{
-			{Hash: "abcd1234", ChainID: 1, Pos: 0, Tokens: 16},
-			{Hash: "ef567890", ChainID: 1, Pos: 1, Tokens: 16},
+		Tree: []viz.TreeNode{
+			{Hash: "abcd1234", RunLen: 1, Tokens: 16, Depth: 0, Parent: -1, Children: []int{1}, Present: []bool{true}},
+			{Hash: "ef567890", RunLen: 1, Tokens: 16, Depth: 1, Parent: 0, Present: []bool{true}},
 		},
-		Backends: []viz.BackendBlocks{
-			{URL: "http://w0:8000", Healthy: &healthy, Inflight: 2, Nodes: 2, Tokens: 32, Present: []bool{true, true}},
+		Backends: []viz.BackendMeta{
+			{URL: "http://w0:8000", Healthy: &healthy, Inflight: 2, Nodes: 2, Tokens: 32},
 		},
-		AvgCopies:   1.0,
-		ChainsShown: 1,
-		ChainsTotal: 1,
+		AvgCopies:  1.0,
+		NodesShown: 2,
+		NodesTotal: 2,
 	}}
 
 	ts := httptest.NewServer(viz.DataHandler(src))
@@ -156,8 +156,14 @@ func TestDataHandler_ServesJSONShape(t *testing.T) {
 	if !snap.PolicyActive {
 		t.Fatalf("PolicyActive = false, want true")
 	}
-	if len(snap.Blocks) != 2 {
-		t.Fatalf("len(Blocks) = %d, want 2", len(snap.Blocks))
+	if len(snap.Tree) != 2 {
+		t.Fatalf("len(Tree) = %d, want 2", len(snap.Tree))
+	}
+	if snap.Tree[0].Parent != -1 || len(snap.Tree[0].Children) != 1 || snap.Tree[0].Children[0] != 1 {
+		t.Fatalf("root/child linkage did not round-trip: %+v", snap.Tree[0])
+	}
+	if snap.Tree[1].Parent != 0 {
+		t.Fatalf("child's Parent = %d, want 0", snap.Tree[1].Parent)
 	}
 	if len(snap.Backends) != 1 || snap.Backends[0].URL != "http://w0:8000" {
 		t.Fatalf("unexpected Backends: %+v", snap.Backends)

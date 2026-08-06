@@ -30,49 +30,68 @@ type DataSource interface {
 	Snapshot(limit int) Snapshot
 }
 
-// Snapshot is one point-in-time view of the fleet's prefix-cache state.
+// Snapshot is one point-in-time view of the fleet's prefix-cache state, as a
+// single merged prefix TREE across every backend — not a per-backend list.
+// A shared prefix (e.g. a common system prompt) appears ONCE, as one common
+// ancestor row, with sessions diverging into separate branches below it,
+// mirroring the reference kv-router-sim.html's radix-compressed tree view.
 type Snapshot struct {
 	GeneratedAt time.Time `json:"generated_at"`
 	// PolicyActive is false when there is no cache-aware policy running (a
 	// round-robin/least-outstanding router has nothing to visualize here).
 	PolicyActive bool `json:"policy_active"`
 
-	// Blocks is the GLOBAL column order every backend's Present slice is
-	// aligned against: index i in every backend's Present corresponds to
-	// Blocks[i]. Ordered so that one chain's blocks are always contiguous
-	// (grouped by prefix-chain/tree order), which is what lets a session
-	// read as one visual run rather than scattered columns.
-	Blocks []BlockInfo `json:"blocks"`
-	// Backends is sorted by URL for a stable, non-flickering render.
-	Backends []BackendBlocks `json:"backends"`
+	// Backends is the header row: identity and health/load for each known
+	// backend, sorted by URL for a stable render. Every TreeNode.Present
+	// slice is aligned to this same order.
+	Backends []BackendMeta `json:"backends"`
 
-	// AvgCopies is the mean number of backends holding each distinct block
-	// in Blocks — anton's duplication metric (~1.0 = essentially no
-	// duplication across the fleet; the target direction is close to 1.0,
-	// e.g. ~1.05 = 105%, not scattered across many nodes).
+	// Tree is a FLAT, parent-indexed view of the merged prefix tree — one
+	// entry per compressed run of blocks (a maximal chain with no branch
+	// and no change in which backends hold it), analogous to the
+	// reference's buildView() output. Parent==-1 marks a root. Rendering
+	// (the y-position/layout pass) happens client-side from this array, but
+	// the compression and truncation happen here so the wire payload stays
+	// small regardless of how large the underlying trie is.
+	Tree []TreeNode `json:"tree"`
+
+	// AvgCopies is the mean number of backends holding each distinct BLOCK
+	// (computed before run-compression, so it reflects true block-level
+	// duplication regardless of how the tree is compressed/capped for
+	// display) — anton's duplication metric: the target direction is close
+	// to 1.0 (e.g. ~1.05 = 105%), meaning the fleet is NOT scattering the
+	// same content across many backends.
 	AvgCopies float64 `json:"avg_copies"`
 
-	// ChainsShown/ChainsTotal/Truncated report how much of the fleet's true
-	// state this snapshot actually reflects — capping never happens
-	// silently (Truncated=true means ChainsShown < ChainsTotal).
-	ChainsShown int  `json:"chains_shown"`
-	ChainsTotal int  `json:"chains_total"`
-	Truncated   bool `json:"truncated"`
+	// NodesShown/NodesTotal/Truncated report how much of the fleet's true
+	// tree this snapshot actually renders — capping never happens silently
+	// (Truncated=true means NodesShown < NodesTotal).
+	NodesShown int  `json:"nodes_shown"`
+	NodesTotal int  `json:"nodes_total"`
+	Truncated  bool `json:"truncated"`
 }
 
-// BlockInfo is one column: a single block's identity and where it sits
-// within its session, for grouping/shading contiguous runs in the UI.
-type BlockInfo struct {
-	Hash    string `json:"hash"` // hex, kvcache.HexHash — for display/debugging only
-	ChainID int    `json:"chain_id"`
-	Pos     int    `json:"pos"`
-	Tokens  int32  `json:"tokens"`
+// TreeNode is one row of the compressed prefix tree: a run of RunLen
+// consecutive blocks that neither branches nor changes which backends hold
+// it, shown as one line the way the reference collapses a shared prefix
+// into a single box rather than one row per block.
+type TreeNode struct {
+	// Hash is the run's FIRST block's hash (hex, kvcache.HexHash) — a stable
+	// display identity; there is no human label since real traffic has no
+	// simulator-assigned tags.
+	Hash     string `json:"hash"`
+	RunLen   int    `json:"run_len"`
+	Tokens   int32  `json:"tokens"` // total estimated tokens across the run
+	Depth    int    `json:"depth"`
+	Parent   int    `json:"parent"`   // index into Tree, -1 for a root
+	Children []int  `json:"children"` // indices into Tree
+	// Present is aligned to Snapshot.Backends: Present[i] is true iff
+	// Backends[i] currently holds this run.
+	Present []bool `json:"present"`
 }
 
-// BackendBlocks is one row: a backend's identity, health/load (best-effort —
-// omitted fields default to their zero value when unavailable), and which
-// columns of Snapshot.Blocks it currently holds.
-type BackendBlocks struct {
+// BackendMeta is one backend's identity and best-effort health/load.
+type BackendMeta struct {
 	URL string `json:"url"`
 	// Healthy is nil when the backend isn't reachable from the data source
 	// (best-effort: a trie can be lazily created before the registry's add
@@ -80,18 +99,16 @@ type BackendBlocks struct {
 	Healthy  *bool `json:"healthy,omitempty"`
 	Inflight int64 `json:"inflight"`
 	// Nodes/Tokens are the backend's TRUE totals (kvcache.Trie.Stats), which
-	// may exceed len(Present) when chains were capped — the per-backend
-	// analog of Snapshot.Truncated.
+	// may exceed what the (possibly capped) Tree shows for it.
 	Nodes  int64 `json:"nodes"`
 	Tokens int64 `json:"tokens"`
-	// Present is parallel to Snapshot.Blocks: Present[i] is true iff this
-	// backend currently holds Blocks[i].
-	Present []bool `json:"present"`
 }
 
-// DefaultChainLimit bounds chains-per-backend when a request omits ?limit=,
-// keeping the default poll cheap regardless of trie size.
-const DefaultChainLimit = 60
+// DefaultChainLimit bounds both how many chains-per-backend are fetched from
+// the underlying trie and how many tree rows are emitted after compression,
+// when a request omits ?limit= — keeping the default poll cheap regardless
+// of trie size.
+const DefaultChainLimit = 80
 
 // MaxChainLimit is the hard ceiling ?limit= is clamped to, so a client can
 // ask for more detail without being able to force an unbounded walk.

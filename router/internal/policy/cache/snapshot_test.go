@@ -1,13 +1,13 @@
 package cache_test
 
 import (
-	"sort"
 	"sync"
 	"testing"
 
 	"github.com/weka/wekai/kvcache"
 	"github.com/weka/wekai/router/internal/policy"
 	cachepolicy "github.com/weka/wekai/router/internal/policy/cache"
+	"github.com/weka/wekai/router/internal/viz"
 )
 
 // concatUnits joins two Unit chains for a Commit call that shares a and then
@@ -17,6 +17,24 @@ func concatUnits(a, b []kvcache.Unit) []kvcache.Unit {
 	out = append(out, a...)
 	out = append(out, b...)
 	return out
+}
+
+func backendIndex(backends []viz.BackendMeta, url string) int {
+	for i, b := range backends {
+		if b.URL == url {
+			return i
+		}
+	}
+	return -1
+}
+
+func treeRoot(tree []viz.TreeNode) *viz.TreeNode {
+	for i := range tree {
+		if tree[i].Parent == -1 {
+			return &tree[i]
+		}
+	}
+	return nil
 }
 
 // TestSnapshot_Empty is the "no traffic yet" state /router-viz must render
@@ -35,28 +53,22 @@ func TestSnapshot_Empty(t *testing.T) {
 	if len(snap.Backends) != 2 {
 		t.Fatalf("len(Backends) = %d, want 2", len(snap.Backends))
 	}
-	if len(snap.Blocks) != 0 {
-		t.Fatalf("len(Blocks) = %d, want 0 (nothing committed yet)", len(snap.Blocks))
+	if len(snap.Tree) != 0 {
+		t.Fatalf("len(Tree) = %d, want 0 (nothing committed yet)", len(snap.Tree))
 	}
 	if snap.AvgCopies != 0 {
 		t.Fatalf("AvgCopies = %v, want 0", snap.AvgCopies)
 	}
-	if snap.ChainsShown != 0 || snap.ChainsTotal != 0 || snap.Truncated {
-		t.Fatalf("unexpected chain counters on an empty snapshot: %+v", snap)
-	}
-	for _, b := range snap.Backends {
-		if len(b.Present) != 0 {
-			t.Fatalf("backend %s has %d Present entries, want 0", b.URL, len(b.Present))
-		}
+	if snap.NodesShown != 0 || snap.NodesTotal != 0 || snap.Truncated {
+		t.Fatalf("unexpected counters on an empty snapshot: %+v", snap)
 	}
 }
 
-// TestSnapshot_Populated commits a shared prefix plus a diverging tail from
-// two backends and checks every field the /router-viz map depends on:
-// column alignment (the shared block lands in the SAME column on both
-// rows), per-backend presence bits, health/inflight, and AvgCopies
-// reflecting that one block is duplicated and the rest are not.
-func TestSnapshot_Populated(t *testing.T) {
+// TestSnapshot_SharedPrefixIsOneCommonAncestor is the core tree property
+// anton asked for: a prefix shared by two backends must appear ONCE, as a
+// single common-ancestor row present on both, with each backend's own
+// divergent tail as a separate child row present on only that backend.
+func TestSnapshot_SharedPrefixIsOneCommonAncestor(t *testing.T) {
 	p := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
 	bs := backends(t, 2) // bs[0].URL < bs[1].URL by construction (w0, w1)
 	for _, b := range bs {
@@ -69,92 +81,162 @@ func TestSnapshot_Populated(t *testing.T) {
 	p.Commit(bs[1], req(concatUnits(shared, units(300))))
 
 	snap := p.Snapshot(50)
-	if !snap.PolicyActive {
-		t.Fatalf("PolicyActive = false, want true")
+	if len(snap.Tree) != 3 {
+		t.Fatalf("len(Tree) = %d, want 3 (1 shared ancestor + 2 divergent children)", len(snap.Tree))
 	}
-	if len(snap.Backends) != 2 {
-		t.Fatalf("len(Backends) = %d, want 2", len(snap.Backends))
-	}
-	if !sort.SliceIsSorted(snap.Backends, func(i, j int) bool { return snap.Backends[i].URL < snap.Backends[j].URL }) {
-		t.Fatalf("Backends not sorted by URL: %+v", snap.Backends)
-	}
-	if len(snap.Blocks) != 3 {
-		t.Fatalf("len(Blocks) = %d, want 3 (1 shared + 2 divergent)", len(snap.Blocks))
+	if snap.NodesShown != 3 || snap.NodesTotal != 3 || snap.Truncated {
+		t.Fatalf("unexpected counters: shown=%d total=%d truncated=%v", snap.NodesShown, snap.NodesTotal, snap.Truncated)
 	}
 
-	hex100, hex200, hex300 := kvcache.HexHash(100), kvcache.HexHash(200), kvcache.HexHash(300)
-
-	// Find the shared block's column and confirm BOTH backends show present
-	// there, aligned at the identical index.
-	sharedCol := -1
-	for i, blk := range snap.Blocks {
-		if blk.Hash == hex100 {
-			sharedCol = i
-		}
+	root := treeRoot(snap.Tree)
+	if root == nil {
+		t.Fatalf("no root in Tree: %+v", snap.Tree)
 	}
-	if sharedCol < 0 {
-		t.Fatalf("shared block (hash 100) missing from Blocks: %+v", snap.Blocks)
+	if root.Hash != kvcache.HexHash(100) {
+		t.Fatalf("root.Hash = %q, want the shared block's hash", root.Hash)
 	}
-	for _, b := range snap.Backends {
-		if !b.Present[sharedCol] {
-			t.Fatalf("backend %s should show the shared block present at column %d: %+v", b.URL, sharedCol, b.Present)
+	if root.RunLen != 1 {
+		t.Fatalf("root.RunLen = %d, want 1", root.RunLen)
+	}
+	if len(root.Children) != 2 {
+		t.Fatalf("root should have exactly 2 children (the two divergent tails), got %d: %+v", len(root.Children), root)
+	}
+	for i, on := range root.Present {
+		if !on {
+			t.Fatalf("shared root should be present on backend %s (index %d): %v", snap.Backends[i].URL, i, root.Present)
 		}
 	}
 
-	var w0, w1 int = -1, -1
-	for i, b := range snap.Backends {
-		switch b.URL {
-		case bs[0].URL:
-			w0 = i
-		case bs[1].URL:
-			w1 = i
+	i0, i1 := backendIndex(snap.Backends, bs[0].URL), backendIndex(snap.Backends, bs[1].URL)
+	if i0 < 0 || i1 < 0 {
+		t.Fatalf("expected both backend URLs in Backends: %+v", snap.Backends)
+	}
+	hex200, hex300 := kvcache.HexHash(200), kvcache.HexHash(300)
+	var child200, child300 *viz.TreeNode
+	for _, ci := range root.Children {
+		n := snap.Tree[ci]
+		switch n.Hash {
+		case hex200:
+			c := n
+			child200 = &c
+		case hex300:
+			c := n
+			child300 = &c
 		}
 	}
-	if w0 < 0 || w1 < 0 {
-		t.Fatalf("expected both backend URLs in the snapshot: %+v", snap.Backends)
+	if child200 == nil || child300 == nil {
+		t.Fatalf("expected both divergent children (200 and 300) under the shared root")
+	}
+	if !child200.Present[i0] || child200.Present[i1] {
+		t.Fatalf("child200 presence wrong: %v (want present on w0 only)", child200.Present)
+	}
+	if !child300.Present[i1] || child300.Present[i0] {
+		t.Fatalf("child300 presence wrong: %v (want present on w1 only)", child300.Present)
 	}
 
-	// Each backend's own divergent tail must NOT show present on the other.
-	col200, col300 := -1, -1
-	for i, blk := range snap.Blocks {
-		if blk.Hash == hex200 {
-			col200 = i
-		}
-		if blk.Hash == hex300 {
-			col300 = i
-		}
-	}
-	if col200 < 0 || col300 < 0 {
-		t.Fatalf("divergent blocks missing from Blocks: %+v", snap.Blocks)
-	}
-	if !snap.Backends[w0].Present[col200] || snap.Backends[w0].Present[col300] {
-		t.Fatalf("backend w0 presence wrong: col200=%v col300=%v, want true/false",
-			snap.Backends[w0].Present[col200], snap.Backends[w0].Present[col300])
-	}
-	if !snap.Backends[w1].Present[col300] || snap.Backends[w1].Present[col200] {
-		t.Fatalf("backend w1 presence wrong: col300=%v col200=%v, want true/false",
-			snap.Backends[w1].Present[col300], snap.Backends[w1].Present[col200])
-	}
-
-	// AvgCopies: shared block held by 2, the two divergent blocks by 1 each
-	// -> mean copies = (2+1+1)/3.
+	// AvgCopies is block-level: shared block held by 2, the two divergent
+	// blocks by 1 each -> mean = (2+1+1)/3.
 	wantAvg := 4.0 / 3.0
 	if diff := snap.AvgCopies - wantAvg; diff > 1e-9 || diff < -1e-9 {
 		t.Fatalf("AvgCopies = %v, want %v", snap.AvgCopies, wantAvg)
 	}
 
-	if snap.Backends[w0].Healthy == nil || !*snap.Backends[w0].Healthy {
-		t.Fatalf("w0.Healthy = %v, want true (added via AddBackend and marked Healthy)", snap.Backends[w0].Healthy)
+	if snap.Backends[i0].Healthy == nil || !*snap.Backends[i0].Healthy {
+		t.Fatalf("w0.Healthy = %v, want true (added via AddBackend and marked Healthy)", snap.Backends[i0].Healthy)
 	}
-	if snap.Backends[w0].Inflight != 3 {
-		t.Fatalf("w0.Inflight = %d, want 3", snap.Backends[w0].Inflight)
+	if snap.Backends[i0].Inflight != 3 {
+		t.Fatalf("w0.Inflight = %d, want 3", snap.Backends[i0].Inflight)
+	}
+}
+
+// TestSnapshot_LongSharedChainCompressesToOneRow is the radix-compression
+// property: a straight, non-branching chain must collapse into a single
+// tree row (one box per RUN, not one per block), the same behavior the
+// reference kv-router-sim.html's tree view relies on for readability.
+func TestSnapshot_LongSharedChainCompressesToOneRow(t *testing.T) {
+	p := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	bs := backends(t, 1)
+	p.AddBackend(bs[0])
+	p.Commit(bs[0], req(units(1, 2, 3, 4, 5)))
+
+	snap := p.Snapshot(50)
+	if len(snap.Tree) != 1 {
+		t.Fatalf("len(Tree) = %d, want 1 (a single-backend straight 5-block chain must fully compress)", len(snap.Tree))
+	}
+	if snap.Tree[0].RunLen != 5 {
+		t.Fatalf("RunLen = %d, want 5", snap.Tree[0].RunLen)
+	}
+}
+
+// TestSnapshot_CompressionBreaksOnPresenceChange is the correctness
+// counterpart to the compression test above: even with NO structural
+// branch, a run must stop the moment the backend-presence set changes,
+// or the row would show a wrong/blended presence pattern.
+func TestSnapshot_CompressionBreaksOnPresenceChange(t *testing.T) {
+	p := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	bs := backends(t, 2)
+	for _, b := range bs {
+		p.AddBackend(b)
+	}
+
+	// Both backends serve blocks 1,2 (same present-set: compress together);
+	// only bs[0] goes on to block 3 (present-set changes: new run).
+	p.Commit(bs[0], req(units(1, 2, 3)))
+	p.Commit(bs[1], req(units(1, 2)))
+
+	snap := p.Snapshot(50)
+	if len(snap.Tree) != 2 {
+		t.Fatalf("len(Tree) = %d, want 2 (compressed run [1,2] + divergent run [3])", len(snap.Tree))
+	}
+	root := treeRoot(snap.Tree)
+	if root == nil {
+		t.Fatalf("no root in Tree: %+v", snap.Tree)
+	}
+	if root.RunLen != 2 {
+		t.Fatalf("root.RunLen = %d, want 2 (blocks 1 and 2 share a present-set and must compress together)", root.RunLen)
+	}
+	if len(root.Children) != 1 {
+		t.Fatalf("root should have exactly 1 child (block 3, where the present-set changes), got %d", len(root.Children))
+	}
+	child := snap.Tree[root.Children[0]]
+	if child.RunLen != 1 {
+		t.Fatalf("child.RunLen = %d, want 1", child.RunLen)
+	}
+}
+
+// TestSnapshot_LimitTruncatesTreeRows checks the "no silent truncation"
+// contract end to end: NodesTotal must reflect the TRUE total regardless of
+// a small display limit (kvcache.Trie.Chains always walks its whole trie
+// internally; only the caller's own fetch cap, decoupled from the display
+// limit, could distort this — this test is what would have caught that bug).
+func TestSnapshot_LimitTruncatesTreeRows(t *testing.T) {
+	p := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	bs := backends(t, 1)
+	p.AddBackend(bs[0])
+	// 10 independent single-block sessions -> 10 separate root runs.
+	for i := 0; i < 10; i++ {
+		p.Commit(bs[0], req(units(uint64(1000+i))))
+	}
+
+	snap := p.Snapshot(4)
+	if len(snap.Tree) > 4 {
+		t.Fatalf("len(Tree) = %d, want <= 4 (limit)", len(snap.Tree))
+	}
+	if snap.NodesTotal != 10 {
+		t.Fatalf("NodesTotal = %d, want 10 (the true total, not capped by the small display limit)", snap.NodesTotal)
+	}
+	if !snap.Truncated {
+		t.Fatalf("Truncated = false, want true (10 sessions, limit 4)")
+	}
+	if snap.NodesShown != len(snap.Tree) {
+		t.Fatalf("NodesShown = %d, want %d (== len(Tree))", snap.NodesShown, len(snap.Tree))
 	}
 }
 
 // TestSnapshot_BackendNeverAddedIsBestEffort exercises the degraded path: a
 // backend that was selected/committed before the registry's AddBackend hook
-// ran (trieStore.get's lazy-create). Its trie and blocks must still show up
-// — only Healthy/Inflight, which need the *registry.Backend reference
+// ran (trieStore.get's lazy-create). Its blocks must still show up in the
+// tree — only Healthy/Inflight, which need the *registry.Backend reference
 // AddBackend supplies, are best-effort and come back unset.
 func TestSnapshot_BackendNeverAddedIsBestEffort(t *testing.T) {
 	p := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
@@ -171,11 +253,11 @@ func TestSnapshot_BackendNeverAddedIsBestEffort(t *testing.T) {
 	if b.URL != bs[0].URL {
 		t.Fatalf("URL = %q, want %q", b.URL, bs[0].URL)
 	}
-	if len(b.Present) != 1 || !b.Present[0] {
-		t.Fatalf("Present = %v, want [true]", b.Present)
-	}
 	if b.Healthy != nil {
 		t.Fatalf("Healthy = %v, want nil (backend was never registered via AddBackend)", *b.Healthy)
+	}
+	if len(snap.Tree) != 1 || !snap.Tree[0].Present[0] {
+		t.Fatalf("expected the committed block present in the tree: %+v", snap.Tree)
 	}
 }
 
