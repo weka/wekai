@@ -24,7 +24,7 @@ import (
 // while the tree gets merged/compressed/flattened or while the caller
 // (viz.DataHandler) JSON-encodes the result — all of that happens on plain
 // Go values with no lock involved.
-func (s *trieStore) snapshot(limit int) viz.Snapshot {
+func (s *trieStore) snapshot(opts viz.SnapshotOptions) viz.Snapshot {
 	s.mu.RLock()
 	urls := make([]string, 0, len(s.tries))
 	tries := make(map[string]*kvcache.Trie, len(s.tries))
@@ -42,20 +42,18 @@ func (s *trieStore) snapshot(limit int) viz.Snapshot {
 	sort.Strings(urls) // stable render: same backend order on every poll
 
 	// Fetch each backend's chains independently (each call takes only that
-	// trie's own RLock, per the doc above), using fetchCapPerBackend rather
-	// than the caller's (possibly small) display limit. This is NOT the same
-	// knob as the display cap applied at flattenTree below: kvcache.Trie.Chains
+	// trie's own RLock, per the doc above), UNLIMITED — deliberately not
+	// opts, which governs only the DISPLAY reduction below. kvcache.Trie.Chains
 	// always walks its ENTIRE trie to compute an accurate totalLeaves
 	// regardless of the limit it's given — only the returned slice is capped
-	// — so passing the small display limit here would silently under-report
-	// NodesTotal once run-compression is in the mix (fewer chains fetched ==
-	// fewer blocks merged == a smaller, wrong "total"). fetchCapPerBackend is
-	// generous enough that NodesTotal is accurate for any realistic fleet
-	// while still bounding worst-case allocation against a pathologically
-	// large trie.
+	// — so tying this fetch to the caller's (possibly small) display options
+	// would silently under-report NodesTotal once run-compression is in the
+	// mix (fewer chains fetched == fewer blocks merged == a smaller, wrong
+	// "total"). NodesTotal must reflect the fleet's true state regardless of
+	// what the user asked to see, so the fetch itself is never capped.
 	chainsByURL := make(map[string][]kvcache.Chain, len(urls))
 	for _, url := range urls {
-		chains, _ := tries[url].Chains(fetchCapPerBackend)
+		chains, _ := tries[url].Chains(0)
 		chainsByURL[url] = chains
 	}
 
@@ -80,7 +78,7 @@ func (s *trieStore) snapshot(limit int) viz.Snapshot {
 		nodesTotal += r.subtreeSize
 	}
 
-	treeNodes := flattenTree(roots, limit, urls)
+	treeNodes := flattenTree(roots, opts, urls)
 
 	backends := make([]viz.BackendMeta, 0, len(urls))
 	for _, url := range urls {

@@ -46,7 +46,7 @@ func TestSnapshot_Empty(t *testing.T) {
 		p.AddBackend(b)
 	}
 
-	snap := p.Snapshot(50)
+	snap := p.Snapshot(viz.SnapshotOptions{})
 	if !snap.PolicyActive {
 		t.Fatalf("PolicyActive = false, want true")
 	}
@@ -61,6 +61,31 @@ func TestSnapshot_Empty(t *testing.T) {
 	}
 	if snap.NodesShown != 0 || snap.NodesTotal != 0 || snap.Truncated {
 		t.Fatalf("unexpected counters on an empty snapshot: %+v", snap)
+	}
+}
+
+// TestSnapshot_DefaultIsUnlimited is anton's explicit requirement: a zero
+// SnapshotOptions (what DataHandler passes when the page's UI controls are
+// all left empty) must show the ENTIRE tree, not some hidden default cap.
+func TestSnapshot_DefaultIsUnlimited(t *testing.T) {
+	p := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	bs := backends(t, 1)
+	p.AddBackend(bs[0])
+	// 200 independent single-block sessions -> 200 separate root runs, well
+	// past any of the old hardcoded defaults (60/80/6).
+	for i := 0; i < 200; i++ {
+		p.Commit(bs[0], req(units(uint64(1000+i))))
+	}
+
+	snap := p.Snapshot(viz.SnapshotOptions{})
+	if len(snap.Tree) != 200 {
+		t.Fatalf("len(Tree) = %d, want 200 (unlimited by default)", len(snap.Tree))
+	}
+	if snap.NodesShown != 200 || snap.NodesTotal != 200 {
+		t.Fatalf("NodesShown/NodesTotal = %d/%d, want 200/200", snap.NodesShown, snap.NodesTotal)
+	}
+	if snap.Truncated {
+		t.Fatalf("Truncated = true, want false (nothing was capped)")
 	}
 }
 
@@ -80,7 +105,7 @@ func TestSnapshot_SharedPrefixIsOneCommonAncestor(t *testing.T) {
 	p.Commit(bs[0], req(concatUnits(shared, units(200))))
 	p.Commit(bs[1], req(concatUnits(shared, units(300))))
 
-	snap := p.Snapshot(50)
+	snap := p.Snapshot(viz.SnapshotOptions{})
 	if len(snap.Tree) != 3 {
 		t.Fatalf("len(Tree) = %d, want 3 (1 shared ancestor + 2 divergent children)", len(snap.Tree))
 	}
@@ -159,7 +184,7 @@ func TestSnapshot_LongSharedChainCompressesToOneRow(t *testing.T) {
 	p.AddBackend(bs[0])
 	p.Commit(bs[0], req(units(1, 2, 3, 4, 5)))
 
-	snap := p.Snapshot(50)
+	snap := p.Snapshot(viz.SnapshotOptions{})
 	if len(snap.Tree) != 1 {
 		t.Fatalf("len(Tree) = %d, want 1 (a single-backend straight 5-block chain must fully compress)", len(snap.Tree))
 	}
@@ -184,7 +209,7 @@ func TestSnapshot_CompressionBreaksOnPresenceChange(t *testing.T) {
 	p.Commit(bs[0], req(units(1, 2, 3)))
 	p.Commit(bs[1], req(units(1, 2)))
 
-	snap := p.Snapshot(50)
+	snap := p.Snapshot(viz.SnapshotOptions{})
 	if len(snap.Tree) != 2 {
 		t.Fatalf("len(Tree) = %d, want 2 (compressed run [1,2] + divergent run [3])", len(snap.Tree))
 	}
@@ -204,12 +229,13 @@ func TestSnapshot_CompressionBreaksOnPresenceChange(t *testing.T) {
 	}
 }
 
-// TestSnapshot_LimitTruncatesTreeRows checks the "no silent truncation"
-// contract end to end: NodesTotal must reflect the TRUE total regardless of
-// a small display limit (kvcache.Trie.Chains always walks its whole trie
-// internally; only the caller's own fetch cap, decoupled from the display
-// limit, could distort this — this test is what would have caught that bug).
-func TestSnapshot_LimitTruncatesTreeRows(t *testing.T) {
+// TestSnapshot_MaxRowsTruncatesTreeRows checks the "no silent truncation"
+// contract end to end when the UI explicitly asks for a row cap: NodesTotal
+// must reflect the TRUE total regardless of the requested cap (kvcache.Trie.Chains
+// always walks its whole trie internally; only the caller's own fetch cap,
+// decoupled from the display option, could distort this — this test is what
+// would have caught that bug).
+func TestSnapshot_MaxRowsTruncatesTreeRows(t *testing.T) {
 	p := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
 	bs := backends(t, 1)
 	p.AddBackend(bs[0])
@@ -218,18 +244,87 @@ func TestSnapshot_LimitTruncatesTreeRows(t *testing.T) {
 		p.Commit(bs[0], req(units(uint64(1000+i))))
 	}
 
-	snap := p.Snapshot(4)
+	snap := p.Snapshot(viz.SnapshotOptions{MaxRows: 4})
 	if len(snap.Tree) > 4 {
-		t.Fatalf("len(Tree) = %d, want <= 4 (limit)", len(snap.Tree))
+		t.Fatalf("len(Tree) = %d, want <= 4 (MaxRows)", len(snap.Tree))
 	}
 	if snap.NodesTotal != 10 {
-		t.Fatalf("NodesTotal = %d, want 10 (the true total, not capped by the small display limit)", snap.NodesTotal)
+		t.Fatalf("NodesTotal = %d, want 10 (the true total, not capped by the small display option)", snap.NodesTotal)
 	}
 	if !snap.Truncated {
-		t.Fatalf("Truncated = false, want true (10 sessions, limit 4)")
+		t.Fatalf("Truncated = false, want true (10 sessions, MaxRows 4)")
 	}
 	if snap.NodesShown != len(snap.Tree) {
 		t.Fatalf("NodesShown = %d, want %d (== len(Tree))", snap.NodesShown, len(snap.Tree))
+	}
+}
+
+// TestSnapshot_MaxChildrenLimitsPerNode is the per-node child cap, another
+// UI-settable option: unlimited by default, applied only when explicitly
+// requested.
+func TestSnapshot_MaxChildrenLimitsPerNode(t *testing.T) {
+	p := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	bs := backends(t, 1)
+	p.AddBackend(bs[0])
+	shared := units(100)
+	for i := 0; i < 5; i++ {
+		p.Commit(bs[0], req(concatUnits(shared, units(uint64(200+i)))))
+	}
+
+	full := p.Snapshot(viz.SnapshotOptions{})
+	if len(full.Tree) != 6 { // 1 shared root + 5 divergent children
+		t.Fatalf("full tree len = %d, want 6", len(full.Tree))
+	}
+
+	limited := p.Snapshot(viz.SnapshotOptions{MaxChildren: 2})
+	root := treeRoot(limited.Tree)
+	if root == nil {
+		t.Fatalf("no root in limited tree: %+v", limited.Tree)
+	}
+	if len(root.Children) != 2 {
+		t.Fatalf("root.Children = %d, want 2 (MaxChildren=2)", len(root.Children))
+	}
+	if !limited.Truncated {
+		t.Fatalf("Truncated = false, want true")
+	}
+	if limited.NodesTotal != 6 {
+		t.Fatalf("NodesTotal = %d, want 6 (true total unaffected by MaxChildren)", limited.NodesTotal)
+	}
+}
+
+// TestSnapshot_MaxDepthLimitsDepth is the depth cap. Uses a chain that
+// changes present-set at every step (no structural branch) so each block is
+// forced into its own row purely by the compression rule, giving a clean
+// 3-level tree to cap.
+func TestSnapshot_MaxDepthLimitsDepth(t *testing.T) {
+	p := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	bs := backends(t, 3)
+	for _, b := range bs {
+		p.AddBackend(b)
+	}
+	p.Commit(bs[0], req(units(1, 2, 3))) // present on block1,2,3
+	p.Commit(bs[1], req(units(1, 2)))    // present on block1,2 only
+	p.Commit(bs[2], req(units(1)))       // present on block1 only
+
+	full := p.Snapshot(viz.SnapshotOptions{})
+	if len(full.Tree) != 3 {
+		t.Fatalf("full tree len = %d, want 3 (depths 0,1,2)", len(full.Tree))
+	}
+
+	limited := p.Snapshot(viz.SnapshotOptions{MaxDepth: 2})
+	if len(limited.Tree) != 2 {
+		t.Fatalf("MaxDepth=2 tree len = %d, want 2 (depths 0,1 only)", len(limited.Tree))
+	}
+	for _, n := range limited.Tree {
+		if n.Depth >= 2 {
+			t.Fatalf("node at depth %d should have been excluded by MaxDepth=2", n.Depth)
+		}
+	}
+	if !limited.Truncated {
+		t.Fatalf("Truncated = false, want true")
+	}
+	if limited.NodesTotal != 3 {
+		t.Fatalf("NodesTotal = %d, want 3 (true total unaffected by MaxDepth)", limited.NodesTotal)
 	}
 }
 
@@ -245,7 +340,7 @@ func TestSnapshot_BackendNeverAddedIsBestEffort(t *testing.T) {
 	// via the lazy get() path.
 	p.Commit(bs[0], req(units(42)))
 
-	snap := p.Snapshot(50)
+	snap := p.Snapshot(viz.SnapshotOptions{})
 	if len(snap.Backends) != 1 {
 		t.Fatalf("len(Backends) = %d, want 1", len(snap.Backends))
 	}
@@ -264,7 +359,8 @@ func TestSnapshot_BackendNeverAddedIsBestEffort(t *testing.T) {
 // TestSnapshot_ConcurrentWithCommit is the concurrent-commit-safety case:
 // Snapshot polled (as /router-viz/data would, roughly once a second, here
 // hammered far harder) while Commit keeps mutating the same backends' tries.
-// Run with -race for a meaningful check.
+// Uses the unlimited default so it also stresses the now-uncapped fetch
+// path. Run with -race for a meaningful check.
 func TestSnapshot_ConcurrentWithCommit(t *testing.T) {
 	p := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
 	bs := backends(t, 3)
@@ -293,7 +389,7 @@ func TestSnapshot_ConcurrentWithCommit(t *testing.T) {
 	}
 
 	for i := 0; i < 200; i++ {
-		snap := p.Snapshot(30)
+		snap := p.Snapshot(viz.SnapshotOptions{})
 		if len(snap.Backends) != 3 {
 			t.Errorf("iteration %d: len(Backends) = %d, want 3", i, len(snap.Backends))
 		}

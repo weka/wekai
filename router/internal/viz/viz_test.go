@@ -16,14 +16,14 @@ import (
 // router/internal/policy/cache implementation (kept isolated per the
 // package's own doc: viz knows nothing about kvcache or policies).
 type fakeSource struct {
-	snap      viz.Snapshot
-	lastLimit int
-	calls     int
+	snap     viz.Snapshot
+	lastOpts viz.SnapshotOptions
+	calls    int
 }
 
-func (f *fakeSource) Snapshot(limit int) viz.Snapshot {
+func (f *fakeSource) Snapshot(opts viz.SnapshotOptions) viz.Snapshot {
 	f.calls++
-	f.lastLimit = limit
+	f.lastOpts = opts
 	return f.snap
 }
 
@@ -90,6 +90,45 @@ func TestPageHandler_ReferencesRelativeDataEndpoint(t *testing.T) {
 	}
 	if strings.Contains(html, "cdn.") || strings.Contains(html, "unpkg.com") || strings.Contains(html, "googleapis.com") {
 		t.Fatalf("page references an external CDN, violates the self-contained requirement")
+	}
+}
+
+// TestPageHandler_HasUIControlsNotJustQueryParams is anton's explicit
+// requirement: any limiting must be a visible UI control the user sets, not
+// a URL query parameter they have to know about. Checks the page defines
+// input elements for the three options and reads THEIR values (not
+// location.search) when building its fetch — a structural proxy for "the
+// configuration surface is the UI," since httptest can't execute the JS.
+func TestPageHandler_HasUIControlsNotJustQueryParams(t *testing.T) {
+	ts := httptest.NewServer(viz.PageHandler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body := new(strings.Builder)
+	buf := make([]byte, 8192)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			body.Write(buf[:n])
+		}
+		if err != nil {
+			break
+		}
+	}
+	html := body.String()
+	for _, id := range []string{"ctl-rows", "ctl-children", "ctl-depth"} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Fatalf("page missing UI control #%s", id)
+		}
+	}
+	// The page must not seed its request params from its own URL — the UI
+	// inputs are the only configuration surface.
+	if strings.Contains(html, "location.search") {
+		t.Fatalf("page reads location.search — configuration must come from the UI controls only")
 	}
 }
 
@@ -171,47 +210,71 @@ func TestDataHandler_ServesJSONShape(t *testing.T) {
 	if snap.Backends[0].Healthy == nil || !*snap.Backends[0].Healthy {
 		t.Fatalf("Healthy = %v, want true", snap.Backends[0].Healthy)
 	}
-	if src.lastLimit != viz.DefaultChainLimit {
-		t.Fatalf("lastLimit = %d, want default %d when no ?limit= given", src.lastLimit, viz.DefaultChainLimit)
-	}
 }
 
-func TestDataHandler_LimitQueryParam(t *testing.T) {
+// TestDataHandler_NoParamsMeansUnlimited is anton's explicit requirement at
+// the wire level: a request with no query params at all must reach the
+// DataSource as a completely zero SnapshotOptions — unlimited in every
+// dimension, no hidden default cap.
+func TestDataHandler_NoParamsMeansUnlimited(t *testing.T) {
 	src := &fakeSource{}
 	ts := httptest.NewServer(viz.DataHandler(src))
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "?limit=15")
+	resp, err := http.Get(ts.URL)
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
 	resp.Body.Close()
-	if src.lastLimit != 15 {
-		t.Fatalf("lastLimit = %d, want 15", src.lastLimit)
+	if src.lastOpts != (viz.SnapshotOptions{}) {
+		t.Fatalf("lastOpts = %+v, want the zero value (unlimited) with no query params", src.lastOpts)
+	}
+}
+
+// TestDataHandler_QueryParamsSetOptions checks each of the three
+// UI-settable knobs is parsed into SnapshotOptions correctly, and that an
+// explicitly-huge value is clamped rather than passed through unbounded —
+// these params are the mechanism the page's OWN UI controls use; a client
+// is still free to hit them directly (e.g. for scripting), but nothing
+// defaults to using them.
+func TestDataHandler_QueryParamsSetOptions(t *testing.T) {
+	src := &fakeSource{}
+	ts := httptest.NewServer(viz.DataHandler(src))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "?limit=15&max_children=3&max_depth=7")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+	want := viz.SnapshotOptions{MaxRows: 15, MaxChildren: 3, MaxDepth: 7}
+	if src.lastOpts != want {
+		t.Fatalf("lastOpts = %+v, want %+v", src.lastOpts, want)
 	}
 
-	// A limit above MaxChainLimit must be clamped, not passed through
-	// unbounded — this is what stops a client forcing an unbounded walk.
-	resp2, err := http.Get(ts.URL + "?limit=999999")
+	// An explicitly huge value must be clamped, not passed through
+	// unbounded — this is what stops a client forcing an unbounded walk
+	// while still keeping "omitted -> unlimited" true.
+	resp2, err := http.Get(ts.URL + "?limit=999999999")
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
 	resp2.Body.Close()
-	if src.lastLimit != viz.MaxChainLimit {
-		t.Fatalf("lastLimit = %d, want clamped to MaxChainLimit=%d", src.lastLimit, viz.MaxChainLimit)
+	if src.lastOpts.MaxRows != viz.MaxParamValue {
+		t.Fatalf("MaxRows = %d, want clamped to MaxParamValue=%d", src.lastOpts.MaxRows, viz.MaxParamValue)
 	}
 
-	// A malformed limit must fall back to the default rather than erroring
-	// the whole page.
-	resp3, err := http.Get(ts.URL + "?limit=not-a-number")
+	// A malformed or non-positive value must fall back to unlimited (0)
+	// rather than erroring the whole page.
+	resp3, err := http.Get(ts.URL + "?limit=not-a-number&max_children=-5&max_depth=0")
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
 	defer resp3.Body.Close()
 	if resp3.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 even with a malformed limit", resp3.StatusCode)
+		t.Fatalf("status = %d, want 200 even with malformed params", resp3.StatusCode)
 	}
-	if src.lastLimit != viz.DefaultChainLimit {
-		t.Fatalf("lastLimit = %d, want default %d for a malformed ?limit=", src.lastLimit, viz.DefaultChainLimit)
+	if src.lastOpts != (viz.SnapshotOptions{}) {
+		t.Fatalf("lastOpts = %+v, want the zero value for malformed/non-positive params", src.lastOpts)
 	}
 }

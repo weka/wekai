@@ -7,18 +7,11 @@ import (
 	"github.com/weka/wekai/router/internal/viz"
 )
 
-// maxChildrenPerNode bounds how many branches a single tree row shows before
-// the rest are simply not rendered (Snapshot.Truncated covers the "how much
-// was left out" reporting at the whole-tree level) — the same idea as the
-// reference kv-router-sim.html capping children per node, kept simpler here
-// (no per-node "+N branches" ghost row) since the top-level NodesShown/
-// NodesTotal/Truncated fields already say how much is missing.
-const maxChildrenPerNode = 6
-
 // fetchCapPerBackend bounds how many chains are fetched from each backend's
-// trie when building the merge tree — see the call site in snapshot.go for
-// why this is deliberately NOT the same knob as the caller's display limit.
-const fetchCapPerBackend = 5000
+// trie when building the merge tree. 0 (unlimited) ALWAYS — see the call
+// site in snapshot.go: NodesTotal must report the fleet's true state
+// regardless of what display reduction (SnapshotOptions) the caller asked
+// for, so the fetch itself is never capped by the caller's own request.
 
 // mergeNode is one exact block, built by inserting every backend's
 // kvcache.Trie.Chains output into a single shared trie keyed by hash — the
@@ -158,22 +151,23 @@ func (r *run) computeSubtreeSize() int {
 	return size
 }
 
-// flattenTree turns root runs into the flat, parent-indexed, capped
-// viz.TreeNode array the page renders. When a node has more children than
-// maxChildrenPerNode, or the overall limit is reached, the rest are simply
-// not emitted — which branch survives is decided by descending subtree
-// size (the "busiest"/biggest branch first), the closest available proxy
-// to the reference's traffic-sorted children since this package has no
-// per-block hit counter to sort by.
-func flattenTree(roots []*run, limit int, backends []string) []viz.TreeNode {
+// flattenTree turns root runs into the flat, parent-indexed viz.TreeNode
+// array the page renders. By default (a zero opts) EVERY row is emitted —
+// anton's explicit ask: unlimited unless the caller (the page's own UI
+// controls, via DataHandler) opted into a smaller view. When a cap IS set
+// and a node has more children than opts.MaxChildren, or the row/depth
+// budget runs out, the rest are simply not emitted — which branch survives
+// is decided by descending subtree size (the "busiest"/biggest branch
+// first), the closest available proxy to the reference's traffic-sorted
+// children since this package has no per-block hit counter to sort by.
+func flattenTree(roots []*run, opts viz.SnapshotOptions, backends []string) []viz.TreeNode {
 	sort.Slice(roots, func(i, j int) bool { return roots[i].subtreeSize > roots[j].subtreeSize })
 
 	var nodes []viz.TreeNode
+	fitsRows := func() bool { return opts.MaxRows <= 0 || len(nodes) < opts.MaxRows }
+
 	var emit func(r *run, depth, parentIdx int)
 	emit = func(r *run, depth, parentIdx int) {
-		if limit > 0 && len(nodes) >= limit {
-			return
-		}
 		idx := len(nodes)
 		present := make([]bool, len(backends))
 		for i, url := range backends {
@@ -188,11 +182,22 @@ func flattenTree(roots []*run, limit int, backends []string) []viz.TreeNode {
 			Depth: depth, Parent: parentIdx, Present: present,
 		})
 
+		// Depth cap: checked ONCE for this node's children collectively (they
+		// all sit at the same depth+1), BEFORE reserving any child index —
+		// deciding this inside the loop after childIdx were already recorded
+		// would leave a dangling Children reference to a node never emitted.
+		if opts.MaxDepth > 0 && depth+1 >= opts.MaxDepth {
+			return
+		}
+
 		kids := append([]*run(nil), r.children...)
 		sort.Slice(kids, func(i, j int) bool { return kids[i].subtreeSize > kids[j].subtreeSize })
 		shown := 0
 		for _, k := range kids {
-			if shown >= maxChildrenPerNode || (limit > 0 && len(nodes) >= limit) {
+			if opts.MaxChildren > 0 && shown >= opts.MaxChildren {
+				break
+			}
+			if !fitsRows() {
 				break
 			}
 			childIdx := len(nodes)
@@ -202,7 +207,7 @@ func flattenTree(roots []*run, limit int, backends []string) []viz.TreeNode {
 		}
 	}
 	for _, r := range roots {
-		if limit > 0 && len(nodes) >= limit {
+		if !fitsRows() {
 			break
 		}
 		emit(r, 0, -1)

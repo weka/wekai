@@ -25,6 +25,15 @@ h1 span{color:var(--muted);font-weight:400}
 .status{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);display:flex;align-items:center;gap:6px}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--good);display:inline-block}
 .dot.stale{background:var(--crit)}
+.ctlbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.ctlbar label{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.04em;font-weight:600}
+.ctlbar input{width:64px;font-family:var(--mono);font-size:12px;color:var(--ink);
+  background:var(--surface-2);border:1px solid var(--border);border-radius:5px;padding:4px 6px}
+.ctlbar input::placeholder{color:var(--muted)}
+.ctlbar button{font-family:var(--font);font-size:11px;font-weight:600;color:var(--ink-2);
+  background:var(--surface-2);border:1px solid var(--border);border-radius:5px;padding:4px 8px;cursor:pointer}
+.ctlbar button:hover{background:#232322;color:var(--ink)}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:9px;margin:12px 0}
 .tile{background:var(--surface-2);border:1px solid var(--border);border-radius:7px;padding:8px 10px}
 .tile .v{font-family:var(--mono);font-size:17px;font-weight:600;letter-spacing:-0.01em}
@@ -54,6 +63,12 @@ footer{font-size:10.5px;color:var(--muted);margin-top:14px;font-family:var(--mon
 <header>
   <h1>Router KV Map <span>— live prefix-cache tree</span></h1>
   <div class="spacer"></div>
+  <div class="ctlbar">
+    <label>rows <input type="number" id="ctl-rows" placeholder="all" min="1"></label>
+    <label>children/node <input type="number" id="ctl-children" placeholder="all" min="1"></label>
+    <label>depth <input type="number" id="ctl-depth" placeholder="all" min="1"></label>
+    <button id="ctl-clear" type="button">show all</button>
+  </div>
   <div class="status"><span class="dot" id="conn-dot"></span><span id="conn-text">connecting…</span></div>
 </header>
 
@@ -64,7 +79,8 @@ footer{font-size:10.5px;color:var(--muted);margin-top:14px;font-family:var(--mon
   <p class="note">Radix-compressed view of the fleet's MERGED prefix cache — one box per run of blocks
     that no session's request diverges from. A prefix shared by more than one backend appears ONCE, as a
     common ancestor box; sessions branch below it wherever their content actually diverges. The small
-    squares on the right of a box show which backends currently hold that run.</p>
+    squares on the right of a box show which backends currently hold that run. Shows the WHOLE tree by
+    default — use the controls above to cap rows, children per node, or depth if it's too much to read.</p>
   <div class="backends" id="backends"></div>
   <div id="treewrap"><div class="empty" id="tree-empty">Waiting for data…</div><svg id="tree"></svg></div>
   <div class="legend">
@@ -81,12 +97,26 @@ footer{font-size:10.5px;color:var(--muted);margin-top:14px;font-family:var(--mon
 
 <script>
 "use strict";
-// DATA_URL is derived from our own path, not hardcoded, so this page keeps
-// working unmodified if it's ever mounted under a different prefix.
-const DATA_URL = location.pathname.replace(/\/+$/, '') + '/data' + location.search;
 const POLL_MS = 1000;
-
 const $ = id => document.getElementById(id);
+
+// dataURL is rebuilt from the UI controls on every poll — NOT from this
+// page's own URL/query string. Configuration lives in the UI, full stop: an
+// empty control means that dimension is unlimited, which is also the
+// default state on load (every input starts empty), so the very first
+// render shows the entire tree with no interaction required.
+function dataURL(){
+  const params = new URLSearchParams();
+  const rows = $('ctl-rows').value.trim();
+  const children = $('ctl-children').value.trim();
+  const depth = $('ctl-depth').value.trim();
+  if (rows) params.set('limit', rows);
+  if (children) params.set('max_children', children);
+  if (depth) params.set('max_depth', depth);
+  const base = location.pathname.replace(/\/+$/, '') + '/data';
+  const qs = params.toString();
+  return qs ? (base + '?' + qs) : base;
+}
 
 function fmtPct(x){ return (x*100).toFixed(0) + '%'; }
 function fmtTime(iso){
@@ -148,6 +178,11 @@ function layout(tree){
   return { ys, rowCount: yc };
 }
 
+// renderTree does the actual O(n) SVG rebuild (one string built, one
+// innerHTML set — never per-node DOM calls, so this stays O(n) even for a
+// large unlimited tree). The caller (poll, below) only invokes this when
+// the tree payload actually changed since the last successful poll, so an
+// idle fleet doesn't pay this cost every second for nothing.
 function renderTree(snap){
   const tree = snap.tree || [];
   const backends = snap.backends || [];
@@ -238,31 +273,61 @@ function renderTruncNote(snap){
   if (snap.truncated){
     t.style.display = '';
     t.textContent = 'Showing ' + snap.nodes_shown + ' of ' + snap.nodes_total +
-      ' known tree rows (capped for display — add ?limit=N to /router-viz/data for more).';
+      ' known tree rows — reduced by the rows/children/depth controls above.';
   } else {
     t.style.display = 'none';
   }
 }
 
-async function poll(){
+// Single-timer polling: pollTimer always holds at most one pending
+// setTimeout. schedulePoll cancels any pending one before arming a new
+// one, so a control change that wants an immediate re-fetch (schedulePoll(0))
+// can never leave a second, duplicate chain of timers running alongside the
+// regular ~1s cadence — without this a control change would silently double
+// (then triple, ...) the effective poll rate over time.
+let pollTimer = null;
+function schedulePoll(delay){
+  if (pollTimer !== null) clearTimeout(pollTimer);
+  pollTimer = setTimeout(runPoll, delay);
+}
+
+let lastTreeJSON = null;
+async function runPoll(){
   try {
-    const resp = await fetch(DATA_URL, {cache:'no-store'});
+    const url = dataURL();
+    const resp = await fetch(url, {cache:'no-store'});
     if (!resp.ok) throw new Error('status ' + resp.status);
     const snap = await resp.json();
     renderTiles(snap);
     renderBackendsHeader(snap.backends || []);
-    renderTree(snap);
+    // Only pay for the O(n) SVG rebuild when the tree actually changed —
+    // an idle fleet's repeated identical snapshot shouldn't churn the DOM
+    // every second. Tiles/backends/footer above are cheap enough to just
+    // always refresh (and their "as of" timestamp should move regardless).
+    const treeJSON = JSON.stringify(snap.tree || []);
+    if (treeJSON !== lastTreeJSON){
+      lastTreeJSON = treeJSON;
+      renderTree(snap);
+    }
     renderTruncNote(snap);
-    $('foot').textContent = 'snapshot generated ' + fmtTime(snap.generated_at) + ' · polling ' + DATA_URL + ' every ' + POLL_MS + 'ms';
+    $('foot').textContent = 'snapshot generated ' + fmtTime(snap.generated_at) + ' · polling ' + url + ' every ' + POLL_MS + 'ms';
     setConn(true);
   } catch (e) {
     setConn(false);
   } finally {
-    setTimeout(poll, POLL_MS);
+    schedulePoll(POLL_MS);
   }
 }
 
-poll();
+['ctl-rows', 'ctl-children', 'ctl-depth'].forEach(id => {
+  $(id).addEventListener('change', () => schedulePoll(0));
+});
+$('ctl-clear').addEventListener('click', () => {
+  ['ctl-rows', 'ctl-children', 'ctl-depth'].forEach(id => { $(id).value = ''; });
+  schedulePoll(0);
+});
+
+schedulePoll(0);
 </script>
 </body>
 </html>

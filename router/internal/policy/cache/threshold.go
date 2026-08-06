@@ -77,7 +77,9 @@ func (p *ThresholdPolicy) Stats() map[string][2]int64 { return p.store.stats() }
 
 // Snapshot implements viz.DataSource for the live KV block map at
 // /router-viz — see snapshot.go for the implementation shared with Policy.
-func (p *ThresholdPolicy) Snapshot(limit int) viz.Snapshot { return p.store.snapshot(limit) }
+func (p *ThresholdPolicy) Snapshot(opts viz.SnapshotOptions) viz.Snapshot {
+	return p.store.snapshot(opts)
+}
 
 // PublishGauges exports per-backend model size on the health interval.
 func (p *ThresholdPolicy) PublishGauges() {

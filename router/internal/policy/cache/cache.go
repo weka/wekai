@@ -216,7 +216,7 @@ func (p *Policy) Stats() map[string][2]int64 { return p.store.stats() }
 // Snapshot implements viz.DataSource for the live KV block map at
 // /router-viz — see snapshot.go for the implementation shared with
 // ThresholdPolicy.
-func (p *Policy) Snapshot(limit int) viz.Snapshot { return p.store.snapshot(limit) }
+func (p *Policy) Snapshot(opts viz.SnapshotOptions) viz.Snapshot { return p.store.snapshot(opts) }
 
 // publishPredictionStats records the spread of a single request's per-candidate
 // predicted-hit fractions into router_cache_prediction_{avg,max,min}. Shared by

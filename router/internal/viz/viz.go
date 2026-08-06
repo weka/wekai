@@ -25,9 +25,21 @@ import (
 // should copy out under its own locks and return before this package ever
 // touches the result, so no lock is ever held while JSON is being encoded.
 type DataSource interface {
-	// Snapshot reports what each known backend currently holds, capped to at
-	// most limit chains PER BACKEND (0 or negative = unlimited).
-	Snapshot(limit int) Snapshot
+	// Snapshot reports the full merged prefix tree by default (every field of
+	// opts left at its zero value means unlimited) — anton's explicit ask:
+	// the default view is everything, and any limiting is something the user
+	// opts into (via the page's UI controls, which DataHandler turns into
+	// these options; there is no default cap to opt out of).
+	Snapshot(opts SnapshotOptions) Snapshot
+}
+
+// SnapshotOptions bounds a Snapshot. Every field's zero value means
+// unlimited — this is a caller-requested reduction from the full tree, not
+// a default the caller has to override.
+type SnapshotOptions struct {
+	MaxRows     int // total tree rows returned; 0 = unlimited
+	MaxChildren int // children shown per node; 0 = unlimited
+	MaxDepth    int // deepest row depth shown (root is depth 0); 0 = unlimited
 }
 
 // Snapshot is one point-in-time view of the fleet's prefix-cache state, as a
@@ -104,36 +116,31 @@ type BackendMeta struct {
 	Tokens int64 `json:"tokens"`
 }
 
-// DefaultChainLimit bounds both how many chains-per-backend are fetched from
-// the underlying trie and how many tree rows are emitted after compression,
-// when a request omits ?limit= — keeping the default poll cheap regardless
-// of trie size.
-const DefaultChainLimit = 80
+// MaxParamValue is the hard ceiling an EXPLICITLY given ?limit=/
+// ?max_children=/?max_depth= is clamped to — a safety bound against an
+// absurd request, not a default: omitting a param entirely still means
+// unlimited, not "clamped to this ceiling."
+const MaxParamValue = 100_000
 
-// MaxChainLimit is the hard ceiling ?limit= is clamped to, so a client can
-// ask for more detail without being able to force an unbounded walk.
-const MaxChainLimit = 2000
-
-// DataHandler serves /router-viz/data: a JSON Snapshot from ds, honoring an
-// optional ?limit= query param (chains per backend). ds may be nil (no
-// cache-aware policy active): the handler still returns 200 with
-// PolicyActive:false rather than erroring, so the page always has something
-// sensible to render.
+// DataHandler serves /router-viz/data: a JSON Snapshot from ds. By default —
+// no query params at all — the response is the FULL tree, unlimited: the
+// page's own UI controls are what set ?limit=/?max_children=/?max_depth=
+// when a user explicitly asks to reduce the view; these are the mechanism
+// the UI uses, not a surface an operator is expected to construct by hand.
+// ds may be nil (no cache-aware policy active): the handler still returns
+// 200 with PolicyActive:false rather than erroring, so the page always has
+// something sensible to render.
 func DataHandler(ds DataSource) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		limit := DefaultChainLimit
-		if q := r.URL.Query().Get("limit"); q != "" {
-			if n, err := strconv.Atoi(q); err == nil && n > 0 {
-				limit = n
-				if limit > MaxChainLimit {
-					limit = MaxChainLimit
-				}
-			}
+		opts := SnapshotOptions{
+			MaxRows:     positiveIntParam(r, "limit"),
+			MaxChildren: positiveIntParam(r, "max_children"),
+			MaxDepth:    positiveIntParam(r, "max_depth"),
 		}
 
 		var snap Snapshot
 		if ds != nil {
-			snap = ds.Snapshot(limit)
+			snap = ds.Snapshot(opts)
 		} else {
 			//clockexempt: informational snapshot timestamp when no policy is active, not a routing/timing decision
 			snap = Snapshot{GeneratedAt: time.Now(), PolicyActive: false}
@@ -143,6 +150,24 @@ func DataHandler(ds DataSource) http.HandlerFunc {
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(snap)
 	}
+}
+
+// positiveIntParam parses query param name as a positive int, clamped to
+// MaxParamValue. An absent, malformed, zero, or negative value returns 0
+// (unlimited) — there is no non-zero default to fall back to.
+func positiveIntParam(r *http.Request, name string) int {
+	q := r.URL.Query().Get(name)
+	if q == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(q)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	if n > MaxParamValue {
+		return MaxParamValue
+	}
+	return n
 }
 
 // PageHandler serves /router-viz: the self-contained HTML+JS page (embedded
