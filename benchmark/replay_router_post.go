@@ -61,7 +61,7 @@ type replayPoster struct {
 	// newReplayPoster, to avoid touching its many existing call sites.
 	outputRatio float64
 	forceOutput bool
-	// limitContext: skip requests whose built body exceeds limitContext*4 bytes
+	// limitContext: skip requests whose capture-recorded prompt tokens exceed it
 	// (chars~=tokens*4 convention). 0 = off.
 	limitContext int
 }
@@ -311,8 +311,14 @@ func (p *replayPoster) do(
 	default:
 		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
 	}
-	if err == nil && p.limitContext > 0 && len(bodyBytes) > p.limitContext*4 {
-		return RequestMetrics{Skipped: true}
+	// --limit-context uses the capture's production-measured token counts
+	// (usage.input_tokens + cache read/creation), not a chars heuristic:
+	// the replay data records the real prompt size of every request.
+	if p.limitContext > 0 {
+		promptTokens := req.InputTokens + req.CacheReadTokens + req.CacheCreationTokens
+		if promptTokens > p.limitContext {
+			return RequestMetrics{Skipped: true}
+		}
 	}
 	if err != nil {
 		return RequestMetrics{
