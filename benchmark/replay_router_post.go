@@ -128,7 +128,7 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 
 	model := dyn.Model
 	if model == "" && !dryRun {
-		discovered, derr := discoverModelName(base)
+		discovered, derr := cachedDiscoverModelName(base)
 		if derr != nil {
 			return nil, fmt.Errorf("model=... not set in %q and model discovery from %s failed: %w", modelSpec, base, derr)
 		}
@@ -158,8 +158,32 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 
 var (
 	discoveredOnceMu sync.Mutex
-	discoveredOnce   = map[string]bool{} // base -> printed-already
+	discoveredOnce   = map[string]bool{}   // base -> printed-already
+	discoveredModel  = map[string]string{} // base -> model id (discovery cache)
 )
+
+// cachedDiscoverModelName memoizes discoverModelName per base URL. Every
+// series instance builds its own poster; without this cache each retired or
+// spawned instance fired its own /v1/models GET, and a fast series churn
+// (e.g. --limit-context retiring oversized sessions with no HTTP) flooded
+// the router with hundreds of concurrent discovery calls at startup,
+// shedding 503s off its request-cap and cascading into per-request errors.
+func cachedDiscoverModelName(base string) (string, error) {
+	discoveredOnceMu.Lock()
+	if m, ok := discoveredModel[base]; ok {
+		discoveredOnceMu.Unlock()
+		return m, nil
+	}
+	discoveredOnceMu.Unlock()
+	m, err := discoverModelName(base)
+	if err != nil {
+		return "", err
+	}
+	discoveredOnceMu.Lock()
+	discoveredModel[base] = m
+	discoveredOnceMu.Unlock()
+	return m, nil
+}
 
 // logDiscoveredModelOnce prints the auto-discovered model name once per
 // endpoint per process. Each agent instance creates its own replayPoster,
