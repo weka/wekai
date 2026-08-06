@@ -64,6 +64,12 @@ type replayPoster struct {
 	// limitContext: skip requests whose capture-recorded prompt tokens exceed it
 	// (chars~=tokens*4 convention). 0 = off.
 	limitContext int
+	// replayCharsPerToken: --replay-chars-per-token. When > 0, synthesized
+	// replay content is sized off each block's captured Tokens count
+	// (tokens * replayCharsPerToken chars) instead of its captured Bytes
+	// count, so the serving tokenizer's counts land near the original
+	// capture's. 0 = byte-faithful sizing (default).
+	replayCharsPerToken float64
 }
 
 func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string, runID string, dryRun bool, coldTPS, warmTPS, outputTPS int, estimator *cacheEstimator) (*replayPoster, error) {
@@ -307,9 +313,9 @@ func (p *replayPoster) do(
 	var err error
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	default:
-		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	}
 	// --limit-context uses the capture's production-measured token counts
 	// (usage.input_tokens + cache read/creation), not a chars heuristic:
@@ -721,9 +727,9 @@ func (p *replayPoster) dryDo(
 	var canonical string
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	default:
-		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	}
 	var ratio float64
 	if p.estimator != nil {

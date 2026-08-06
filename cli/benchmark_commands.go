@@ -268,6 +268,7 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		FromDataset:                c.FromDataset,
 		ReplaySeries:               c.ReplaySeries,
 		LimitContext:               c.LimitContext,
+		ReplayCharsPerToken:        c.ReplayCharsPerToken,
 		ReplayNoStamp:              c.ReplayNoStamp,
 		AbortOnCollapse:            c.AbortOnCollapse,
 		ReplayStopAtLowConcurrency: c.ReplayStopAtLowConcurrency,
