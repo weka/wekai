@@ -68,21 +68,8 @@ type replayPoster struct {
 	// replay content is sized off each block's captured Tokens count
 	// (tokens * replayCharsPerToken chars) instead of its captured Bytes
 	// count, so the serving tokenizer's counts land near the original
-	// capture's. 0 = byte-faithful sizing (default). Superseded per-block by
-	// exactTokenIndex when that's set (see replaySizer.budget).
+	// capture's. 0 = byte-faithful sizing (default).
 	replayCharsPerToken float64
-	// exactTokenIndex: --replay-exact-tokens. When set, sizing uses the
-	// corpus token index (built once at startup against the first target
-	// endpoint's own /tokenize — see replay_router_tokenize.go and
-	// AutoBenchmarkConfig.replayTokenIndex) instead of the fixed
-	// replayCharsPerToken ratio. nil = ratio/byte sizing only.
-	exactTokenIndex *corpusTokenIndex
-}
-
-// sizer builds the replaySizer this poster uses for the current request,
-// bundling its ratio and (if --replay-exact-tokens) exact-mode token index.
-func (p *replayPoster) sizer() replaySizer {
-	return replaySizer{charsPerToken: p.replayCharsPerToken, tokenIndex: p.exactTokenIndex}
 }
 
 func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string, runID string, dryRun bool, coldTPS, warmTPS, outputTPS int, estimator *cacheEstimator) (*replayPoster, error) {
@@ -326,9 +313,9 @@ func (p *replayPoster) do(
 	var err error
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.sizer())
+		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	default:
-		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.sizer())
+		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	}
 	// --limit-context uses the capture's production-measured token counts
 	// (usage.input_tokens + cache read/creation), not a chars heuristic:
@@ -740,9 +727,9 @@ func (p *replayPoster) dryDo(
 	var canonical string
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.sizer())
+		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	default:
-		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.sizer())
+		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	}
 	var ratio float64
 	if p.estimator != nil {

@@ -26,7 +26,7 @@ func TestBuildAnthropicMessagesBodyRunGUIDStamp(t *testing.T) {
 
 	// --- runID set ---
 	runID := "test-run-id"
-	body, _, err := buildAnthropicMessagesBody(req, docs, modelName, runID, 0, false, replaySizer{})
+	body, _, err := buildAnthropicMessagesBody(req, docs, modelName, runID, 0, false, 0)
 	if err != nil {
 		t.Fatalf("buildAnthropicMessagesBody with runID: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestBuildAnthropicMessagesBodyRunGUIDStamp(t *testing.T) {
 	}
 
 	// --- runID empty ---
-	body, _, err = buildAnthropicMessagesBody(req, docs, modelName, "", 0, false, replaySizer{})
+	body, _, err = buildAnthropicMessagesBody(req, docs, modelName, "", 0, false, 0)
 	if err != nil {
 		t.Fatalf("buildAnthropicMessagesBody empty runID: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestBuildAnthropicMessagesBodyRunGUIDStamp(t *testing.T) {
 
 	// --- runID set, 0 system blocks ---
 	reqNoSys := RouterReplayRequest{} // no SystemBlocks
-	body, _, err = buildAnthropicMessagesBody(reqNoSys, docs, modelName, runID, 0, false, replaySizer{})
+	body, _, err = buildAnthropicMessagesBody(reqNoSys, docs, modelName, runID, 0, false, 0)
 	if err != nil {
 		t.Fatalf("buildAnthropicMessagesBody no system blocks: %v", err)
 	}
@@ -107,8 +107,8 @@ func TestBuildAnthropicMessagesBodyCanonicalDeterminism(t *testing.T) {
 			{Hash: "m1", Role: "user", BlockTypes: []string{"text"}, Bytes: 30},
 		},
 	}
-	_, c1, err1 := buildAnthropicMessagesBody(req, docs, "model", "run1", 0, false, replaySizer{})
-	_, c2, err2 := buildAnthropicMessagesBody(req, docs, "model", "run1", 0, false, replaySizer{})
+	_, c1, err1 := buildAnthropicMessagesBody(req, docs, "model", "run1", 0, false, 0)
+	_, c2, err2 := buildAnthropicMessagesBody(req, docs, "model", "run1", 0, false, 0)
 	if err1 != nil || err2 != nil {
 		t.Fatalf("errors: %v %v", err1, err2)
 	}
@@ -131,7 +131,7 @@ func TestBuildAnthropicMessagesBodyCanonicalContainsAllBlocks(t *testing.T) {
 			{Hash: "msg1", Role: "user", BlockTypes: []string{"text"}, Bytes: 100},
 		},
 	}
-	_, canonical, err := buildAnthropicMessagesBody(req, docs, "model", "runX", 0, false, replaySizer{})
+	_, canonical, err := buildAnthropicMessagesBody(req, docs, "model", "runX", 0, false, 0)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -174,12 +174,12 @@ func TestEffectiveSystemBlocksSkipsHeader(t *testing.T) {
 	hdrText := synthText("uniq-header-per-req", 106, "")
 	for _, builder := range []struct {
 		name string
-		fn   func(RouterReplayRequest, string, string, string, float64, bool, replaySizer) ([]byte, string, error)
+		fn   func(RouterReplayRequest, string, string, string, float64, bool, float64) ([]byte, string, error)
 	}{
 		{"openai", buildOpenAIChatCompletionsBody},
 		{"anthropic", buildAnthropicMessagesBody},
 	} {
-		body, canonical, err := builder.fn(req, "", "m", "", 0, false, replaySizer{})
+		body, canonical, err := builder.fn(req, "", "m", "", 0, false, 0)
 		if err != nil {
 			t.Fatalf("%s build: %v", builder.name, err)
 		}
@@ -274,7 +274,7 @@ func TestBuildAnthropicMessagesBodyForceOutput(t *testing.T) {
 	}
 
 	// --- force-output off (--replay-natural-output) ---
-	body, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, replaySizer{})
+	body, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, 0)
 	if err != nil {
 		t.Fatalf("build (force-output off): %v", err)
 	}
@@ -283,7 +283,7 @@ func TestBuildAnthropicMessagesBodyForceOutput(t *testing.T) {
 	}
 
 	// --- force-output on (default) ---
-	body, _, err = buildAnthropicMessagesBody(req, docs, "model", "", 0, true, replaySizer{})
+	body, _, err = buildAnthropicMessagesBody(req, docs, "model", "", 0, true, 0)
 	if err != nil {
 		t.Fatalf("build (force-output on): %v", err)
 	}
@@ -305,7 +305,7 @@ func TestBuildAnthropicMessagesBodyForceOutput(t *testing.T) {
 
 	// --- force-output on, no system blocks at all: instruction must still be injected ---
 	reqNoSys := RouterReplayRequest{InputTokens: 100}
-	body, _, err = buildAnthropicMessagesBody(reqNoSys, docs, "model", "", 0, true, replaySizer{})
+	body, _, err = buildAnthropicMessagesBody(reqNoSys, docs, "model", "", 0, true, 0)
 	if err != nil {
 		t.Fatalf("build (force-output on, no system blocks): %v", err)
 	}
@@ -328,7 +328,7 @@ func TestBuildOpenAIChatCompletionsBodyForceOutput(t *testing.T) {
 	}
 
 	// force-output off: neither ignore_eos nor the instruction in the body.
-	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, replaySizer{})
+	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, 0)
 	if err != nil {
 		t.Fatalf("build (force-output off): %v", err)
 	}
@@ -344,7 +344,7 @@ func TestBuildOpenAIChatCompletionsBodyForceOutput(t *testing.T) {
 	}
 
 	// force-output on (default): ignore_eos=true AND the instruction is present.
-	body, _, err = buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, true, replaySizer{})
+	body, _, err = buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, true, 0)
 	if err != nil {
 		t.Fatalf("build (force-output on): %v", err)
 	}
@@ -367,7 +367,7 @@ func TestBuildAnthropicMessagesBodyOutputRatioMaxTokens(t *testing.T) {
 	docs := strings.Repeat("doc content ", 50)
 	req := RouterReplayRequest{InputTokens: 2000, OutputTokens: 10}
 
-	anthBody, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0.25, false, replaySizer{})
+	anthBody, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0.25, false, 0)
 	if err != nil {
 		t.Fatalf("anthropic build: %v", err)
 	}
@@ -379,7 +379,7 @@ func TestBuildAnthropicMessagesBodyOutputRatioMaxTokens(t *testing.T) {
 		t.Errorf("anthropic max_tokens = %v, want %v", got, want)
 	}
 
-	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0.25, false, replaySizer{})
+	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0.25, false, 0)
 	if err != nil {
 		t.Fatalf("openai build: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestBuildAnthropicMessagesBodyOutputRatioMaxTokens(t *testing.T) {
 	}
 
 	// Without a ratio, max_tokens falls back to the original output_tokens.
-	anthBodyNoRatio, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, replaySizer{})
+	anthBodyNoRatio, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, 0)
 	if err != nil {
 		t.Fatalf("anthropic build (no ratio): %v", err)
 	}

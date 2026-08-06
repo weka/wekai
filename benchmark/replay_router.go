@@ -694,18 +694,6 @@ func runRouterReplayInstance(
 	if err == nil {
 		poster.outputRatio = cfg.ReplayOutputRatio
 		poster.forceOutput = cfg.ReplayForceOutput
-		// limitContext/replayCharsPerToken/exactTokenIndex were previously
-		// only wired on the multi-endpoint path (auto.go) — this
-		// single-endpoint fallback poster is rebuilt fresh per instance, so
-		// without these three lines --limit-context and
-		// --replay-chars-per-token were silent no-ops here, and
-		// --replay-exact-tokens would have been too. exactTokenIndex is a
-		// shared pointer (built once in RunAutoBenchmark, see
-		// AutoBenchmarkConfig.replayTokenIndex) — this does NOT re-trigger
-		// corpus indexing per instance.
-		poster.limitContext = cfg.LimitContext
-		poster.replayCharsPerToken = cfg.ReplayCharsPerToken
-		poster.exactTokenIndex = cfg.replayTokenIndex
 	}
 	if err != nil {
 		// Configuration error — record one error per request in this

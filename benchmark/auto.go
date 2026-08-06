@@ -88,16 +88,8 @@ type AutoBenchmarkConfig struct {
 	// count, so the serving tokenizer's counts land near the original
 	// capture's. 0 = byte-faithful sizing (default).
 	ReplayCharsPerToken float64
-	// ReplayExactTokens: --replay-exact-tokens. Supersedes ReplayCharsPerToken
-	// per-block: sizes synthesized replay content by binary-searching a
-	// corpus token index built once at startup against the first target
-	// endpoint's own POST /tokenize (see replay_router_tokenize.go), instead
-	// of a fixed chars/token ratio. RunAutoBenchmark builds the index (and
-	// fails the whole run fast if /tokenize isn't reachable) before any
-	// per-model goroutine spawns, storing it in replayTokenIndex below.
-	ReplayExactTokens bool
-	ReplayNoStamp     bool // when true, skip the per-run <ignore>RUN_GUID</ignore> prefix injection (default is to stamp so each run starts with a pristine server prefix cache while still permitting within-run cross-series cache hits)
-	AbortOnCollapse   bool // when true, abort if windowed cache hit rate < 50% for 2 minutes (legacy collapse detector, off by default — fires spuriously on legitimate low-reuse workloads)
+	ReplayNoStamp       bool // when true, skip the per-run <ignore>RUN_GUID</ignore> prefix injection (default is to stamp so each run starts with a pristine server prefix cache while still permitting within-run cross-series cache hits)
+	AbortOnCollapse     bool // when true, abort if windowed cache hit rate < 50% for 2 minutes (legacy collapse detector, off by default — fires spuriously on legitimate low-reuse workloads)
 	// ReplayStopAtLowConcurrency terminates the run when the queue is drained
 	// AND active worker count < desired concurrency — a long-tail cutoff so
 	// throughput numbers reflect steady-state behavior rather than the slow
@@ -123,17 +115,6 @@ type AutoBenchmarkConfig struct {
 	// serializes behind arrow-go's file handle and starves models 2..N of
 	// startup progress).
 	replayConversations []Conversation
-
-	// replayTokenIndex is the corpus token index built once by
-	// RunAutoBenchmark (--replay-exact-tokens only) against the first target
-	// endpoint, before any per-model goroutine spawns — same
-	// build-once-share-by-value-copy pattern as replayConversations above.
-	// Every poster the run constructs (both the multi-endpoint path in this
-	// file and the single-endpoint fallback in replay_router.go) reads this
-	// field rather than building its own index, so a run performs exactly
-	// ONE corpus-indexing pass regardless of endpoint/instance count. nil
-	// when --replay-exact-tokens is off.
-	replayTokenIndex *corpusTokenIndex
 
 	// Tree-aware router replay. When set, instead of synthetic prompts
 	// or hermes-style flat conversations, the benchmark replays a tree of
@@ -1624,7 +1605,6 @@ func runSingleModelBenchmark(
 			pp.outputRatio = cfg.ReplayOutputRatio
 			pp.limitContext = cfg.LimitContext
 			pp.replayCharsPerToken = cfg.ReplayCharsPerToken
-			pp.exactTokenIndex = cfg.replayTokenIndex
 			pp.forceOutput = cfg.ReplayForceOutput
 			posters[i] = pp
 		}
@@ -2602,26 +2582,6 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		}
 		cfg.replayConversations = convs
 		fmt.Printf("Loaded %d conversations. Starting auto benchmark...\n\n", len(convs))
-	}
-
-	// --replay-exact-tokens: build the corpus token index against the FIRST
-	// target endpoint (models[0]'s first base URL) ONCE here, before any
-	// per-model goroutine spawns. Fails the whole run fast if that
-	// endpoint's /tokenize isn't reachable — deliberately NOT a silent
-	// per-request degrade to --replay-chars-per-token, so a broken/missing
-	// /tokenize is caught in the first few seconds instead of surfacing as
-	// unexplained byte-faithful sizing thousands of requests in. The built
-	// index is shared (cfg.replayTokenIndex) by every poster the run
-	// constructs, so this is the run's only corpus-indexing pass.
-	if cfg.ReplayExactTokens {
-		fmt.Println("Building corpus token index for --replay-exact-tokens (one-time; probes /tokenize on the first target endpoint)...")
-		idx, err := buildReplayTokenIndex(models[0], config.GetAPIKeys(), fullDocs)
-		if err != nil {
-			return fmt.Errorf("--replay-exact-tokens requires a working POST /tokenize on the first target endpoint (%s): %w — "+
-				"use --replay-chars-per-token for ratio-based sizing instead, or drop both flags for byte-faithful sizing", models[0], err)
-		}
-		cfg.replayTokenIndex = idx
-		fmt.Println("Corpus token index built.")
 	}
 
 	// Tree-aware router replay: only the header (line 1) is read here so
