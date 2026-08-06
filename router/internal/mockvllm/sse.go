@@ -4,10 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
-
-	"github.com/weka/wekai/kvcache"
 )
 
 // This file implements minimal OpenAI-compatible SSE streaming: a role-only
@@ -68,7 +65,7 @@ func startSSE(w http.ResponseWriter) http.Flusher {
 	return flusher
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatCompletionRequest, modelID string, units []kvcache.Unit, cached, total, maxTok int, ttft time.Duration) {
+func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatCompletionRequest, modelID string, cached, total, maxTok int, ttft time.Duration) {
 	ctx := r.Context()
 	flusher := startSSE(w)
 	id := s.newID("chatcmpl")
@@ -113,15 +110,10 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatComp
 	writeSSEDone(w, flusher)
 
 	s.engine.RecordOutput(generated)
-	// AppendOutputBlocks uses what was ACTUALLY streamed (generated may be
-	// less than maxTok on an early client disconnect), matching real vLLM:
-	// decode-KV is written for whatever was actually generated, not the
-	// originally requested budget.
-	s.engine.AppendOutputBlocks(units, generated, strings.Join(tokens[:generated], " "))
 	s.coll.observe("success", cached, total, generated)
 }
 
-func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, req completionRequest, modelID string, units []kvcache.Unit, cached, total, maxTok int, ttft time.Duration) {
+func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, req completionRequest, modelID string, cached, total, maxTok int, ttft time.Duration) {
 	ctx := r.Context()
 	flusher := startSSE(w)
 	id := s.newID("cmpl")
@@ -159,6 +151,5 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, req co
 	writeSSEDone(w, flusher)
 
 	s.engine.RecordOutput(generated)
-	s.engine.AppendOutputBlocks(units, generated, strings.Join(tokens[:generated], " "))
 	s.coll.observe("success", cached, total, generated)
 }

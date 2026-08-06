@@ -372,37 +372,154 @@ func TestEngine_OutputKVMultiplierZeroDisablesModeling(t *testing.T) {
 	e := NewEngine(Config{BlockSizeTokens: 16, OutputKVMultiplier: 0})
 	promptUnits := e.Tokenize("prompt text for the disabled case")
 	before, _, _ := e.trie.Stats()
-	e.AppendOutputBlocks(promptUnits, 100, "some reply content that would otherwise become blocks")
+	release := e.PinOutputBlocks(promptUnits, 100, "some reply content that would otherwise become blocks")
 	after, _, _ := e.trie.Stats()
 	if after != before {
 		t.Fatalf("OutputKVMultiplier=0 must be a no-op: nodes before=%d after=%d", before, after)
 	}
+	if pinned := e.Stats().PinnedNodes; pinned != 0 {
+		t.Fatalf("OutputKVMultiplier=0 must pin nothing, got PinnedNodes=%d", pinned)
+	}
+	release() // must be safe to call even though nothing was pinned
 }
 
 // TestEngine_OutputKVMultiplierScalesBlockCount checks the exact formula:
 // ceil(outputTokens * multiplier / BlockSizeTokens).
 func TestEngine_OutputKVMultiplierScalesBlockCount(t *testing.T) {
-	reply := "short reply" // count is formula-driven, not content-length-driven -- see AppendOutputBlocks's filler fallback
+	reply := "short reply" // count is formula-driven, not content-length-driven -- see outputChain's filler fallback
 
 	e1 := NewEngine(Config{BlockSizeTokens: 16, OutputKVMultiplier: 1.0})
-	e1.AppendOutputBlocks(nil, 64, reply)
+	release1 := e1.PinOutputBlocks(nil, 64, reply)
 	if n, _, _ := e1.trie.Stats(); n != 4 { // ceil(64*1.0/16)
 		t.Fatalf("multiplier=1.0: nodes = %d, want 4", n)
 	}
+	release1()
 
 	e25 := NewEngine(Config{BlockSizeTokens: 16, OutputKVMultiplier: 2.5})
-	e25.AppendOutputBlocks(nil, 64, reply)
+	release25 := e25.PinOutputBlocks(nil, 64, reply)
 	if n, _, _ := e25.trie.Stats(); n != 10 { // ceil(64*2.5/16)
 		t.Fatalf("multiplier=2.5: nodes = %d, want 10", n)
 	}
+	release25()
 }
 
-// TestEngine_OutputBlocksOccupyCapacityAndAreEvictable is GAP 2's primary
-// claim: appended output blocks are real trie nodes (occupy capacity) and
-// are NOT permanently pinned just because they came from output — once the
-// request completes and releases, heavy unrelated pressure against a tiny
-// cap must eventually be able to reclaim them, exactly like prompt blocks.
-func TestEngine_OutputBlocksOccupyCapacityAndAreEvictable(t *testing.T) {
+// TestEngine_PinOutputBlocks_PinnedNodesReflectsPromptAndOutput is explicit
+// ask (a): while a request is in flight — nothing released yet — PinnedNodes
+// must count BOTH its prompt blocks and its output-KV blocks, not just the
+// prompt. This is the "peak allocation held over the request window" anton
+// asked for: output blocks exert in-flight pressure for the request's whole
+// simulated duration, mirroring real vLLM's decode growing a running
+// request's allocation throughout generation rather than only at the end.
+func TestEngine_PinOutputBlocks_PinnedNodesReflectsPromptAndOutput(t *testing.T) {
+	e := NewEngine(Config{BlockSizeTokens: 16, OutputKVMultiplier: 1.0})
+	promptUnits := e.Tokenize(repeatWord("prompt", 200)) // several distinct blocks
+
+	release, _, _, ok := e.Admit(promptUnits)
+	if !ok {
+		t.Fatalf("admit failed")
+	}
+	promptOnlyPinned := e.Stats().PinnedNodes
+	if promptOnlyPinned == 0 {
+		t.Fatalf("expected the prompt's own blocks to be pinned after Admit, got PinnedNodes=0")
+	}
+
+	outputTokens := 64
+	reply := strings.Join(syntheticTokens(outputTokens), " ") // deterministic, as a real handler computes upfront
+	releaseOutput := e.PinOutputBlocks(promptUnits, outputTokens, reply)
+
+	withOutputPinned := e.Stats().PinnedNodes
+	if withOutputPinned <= promptOnlyPinned {
+		t.Fatalf("expected PinnedNodes to grow once output blocks are pinned: prompt-only=%d, with-output=%d",
+			promptOnlyPinned, withOutputPinned)
+	}
+
+	// The full prompt+output chain must be resident and hit entirely while
+	// still "in flight" (mirrors a slow request mid-generation: nothing
+	// released yet).
+	full := e.outputChain(promptUnits, outputTokens, reply)
+	if c, tot := e.Query(full); c != tot {
+		t.Fatalf("expected the full in-flight prompt+output chain to be fully cached: cached=%d total=%d", c, tot)
+	}
+
+	releaseOutput()
+	release()
+}
+
+// TestEngine_ConcurrentInFlightOutputBlocksEvictUnpinnedCache is explicit ask
+// (b): output blocks pinned by OTHER, still-in-flight requests must exert
+// real capacity pressure — enough, under a tight cap, to evict unrelated
+// UNPINNED cache — while every in-flight request's own chain (prompt AND
+// output) stays fully resident throughout, because it's pinned.
+func TestEngine_ConcurrentInFlightOutputBlocksEvictUnpinnedCache(t *testing.T) {
+	const (
+		requests               = 5
+		promptBlocksPerRequest = 3 // strings.Repeat(letter, 140) at 64 bytes/block (64+64+12)
+		outputTokens           = 32
+		outputBlocksPerRequest = 2 // ceil(32*1.0/16)
+		backgroundBlocks       = 3 // same 140-byte shape as each request's prompt
+	)
+	// blockCapacity MUST be >= the total blocks all requests end up pinning
+	// (requests*(prompt+output)): pinned content is never evicted, but a
+	// single request's own freshly inserted blocks are briefly UNPINNED
+	// between insertion and Engine.Admit/PinOutputBlocks's own pin (see
+	// kvcache.Trie.insertFrom, which evicts before the caller pins) — if the
+	// cap were tighter than the eventual pinned total, a later request could
+	// transiently evict its own not-yet-pinned tail when nothing else is left
+	// to reclaim. One block of headroom above that total (less than adding
+	// the full backgroundBlocks) is enough for background to be forced out
+	// without ever touching a request's own blocks.
+	blockCapacity := int64(requests*(promptBlocksPerRequest+outputBlocksPerRequest)) + 1
+	if blockCapacity >= int64(requests*(promptBlocksPerRequest+outputBlocksPerRequest)+backgroundBlocks) {
+		t.Fatalf("test setup: blockCapacity=%d leaves no pressure to evict background (%d blocks)", blockCapacity, backgroundBlocks)
+	}
+	e := NewEngine(Config{BlockSizeTokens: 16, BlockCapacity: blockCapacity, OutputKVMultiplier: 1.0})
+
+	// Seed unrelated, never-pinned "background" cache — comfortably under cap
+	// on its own.
+	background := strings.Repeat("B", 140)
+	serveOnce(e, background)
+	if c, tot := e.Query(e.Tokenize(background)); c != tot {
+		t.Fatalf("test setup: background prompt should be fully cached before any pressure, cached=%d total=%d", c, tot)
+	}
+
+	// Several concurrent, still-in-flight requests, each pinning its own
+	// prompt and output blocks — by the last one, cumulative pinned content
+	// plus background exceeds cap, so eviction has no unpinned target left
+	// except background.
+	var releases []func()
+	for i := 0; i < requests; i++ {
+		prompt := strings.Repeat(string(rune('C'+i)), 140) // distinct content per request
+		units := e.Tokenize(prompt)
+		release, _, _, ok := e.Admit(units)
+		if !ok {
+			t.Fatalf("admit %d unexpectedly rejected", i)
+		}
+		reply := strings.Join(syntheticTokens(outputTokens), " ")
+		releaseOutput := e.PinOutputBlocks(units, outputTokens, reply)
+		releases = append(releases, release, releaseOutput)
+
+		// Each in-flight request's own chain must survive its own admission,
+		// regardless of how much pressure came before it.
+		full := e.outputChain(units, outputTokens, reply)
+		if c, tot := e.Query(full); c != tot {
+			t.Fatalf("in-flight request %d's own chain was evicted while pinned: cached=%d total=%d", i, c, tot)
+		}
+	}
+
+	if c, tot := e.Query(e.Tokenize(background)); c == tot {
+		t.Fatalf("expected unpinned background cache to be evicted under pressure from concurrent in-flight output blocks, but it's still fully cached")
+	}
+
+	for _, r := range releases {
+		r()
+	}
+}
+
+// TestEngine_OutputBlocksAreEvictableAfterRelease is explicit ask (c): once a
+// request's output blocks are unpinned at release, they become ordinary
+// evictable cache — not permanently pinned just because they came from
+// output — exactly like prompt blocks.
+func TestEngine_OutputBlocksAreEvictableAfterRelease(t *testing.T) {
 	e := NewEngine(Config{BlockSizeTokens: 16, BlockCapacity: 10, OutputKVMultiplier: 1.0})
 	promptUnits := e.Tokenize("short prompt for the output-kv capacity test")
 
@@ -411,31 +528,35 @@ func TestEngine_OutputBlocksOccupyCapacityAndAreEvictable(t *testing.T) {
 		t.Fatalf("admit failed")
 	}
 
+	outputTokens := 64
+	reply := strings.Repeat("reply filler text ", 10)
 	before, _, _ := e.trie.Stats()
-	e.AppendOutputBlocks(promptUnits, 64, strings.Repeat("reply filler text ", 10))
+	releaseOutput := e.PinOutputBlocks(promptUnits, outputTokens, reply)
 	after, _, _ := e.trie.Stats()
 	if after <= before {
-		t.Fatalf("AppendOutputBlocks should add nodes to the trie: before=%d after=%d", before, after)
+		t.Fatalf("PinOutputBlocks should add nodes to the trie: before=%d after=%d", before, after)
 	}
 
-	// Immediately after completion, the request's own prefix must still be
-	// fully resident (it's the very content just inserted).
-	if c, tot := e.Query(promptUnits); c != tot {
-		t.Fatalf("expected the prompt prefix to be fully cached immediately after completion: cached=%d total=%d", c, tot)
+	// While still in flight, the request's whole chain — prompt AND output —
+	// must be fully resident.
+	full := e.outputChain(promptUnits, outputTokens, reply)
+	if c, tot := e.Query(full); c != tot {
+		t.Fatalf("expected the full prompt+output chain to be fully cached while in flight: cached=%d total=%d", c, tot)
 	}
 
 	release()
+	releaseOutput()
 
 	for i := 0; i < 500; i++ {
 		serveOnce(e, fmt.Sprintf("pressure-%d", i))
 	}
-	if c, tot := e.Query(promptUnits); c == tot {
-		t.Fatalf("expected this request's chain (including its output blocks) to eventually be evicted under a tiny cap, but it's still fully cached")
+	if c, tot := e.Query(full); c == tot {
+		t.Fatalf("expected this request's chain (including its output blocks) to eventually be evicted under a tiny cap after release, but it's still fully cached")
 	}
 }
 
 // TestEngine_OutputBlocksHitByFollowUpTurn is the achievable-alignment case
-// documented on AppendOutputBlocks: when the prompt ends exactly on a block
+// documented on outputChain: when the prompt ends exactly on a block
 // boundary and OutputKVMultiplier=1 with a response long enough to cover
 // every target block, a follow-up turn that embeds the exact same response
 // text (as chatCompletionRequest.promptBytes renders an assistant message)
@@ -445,8 +566,8 @@ func TestEngine_OutputBlocksHitByFollowUpTurn(t *testing.T) {
 	blockBytes := e.cfg.blockSizeBytes()
 
 	// Build turn 1's prompt to land EXACTLY on a block boundary (4 blocks),
-	// so AppendOutputBlocks' fresh-continuation assumption holds exactly —
-	// the documented achievable case, not the documented limitation.
+	// so outputChain's fresh-continuation assumption holds exactly — the
+	// documented achievable case, not the documented limitation.
 	const prefix, suffix = "user:", "\n"
 	targetLen := blockBytes * 4
 	fillLen := targetLen - len(prefix) - len(suffix)
@@ -459,7 +580,8 @@ func TestEngine_OutputBlocksHitByFollowUpTurn(t *testing.T) {
 	outputTokens := 80
 	reply := strings.Join(syntheticTokens(outputTokens), " ") // exactly what a real handler would generate
 
-	e.AppendOutputBlocks(promptUnits, outputTokens, reply)
+	release := e.PinOutputBlocks(promptUnits, outputTokens, reply)
+	release() // request completes; output blocks remain as ordinary cache
 
 	turn2Prompt := turn1Prompt + "assistant:" + reply + "\n" + "user:" + "a new question\n"
 	turn2Units := chunkContent("prompt", []byte(turn2Prompt), blockBytes, e.cfg.CharsPerToken)

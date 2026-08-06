@@ -99,13 +99,15 @@ type Config struct {
 	// max_tokens (or sends <= 0).
 	DefaultMaxTokens int
 
-	// OutputKVMultiplier models real vLLM's decode-KV behavior: generated
-	// tokens become cached blocks of the SAME sequence, written into the
-	// same pool prompt blocks occupy. On completion,
-	// ceil(outputTokens * OutputKVMultiplier / BlockSizeTokens) blocks are
-	// appended to the request's own chain — occupying capacity and
-	// evictable exactly like prompt blocks (see Engine.AppendOutputBlocks).
-	// The realistic default is 1.0 (DefaultConfig and the CLI flag both use
+	// OutputKVMultiplier models real vLLM's decode-KV behavior: a running
+	// request's generated tokens become cached blocks of the SAME sequence,
+	// growing its allocation throughout generation — not appearing only at
+	// completion. ceil(outputTokens * OutputKVMultiplier / BlockSizeTokens)
+	// blocks are reserved and PINNED alongside the prompt at admission time
+	// (see Engine.PinOutputBlocks), held for the request's entire simulated
+	// duration, and unpin at release exactly like prompt blocks — after
+	// which they remain in the trie as ordinary, evictable cache. The
+	// realistic default is 1.0 (DefaultConfig and the CLI flag both use
 	// it); 0 disables this entirely — outputs stay invisible to the cache,
 	// the historical behavior before this existed. Unlike CharsPerToken,
 	// 0 here is a meaningful, deliberate "off" state, not invalid input, so
@@ -300,13 +302,11 @@ func tokensAtRate(n int, tps float64) time.Duration {
 // once the (synthetic) completion length for a request is known.
 func (e *Engine) RecordOutput(n int) { e.genToks.Add(int64(n)) }
 
-// AppendOutputBlocks models real vLLM's decode-KV behavior: generated
-// tokens become cached blocks of the SAME sequence, extending its trie
-// chain the same way prompt blocks did. Call once a response is fully
-// built (or as far as generation got before a client disconnect) — any
-// time after Admit, before release.
+// outputChain builds promptUnits extended with this request's output-KV
+// blocks — a pure computation, no trie access — or returns nil if
+// output-KV modeling is disabled or there's nothing to add.
 //
-// numOutputBlocks = ceil(outputTokens * OutputKVMultiplier / BlockSizeTokens).
+// numBlocks = ceil(outputTokens * OutputKVMultiplier / BlockSizeTokens).
 // OutputKVMultiplier <= 0 disables this entirely: outputs stay invisible to
 // the cache, the historical behavior before this existed.
 //
@@ -318,7 +318,11 @@ func (e *Engine) RecordOutput(n int) { e.genToks.Add(int64(n)) }
 // so at the realistic default (OutputKVMultiplier=1) with a response long
 // enough to cover every block, this hashes IDENTICALLY to what a real
 // follow-up's own chunker would produce for that text: the common,
-// realistic case this feature exists for. Two known limitations, both
+// realistic case this feature exists for. respContent is the request's
+// deterministic, precomputable completion text (synthetic, a pure function
+// of the resolved output length — nothing here actually generates tokens),
+// which is what lets this run at admission time, before "generation"
+// happens, rather than needing to wait for it. Two known limitations, both
 // accepted per design guidance rather than chased further:
 //
 //  1. If the response text is shorter than the target block count (a short
@@ -333,13 +337,13 @@ func (e *Engine) RecordOutput(n int) { e.genToks.Add(int64(n)) }
 //     If the prompt's last block wasn't already full, the one block
 //     spanning that boundary won't hash identically to a real follow-up's
 //     version of it — only that single boundary block is affected.
-func (e *Engine) AppendOutputBlocks(promptUnits []kvcache.Unit, outputTokens int, respContent string) {
+func (e *Engine) outputChain(promptUnits []kvcache.Unit, outputTokens int, respContent string) []kvcache.Unit {
 	if e.cfg.OutputKVMultiplier <= 0 || outputTokens <= 0 {
-		return
+		return nil
 	}
 	numBlocks := int(math.Ceil(float64(outputTokens) * e.cfg.OutputKVMultiplier / float64(e.cfg.BlockSizeTokens)))
 	if numBlocks <= 0 {
-		return
+		return nil
 	}
 
 	blockBytes := e.cfg.blockSizeBytes()
@@ -377,7 +381,37 @@ func (e *Engine) AppendOutputBlocks(promptUnits []kvcache.Unit, outputTokens int
 			Tokens: tokensForBytes(len(chunk), e.cfg.CharsPerToken),
 		})
 	}
-	e.trie.Commit(units)
+	return units
+}
+
+// PinOutputBlocks reserves and pins this request's output-KV blocks — at
+// admission time, alongside Engine.Admit's own prompt pin, so they exert
+// in-flight capacity pressure for the request's entire simulated duration,
+// not just at completion. This mirrors real vLLM: decode grows a running
+// request's allocation throughout generation, it doesn't appear only when
+// generation finishes.
+//
+// outputTokens is the request's RESOLVED completion length (what
+// MaxTokensOrDefault returns), known before any simulated latency —
+// nothing here actually generates tokens, so the exact completion text
+// (respContent) is fully computable upfront too. Call this immediately
+// alongside Admit, before any sleep; on an early client disconnect the
+// blocks are still released at the request's actual release point, same as
+// the prompt's — this engine doesn't shrink the reservation mid-flight, it
+// pins for the full requested budget regardless of how much is eventually
+// actually sent, which is intentionally the conservative side of "peak
+// allocation held over the request window."
+//
+// The returned release is safe to call even when output-KV modeling is
+// disabled (a no-op then) — always defer it alongside Admit's own release,
+// in either order, exactly once each.
+func (e *Engine) PinOutputBlocks(promptUnits []kvcache.Unit, outputTokens int, respContent string) (release func()) {
+	units := e.outputChain(promptUnits, outputTokens, respContent)
+	if units == nil {
+		return func() {}
+	}
+	_, _, pin := e.trie.RecordAndPin(units)
+	return func() { e.trie.Unpin(pin) }
 }
 
 // MaxTokensOrDefault resolves a request's requested output length, falling
