@@ -85,11 +85,14 @@ func buildMergeTree(chainsByURL map[string][]kvcache.Chain, urls []string) (root
 // backends hold them — otherwise the row would show a wrong/blended
 // presence pattern.
 type run struct {
-	hashes      []uint64
-	tokens      []int32
-	present     map[string]bool
-	children    []*run
-	subtreeSize int // this run plus every run in its subtree; filled bottom-up for ordering
+	hashes   []uint64
+	tokens   []int32
+	present  map[string]bool
+	children []*run
+
+	// Filled bottom-up by computeSubtree, before any display capping:
+	subtreeSize   int // this run plus every run (row) in its subtree — for ordering which branch survives a cap
+	subtreeBlocks int // REAL blocks (sum of RunLen), not rows, this run plus its whole subtree — the UI's "⊂N" badge
 }
 
 // compressFrom walks n and its single-child, present-homogeneous
@@ -142,13 +145,23 @@ func sortedChildren(n *mergeNode) []*mergeNode {
 	return out
 }
 
-func (r *run) computeSubtreeSize() int {
-	size := 1
+// computeSubtree fills subtreeSize (rows) and subtreeBlocks (real blocks,
+// i.e. sum of RunLen) for r and its entire subtree, bottom-up, in one walk.
+// subtreeBlocks is deliberately NOT the same number as subtreeSize: a
+// single compressed row can represent many blocks (a long uncontested
+// shared prefix collapses to ONE row but should still count all of its
+// blocks toward the total), which is exactly the distinction anton asked
+// the UI badge to make visible.
+func (r *run) computeSubtree() (rows, blocks int) {
+	rows, blocks = 1, len(r.hashes)
 	for _, c := range r.children {
-		size += c.computeSubtreeSize()
+		cr, cb := c.computeSubtree()
+		rows += cr
+		blocks += cb
 	}
-	r.subtreeSize = size
-	return size
+	r.subtreeSize = rows
+	r.subtreeBlocks = blocks
+	return rows, blocks
 }
 
 // flattenTree turns root runs into the flat, parent-indexed viz.TreeNode
@@ -179,7 +192,8 @@ func flattenTree(roots []*run, opts viz.SnapshotOptions, backends []string) []vi
 		}
 		nodes = append(nodes, viz.TreeNode{
 			Hash: kvcache.HexHash(r.hashes[0]), RunLen: len(r.hashes), Tokens: totalTok,
-			Depth: depth, Parent: parentIdx, Present: present,
+			SubtreeBlocks: r.subtreeBlocks,
+			Depth:         depth, Parent: parentIdx, Present: present,
 		})
 
 		// Depth cap: checked ONCE for this node's children collectively (they

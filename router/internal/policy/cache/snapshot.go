@@ -70,7 +70,7 @@ func (s *trieStore) snapshot(opts viz.SnapshotOptions) viz.Snapshot {
 	var roots []*run
 	for _, c := range sortedChildren(mergeRoot) {
 		r := compressFrom(c)
-		r.computeSubtreeSize()
+		r.computeSubtree()
 		roots = append(roots, r)
 	}
 	nodesTotal := 0

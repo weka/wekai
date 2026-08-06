@@ -91,12 +91,17 @@ type TreeNode struct {
 	// Hash is the run's FIRST block's hash (hex, kvcache.HexHash) — a stable
 	// display identity; there is no human label since real traffic has no
 	// simulator-assigned tags.
-	Hash     string `json:"hash"`
-	RunLen   int    `json:"run_len"`
-	Tokens   int32  `json:"tokens"` // total estimated tokens across the run
-	Depth    int    `json:"depth"`
-	Parent   int    `json:"parent"`   // index into Tree, -1 for a root
-	Children []int  `json:"children"` // indices into Tree
+	Hash   string `json:"hash"`
+	RunLen int    `json:"run_len"`
+	Tokens int32  `json:"tokens"` // total estimated tokens across the run
+	// SubtreeBlocks is the total REAL blocks (not compressed rows) in this
+	// run's subtree, including its own RunLen — a long shared prefix that
+	// compresses to one row still counts every block it represents, and a
+	// row further down the tree adds its own descendants' blocks on top.
+	SubtreeBlocks int   `json:"subtree_blocks"`
+	Depth         int   `json:"depth"`
+	Parent        int   `json:"parent"`   // index into Tree, -1 for a root
+	Children      []int `json:"children"` // indices into Tree
 	// Present is aligned to Snapshot.Backends: Present[i] is true iff
 	// Backends[i] currently holds this run.
 	Present []bool `json:"present"`

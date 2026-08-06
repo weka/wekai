@@ -174,6 +174,52 @@ func TestSnapshot_SharedPrefixIsOneCommonAncestor(t *testing.T) {
 	}
 }
 
+// TestSnapshot_SubtreeBlocksCountsRealBlocksNotRows is the per-node "⊂N"
+// badge anton asked for: a known 3-row tree where the ROOT compresses
+// multiple blocks into one row (RunLen=3), and each child is itself a
+// multi-block compressed run (2 and 4 blocks) — so root.SubtreeBlocks (9)
+// must differ from a naive row count (3) and from the root's own RunLen
+// (3), proving the badge counts real underlying blocks, not tree rows.
+func TestSnapshot_SubtreeBlocksCountsRealBlocksNotRows(t *testing.T) {
+	p := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	bs := backends(t, 2)
+	for _, b := range bs {
+		p.AddBackend(b)
+	}
+
+	shared := units(100, 101, 102)                                       // present on both -> compresses to ONE 3-block row
+	p.Commit(bs[0], req(concatUnits(shared, units(200, 201))))           // A's 2-block divergent tail
+	p.Commit(bs[1], req(concatUnits(shared, units(300, 301, 302, 303)))) // B's 4-block divergent tail
+
+	snap := p.Snapshot(viz.SnapshotOptions{})
+	if len(snap.Tree) != 3 {
+		t.Fatalf("len(Tree) = %d, want 3 (1 shared root + 2 divergent children)", len(snap.Tree))
+	}
+
+	root := treeRoot(snap.Tree)
+	if root == nil {
+		t.Fatalf("no root in Tree: %+v", snap.Tree)
+	}
+	if root.RunLen != 3 {
+		t.Fatalf("root.RunLen = %d, want 3", root.RunLen)
+	}
+	if len(root.Children) != 2 {
+		t.Fatalf("root should have 2 children, got %d", len(root.Children))
+	}
+	if root.SubtreeBlocks != 9 {
+		t.Fatalf("root.SubtreeBlocks = %d, want 9 (3 own + 2 + 4 descendants) — must count real blocks, not rows", root.SubtreeBlocks)
+	}
+
+	for _, ci := range root.Children {
+		child := snap.Tree[ci]
+		// Each child here is a leaf: its subtree is only itself, so
+		// SubtreeBlocks must equal its own RunLen exactly.
+		if child.SubtreeBlocks != child.RunLen {
+			t.Fatalf("leaf child SubtreeBlocks = %d, want == its own RunLen %d", child.SubtreeBlocks, child.RunLen)
+		}
+	}
+}
+
 // TestSnapshot_LongSharedChainCompressesToOneRow is the radix-compression
 // property: a straight, non-branching chain must collapse into a single
 // tree row (one box per RUN, not one per block), the same behavior the
