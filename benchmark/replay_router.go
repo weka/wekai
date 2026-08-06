@@ -789,6 +789,13 @@ func runRouterReplayInstance(
 			// every later turn would overflow too: retire the instance
 			// (neither completed nor error). The deferred sweep closes the
 			// remaining done-channels so descendants unblock.
+			//
+			// Give the emission budget back: a skip consumed a totalEmitted
+			// slot but will never complete, and the --total terminator
+			// waits on COMPLETED — without this the emission gate closes at
+			// --total emitted while completions can never reach it, and the
+			// run hangs drained forever.
+			st.totalEmitted.Add(-1)
 			return
 		}
 
