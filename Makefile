@@ -114,6 +114,25 @@ router-image-multiarch: ## Build and push a multi-arch router image
 		--build-arg BUILD_DATE=$(BUILD_DATE) \
 		-t $(IMAGE_REPO):$(VERSION) --push .
 
+.PHONY: router-image-smoke
+router-image-smoke: router-image ## Build the image and check the binary reports its version
+	docker run --rm $(IMAGE_REPO):$(VERSION) -version
+
+.PHONY: router-run
+router-run: router-build ## Run the router locally against a backend at :8000
+	./$(ROUTER) -listen 127.0.0.1:8080 -metrics-listen 127.0.0.1:29000 \
+		-backends http://127.0.0.1:8000 -log-format text
+
+.PHONY: router-deploy
+router-deploy: ## Apply the router's Kubernetes manifests
+	kubectl apply -f router/deploy/k8s/rbac.yaml
+	kubectl apply -f router/deploy/k8s/deployment.yaml
+
+.PHONY: router-manifests-validate
+router-manifests-validate: ## Server-side dry-run of the router manifests
+	kubectl apply --dry-run=server -f router/deploy/k8s/rbac.yaml
+	kubectl apply --dry-run=server -f router/deploy/k8s/deployment.yaml
+
 .PHONY: router-image-size
 router-image-size: ## Report router image size, uncompressed and compressed
 	@# `docker image inspect --format {{.Size}}` is NOT used: on a manifest-list
