@@ -269,29 +269,33 @@ func TestEngine_MaxTokensOrDefault(t *testing.T) {
 	}
 }
 
-// TestEngine_LatencyChargesColdCachedAndOutputSeparately is the rate-based
+// TestEngine_PrefillWorkChargesColdAndCachedSeparately is the rate-based
 // replacement for the old per-token-duration model: cold (uncached) prompt
-// tokens, cached prompt tokens, and output tokens are each charged at their
-// own configurable rate, calibratable against a real fleet's measured
-// throughput. "want" mirrors tokensAtRate's exact float64 formula and
-// Duration-then-sum order so this stays an exact equality, not an epsilon
-// comparison.
-func TestEngine_LatencyChargesColdCachedAndOutputSeparately(t *testing.T) {
+// tokens and cached prompt tokens are each charged at their own
+// configurable rate, calibratable against a real fleet's measured
+// throughput, and decode is charged separately at OutputTPS. "want" mirrors
+// tokensAtRate's exact float64 formula so this stays an exact equality, not
+// an epsilon comparison — PrefillWork/DecodeDuration are pure functions (no
+// waiting), unlike AwaitTTFT below, which is why this can assert exact
+// values rather than a wall-clock tolerance.
+func TestEngine_PrefillWorkChargesColdAndCachedSeparately(t *testing.T) {
 	e := NewEngine(Config{
 		BaseLatency:    0,
 		ColdInputTPS:   1000, // 1ms/token
 		CachedInputTPS: 2000, // 0.5ms/token
 		OutputTPS:      500,  // 2ms/token
 	})
-	ttft, total := e.Latency(40, 100, 10) // 40 cached, 60 uncached, 10 output
+	defer e.Close()
+	work := e.PrefillWork(40, 100) // 40 cached, 60 uncached
 
-	wantTTFT := time.Duration(60.0/1000*float64(time.Second)) + time.Duration(40.0/2000*float64(time.Second))
-	if ttft != wantTTFT {
-		t.Fatalf("ttft = %v, want %v", ttft, wantTTFT)
+	wantWork := time.Duration(60.0/1000*float64(time.Second)) + time.Duration(40.0/2000*float64(time.Second))
+	if work != wantWork {
+		t.Fatalf("work = %v, want %v", work, wantWork)
 	}
-	wantTotal := wantTTFT + time.Duration(10.0/500*float64(time.Second))
-	if total != wantTotal {
-		t.Fatalf("total = %v, want %v", total, wantTotal)
+	decode := e.DecodeDuration(10)
+	wantDecode := time.Duration(10.0 / 500 * float64(time.Second))
+	if decode != wantDecode {
+		t.Fatalf("decode = %v, want %v", decode, wantDecode)
 	}
 }
 
@@ -301,9 +305,10 @@ func TestEngine_LatencyChargesColdCachedAndOutputSeparately(t *testing.T) {
 // literally free), matching a real cache read having some cost.
 func TestEngine_CachedTokensAreNotFree(t *testing.T) {
 	e := NewEngine(Config{CachedInputTPS: 1000})
-	ttft, _ := e.Latency(100, 100, 0) // fully cached, zero uncached
-	if ttft <= 0 {
-		t.Fatalf("a fully cached request should still cost time at CachedInputTPS, got ttft=%v", ttft)
+	defer e.Close()
+	work := e.PrefillWork(100, 100) // fully cached, zero uncached
+	if work <= 0 {
+		t.Fatalf("a fully cached request should still cost time at CachedInputTPS, got work=%v", work)
 	}
 }
 
@@ -312,9 +317,11 @@ func TestEngine_CachedTokensAreNotFree(t *testing.T) {
 // Config{} stays instant by default.
 func TestEngine_ZeroRateIsInstant(t *testing.T) {
 	e := NewEngine(Config{})
-	ttft, total := e.Latency(0, 100, 50)
-	if ttft != 0 || total != 0 {
-		t.Fatalf("zero-rate Config should be instant, got ttft=%v total=%v", ttft, total)
+	defer e.Close()
+	work := e.PrefillWork(0, 100)
+	decode := e.DecodeDuration(50)
+	if work != 0 || decode != 0 {
+		t.Fatalf("zero-rate Config should be instant, got work=%v decode=%v", work, decode)
 	}
 }
 

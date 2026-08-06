@@ -81,8 +81,21 @@ type Config struct {
 	// fleet: read the fleet's actual prefill/decode throughput (or a
 	// reasonable estimate of it) and set these directly, in the same units.
 	//
-	//	ttft   = BaseLatency + uncachedPromptTokens/ColdInputTPS + cachedPromptTokens/CachedInputTPS
-	//	total  = ttft + outputTokens/OutputTPS
+	// ColdInputTPS and CachedInputTPS are INSTANCE-AGGREGATE rates, not
+	// independent per-request rates: real vLLM's prefill throughput is a
+	// genuinely shared GPU resource, so N concurrently-prefilling requests
+	// on the same instance share ONE token-rate budget via processor
+	// sharing (see prefillScheduler) — each drains at 1/N of the instance
+	// rate, and the instance's aggregate throughput stays conserved
+	// regardless of N. This is the fix for a real fidelity gap: modeling
+	// prefill as independent per-request rates let mock warm/cached share
+	// converge (46/48) where a real fleet under load spreads (51/35) —
+	// contention, not just per-token cost, is what makes deep cold turns
+	// expensive fleet-wide under concurrency.
+	//
+	//	prefillWork (per request) = uncachedPromptTokens/ColdInputTPS + cachedPromptTokens/CachedInputTPS
+	//	TTFT (per request)        = BaseLatency + this request's share of prefillWork under contention
+	//	total (per request)       = TTFT + outputTokens/OutputTPS
 	//
 	// Cached tokens are NOT free: a cache hit still costs something (a KV
 	// read, a network hop for an offloaded tier, etc.) — only recompute is
@@ -90,10 +103,16 @@ type Config struct {
 	// ColdInputTPS rather than left at zero. Any rate left at 0 contributes
 	// no time for that term (division only happens when the rate is
 	// positive), so the default Config is instant except for BaseLatency.
+	//
+	// OutputTPS stays PER-REQUEST, deliberately NOT contended: real vLLM's
+	// continuous batching keeps each in-flight request's own decode rate
+	// roughly constant until the batch itself saturates, so treating output
+	// as independent per request remains a reasonable approximation — see
+	// Engine.DecodeDuration / Engine.OutputTokenInterval.
 	BaseLatency    time.Duration
-	ColdInputTPS   float64 // tokens/sec, UNCACHED prompt tokens (prefill)
-	CachedInputTPS float64 // tokens/sec, CACHED prompt tokens (cache read)
-	OutputTPS      float64 // tokens/sec, decode — also paces SSE chunk spacing
+	ColdInputTPS   float64 // tokens/sec, UNCACHED prompt tokens — INSTANCE aggregate, shared via processor sharing
+	CachedInputTPS float64 // tokens/sec, CACHED prompt tokens (cache read) — INSTANCE aggregate, shared via processor sharing
+	OutputTPS      float64 // tokens/sec, decode — PER-REQUEST, not contended; also paces SSE chunk spacing
 
 	// DefaultMaxTokens is the completion length used when a request omits
 	// max_tokens (or sends <= 0).
@@ -175,8 +194,9 @@ func (c Config) blockSizeBytes() int {
 // Engine holds one server's live cache model, admission state, and counters.
 // Safe for concurrent use.
 type Engine struct {
-	cfg  Config
-	trie *kvcache.Trie
+	cfg     Config
+	trie    *kvcache.Trie
+	prefill *prefillScheduler // this instance's shared prefill processor-sharing resource
 
 	inflight   atomic.Int64
 	admitted   atomic.Int64
@@ -187,7 +207,9 @@ type Engine struct {
 }
 
 // NewEngine builds an Engine. A zero BlockCapacity means an unbounded cache
-// (kvcache.Config{} semantics), matching an infinite-KV-memory worker.
+// (kvcache.Config{} semantics), matching an infinite-KV-memory worker. Call
+// Close when done with it (only load-bearing for a caller that creates many
+// short-lived Engines, e.g. tests — see prefillScheduler.Close).
 func NewEngine(cfg Config) *Engine {
 	cfg = cfg.normalize()
 	kvcfg := kvcache.Config{}
@@ -197,10 +219,15 @@ func NewEngine(cfg Config) *Engine {
 			MaxTokens: cfg.BlockCapacity * int64(cfg.BlockSizeTokens),
 		}
 	}
-	return &Engine{cfg: cfg, trie: kvcache.New(kvcfg)}
+	return &Engine{cfg: cfg, trie: kvcache.New(kvcfg), prefill: newPrefillScheduler(nil)}
 }
 
 func (e *Engine) Config() Config { return e.cfg }
+
+// Close stops this Engine's background prefill scheduler goroutine. See
+// NewEngine's doc — production callers (router/cmd/mock-vllm) don't need to
+// call this, since their Engines live for the process's lifetime.
+func (e *Engine) Close() { e.prefill.Close() }
 
 // Tokenize chunks raw prompt bytes into vLLM-block-sized Units, at this
 // engine's own CharsPerToken ratio (see tokenize.go for why that means a
@@ -265,18 +292,45 @@ func (e *Engine) Admit(units []kvcache.Unit) (release func(), cached, total int,
 	}, cached, total, true
 }
 
-// Latency computes TTFT (BaseLatency plus the uncached portion charged at
-// ColdInputTPS and the cached portion charged at CachedInputTPS — a cache hit
-// still costs a KV read, it just isn't full recompute) and total request
-// duration (TTFT plus the output charged at OutputTPS).
-func (e *Engine) Latency(cachedTokens, totalTokens, outputTokens int) (ttft, total time.Duration) {
+// PrefillWork computes this request's prefill job SIZE — the amount of
+// solo-rate GPU time it would take if it were the ONLY thing prefilling on
+// this instance: uncachedTokens/ColdInputTPS + cachedTokens/CachedInputTPS
+// (a cache hit still costs a KV read at CachedInputTPS, it just isn't full
+// recompute at ColdInputTPS). Pure: no side effects, no waiting. Feed the
+// result to AwaitTTFT, which is where contention with every other
+// concurrently-prefilling request on this instance is actually applied.
+func (e *Engine) PrefillWork(cachedTokens, totalTokens int) time.Duration {
 	uncached := totalTokens - cachedTokens
 	if uncached < 0 {
 		uncached = 0
 	}
-	ttft = e.cfg.BaseLatency + tokensAtRate(uncached, e.cfg.ColdInputTPS) + tokensAtRate(cachedTokens, e.cfg.CachedInputTPS)
-	total = ttft + tokensAtRate(outputTokens, e.cfg.OutputTPS)
-	return ttft, total
+	return tokensAtRate(uncached, e.cfg.ColdInputTPS) + tokensAtRate(cachedTokens, e.cfg.CachedInputTPS)
+}
+
+// AwaitTTFT blocks for BaseLatency, then submits work (see PrefillWork) to
+// this instance's prefill processor-sharing scheduler and blocks until it
+// has fully drained — i.e. until TTFT has genuinely elapsed, including this
+// request's share of contention from every other request concurrently
+// prefilling on the SAME instance (see prefillScheduler). For a solo
+// request with no contention this takes exactly BaseLatency+work, same as
+// the old pure-duration Latency(); under concurrent load it takes longer,
+// which is the whole point. Returns false if ctx is done first, at either
+// stage (client disconnected before or during prefill).
+func (e *Engine) AwaitTTFT(ctx context.Context, work time.Duration) bool {
+	if !sleepCtx(ctx, e.cfg.BaseLatency) {
+		return false
+	}
+	return e.prefill.submit(ctx, work.Seconds())
+}
+
+// DecodeDuration is how long generating n output tokens takes at OutputTPS —
+// PER-REQUEST, not contended (see the OutputTPS field doc for why decode
+// stays per-request while prefill is instance-shared). The lump-sum
+// counterpart to OutputTokenInterval, for a caller (the non-streaming path)
+// that waits for the whole completion at once rather than pacing individual
+// chunks.
+func (e *Engine) DecodeDuration(outputTokens int) time.Duration {
+	return tokensAtRate(outputTokens, e.cfg.OutputTPS)
 }
 
 // OutputTokenInterval is the per-token duration OutputTPS implies, for a

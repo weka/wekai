@@ -53,16 +53,19 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer release()
 
 	maxTok := s.engine.MaxTokensOrDefault(req.MaxTokens)
-	ttft, totalDur := s.engine.Latency(cached, total, maxTok)
+	work := s.engine.PrefillWork(cached, total)
 	modelID := s.engine.Config().ModelID
 
 	if req.Stream {
-		s.streamChat(w, r, req, modelID, units, cached, total, maxTok, ttft)
+		s.streamChat(w, r, req, modelID, units, cached, total, maxTok, work)
 		return
 	}
 
-	if !sleepCtx(r.Context(), totalDur) {
-		return // client disconnected mid-"inference"
+	if !s.engine.AwaitTTFT(r.Context(), work) {
+		return // client disconnected mid-prefill
+	}
+	if !sleepCtx(r.Context(), s.engine.DecodeDuration(maxTok)) {
+		return // client disconnected mid-decode
 	}
 	s.engine.RecordOutput(maxTok)
 
@@ -102,15 +105,18 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	defer release()
 
 	maxTok := s.engine.MaxTokensOrDefault(req.MaxTokens)
-	ttft, totalDur := s.engine.Latency(cached, total, maxTok)
+	work := s.engine.PrefillWork(cached, total)
 	modelID := s.engine.Config().ModelID
 
 	if req.Stream {
-		s.streamCompletion(w, r, req, modelID, units, cached, total, maxTok, ttft)
+		s.streamCompletion(w, r, req, modelID, units, cached, total, maxTok, work)
 		return
 	}
 
-	if !sleepCtx(r.Context(), totalDur) {
+	if !s.engine.AwaitTTFT(r.Context(), work) {
+		return
+	}
+	if !sleepCtx(r.Context(), s.engine.DecodeDuration(maxTok)) {
 		return
 	}
 	s.engine.RecordOutput(maxTok)

@@ -68,14 +68,14 @@ func startSSE(w http.ResponseWriter) http.Flusher {
 	return flusher
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatCompletionRequest, modelID string, units []kvcache.Unit, cached, total, maxTok int, ttft time.Duration) {
+func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatCompletionRequest, modelID string, units []kvcache.Unit, cached, total, maxTok int, work time.Duration) {
 	ctx := r.Context()
 	flusher := startSSE(w)
 	id := s.newID("chatcmpl")
 	//clockexempt: cosmetic OpenAI wire-format timestamp, not a routing or timing decision
 	created := time.Now().Unix()
 
-	if !sleepCtx(ctx, ttft) {
+	if !s.engine.AwaitTTFT(ctx, work) {
 		return
 	}
 
@@ -121,14 +121,14 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatComp
 	s.coll.observe("success", cached, total, generated)
 }
 
-func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, req completionRequest, modelID string, units []kvcache.Unit, cached, total, maxTok int, ttft time.Duration) {
+func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, req completionRequest, modelID string, units []kvcache.Unit, cached, total, maxTok int, work time.Duration) {
 	ctx := r.Context()
 	flusher := startSSE(w)
 	id := s.newID("cmpl")
 	//clockexempt: cosmetic OpenAI wire-format timestamp, not a routing or timing decision
 	created := time.Now().Unix()
 
-	if !sleepCtx(ctx, ttft) {
+	if !s.engine.AwaitTTFT(ctx, work) {
 		return
 	}
 
