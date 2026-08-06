@@ -90,6 +90,14 @@ type run struct {
 	present  map[string]bool
 	children []*run
 
+	// blockDepth is filled TOP-DOWN, during compressFrom itself (it needs
+	// the parent's depth to compute its own, the opposite direction from
+	// subtreeSize/subtreeBlocks below): the number of REAL blocks from the
+	// root through the END of this run, inclusive — a 12-block compressed
+	// run advances depth by 12 in one row, not one per block. The UI's "d N"
+	// badge: the deepest block this box represents is the Nth from root.
+	blockDepth int
+
 	// Filled bottom-up by computeSubtree, before any display capping:
 	subtreeSize   int // this run plus every run (row) in its subtree — for ordering which branch survives a cap
 	subtreeBlocks int // REAL blocks (sum of RunLen), not rows, this run plus its whole subtree — the UI's "⊂N" badge
@@ -99,8 +107,9 @@ type run struct {
 // descendants into one run, then starts a fresh run at each remaining
 // branch point (children returned in sorted-by-hash order, for a
 // deterministic tree that doesn't reshuffle between polls when nothing
-// changed).
-func compressFrom(n *mergeNode) *run {
+// changed). parentBlockDepth is the parent run's own blockDepth (0 for a
+// root, whose parent is the virtual, block-less merge root).
+func compressFrom(n *mergeNode, parentBlockDepth int) *run {
 	r := &run{present: n.present}
 	cur := n
 	for {
@@ -118,8 +127,9 @@ func compressFrom(n *mergeNode) *run {
 		}
 		cur = only
 	}
+	r.blockDepth = parentBlockDepth + len(r.hashes)
 	for _, c := range sortedChildren(cur) {
-		r.children = append(r.children, compressFrom(c))
+		r.children = append(r.children, compressFrom(c, r.blockDepth))
 	}
 	return r
 }
@@ -192,8 +202,8 @@ func flattenTree(roots []*run, opts viz.SnapshotOptions, backends []string) []vi
 		}
 		nodes = append(nodes, viz.TreeNode{
 			Hash: kvcache.HexHash(r.hashes[0]), RunLen: len(r.hashes), Tokens: totalTok,
-			SubtreeBlocks: r.subtreeBlocks,
-			Depth:         depth, Parent: parentIdx, Present: present,
+			SubtreeBlocks: r.subtreeBlocks, BlockDepth: r.blockDepth,
+			Depth: depth, Parent: parentIdx, Present: present,
 		})
 
 		// Depth cap: checked ONCE for this node's children collectively (they

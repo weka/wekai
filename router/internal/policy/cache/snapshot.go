@@ -69,7 +69,7 @@ func (s *trieStore) snapshot(opts viz.SnapshotOptions) viz.Snapshot {
 	// decisions are based on the FULL tree, not an already-cut one.
 	var roots []*run
 	for _, c := range sortedChildren(mergeRoot) {
-		r := compressFrom(c)
+		r := compressFrom(c, 0)
 		r.computeSubtree()
 		roots = append(roots, r)
 	}

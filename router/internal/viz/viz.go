@@ -98,10 +98,15 @@ type TreeNode struct {
 	// run's subtree, including its own RunLen — a long shared prefix that
 	// compresses to one row still counts every block it represents, and a
 	// row further down the tree adds its own descendants' blocks on top.
-	SubtreeBlocks int   `json:"subtree_blocks"`
-	Depth         int   `json:"depth"`
-	Parent        int   `json:"parent"`   // index into Tree, -1 for a root
-	Children      []int `json:"children"` // indices into Tree
+	SubtreeBlocks int `json:"subtree_blocks"`
+	// BlockDepth is the number of REAL blocks from the root through the END
+	// of this run, inclusive — a 12-block compressed run advances depth by
+	// 12 in one row, not one per block. Distinct from Depth below, which
+	// counts TREE ROWS (for layout), not blocks.
+	BlockDepth int   `json:"block_depth"`
+	Depth      int   `json:"depth"`
+	Parent     int   `json:"parent"`   // index into Tree, -1 for a root
+	Children   []int `json:"children"` // indices into Tree
 	// Present is aligned to Snapshot.Backends: Present[i] is true iff
 	// Backends[i] currently holds this run.
 	Present []bool `json:"present"`

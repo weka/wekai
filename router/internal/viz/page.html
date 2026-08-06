@@ -86,7 +86,7 @@ footer{font-size:10.5px;color:var(--muted);margin-top:14px;font-family:var(--mon
   <div class="legend">
     <span><i style="background:var(--good)"></i>backend holds this run</span>
     <span><i style="background:var(--grid)"></i>does not</span>
-    <span style="color:var(--muted)">box shade intensity ∝ fraction of the fleet holding it · <b style="font-family:var(--mono)">×N</b> = backend count · <b style="font-family:var(--mono)">·k</b> = blocks in this row · <b style="font-family:var(--mono)">⊂N</b> = total blocks in this row's subtree, including itself</span>
+    <span style="color:var(--muted)">box shade intensity ∝ fraction of the fleet holding it · <b style="font-family:var(--mono)">×N</b> = backend count · <b style="font-family:var(--mono)">·k</b> = blocks in this row · <b style="font-family:var(--mono)">dN</b> = block depth from root (through the end of this row) · <b style="font-family:var(--mono)">⊂N</b> = total blocks in this row's subtree, including itself</span>
   </div>
   <div class="trunc" id="trunc-note" style="display:none"></div>
 </div>
@@ -209,11 +209,12 @@ function renderTree(snap){
   $('tree-empty').style.display = 'none';
 
   // Sizing mirrors the reference: node box width grows with how many
-  // backend-presence squares must fit on its right edge, plus a reserved
-  // slot for the "⊂N" subtree-blocks badge just left of those squares.
+  // backend-presence squares must fit on its right edge, plus reserved
+  // slots for the "d N" block-depth and "⊂N" subtree-blocks badges just
+  // left of those squares (two distinct badges, side by side).
   const sq = backends.length > 10 ? 4 : 6, gap = backends.length > 10 ? 1 : 2;
   const marksW = backends.length * (sq + gap);
-  const badgeW = 34;
+  const badgeW = 68; // two badge slots, ~34px each
   const NW = Math.max(190, marksW + badgeW + 118), GAPX = 24, RH = 30;
   const labelChars = Math.max(4, Math.floor((NW - 7 - marksW - badgeW - 34) / 6));
 
@@ -245,8 +246,13 @@ function renderTree(snap){
     if (lbl.length > labelChars) lbl = v.hash.slice(0, Math.max(2, labelChars - String(v.run_len).length - 2)) + '…·' + v.run_len;
     s += '<text class="tlabel" x="' + (x + 7) + '" y="' + (y + 15) + '">' + lbl + '</text>';
     const sx = x + NW - 26 - marksW;
-    // "⊂N": total REAL blocks in this row's subtree, including itself —
-    // distinct from the "×N" backend-copies marker at the far right below.
+    // Two distinct badges just left of the presence squares: "d N" is this
+    // row's END-of-run depth in real blocks from the root (a 12-block run
+    // advances depth by 12, not by 1), "⊂N" is the total real blocks in
+    // this row's subtree including itself — different questions, kept as
+    // two separate labels rather than merged so neither is ambiguous.
+    // Distinct from the "×N" backend-copies marker at the far right below.
+    s += '<text class="tsub" x="' + (sx - 6 - 34) + '" y="' + (y + 15) + '" text-anchor="end">d' + (v.block_depth || v.run_len) + '</text>';
     s += '<text class="tsub" x="' + (sx - 6) + '" y="' + (y + 15) + '" text-anchor="end">⊂' + (v.subtree_blocks || v.run_len) + '</text>';
     for (let k = 0; k < backends.length; k++){
       const on = !!(v.present && v.present[k]);

@@ -220,6 +220,54 @@ func TestSnapshot_SubtreeBlocksCountsRealBlocksNotRows(t *testing.T) {
 	}
 }
 
+// TestSnapshot_BlockDepthAccountsForCompressedRuns is the per-node "d N"
+// badge anton asked for: block depth must advance by the FULL RunLen of a
+// compressed row in one step, not by 1 per row, and must accumulate
+// correctly down each branch. Reuses the same 3-row tree as the
+// SubtreeBlocks test above (root compresses 3 blocks into one row; each
+// child is itself a multi-block run of 2 and 4 blocks) so the two badges
+// can be cross-checked against the same known structure.
+func TestSnapshot_BlockDepthAccountsForCompressedRuns(t *testing.T) {
+	p := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	bs := backends(t, 2)
+	for _, b := range bs {
+		p.AddBackend(b)
+	}
+
+	shared := units(100, 101, 102)                                       // present on both -> compresses to ONE 3-block row
+	p.Commit(bs[0], req(concatUnits(shared, units(200, 201))))           // A's 2-block divergent tail
+	p.Commit(bs[1], req(concatUnits(shared, units(300, 301, 302, 303)))) // B's 4-block divergent tail
+
+	snap := p.Snapshot(viz.SnapshotOptions{})
+	root := treeRoot(snap.Tree)
+	if root == nil {
+		t.Fatalf("no root in Tree: %+v", snap.Tree)
+	}
+
+	// Root's own run is 3 blocks starting at the root of the tree: its
+	// end-of-run depth is exactly 3, not 1 (a row =/= a block).
+	if root.BlockDepth != 3 {
+		t.Fatalf("root.BlockDepth = %d, want 3 (its own 3-block run, counted through the end)", root.BlockDepth)
+	}
+
+	hex200, hex300 := kvcache.HexHash(200), kvcache.HexHash(300)
+	for _, ci := range root.Children {
+		child := snap.Tree[ci]
+		switch child.Hash {
+		case hex200: // 2-block divergent tail: depth = root's 3 + its own 2
+			if child.BlockDepth != 5 {
+				t.Fatalf("200-tail BlockDepth = %d, want 5 (3 root blocks + 2 of its own)", child.BlockDepth)
+			}
+		case hex300: // 4-block divergent tail: depth = root's 3 + its own 4
+			if child.BlockDepth != 7 {
+				t.Fatalf("300-tail BlockDepth = %d, want 7 (3 root blocks + 4 of its own)", child.BlockDepth)
+			}
+		default:
+			t.Fatalf("unexpected child hash %q", child.Hash)
+		}
+	}
+}
+
 // TestSnapshot_LongSharedChainCompressesToOneRow is the radix-compression
 // property: a straight, non-branching chain must collapse into a single
 // tree row (one box per RUN, not one per block), the same behavior the
