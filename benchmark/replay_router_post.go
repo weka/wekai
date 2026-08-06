@@ -61,6 +61,9 @@ type replayPoster struct {
 	// newReplayPoster, to avoid touching its many existing call sites.
 	outputRatio float64
 	forceOutput bool
+	// limitContext: skip requests whose built body exceeds limitContext*4 bytes
+	// (chars~=tokens*4 convention). 0 = off.
+	limitContext int
 }
 
 func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string, runID string, dryRun bool, coldTPS, warmTPS, outputTPS int, estimator *cacheEstimator) (*replayPoster, error) {
@@ -307,6 +310,9 @@ func (p *replayPoster) do(
 		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
 	default:
 		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput)
+	}
+	if err == nil && p.limitContext > 0 && len(bodyBytes) > p.limitContext*4 {
+		return RequestMetrics{Skipped: true}
 	}
 	if err != nil {
 		return RequestMetrics{

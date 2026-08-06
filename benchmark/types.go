@@ -8,6 +8,9 @@ import (
 
 // RequestMetrics captures metrics for a single LLM request
 type RequestMetrics struct {
+	// Skipped: request filtered out pre-send (--limit-context); counted as
+	// neither completed nor error by the auto aggregator.
+	Skipped bool
 	RequestNum        int           // Request number (1-based) within a series
 	SeriesNum         int           // Series number (1-based) within a cycle
 	CycleNum          int           // Cycle number (1-based)

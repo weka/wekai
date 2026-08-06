@@ -81,6 +81,7 @@ type AutoBenchmarkConfig struct {
 	// knobs are ignored in this mode.
 	FromDataset     string // short name, e.g. "hermes-lambda"
 	ReplaySeries    int    // number of conversations to replay (0 = whole dataset)
+	LimitContext    int    // --limit-context: skip requests over N tokens (~N*4 chars); 0=off
 	ReplayNoStamp   bool   // when true, skip the per-run <ignore>RUN_GUID</ignore> prefix injection (default is to stamp so each run starts with a pristine server prefix cache while still permitting within-run cross-series cache hits)
 	AbortOnCollapse bool   // when true, abort if windowed cache hit rate < 50% for 2 minutes (legacy collapse detector, off by default — fires spuriously on legitimate low-reuse workloads)
 	// ReplayStopAtLowConcurrency terminates the run when the queue is drained
@@ -1596,6 +1597,7 @@ func runSingleModelBenchmark(
 				break
 			}
 			pp.outputRatio = cfg.ReplayOutputRatio
+			pp.limitContext = cfg.LimitContext
 			pp.forceOutput = cfg.ReplayForceOutput
 			posters[i] = pp
 		}
@@ -1904,6 +1906,9 @@ func runSingleModelBenchmark(
 						ErrorMessage:         errMsg,
 						IsEmpty:              metrics.IsEmpty,
 						LocalCacheRatio:      ratio,
+					}
+					if rec.Skipped {
+						continue // --limit-context filter: neither completed nor error
 					}
 					if rec.IsError || rec.IsEmpty {
 						rec.PromptText = metrics.CachedPrompt
