@@ -753,14 +753,20 @@ func runRouterReplayInstance(
 			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
 		} else {
 			metrics = reqPoster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
-			if metrics.Skipped {
-				// --limit-context filter: not sent — neither completed nor error.
-				continue
-			}
 		}
 		picker.release(epIdx)
 		reqCancel()
 		gate.Release()
+
+		if metrics.Skipped || isContextOverflow(metrics.Error) {
+			// The session outgrew the context budget — caught by the
+			// --limit-context estimate (Skipped) or by the server's
+			// context-length 400. Prompts only grow within a session, so
+			// every later turn would overflow too: retire the instance
+			// (neither completed nor error). The deferred sweep closes the
+			// remaining done-channels so descendants unblock.
+			return
+		}
 
 		if ch, ok := requestDone[req.RequestID]; ok {
 			closeOnce(ch)
@@ -769,6 +775,14 @@ func runRouterReplayInstance(
 		recordReplayRequest(cfg, st, rdw, metrics, isFirstRequest, &coldStartTTFT)
 		isFirstRequest = false
 	}
+}
+
+// isContextOverflow reports whether err is a server-side context-length
+// rejection (vLLM's 400 "This model's maximum context length is N tokens").
+// Only this specific 400 retires a replay instance — transient errors
+// (5xx, timeouts) must keep counting as errors.
+func isContextOverflow(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "maximum context length")
 }
 
 // closeOnce closes ch unless already closed. Each replay request's done
