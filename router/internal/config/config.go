@@ -119,6 +119,17 @@ type CacheConfig struct {
 	MaxTokens int64 `json:"max_tokens_per_backend"`
 	// ChunkBytes is the prefix-unit granularity; see prefix.DefaultChunkBytes.
 	ChunkBytes int `json:"chunk_bytes"`
+
+	// --- prefix-cache-split only ---
+
+	// SplitGuard keeps a split from landing on a backend nearly as loaded as
+	// the saturated holders it is relieving, which is what stops every backend
+	// from ending up marked as holding every prefix. A candidate qualifies
+	// while its in-flight is below MaxNodeConcurrency * (1 - SplitGuard).
+	SplitGuard float64 `json:"split_guard"`
+	// TailTTL is how long a leaf of the shared prefix tree may go untouched
+	// before eviction. Eviction is tail-only: the middle is never removed.
+	TailTTL Duration `json:"tail_ttl"`
 }
 
 // Discovery configures Kubernetes-based backend discovery. Disabled by default:
@@ -143,7 +154,7 @@ type Discovery struct {
 // one of its two divergent name tables.
 var ValidPolicies = []string{
 	"least-outstanding", "round-robin", "random", "prefix-cache-aware",
-	"prefix-cache-candidates",
+	"prefix-cache-candidates", "prefix-cache-split",
 }
 
 func Default() Config {
@@ -171,6 +182,8 @@ func Default() Config {
 			MaxNodes:            100_000,
 			MaxTokens:           2_000_000,
 			ChunkBytes:          1024,
+			SplitGuard:          0.20,
+			TailTTL:             Duration(5 * time.Minute),
 		},
 		Discovery: Discovery{
 			Mode:           "endpointslice",
@@ -224,6 +237,13 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 			"vLLM itself would 429, for testing a lower ceiling without restarting the backend. A backend at "+
 			"or above this many router-leased in-flight requests is excluded from candidate selection; if "+
 			"every healthy backend is at cap, the router returns 429 instead of 503")
+	fs.Float64Var(&cfg.Cache.SplitGuard, "cache-split-guard", cfg.Cache.SplitGuard,
+		"prefix-cache-split only: a saturated prefix is split onto a backend whose in-flight is below "+
+			"max-node-concurrency * (1 - this). Higher values keep the holder set tighter at the cost of "+
+			"splitting less readily")
+	fs.Var(&cfg.Cache.TailTTL, "cache-tail-ttl",
+		"prefix-cache-split only: how long a leaf of the shared prefix tree may go untouched before "+
+			"eviction, e.g. 5m. Eviction is tail-only; the middle of the tree is never removed")
 	fs.Var(&cfg.HealthInterval, "health-interval", "health check interval, e.g. 10s")
 	fs.Var(&cfg.HealthTimeout, "health-timeout", "per-check timeout, e.g. 5s")
 	fs.StringVar(&cfg.HealthPath, "health-path", cfg.HealthPath, "backend health endpoint path")
@@ -386,6 +406,27 @@ func (c Config) Validate() error {
 	if c.Policy == "prefix-cache-candidates" {
 		if c.Cache.BalanceAbsThreshold <= 0 {
 			errs = append(errs, fmt.Errorf("cache.balance_abs_threshold %v must be > 0 (used as the pending-tasks threshold)", c.Cache.BalanceAbsThreshold))
+		}
+	}
+	if c.Policy == "prefix-cache-split" {
+		// The one setting this policy cannot infer. Left unset, the gateway
+		// applies no admission cap at all while every other capacity source
+		// reads 1 (--backends carries no capacity field, max_inflight_per_backend
+		// defaults to 1, and Backend.Capacity clamps below 1 up to 1) — so the
+		// split guard would be computed against a number that means nothing.
+		// Failing loudly beats a second default that could disagree with the
+		// gateway's own filter; one number has to mean one thing.
+		if c.MaxNodeConcurrency <= 0 {
+			errs = append(errs, errors.New(
+				"max_node_concurrency (--max-node-concurrency) must be > 0 for policy prefix-cache-split: "+
+					"it is both the gateway's admission cap and the limit the split guard is measured against; "+
+					"set it to the backends' vLLM --max-num-seqs"))
+		}
+		if c.Cache.SplitGuard <= 0 || c.Cache.SplitGuard >= 1 {
+			errs = append(errs, fmt.Errorf("cache.split_guard %v must be in (0,1)", c.Cache.SplitGuard))
+		}
+		if time.Duration(c.Cache.TailTTL) <= 0 {
+			errs = append(errs, errors.New("cache.tail_ttl must be > 0"))
 		}
 	}
 	if c.Discovery.Enabled {

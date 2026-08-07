@@ -261,7 +261,7 @@ func TestNoDeadMetrics(t *testing.T) {
 // is caught too.
 func TestCoreDoesNotImportDialects(t *testing.T) {
 	core := []string{
-		"registry", "lease", "policy", "policy/cache",
+		"registry", "lease", "policy", "policy/cache", "policy/affinity",
 		"proxy", "circuit", "health",
 	}
 	for _, pkg := range core {

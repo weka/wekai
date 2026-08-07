@@ -310,3 +310,55 @@ func load(t *testing.T, body string) (config.Config, error) {
 	}
 	return config.Load([]string{"-config", path}, func(string) string { return "" })
 }
+
+// TestSplitPolicyRequiresNodeConcurrency is the loud failure that replaces a
+// silent one. With --backends alone, the gateway applies no admission cap and
+// every other capacity source reads 1 (--backends carries no capacity field,
+// max_inflight_per_backend defaults to 1, Backend.Capacity clamps below 1 up to
+// 1) — so prefix-cache-split would compute its split guard against a number
+// that means nothing, and route plausibly-but-wrongly forever without a signal.
+func TestSplitPolicyRequiresNodeConcurrency(t *testing.T) {
+	_, err := load(t, `{"backends":[{"url":"http://w:8000"}],"policy":"prefix-cache-split"}`)
+	if err == nil {
+		t.Fatal("prefix-cache-split with no max_node_concurrency should be rejected")
+	}
+	if !strings.Contains(err.Error(), "max_node_concurrency") {
+		t.Errorf("the error must name the setting to fix:\n%s", err)
+	}
+
+	if _, err := load(t, `{"backends":[{"url":"http://w:8000"}],
+	    "policy":"prefix-cache-split","max_node_concurrency":32}`); err != nil {
+		t.Errorf("a configured concurrency limit should be accepted: %v", err)
+	}
+}
+
+// TestSplitPolicyKnobsAreValidated: both have defaults, so reaching these
+// errors means an operator set something meaningless on purpose.
+func TestSplitPolicyKnobsAreValidated(t *testing.T) {
+	base := `{"backends":[{"url":"http://w:8000"}],"policy":"prefix-cache-split","max_node_concurrency":32,`
+	for _, tc := range []struct{ frag, want string }{
+		{`"cache":{"split_guard":0,"tail_ttl":"5m"}}`, "split_guard"},
+		{`"cache":{"split_guard":1,"tail_ttl":"5m"}}`, "split_guard"},
+		{`"cache":{"split_guard":0.2,"tail_ttl":"0s"}}`, "tail_ttl"},
+	} {
+		_, err := load(t, base+tc.frag)
+		if err == nil {
+			t.Errorf("%s should be rejected", tc.frag)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error should name %q:\n%s", tc.frag, tc.want, err)
+		}
+	}
+}
+
+// TestOtherPoliciesDoNotRequireNodeConcurrency: the new requirement must not
+// leak onto the policies that shipped without it.
+func TestOtherPoliciesDoNotRequireNodeConcurrency(t *testing.T) {
+	for _, p := range []string{"least-outstanding", "round-robin", "random",
+		"prefix-cache-aware", "prefix-cache-candidates"} {
+		if _, err := load(t, `{"backends":[{"url":"http://w:8000"}],"policy":"`+p+`"}`); err != nil {
+			t.Errorf("policy %s should still start without max_node_concurrency: %v", p, err)
+		}
+	}
+}

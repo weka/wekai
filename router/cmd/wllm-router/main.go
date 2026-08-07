@@ -25,6 +25,7 @@ import (
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/obs"
 	"github.com/weka/wekai/router/internal/policy"
+	"github.com/weka/wekai/router/internal/policy/affinity"
 	cachepolicy "github.com/weka/wekai/router/internal/policy/cache"
 	"github.com/weka/wekai/router/internal/proxy"
 	"github.com/weka/wekai/router/internal/registry"
@@ -82,7 +83,7 @@ func run(args []string) error {
 	reg := metrics.Registry()
 	clk := clock.Real{}
 
-	pol, cachePol, err := buildPolicy(cfg)
+	pol, cachePol, err := buildPolicy(cfg, clk)
 	if err != nil {
 		return err
 	}
@@ -188,6 +189,24 @@ func run(args []string) error {
 		}()
 	}
 
+	// TTL eviction runs on its own ticker rather than from the request path, so
+	// a routing decision never pays for a sweep. Only prefix-cache-split has a
+	// tail set to sweep; the older policies bound their tries by size on insert.
+	if sw, ok := cachePol.(sweeper); ok {
+		go func() {
+			t := clk.NewTicker(sweepInterval(sw.TailTTL()))
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C():
+					sw.Sweep()
+				}
+			}
+		}()
+	}
+
 	// Publish fleet-wide load stats on the health interval, regardless of
 	// policy: router_worker_load_{avg,max,min} answer "how balanced is the
 	// fleet right now" without a PromQL aggregation over per-backend series.
@@ -277,7 +296,24 @@ type cacheLifecycle interface {
 	viz.DataSource
 }
 
-func buildPolicy(cfg config.Config) (proxy.Selector, cacheLifecycle, error) {
+// sweeper is implemented by a cache policy that evicts on a timer rather than
+// on insert. Detected structurally, like policy.Committer, so wiring does not
+// have to name a concrete policy type.
+type sweeper interface {
+	Sweep() int64
+	TailTTL() time.Duration
+}
+
+// sweepInterval picks how often to look for expired tails. A fraction of the
+// TTL so a run is released reasonably promptly after going idle, clamped so a
+// very short TTL cannot spin and a very long one cannot leave the tail set
+// unvisited for an hour.
+func sweepInterval(ttl time.Duration) time.Duration {
+	d := ttl / 10
+	return min(max(d, time.Second), time.Minute)
+}
+
+func buildPolicy(cfg config.Config, clk clock.Clock) (proxy.Selector, cacheLifecycle, error) {
 	switch cfg.Policy {
 	case "least-outstanding":
 		return policy.LeastOutstanding{}, nil, nil
@@ -310,6 +346,21 @@ func buildPolicy(cfg config.Config) (proxy.Selector, cacheLifecycle, error) {
 				MaxTokens: cfg.Cache.MaxTokens,
 			},
 		}, policy.LeastOutstanding{})
+		return p, p, nil
+	case affinity.PolicyName:
+		// One shared tree whose runs record WHICH backends hold them, with no
+		// threshold, a split that grows the holder set under saturation rather
+		// than abandoning affinity, and tail-only TTL eviction. Admission stays
+		// with the gateway: this policy never rejects.
+		p, err := affinity.New(affinity.Config{
+			NodeConcurrency: cfg.MaxNodeConcurrency,
+			SplitGuard:      cfg.Cache.SplitGuard,
+			TailTTL:         cfg.Cache.TailTTL.D(),
+			Clock:           clk,
+		}, policy.LeastOutstanding{})
+		if err != nil {
+			return nil, nil, err
+		}
 		return p, p, nil
 	}
 	return nil, nil, fmt.Errorf("unknown policy %q", cfg.Policy)
