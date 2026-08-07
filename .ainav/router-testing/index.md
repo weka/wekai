@@ -117,7 +117,9 @@ on consecutive ports:
   listing (`/workers`), and readiness (`/readiness`) all live on `--metrics-listen` /
   `--listen` respectively — see [../viz/index.md](../viz/index.md) for the KV map.
 - `--policy prefix-cache-aware` is the routing policy under test; `least-outstanding`
-  (default) is the load-only baseline for A/B.
+  (default) is the load-only baseline for A/B. `prefix-cache-split` is the newer
+  shared-marked-tree policy — see [A/B'ing prefix-cache-split](#abing-prefix-cache-split)
+  below, and note it REQUIRES `--max-node-concurrency`.
 - `--max-node-concurrency N`: a backend at or above N router-leased in-flight requests
   is excluded from candidate selection for EVERY policy (affinity and fallback alike —
   filtered once at the candidate-set level, not per-policy). If every healthy backend
@@ -187,3 +189,55 @@ For anything whose cache-hit numbers matter, use the
   state (never persisted); a stale warm cache from a prior run silently changes the
   next run's cache-hit numbers. Kill both, relaunch, re-gate readiness, then start the
   next arm.
+
+## A/B'ing `prefix-cache-split`
+
+`prefix-cache-split` (`router/internal/policy/affinity/`) is the shared-marked-tree
+policy: one tree whose runs record WHICH backends hold them, no threshold, a split
+that grows the holder set under saturation, and tail-only TTL eviction. See
+[../../router/docs/cache-affinity-redesign.md](../../router/docs/cache-affinity-redesign.md)
+§9 for the design and the numbers.
+
+Operationally it differs from the other policies in three ways worth knowing before
+you run it:
+
+- **`--max-node-concurrency` is MANDATORY.** Startup fails naming the flag if it is
+  unset. It is both the gateway's admission cap and the limit the split guard is
+  measured against, so it has to mean one thing; set it to the backends' real vLLM
+  `--max-num-seqs`. Every other capacity source in the shipped config reads 1.
+- **Two extra knobs:** `--cache-split-guard` (default `0.20`) and `--cache-tail-ttl`
+  (default `5m`).
+- **It never returns 429 itself.** Admission stays with the gateway, so a
+  `429 all_backends_at_capacity` means every healthy backend was at the cap — which
+  is exactly the acceptance criterion, and is why `router_saturation_rejects_total`
+  is the metric to watch.
+
+```bash
+# Arm B: same fleet and replay as the Validated Standard Recipe, new policy.
+/tmp/wllm-router \
+  --listen :8080 --metrics-listen 127.0.0.1:29000 \
+  --backends http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003,http://127.0.0.1:9004 \
+  --policy prefix-cache-split --max-node-concurrency 32
+```
+
+Read these after each arm (`curl -s http://127.0.0.1:29000/metrics | grep ...`):
+
+| Metric | What it tells you |
+|---|---|
+| `router_route_decisions_total` | **Aggregate by label**, never enumerate members — the tiers are `cache`, `split`, `overflow`, `load`, `other`. Anton's bar is "absolute majority routed by cache". |
+| `router_cache_avg_copies` | Mean backends holding each block, target ~1.0. A high value at LOW utilisation is the one to investigate; under oversubscription it rises legitimately because bouncing sessions really are on several nodes. |
+| `router_cache_splits_total` | The holder set grew under saturation. Should track load peaks, not be constant. |
+| `router_cache_overflows_total` | Idle capacity used without marking. These are the requests the reference design would have 429'd while backends sat under their limit. |
+| `router_saturation_rejects_total` | The only rejections. Compare against `router_backend_inflight`: a reject while any backend is under the cap would be a bug. |
+| `router_cache_tree_runs` / `_tail_set` / `_blocks_expired_total` | Whether the TTL is right for the workload's session lifetime. |
+
+**A short smoke run will not discriminate the policies.** With a large shared system
+prompt, `prefix-cache-candidates`'s 0.5 threshold is satisfied anyway and both arms
+score the same. The regime where they diverge is a MODEST shared prefix inside large
+requests (0 vs 192 cache decisions out of ~200 in one measured run), and saturation
+with skewed load, where tiers 2/3 actually fire. Use the long `--total 30000` recipe.
+
+Offline, `go test ./router/internal/policy/affinity/ -run TestFleet -v` replays the
+same workload against the real policy in-process in about a second, and prints the
+verdict, the A/B against `least-outstanding`, and the cross-check against the
+reference simulator's own 3-tier ladder. Start there before booting a fleet.
