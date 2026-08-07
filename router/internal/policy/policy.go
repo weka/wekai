@@ -49,6 +49,18 @@ type RoutingRequest struct {
 	Units    []kvcache.Unit
 	Locality string
 	Deadline time.Time
+	// PolicyState carries opaque per-request state from Select to Commit.
+	//
+	// A policy whose commit depends on WHICH branch its selection took has
+	// nowhere else to put that: Committer.Commit receives only the backend and
+	// this struct. The affinity policy uses it to distinguish a request it
+	// routed onto a cold backend deliberately, to use idle capacity, from one
+	// it means to record as a genuine holder of the prefix.
+	//
+	// Owned by whichever policy is active and meaningless to any other. The
+	// proxy may call Select more than once per request when it retries onto a
+	// different backend, so the last selection wins; Commit runs at most once.
+	PolicyState any
 }
 
 type Policy interface {

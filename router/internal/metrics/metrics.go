@@ -84,15 +84,28 @@ var (
 	}, []string{"policy", "reason"})
 
 	// RouteDecisions classifies every selection that reached an attempt by the
-	// mechanism that actually chose the backend: "cache" (prefix affinity
-	// decided, whether alone or as the tie-break among several cache
-	// candidates), "load" (least-outstanding decided — either because that is
-	// the configured policy, or because a cache policy declined and fell back),
-	// or "other" (round-robin/random). A closed three-value enum, so this is
-	// cheap to keep forever (API-14).
+	// mechanism that actually chose the backend:
+	//
+	//   cache    — prefix affinity decided, whether alone or as the tie-break
+	//              among several cache candidates.
+	//   split    — every backend holding the prefix was saturated, so affinity
+	//              was EXTENDED onto a backend outside the holder set, which
+	//              then becomes a holder too (prefix-cache-split only).
+	//   overflow — holders were saturated and nothing cleared the split guard,
+	//              so idle capacity was used without recording a new holder:
+	//              served cold on purpose, leaving the tree unpolluted
+	//              (prefix-cache-split only).
+	//   load     — least-outstanding decided, either because that is the
+	//              configured policy or because a cache policy declined.
+	//   other    — round-robin/random.
+	//
+	// A closed enum, so this stays cheap to keep forever (API-14). Consumers
+	// must aggregate by label rather than enumerating members: the dashboard
+	// panel that named cache/load/other individually silently dropped traffic
+	// the day split and overflow were added.
 	RouteDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_route_decisions_total",
-		Help: "Selections classified by decision mechanism: cache, load, or other.",
+		Help: "Selections by decision mechanism: cache, split, overflow, load, or other.",
 	}, []string{"decision"})
 
 	// Fleet load. Cache policies already expose per-backend inflight via
@@ -213,6 +226,76 @@ var (
 		Help: "Estimated tokens held in a backend's prefix model.",
 	}, []string{"backend"})
 
+	// --- prefix-cache-split only, from here to CacheBlocksExpired ---
+
+	// CacheSplits counts affinity being EXTENDED under saturation rather than
+	// abandoned: every backend holding the prefix was at its cap, so a backend
+	// outside the holder set was chosen and recorded as a new holder. A healthy
+	// system splits during load peaks and then stops.
+	CacheSplits = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "router_cache_splits_total",
+		Help: "Times the holder set for a prefix was extended onto a new backend under saturation.",
+	})
+
+	// CacheOverflows counts idle capacity being used WITHOUT recording a
+	// holder, because nothing cleared the split guard. This is the capacity the
+	// reference simulator would instead have rejected with a 429 while nodes
+	// sat idle; the difference between this counter and zero is the reason
+	// premature rejections do not happen here.
+	CacheOverflows = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "router_cache_overflows_total",
+		Help: "Requests routed to idle capacity without marking the backend as a prefix holder.",
+	})
+
+	// CacheAvgCopies is the mean number of backends holding each block, and the
+	// tripwire for the one hazard this design knowingly accepts: a run under
+	// continuous traffic never reaches its idle TTL, and TTL is the only thing
+	// that removes a holder, so holder sets on hot runs can only grow. Target
+	// is ~1.0. Sustained drift upward means the same context is being
+	// duplicated across GPUs.
+	CacheAvgCopies = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "router_cache_avg_copies",
+		Help: "Mean number of backends holding each cached block; 1.0 means no duplication.",
+	})
+
+	// CacheAnchorBlocks is how deep, in blocks, the affinity match ran. It
+	// replaces CachePredictedFraction as the affinity-strength signal for this
+	// policy: a fraction of the whole request shrinks as a session grows even
+	// though the backend still holds everything it has ever seen, which is
+	// precisely the defect this policy exists to fix.
+	CacheAnchorBlocks = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "router_cache_anchor_blocks",
+		Help:    "Blocks matched at the anchor run when affinity chose the backend.",
+		Buckets: blockBuckets,
+	})
+
+	// CachePoolSize is how many backends held the anchor. Persistent large
+	// values mean the fleet is converging on "everyone holds everything", which
+	// is the observable form of the CacheAvgCopies hazard.
+	CachePoolSize = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "router_cache_pool_size",
+		Help:    "Number of backends holding the anchor run at selection time.",
+		Buckets: poolBuckets,
+	})
+
+	CacheTreeRuns = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "router_cache_tree_runs",
+		Help: "Compressed runs in the shared prefix tree.",
+	})
+
+	// CacheTailSet is the size of the eviction candidate set. Eviction is
+	// tail-only, so this bounds the sweep's cost and is the evidence for
+	// whether the TTL is set right.
+	CacheTailSet = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "router_cache_tail_set",
+		Help: "Runs currently eligible for TTL eviction (leaves of the shared prefix tree).",
+	})
+
+	CacheBlocksExpired = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "router_cache_blocks_expired_total",
+		Help: "Blocks released by TTL eviction of idle tails.",
+	})
+
 	RequestsShed = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "router_requests_shed_total",
 		Help: "Requests rejected with 503 because the router was at its concurrency cap.",
@@ -251,6 +334,15 @@ var durationBuckets = []float64{
 	0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 240,
 }
 
+// blockBuckets spans a shared system prompt (tens of blocks) through a
+// long-running agentic session (hundreds), at ~256 estimated tokens per block.
+var blockBuckets = []float64{0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048}
+
+// poolBuckets counts backends, so it is small and linear at the low end where
+// the interesting difference between "pinned to one" and "spread over four"
+// lives.
+var poolBuckets = []float64{1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64}
+
 // All returns every collector this package declares. The dead-metric check in
 // hack/ walks this list, so a new collector must be added here to be registered
 // — and must be referenced somewhere to pass.
@@ -264,6 +356,8 @@ func All() []prometheus.Collector {
 		UpstreamErrors, RetriesTotal, StreamAborted, PanicsTotal, ClientDisconnects,
 		LoadAccountingErrors, DiscoveryConflicts,
 		CachePredictedFraction, CacheObservedFraction, CacheEntries, CacheTokens,
+		CacheSplits, CacheOverflows, CacheAvgCopies, CacheAnchorBlocks,
+		CachePoolSize, CacheTreeRuns, CacheTailSet, CacheBlocksExpired,
 		CachePredictionAvg, CachePredictionMax, CachePredictionMin,
 		RequestsShed, SaturationRejects, BackendCapExceeded, observedShadow,
 	}
