@@ -53,8 +53,39 @@ type Config struct {
 	// TailTTL is how long a leaf run may go untouched before eviction.
 	TailTTL time.Duration
 
+	// Ladder selects the decision ladder. Default (zero value) is LadderStrict,
+	// the reference design. See ladderMode.
+	Ladder ladderMode
+
 	Clock clock.Clock
 }
+
+// ladderMode selects what happens when a request's prefix has holders and none
+// of them is available.
+type ladderMode int
+
+const (
+	// LadderStrict is the reference design and the default: the guard is an
+	// absolute rule. A request either lands on a backend that holds its
+	// deepest marked prefix, or splits onto one far enough below the limit to
+	// be worth a copy, or is rejected. There is no serve-anyway path, so the
+	// only way a backend is ever recorded as holding a prefix is a guarded
+	// split.
+	//
+	// This deliberately rejects while idle capacity exists — a backend between
+	// 80% and 100% of the limit is idle-but-unusable — which is Anton's call:
+	// duplication near 1.05 is worth 429s and worth nodes not always reaching
+	// full concurrency.
+	LadderStrict ladderMode = iota
+
+	// LadderServeAnyway is the previous behavior, kept only so the trade can be
+	// re-measured (copies_sweep_test.go). Tier 1 anchors on ANY run a candidate
+	// holds rather than the deepest marked one, and a request that clears no
+	// guard is served anyway without a mark. Measured over a 4x32 fleet it
+	// produces ~50% shallow anchors and avg copies 2.5 at full utilisation,
+	// against 1.0x for LadderStrict.
+	LadderServeAnyway
+)
 
 func (c Config) withDefaults() Config {
 	if c.SplitGuard <= 0 || c.SplitGuard >= 1 {
@@ -74,31 +105,35 @@ func (c Config) withDefaults() Config {
 // The ladder, in order. limit is Config.NodeConcurrency; candidates arrive
 // already filtered by the gateway to healthy backends BELOW that limit.
 //
-//  1. cache    — some run on the request's path is held by a candidate. Route
-//     to the least-loaded holder. No threshold: the deepest run
-//     with an available holder wins however small a share of the
-//     request it is.
-//  2. split    — holders exist but none is a candidate, i.e. they are all
-//     saturated or gone. Route to the least-loaded backend outside
-//     the holder set whose in-flight is under limit*(1-guard), and
-//     record it as a new holder. The holder set GROWS under
-//     pressure instead of affinity being thrown away.
-//  3. overflow — holders exist, nothing clears the guard. Route to the
-//     least-loaded candidate anyway and do NOT record it. The
-//     reference simulator rejects here, which is why its own
-//     verdict reads MARGINAL: with a 20% guard, backends between
-//     80% and 100% of the limit are idle-but-unusable. Anton's
-//     stated reason for the guard is to stop every backend being
-//     marked as holding every prefix — that is about MARKING, not
-//     about refusing to serve. Separating the two keeps the guard's
-//     real job and makes premature rejection impossible.
-//  4. load     — nothing is marked anywhere: a genuinely new prompt. Route by
+//  1. cache  — the DEEPEST marked run on the request's path is held by a
+//     candidate. Route to the least-loaded holder. No threshold: the
+//     deepest run wins however small a share of the request it is.
+//     The anchor must be the deepest marked run, not merely some
+//     ancestor a candidate happens to hold; anchoring on an ancestor
+//     is how a backend ends up marked as holding a session tail it
+//     never had, which is the whole of the duplication problem.
+//  2. split  — holders exist but none is available, i.e. they are all at the
+//     limit or gone. Route to the least-loaded backend outside the
+//     holder set whose in-flight is under limit*(1-guard), and record
+//     it as a new holder. The holder set GROWS under pressure instead
+//     of affinity being thrown away.
+//  3. reject — holders exist and nothing clears the guard. Return
+//     ErrSplitGuardBlocked; the gateway answers 429. Idle capacity
+//     may exist and is deliberately left unused: spending it would
+//     mean a duplicate copy of this prefix, and the guard says that
+//     copy is not worth it. This is Anton's call, taken with the
+//     numbers in front of him — mean holders per block near 1.05 is
+//     worth 429s and worth nodes not always reaching full
+//     concurrency.
+//  4. load   — nothing is marked anywhere: a genuinely new prompt, so there is
+//     no holder set to split from and nothing to duplicate. Route by
 //     least-outstanding and record the result.
 //
-// There is no fifth tier. This policy never rejects: admission is the
-// gateway's, which returns 429 all_backends_at_capacity exactly when no
-// backend is under its limit — so a rejection means zero idle slots
-// fleet-wide, which is the acceptance criterion.
+// The gateway's own admission is unchanged and sits outside this: it filters
+// candidates to healthy backends under the limit and returns 429
+// all_backends_at_capacity when none are left. That rejection means zero idle
+// slots fleet-wide; tier 3's means idle slots existed but every one of them
+// was too close to the limit to be worth a copy.
 type Policy struct {
 	cfg      Config
 	tree     *tree
@@ -184,8 +219,21 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 
 	a := p.tree.walk(pth, candMask)
 
-	// Tier 1: a candidate already holds this prefix.
-	if !a.pool.Empty() {
+	threshold := float64(p.cfg.NodeConcurrency) * (1 - p.cfg.SplitGuard)
+
+	// shallow means the anchor is NOT the deepest marked run: this request's own
+	// holders are unavailable and only a shared ancestor is left. Serving it
+	// there and marking the whole path is what put a session's private tail on
+	// every backend in the fleet, so under LadderStrict it is not a cache hit —
+	// it falls through to the split, which is guarded.
+	shallow := !a.pool.Empty() && !a.availDeepest
+	if shallow {
+		metrics.CacheShallowAnchors.Inc()
+		metrics.CacheShallowAnchorBlocks.Add(float64(a.heldBlocks - a.anchorBlocks))
+	}
+
+	// Tier 1: a candidate holds the deepest marked run.
+	if !a.pool.Empty() && !(shallow && p.cfg.Ladder == LadderStrict) {
 		pool := make([]*registry.Backend, 0, len(cands))
 		for i, c := range cands {
 			if a.pool.Has(slots[i]) {
@@ -206,7 +254,6 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	// available. Either they are all at their concurrency limit or they have
 	// left the fleet.
 	if !a.held.Empty() {
-		threshold := float64(p.cfg.NodeConcurrency) * (1 - p.cfg.SplitGuard)
 		split := make([]*registry.Backend, 0, len(cands))
 		for i, c := range cands {
 			if a.held.Has(slots[i]) {
@@ -224,9 +271,17 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 			return p.fallback.Select(ctx, split, rr)
 		}
 
-		// Nothing cleared the guard, but the gateway has handed us candidates,
-		// so by construction there IS idle capacity. Use it and leave the tree
-		// alone.
+		// Tier 3. Nothing cleared the guard. Idle capacity may exist — a
+		// backend between limit*(1-guard) and the limit is idle and refused on
+		// purpose — because using it means another copy of this prefix, and the
+		// guard is the rule that says the copy is not worth it. Splitting is the
+		// only way a backend is ever added to a holder set; there is no
+		// serve-anyway path.
+		if p.cfg.Ladder == LadderStrict {
+			metrics.CacheGuardRejects.Inc()
+			metrics.PolicyFallbacks.WithLabelValues(p.Name(), "guard_blocked").Inc()
+			return nil, policy.ErrSplitGuardBlocked
+		}
 		rr.PolicyState = noMarkDecision
 		metrics.RouteDecisions.WithLabelValues("overflow").Inc()
 		metrics.CacheOverflows.Inc()

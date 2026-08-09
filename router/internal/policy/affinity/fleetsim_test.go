@@ -741,16 +741,25 @@ func buildSimLadder(clk clock.Clock, cfg simConfig) simPolicy {
 
 // ---------------------------------------------------------------- the tests
 
-// TestFleetVerdictEveryNodeSaturatesBeforeAnyRejection is the acceptance
-// criterion, lifted from the reference simulator's renderVerdict(): a 429
-// before every node has reached its concurrency limit is a FAIL, and a
-// rejection issued while idle slots existed anywhere is a premature one.
+// TestFleetVerdictDuplicationHoldsAtSaturation is the acceptance criterion.
 //
-// Both hold here by construction rather than by tuning, which is the whole
-// point of separating the split guard from the routing decision: admission
-// belongs to the gateway, and the gateway only rejects when no backend is under
-// its limit.
-func TestFleetVerdictEveryNodeSaturatesBeforeAnyRejection(t *testing.T) {
+// It is NOT the reference simulator's renderVerdict(). That function fails a
+// run in which any 429 is issued while idle capacity exists anywhere, and this
+// policy issues a great many of them: with a 20% guard, a backend between 80%
+// and 100% of its limit is idle and refused on purpose, because serving there
+// means a second copy of the prefix. Anton's call, made with these numbers in
+// front of him: mean holders per block near 1.05 is worth the 429s and worth
+// nodes not always reaching full concurrency.
+//
+// So what is asserted here is the thing that call was made FOR — duplication
+// stays near one even at full saturation — and the cost is measured and logged
+// rather than asserted away. The previous ladder scored 3.4 on this workload.
+//
+// The cost turned out to be much smaller than the trade implied: a request that
+// lands warm finishes sooner and frees its slot sooner, so accepted work is
+// unchanged to within a percent while the hit rate rises ~20 points. What is
+// genuinely paid is that the first 429 now arrives before every node has maxed.
+func TestFleetVerdictDuplicationHoldsAtSaturation(t *testing.T) {
 	cfg := saturatedSimConfig()
 	st := newSimFleet(t, cfg, "prefix-cache-split", buildAffinity).run()
 	t.Log(st)
@@ -759,71 +768,91 @@ func TestFleetVerdictEveryNodeSaturatesBeforeAnyRejection(t *testing.T) {
 		t.Fatalf("the workload never saturated the fleet, so the verdict is untested "+
 			"(peak utilisation %.0f%%); raise simConfig.sessions", 100*st.peakUtil)
 	}
-	if !st.saturatedFirst() {
-		t.Errorf("FAIL: first 429 at %v but all nodes maxed at %v (never maxed: %v)",
-			st.firstRejectAt, st.allMaxedAt, st.neverMaxed)
-	}
-	if st.rejPremature != 0 {
-		t.Errorf("%d of %d rejections found idle capacity (mean %.1f%% of the fleet idle, worst %d slots); "+
-			"this policy must never reject while a backend is under its limit",
-			st.rejPremature, st.rej429, st.meanIdlePct(int64(cfg.nodes)*cfg.conc), st.worstIdle)
-	}
 	if st.peakUtil < 0.99 {
-		t.Errorf("peak utilisation %.1f%%, want ~100%% before rejecting", 100*st.peakUtil)
+		t.Errorf("peak utilisation %.1f%%, want ~100%%: the guard is only under test at full load",
+			100*st.peakUtil)
+	}
+
+	// The bar. Under 164% oversubscription the previous ladder reached 3.4
+	// holders per block; the guard exists to keep this near 1.
+	if st.avgCopies > 1.20 {
+		t.Errorf("mean holders per block = %.2f at %.0f%% utilisation, want <= 1.20: the split "+
+			"guard is the only thing that adds a holder, so anything higher means something "+
+			"is marking outside it", st.avgCopies, 100*st.peakUtil)
+	}
+
+	// A rejection must never happen while a backend that HOLDS the prefix was
+	// available — that would be affinity failing, not the guard biting.
+	if st.rejHard == 0 {
+		t.Error("no rejection happened with the fleet genuinely full, so the workload is not " +
+			"exercising the admission path the guard sits behind")
+	}
+
+	// Measured, not asserted: this is the price of the bar above.
+	t.Logf("cost of the guard: %d of %d rejections found idle capacity (mean %.1f%% of the fleet "+
+		"idle, worst %d slots); first 429 at %v, all nodes maxed at %v",
+		st.rejPremature, st.rej429, st.meanIdlePct(int64(cfg.nodes)*cfg.conc), st.worstIdle,
+		st.firstRejectAt, st.allMaxedAt)
+	if !st.saturatedFirst() {
+		t.Logf("note: the reference simulator's renderVerdict() would call this run FAIL "+
+			"(first 429 at %v precedes all-nodes-maxed at %v); accepted deliberately",
+			st.firstRejectAt, st.allMaxedAt)
 	}
 }
 
-// TestSimulatorLadderRejectsWhileCapacityIsIdle is the cross-check against the
-// reference design, and the measurement that justifies diverging from it.
+// TestMatchesReferenceLadderAtSaturation is the cross-check against the
+// reference design, which this policy no longer diverges from on the axis that
+// used to differ.
 //
-// Same seed, same workload, same fleet — only the ladder differs. The reference
-// simulator's route() has no overflow tier: when every holder is saturated and
-// nothing clears the split guard, it rejects. With a 20% guard, every backend
-// sitting between 80% and 100% of its limit is idle-but-unusable, which is
-// exactly why the simulator's own verdict function reports MARGINAL. This test
-// pins that number rather than arguing about it.
-func TestSimulatorLadderRejectsWhileCapacityIsIdle(t *testing.T) {
+// Same seed, same workload, same fleet — only the ladder differs. The one
+// structural difference left is where admission lives: the reference makes its
+// own, so it is handed the unfiltered backend list, while ours inherits the
+// gateway's under-the-limit filter. On behaviour they should now agree, because
+// both refuse rather than serve a prefix onto a backend that fails the guard.
+//
+// The shape of the disagreement is the interesting part if this ever breaks:
+// ours rejecting MORE than the reference would mean the gateway filter and the
+// guard are double-counting; ours duplicating more would mean something still
+// marks outside a split.
+func TestMatchesReferenceLadderAtSaturation(t *testing.T) {
 	cfg := saturatedSimConfig()
 	faithful := newSimFleet(t, cfg, "reference 3-tier ladder", buildSimLadder).run()
 	ours := newSimFleet(t, cfg, "prefix-cache-split", buildAffinity).run()
 
 	t.Log(faithful)
 	t.Log(ours)
+	t.Logf("our decisions by tier: %v", ours.byDecision)
 
 	if faithful.rejPremature == 0 {
 		t.Fatal("the reference ladder rejected nothing prematurely, so either the port " +
 			"or the workload is not reproducing the conditions the guard bites under")
 	}
-	t.Logf("reference ladder: %d of %d rejections found idle capacity "+
-		"(mean %.1f%% of the fleet idle, worst %d slots) -- the MARGINAL verdict",
-		faithful.rejPremature, faithful.rej429,
-		faithful.meanIdlePct(int64(cfg.nodes)*cfg.conc), faithful.worstIdle)
-	t.Logf("prefix-cache-split: %d premature rejections; the %d overflows are the requests "+
-		"the reference would have refused while backends sat under their limit",
-		ours.rejPremature, ours.overflows)
 
-	if ours.rejPremature != 0 {
-		t.Errorf("our ladder issued %d premature rejections; it must issue none", ours.rejPremature)
+	// Duplication must match the reference's, since both now grow a holder set
+	// only through a guarded split.
+	if d := ours.avgCopies - faithful.avgCopies; d > 0.15 {
+		t.Errorf("avg copies %.2f vs reference %.2f (+%.2f): ours is marking through some path "+
+			"the reference does not have", ours.avgCopies, faithful.avgCopies, d)
 	}
 
-	// The trade this buys, reported rather than asserted, because which side is
-	// preferable is a product decision and not a property of the code.
-	//
-	// The reference keeps a markedly higher hit rate (it refuses to serve cold,
-	// so every request it does serve is warm) at the cost of rejecting clients
-	// while backends sit under their limit. Ours serves them, cold if it must,
-	// and pays in hit rate and in duplication as those sessions spread. Total
-	// work completed comes out within a percent either way, so this is not a
-	// throughput argument in either direction: it is 429s versus cache hits.
-	//
-	// On this fleet a mispredicted or cold route costs a KV read from WEKA
-	// rather than a full prefill recompute, which is what makes serving the
-	// better side of that trade here.
-	t.Logf("trade-off at saturation: hit rate %.1f%% (reference %.1f%%), "+
-		"avg copies %.2f (reference %.2f), accepted %d (reference %d)",
+	// Hit rate must not trail the reference by more than noise.
+	if d := faithful.hitRate() - ours.hitRate(); d > 0.03 {
+		t.Errorf("hit rate %.1f%% vs reference %.1f%% (-%.1f points): affinity is landing worse "+
+			"than the design it implements", 100*ours.hitRate(), 100*faithful.hitRate(), 100*d)
+	}
+
+	// Work completed must not trail either: refusing to serve cold frees slots
+	// sooner, so this should come out level rather than paying for the guard.
+	if float64(ours.accepted) < 0.95*float64(faithful.accepted) {
+		t.Errorf("accepted %d vs reference %d: the guard is costing throughput the reference "+
+			"does not pay", ours.accepted, faithful.accepted)
+	}
+
+	t.Logf("at saturation: hit rate %.1f%% (reference %.1f%%), avg copies %.2f (reference %.2f), "+
+		"accepted %d (reference %d), premature 429s %d (reference %d)",
 		100*ours.hitRate(), 100*faithful.hitRate(),
-		ours.avgCopies, faithful.avgCopies, ours.accepted, faithful.accepted)
-	t.Logf("our decisions by tier: %v", ours.byDecision)
+		ours.avgCopies, faithful.avgCopies, ours.accepted, faithful.accepted,
+		ours.rejPremature, faithful.rejPremature)
 }
 
 // TestFleetHolderSetsDoNotExplode is the tripwire for the one hazard this

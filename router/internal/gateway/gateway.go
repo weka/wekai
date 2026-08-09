@@ -6,6 +6,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"time"
@@ -141,7 +142,20 @@ func (s *Server) inferenceHandler(route dialect.Route) http.Handler {
 			accepted = func(b *registry.Backend) { c.Commit(b, rr) }
 		}
 		res := s.px.Serve(w, r, candidates, s.pol, s.dialect, rr, body, accepted)
-		if res.Err != nil && !res.Committed {
+		switch {
+		case res.Committed || res.Err == nil:
+		case errors.Is(res.Err, policy.ErrSplitGuardBlocked):
+			// The policy declined on purpose: every backend holding this
+			// prefix is at its limit and none of the rest is far enough below
+			// it to be worth a duplicate copy. Idle capacity may exist, which
+			// is what makes this a distinct code from all_backends_at_capacity
+			// above — retrying shortly is still the right client behavior, so
+			// the status and Retry-After match.
+			w.Header().Set("Retry-After", "1")
+			s.dialect.WriteError(w, http.StatusTooManyRequests,
+				"split_guard_blocked",
+				"every backend holding this prefix is at its concurrency cap and no other is far enough below it; retry shortly")
+		default:
 			s.dialect.WriteError(w, http.StatusBadGateway,
 				"upstream_unavailable", "all upstream attempts failed")
 		}

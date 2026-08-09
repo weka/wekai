@@ -229,16 +229,21 @@ func TestSplitExtendsTheHolderSetWhenEveryHolderIsSaturated(t *testing.T) {
 	}
 }
 
-// TestOverflowRoutesToIdleCapacityWithoutMarkingIt covers tier 3, the one
-// deliberate divergence from the reference simulator.
+// TestGuardBlockedRejectsRatherThanServingCold covers tier 3.
 //
 // Every holder is saturated and every remaining backend sits inside the guard
-// band — between 80% and 100% of the limit at a 20% guard. The simulator
-// rejects here, which is exactly why its own verdict function reports MARGINAL:
-// real idle slots go unused. This policy serves the request and, crucially,
-// does NOT record a new holder, so the guard still does the job Anton wanted it
-// for.
-func TestOverflowRoutesToIdleCapacityWithoutMarkingIt(t *testing.T) {
+// band — between 80% and 100% of the limit at a 20% guard. Real idle slots
+// exist and are deliberately left unused: serving there would mean a second
+// copy of this prefix, and the guard is the rule that says the copy is not
+// worth it. The request is rejected instead, and the tree is untouched.
+//
+// This was previously an "overflow" tier that served the request cold without
+// marking. Measured on the fleet simulation, serving cold cost 11 to 20 points
+// of hit rate and drove mean holders per block to 2.5-3.4, because the shallow
+// anchor that fed it marked the whole path; the strict ladder holds ~1.02 with
+// the SAME accepted count, since a warm request finishes sooner and frees the
+// slot. See copies_sweep_test.go.
+func TestGuardBlockedRejectsRatherThanServingCold(t *testing.T) {
 	p, _ := newTestPolicy(t)
 	cands := fleet(t, 3)
 
@@ -253,30 +258,65 @@ func TestOverflowRoutesToIdleCapacityWithoutMarkingIt(t *testing.T) {
 		load(t, b, 30)
 	}
 
-	beforeOverflow := counter(t, metrics.CacheOverflows)
+	beforeRejects := counter(t, metrics.CacheGuardRejects)
 	beforeSplits := counter(t, metrics.CacheSplits)
 
 	rr := req(units(1, 2, 3))
 	got, err := p.Select(context.Background(), available, rr)
-	if err != nil {
-		t.Fatalf("Select rejected while idle capacity existed: %v", err)
+	if !errors.Is(err, policy.ErrSplitGuardBlocked) {
+		t.Fatalf("Select returned (%v, %v), want ErrSplitGuardBlocked", got, err)
 	}
-	p.Commit(got, rr)
+	if got != nil {
+		t.Errorf("Select returned backend %v alongside the rejection", got.URL)
+	}
 
-	if d := counter(t, metrics.CacheOverflows) - beforeOverflow; d != 1 {
-		t.Errorf("%v overflows recorded, want 1", d)
+	if d := counter(t, metrics.CacheGuardRejects) - beforeRejects; d != 1 {
+		t.Errorf("%v guard rejects recorded, want 1", d)
 	}
 	if d := counter(t, metrics.CacheSplits) - beforeSplits; d != 0 {
-		t.Errorf("%v splits recorded during an overflow, want 0", d)
+		t.Errorf("%v splits recorded during a guard reject, want 0", d)
 	}
 
-	// The tree must be unchanged: the overflow target is not a holder.
+	// The tree must be unchanged: a rejection creates no holder.
 	a := p.tree.walk(path{units: units(1, 2, 3), modelKey: modelKey("m")}, allSlots(p, cands))
-	if a.pool.Has(p.tree.slotOrCreate(got.URL)) {
-		t.Error("an overflow marked its target as a holder, defeating the guard")
-	}
 	if a.pool.Count() != 1 {
-		t.Errorf("holder count = %d after an overflow, want the original 1", a.pool.Count())
+		t.Errorf("holder count = %d after a guard reject, want the original 1", a.pool.Count())
+	}
+}
+
+// TestShallowAnchorDoesNotServeUnguarded is the regression test for the defect
+// that made this change necessary.
+//
+// The request's own holder is saturated, but a shared ANCESTOR of its path is
+// held by a backend that is available — merely under the limit, not under the
+// guard. Anchoring there and serving is what marked a session's private tail
+// onto every backend in the fleet, because Commit marks the whole path. Tier 1
+// must not answer here; the guard must.
+func TestShallowAnchorDoesNotServeUnguarded(t *testing.T) {
+	p, _ := newTestPolicy(t)
+	cands := fleet(t, 2)
+
+	// A shared ancestor both backends hold.
+	shared := req(units(1, 2))
+	a0 := route(t, p, cands, shared)
+	p.Commit(a0, shared)
+	shared2 := req(units(1, 2))
+	a1 := route(t, p, without(cands, a0), shared2)
+	p.Commit(a1, shared2)
+
+	// One backend extends it with a private tail, then saturates.
+	deep := req(units(1, 2, 3, 4))
+	p.Commit(a0, deep)
+	load(t, a0, testConcurrency)
+
+	// The other is available but inside the guard band.
+	load(t, a1, 30)
+
+	rr := req(units(1, 2, 3, 4))
+	got, err := p.Select(context.Background(), []*registry.Backend{a1}, rr)
+	if !errors.Is(err, policy.ErrSplitGuardBlocked) {
+		t.Fatalf("Select returned (%v, %v) for a shallow anchor; the ancestor must not "+
+			"authorise serving the deep prefix unguarded", got, err)
 	}
 }
 
@@ -319,20 +359,28 @@ func TestSplitGuardBoundary(t *testing.T) {
 		load(t, other, tc.inflight)
 
 		beforeSplits := counter(t, metrics.CacheSplits)
-		beforeOverflow := counter(t, metrics.CacheOverflows)
+		beforeRejects := counter(t, metrics.CacheGuardRejects)
 		rr := req(units(1, 2))
-		if _, err := p.Select(context.Background(), []*registry.Backend{other}, rr); err != nil {
-			t.Fatalf("guard=%v inflight=%d: %v", tc.guard, tc.inflight, err)
-		}
+		_, err = p.Select(context.Background(), []*registry.Backend{other}, rr)
+
 		gotSplit := counter(t, metrics.CacheSplits)-beforeSplits == 1
-		gotOverflow := counter(t, metrics.CacheOverflows)-beforeOverflow == 1
+		gotReject := counter(t, metrics.CacheGuardRejects)-beforeRejects == 1
 
 		if gotSplit != tc.wantSplit {
 			t.Errorf("guard=%v inflight=%d: split=%v, want %v", tc.guard, tc.inflight, gotSplit, tc.wantSplit)
 		}
-		if gotOverflow == tc.wantSplit {
-			t.Errorf("guard=%v inflight=%d: exactly one of split/overflow must fire (split=%v overflow=%v)",
-				tc.guard, tc.inflight, gotSplit, gotOverflow)
+		// Exactly one of the two fires: below the threshold the holder set
+		// grows, at or above it the request is refused. There is no third
+		// outcome — that is the whole of this change.
+		if gotReject == tc.wantSplit {
+			t.Errorf("guard=%v inflight=%d: exactly one of split/reject must fire (split=%v reject=%v)",
+				tc.guard, tc.inflight, gotSplit, gotReject)
+		}
+		if tc.wantSplit && err != nil {
+			t.Errorf("guard=%v inflight=%d: split path returned %v", tc.guard, tc.inflight, err)
+		}
+		if !tc.wantSplit && !errors.Is(err, policy.ErrSplitGuardBlocked) {
+			t.Errorf("guard=%v inflight=%d: got %v, want ErrSplitGuardBlocked", tc.guard, tc.inflight, err)
 		}
 	}
 }

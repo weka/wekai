@@ -303,6 +303,18 @@ type anchors struct {
 	// anchorBlocks is the block depth reached at the pool anchor, reported as
 	// the affinity strength in place of a whole-request fraction.
 	anchorBlocks int
+	// heldBlocks is the block depth reached at the held anchor — the deepest
+	// run marked by anyone at all. It is >= anchorBlocks by the subset
+	// invariant, and the difference is the depth a request gives up when its
+	// own holders are unavailable and it anchors on a shallower ancestor
+	// instead. Those are the blocks a commit then duplicates onto a backend
+	// that did not hold them.
+	heldBlocks int
+	// availDeepest reports whether the pool anchor IS the deepest marked run.
+	// False means the request's most specific holders were all unavailable and
+	// tier 1 fell back to a shared ancestor — the unguarded copy-creating path,
+	// counted by metrics.CacheShallowAnchors.
+	availDeepest bool
 }
 
 // walk finds the anchors for p without mutating anything.
@@ -321,7 +333,7 @@ func (t *tree) walk(p path, cands markSet) anchors {
 	}
 	var avail, marked *run
 	cur, i, n := root, 0, p.len()
-	availAt := 0
+	availAt, markedAt := 0, 0
 	for i < n {
 		child := cur.find(p.hash(i))
 		if child == nil {
@@ -332,7 +344,7 @@ func (t *tree) walk(p path, cands markSet) anchors {
 			m++
 		}
 		if !child.marks.Empty() {
-			marked = child
+			marked, markedAt = child, i+m
 			if child.marks.Intersects(cands) {
 				avail, availAt = child, i+m
 			}
@@ -347,8 +359,10 @@ func (t *tree) walk(p path, cands markSet) anchors {
 		a.pool, a.anchorBlocks = avail.marks.Clone(), availAt
 	}
 	if marked != nil {
-		a.held = marked.marks.Clone()
+		a.held, a.heldBlocks = marked.marks.Clone(), markedAt
 	}
+	// A pointer compare, so the attribution costs nothing on the request path.
+	a.availDeepest = avail != nil && avail == marked
 	return a
 }
 

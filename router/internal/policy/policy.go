@@ -33,6 +33,17 @@ import (
 // with a distinguishable code; a policy never invents a backend (HLT-11).
 var ErrNoCandidates = errors.New("policy: no candidates")
 
+// ErrSplitGuardBlocked reports that every backend holding the request's prefix
+// is at its concurrency limit and no other backend is far enough below it to
+// take a copy of that prefix without the fleet converging on "everyone holds
+// everything". Idle capacity may well exist; the guard forbids spending it on a
+// duplicate.
+//
+// Callers turn this into a 429 with its own code, distinct from the gateway's
+// all_backends_at_capacity (which means zero idle slots fleet-wide). Only
+// prefix-cache-split returns it.
+var ErrSplitGuardBlocked = errors.New("policy: split guard blocked every candidate")
+
 // RoutingRequest is everything a policy may know about a request.
 //
 // Note what is absent: headers, body, and any dialect type. Units are

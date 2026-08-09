@@ -247,6 +247,42 @@ var (
 		Help: "Requests routed to idle capacity without marking the backend as a prefix holder.",
 	})
 
+	// CacheGuardRejects counts the 429s the split guard causes: every backend
+	// holding the prefix was at its limit and no other backend was far enough
+	// below it to be worth a duplicate copy. Idle capacity existed and was
+	// deliberately left unused.
+	//
+	// This is the price of keeping router_cache_avg_copies near 1.0, and the
+	// pair to watch together — a rise here with no fall there means the guard
+	// is costing throughput without buying locality. Distinct from
+	// SaturationRejects, which means zero idle slots fleet-wide.
+	CacheGuardRejects = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "router_cache_guard_rejects_total",
+		Help: "Requests rejected with 429 because no backend cleared the split guard, though idle capacity existed.",
+	})
+
+	// CacheShallowAnchors counts tier-1 decisions whose anchor was NOT the
+	// deepest marked run: the request's own holders were all unavailable, so
+	// affinity fell back to a shared ancestor and served a backend that did not
+	// hold the specific prefix. The commit that follows marks that backend on
+	// the WHOLE path, so this is the unguarded path by which holder sets grow —
+	// the split guard never sees these, because tier 1 answered first.
+	//
+	// Read it against router_cache_splits_total: splits are guarded growth,
+	// these are not.
+	CacheShallowAnchors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "router_cache_shallow_anchors_total",
+		Help: "Affinity decisions anchored on a shared ancestor because the deepest holders were unavailable.",
+	})
+
+	// CacheShallowAnchorBlocks is the block depth those decisions gave up
+	// (deepest marked depth minus anchor depth), i.e. the blocks each one
+	// duplicates onto a new holder. Volume, where CacheShallowAnchors is count.
+	CacheShallowAnchorBlocks = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "router_cache_shallow_anchor_blocks_total",
+		Help: "Blocks of prefix depth forgone by shallow-anchored affinity decisions, and thereby duplicated.",
+	})
+
 	// CacheAvgCopies is the mean number of backends holding each block, and the
 	// tripwire for the one hazard this design knowingly accepts: a run under
 	// continuous traffic never reaches its idle TTL, and TTL is the only thing
@@ -357,6 +393,7 @@ func All() []prometheus.Collector {
 		LoadAccountingErrors, DiscoveryConflicts,
 		CachePredictedFraction, CacheObservedFraction, CacheEntries, CacheTokens,
 		CacheSplits, CacheOverflows, CacheAvgCopies, CacheAnchorBlocks,
+		CacheShallowAnchors, CacheShallowAnchorBlocks, CacheGuardRejects,
 		CachePoolSize, CacheTreeRuns, CacheTailSet, CacheBlocksExpired,
 		CachePredictionAvg, CachePredictionMax, CachePredictionMin,
 		RequestsShed, SaturationRejects, BackendCapExceeded, observedShadow,
