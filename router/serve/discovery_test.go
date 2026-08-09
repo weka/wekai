@@ -18,8 +18,14 @@ import (
 func TestVLLMIsDiscoveredAndOthersFallBackToPassive(t *testing.T) {
 	var probes int
 	vllm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/models" {
+		if r.URL.Path == "/metrics" {
 			probes++
+			// A vLLM instance is identified by its own metric names, whatever
+			// request format it is fronted with.
+			fmt.Fprint(w, "# HELP vllm:num_requests_running\nvllm:num_requests_running 3\n")
+			return
+		}
+		if r.URL.Path == "/v1/models" {
 			fmt.Fprint(w, `{"object":"list","data":[{"id":"m"}]}`)
 			return
 		}
@@ -35,7 +41,7 @@ func TestVLLMIsDiscoveredAndOthersFallBackToPassive(t *testing.T) {
 	// benchmark sampler's retry-forever bug, one layer down.
 	var hostedProbes int
 	hosted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/models" || r.URL.Path == "/health" {
+		if r.URL.Path == "/metrics" || r.URL.Path == "/v1/models" || r.URL.Path == "/health" {
 			hostedProbes++
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -82,6 +88,6 @@ func TestVLLMIsDiscoveredAndOthersFallBackToPassive(t *testing.T) {
 			"a failed probe must be latched, not retried", hostedProbes-before)
 	}
 	if probes != 1 {
-		t.Errorf("vLLM endpoint discovery probed %d times, want exactly 1", probes)
+		t.Errorf("vLLM /metrics was probed %d times, want exactly 1", probes)
 	}
 }

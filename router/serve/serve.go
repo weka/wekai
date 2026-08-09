@@ -403,27 +403,50 @@ func vizData(pools []*pool.Pool) http.HandlerFunc {
 // positive would mean probing /health on something that lacks it, which is why
 // the probe asks for the thing vLLM definitely serves rather than sniffing.
 func probeIsVLLM(ctx context.Context, endpoint string, log *slog.Logger) bool {
+	// /metrics FIRST, because it is the question that actually matters and the
+	// only one whose answer is unambiguous.
+	//
+	// Wire format and engine are independent: a vLLM instance may be fronted so
+	// it accepts Anthropic-format messages, and it still serves vLLM's own
+	// Prometheus metrics at /metrics either way. Deciding "is this vLLM" from
+	// which request schema it accepts would therefore get exactly that
+	// deployment wrong — it would be classed a hosted API and its metrics left
+	// unread. What identifies the engine is the engine's own metric names.
+	if body, ok := probeGet(ctx, endpoint+"/metrics", log); ok && strings.Contains(body, "vllm:") {
+		return true
+	}
+	// Otherwise fall back to the OpenAI model listing. This is a weaker signal —
+	// plenty of things serve it — but it is enough to decide the only thing
+	// riding on this: whether active health probing can work.
+	_, ok := probeGet(ctx, endpoint+"/v1/models", log)
+	if !ok {
+		log.Info("endpoint looks like neither a vLLM instance nor an OpenAI model server; "+
+			"treating as passive", "endpoint", endpoint)
+	}
+	return ok
+}
+
+// probeGet performs one bounded GET and returns a prefix of the body. It never
+// retries: see probeIsVLLM.
+func probeGet(ctx context.Context, url string, log *slog.Logger) (string, bool) {
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, endpoint+"/v1/models", nil)
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
 	if err != nil {
-		return false
+		return "", false
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Info("endpoint did not answer /v1/models; treating as passive",
-			"endpoint", endpoint, "err", err)
-		return false
+		return "", false
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	// Bounded: /metrics on a busy vLLM is large, and this only needs to spot a
+	// metric-name prefix near the top.
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 	if resp.StatusCode != http.StatusOK {
-		log.Info("endpoint did not answer /v1/models; treating as passive",
-			"endpoint", endpoint, "status", resp.StatusCode)
-		return false
+		return "", false
 	}
-	return true
+	return string(b), true
 }
 
 func publishFleetLoad(pools []*pool.Pool) {
