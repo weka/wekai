@@ -50,23 +50,46 @@ type Outcome uint8
 const (
 	Success Outcome = iota
 	Failure
+	// Ignored is neither. The attempt says nothing about backend health, so it
+	// must not move the breaker in either direction — counting it a success
+	// would mask a backend that never serves anything, counting it a failure
+	// would open the breaker on a healthy one.
+	Ignored
 )
 
 // Classify is explicit and total (HLT-9).
 //
-// Failures: transport errors, timeouts, all 5xx, and the overload/backpressure
-// statuses 408, 425, 429. Successes: 2xx, 3xx, and other 4xx — those are the
-// client's fault and say nothing about backend health.
+// Failures: transport errors, timeouts, all 5xx, and 408/425. Successes: 2xx,
+// 3xx, and other 4xx — those are the client's fault and say nothing about
+// backend health.
 //
-// 429 being a failure is deliberate and is the v1 fix: it is simultaneously in
-// the retryable set, so v1 would retry a request elsewhere while recording the
-// overloaded backend as healthy, and the breaker never tripped.
+// 429 is IGNORED, and that is a reversal worth explaining because the opposite
+// was itself a deliberate fix. v1 recorded 429 as a success while also
+// retrying it elsewhere, so an overloaded backend looked healthy forever and
+// the breaker never tripped; the fix made it a failure.
+//
+// That fix was correct when nothing else in the router understood 429. It is
+// wrong now: 429 is the routing flow's ULTIMATE SIGNAL, raised routinely and by
+// design every time a backend is momentarily full, and the flow already
+// responds by excluding that backend and splitting the prefix elsewhere.
+// Leaving it as a health failure means a busy-but-healthy backend trips its
+// breaker and leaves the candidate set entirely — for OpenFor, on a fleet-wide
+// timer, rather than for as long as it is actually full. Under saturation that
+// removes the whole fleet.
+//
+// What replaces it is strictly better targeted: the flow records "refused at
+// in-flight N" against the backend and declines to retry it until its in-flight
+// drops below N. That clears the instant load falls rather than on a timer, and
+// it is per-backend load rather than a health verdict — which is what a 429
+// actually reports. The breaker keeps its real job: outages.
 func Classify(status int, err error) Outcome {
 	if err != nil {
 		return Failure
 	}
 	switch status {
-	case 408, 425, 429:
+	case 429:
+		return Ignored
+	case 408, 425:
 		return Failure
 	}
 	if status >= 500 {
@@ -198,6 +221,13 @@ func (b *Breaker) Allow() (permitted bool, token bool) {
 func (b *Breaker) Record(o Outcome, token bool) {
 	if token {
 		defer b.halfOpenTokens.Add(-1)
+	}
+	// Ignored moves nothing: the half-open probe token is still returned above,
+	// so a backend that answers a probe with 429 neither closes the breaker nor
+	// re-opens it — it simply gets probed again. Anything else would let load
+	// masquerade as health.
+	if o == Ignored {
+		return
 	}
 
 	b.mu.Lock()

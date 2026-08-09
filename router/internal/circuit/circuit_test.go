@@ -34,7 +34,7 @@ func TestClassify429IsFailure(t *testing.T) {
 		{404, nil, circuit.Success},
 		{408, nil, circuit.Failure},
 		{425, nil, circuit.Failure},
-		{429, nil, circuit.Failure}, // the v1 bug
+		{429, nil, circuit.Ignored}, // see below
 		{500, nil, circuit.Failure},
 		{502, nil, circuit.Failure},
 		{503, nil, circuit.Failure},
@@ -45,6 +45,45 @@ func TestClassify429IsFailure(t *testing.T) {
 		if got := circuit.Classify(c.status, c.err); got != c.want {
 			t.Errorf("Classify(%d, %v) = %v, want %v", c.status, c.err, got, c.want)
 		}
+	}
+}
+
+// TestClassify429IsIgnoredNotFailed pins a reversal, so the reasoning travels
+// with it rather than looking like the v1 bug being reintroduced.
+//
+// v1 recorded 429 as a SUCCESS while also retrying it elsewhere, so an
+// overloaded backend looked healthy forever and the breaker never tripped. The
+// fix made it a failure, and that was right while nothing else in the router
+// understood 429.
+//
+// It is wrong now. 429 is the routing flow's ultimate signal, raised routinely
+// and by design whenever a backend is momentarily full, and the flow already
+// answers it by excluding that backend and trying this prefix's other holders.
+// Leaving it a health failure means a busy-but-healthy backend trips its
+// breaker and leaves the candidate set entirely, for OpenFor on a timer rather
+// than for as long as it is actually full — under fleet-wide saturation, that
+// removes the whole fleet.
+//
+// Ignored, not Success: counting it a success would recreate the v1 bug, where
+// a backend that only ever refuses reads as healthy. Ignored moves the breaker
+// in neither direction, and the flow's refused-at-in-flight-N latch does the
+// targeted job instead — clearing when load falls rather than when a timer
+// expires.
+func TestClassify429IsIgnoredNotFailed(t *testing.T) {
+	if got := circuit.Classify(429, nil); got != circuit.Ignored {
+		t.Errorf("Classify(429) = %v, want Ignored", got)
+	}
+	// The breaker must not move in either direction on a refusal.
+	clk := clock.NewFake(time.Time{})
+	b := newBreaker(clk, func(c *circuit.Config) {
+		c.MinRequests = 1
+		c.FailureRate = 0.01
+	})
+	for range 100 {
+		b.Record(circuit.Ignored, false)
+	}
+	if got := b.State(); got != circuit.Closed {
+		t.Errorf("state after 100 refusals = %v, want Closed: a full backend is not a broken one", got)
 	}
 }
 

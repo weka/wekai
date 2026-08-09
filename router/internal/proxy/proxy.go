@@ -142,17 +142,48 @@ type Selector interface {
 // looks warm for a prefix it never received.
 type OnAccepted func(*registry.Backend)
 
+// OnOutcome reports the upstream status of an attempt, whatever it was, to
+// whoever is listening — today the routing flow's signals.
+//
+// This is the path by which a backend's own 429 becomes a split signal. Nothing
+// else in the router is ground truth about a vLLM's capacity: a router-side
+// concurrency limit is a guess at --max-num-seqs, an imbalance is a heuristic,
+// but a 429 is the engine saying it will not take this request. Without this
+// callback the flow can only ever guess.
+//
+// Separate from OnAccepted because that one means "commit the prefix" and fires
+// only on 2xx; this one fires on every completed attempt, including the
+// refusals OnAccepted deliberately ignores.
+type OnOutcome func(b *registry.Backend, status int)
+
 // Serve routes one request, retrying on a different backend where allowed.
 func (p *Proxy) Serve(
 	w http.ResponseWriter, r *http.Request,
 	candidates []*registry.Backend,
 	sel Selector, d dialect.Dialect,
 	rr *policy.RoutingRequest, body []byte,
-	accepted OnAccepted,
+	accepted OnAccepted, outcome OnOutcome,
 ) Result {
 	res := Result{}
 	remaining := append([]*registry.Backend(nil), candidates...)
 	committed := false
+
+	// Two budgets, because a 429 and a 502 mean different things.
+	//
+	// MaxAttempts bounds retries after a FAILURE — the backend broke, and
+	// replaying an expensive request is a cost we cap tightly (default 2).
+	//
+	// A 429 is not a failure. The backend is healthy and simply full, and the
+	// flow's answer is to try this prefix's other holders before it will
+	// consider splitting onto a backend that does not hold it at all. That has
+	// to be allowed to walk the holder set, so refusals draw on their own
+	// budget, bounded by the number of candidates: each refusal both removes
+	// that backend from `remaining` and latches it as refused-at-its-current
+	// in-flight, so the usable set strictly shrinks and the loop terminates.
+	//
+	// Splitting is not attempted here. It is what Select does once no holder is
+	// usable, which is exactly the state a walk of the holder set leaves behind.
+	failovers, maxFailovers := 0, len(candidates)
 
 	for attempt := 0; attempt < p.cfg.MaxAttempts; attempt++ {
 		if len(remaining) == 0 {
@@ -181,8 +212,9 @@ func (p *Proxy) Serve(
 		res.Backend = b
 		res.Attempts++
 
-		canRetry := attempt+1 < p.cfg.MaxAttempts && len(remaining) > 1
-		out := p.attempt(w, r, b, d, body, &committed, canRetry, accepted)
+		refusalsLeft := failovers < maxFailovers
+		canRetry := (attempt+1 < p.cfg.MaxAttempts || refusalsLeft) && len(remaining) > 1
+		out := p.attempt(w, r, b, d, body, &committed, canRetry, accepted, outcome)
 		b.CB.Record(circuit.Classify(out.status, out.err), token)
 		if out.err != nil {
 			metrics.UpstreamErrors.WithLabelValues(b.URL, kindOf(out.err)).Inc()
@@ -192,6 +224,21 @@ func (p *Proxy) Serve(
 		}
 
 		res.Status, res.Err, res.Committed = out.status, out.err, committed
+
+		// A refusal does not spend the failure budget: the backend is healthy,
+		// it is full, and walking this prefix's remaining holders is the
+		// intended response rather than error recovery. It draws on the
+		// failover budget instead, which is why this is checked BEFORE the
+		// MaxAttempts guard below — at the shipped MaxAttempts of 2 that guard
+		// would otherwise end the walk after a single refusal.
+		refused := out.status == http.StatusTooManyRequests && failovers < maxFailovers
+		if refused && out.retryable && !committed && len(remaining) > 1 {
+			failovers++
+			attempt-- // undone by the loop's increment: refusals do not count
+			metrics.RetriesTotal.WithLabelValues("refused", "retried").Inc()
+			remaining = without(remaining, b)
+			continue
+		}
 
 		if !out.retryable || committed || attempt+1 >= p.cfg.MaxAttempts {
 			return res
@@ -245,7 +292,7 @@ type attemptOut struct {
 func (p *Proxy) attempt(
 	w http.ResponseWriter, r *http.Request,
 	b *registry.Backend, d dialect.Dialect,
-	body []byte, committed *bool, canRetry bool, accepted OnAccepted,
+	body []byte, committed *bool, canRetry bool, accepted OnAccepted, outcome OnOutcome,
 ) attemptOut {
 	// The lease is the only in-flight increment in the program (LB-1), and the
 	// deferred release fires after ServeHTTP returns — i.e. after the response
@@ -307,6 +354,13 @@ func (p *Proxy) attempt(
 	}
 	rp.ModifyResponse = func(resp *http.Response) error {
 		upstreamStatus = resp.StatusCode
+		// Report the outcome BEFORE the retry branch below returns: a 429 is
+		// exactly the case that gets retried, and it is also exactly the signal
+		// the flow needs. Reporting after the early return would drop every
+		// refusal the router acts on.
+		if outcome != nil {
+			outcome(b, resp.StatusCode)
+		}
 		if canRetry && !*committed && isRetryable(resp.StatusCode, nil) {
 			// Returning an error makes ReverseProxy close the upstream body and
 			// call ErrorHandler INSTEAD of copying the response. That is what
