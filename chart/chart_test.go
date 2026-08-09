@@ -5,7 +5,9 @@
 package chart
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -187,5 +189,27 @@ func TestRouterChartRBACIsOptedInto(t *testing.T) {
 		"--set", "discovery.enabled=true", "--set", "discovery.mode=pod")
 	if !strings.Contains(podMode, `resources: ["pods"]`) {
 		t.Error("pod-mode discovery did not grant pod read, so it cannot work")
+	}
+}
+
+// TestRouterChartPassesRoutesVerbatim: a route is one string, and every part of
+// its syntax — pipe-separated endpoints for a pool, and `as <model>` to rewrite
+// before forwarding — must survive templating unchanged. Helm quoting is the
+// obvious place for a route to arrive subtly different from what the operator
+// wrote, and it would fail at runtime rather than at render.
+func TestRouterChartPassesRoutesVerbatim(t *testing.T) {
+	const route = "sonnet,big => http://a:8000|http://b:8000 as Qwen/Qwen3-32B"
+	// A values FILE, not --set: helm's --set splits on commas, so a route with
+	// several model patterns is truncated at the first one. That is a helm CLI
+	// property rather than a chart defect, and it is why the docs tell operators
+	// to put routes in values.yaml.
+	dir := t.TempDir()
+	vals := filepath.Join(dir, "values.yaml")
+	if err := os.WriteFile(vals, []byte("router:\n  routes:\n    - \""+route+"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := renderRouter(t, "-f", vals)
+	if !strings.Contains(out, `- "--route=`+route+`"`) {
+		t.Errorf("route did not survive templating verbatim; wanted %q in:\n%s", route, out)
 	}
 }
