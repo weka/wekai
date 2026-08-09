@@ -126,36 +126,37 @@ on consecutive ports:
   say so. Use it to test a lower ceiling than the real fleet's own
   `WEKA_MAX_CONCURRENT_REQUESTS` without restarting vLLM. It is no longer an admission
   filter in the gateway and no longer mandatory.
-- The two 429s are distinct and both carry `Retry-After: 1`:
-  `all_backends_saturated` (no backend can take work) and `split_guard_blocked`
-  (capacity exists, but every idle backend is inside the guard band, so spending it
-  would mean a duplicate copy of this prefix). Both differ from
-  `503 no_healthy_backends` (an outage) and the router-wide
-  `--max-concurrent-requests` `503 router_at_capacity` shed.
-- `/readiness` reflects backend HEALTH only — a fully saturated router still answers
+- **Reading a 429 in a run:** `all_backends_saturated` means nothing could take work;
+  `split_guard_blocked` means capacity existed and the guard refused to spend it on a
+  duplicate copy of the prefix. Neither is an error — the second is the policy working
+  as designed. The 503s mean something else entirely (`no_healthy_backends` is an
+  outage, `router_at_capacity` is the router's own shed).
+- `/readiness` reflects backend HEALTH only — a saturated router still answers
   ready=true and sheds with 429.
 
-### Signals: what replaced the policies
+### Which signals to enable for a test run
 
-`--policy` and its six values are gone. `least-outstanding` became the flow's selector;
-`prefix-cache-aware`'s spill guard and `prefix-cache-candidates`' `MaxPending` came back
-as signals; `round-robin` and `random` were deleted outright.
+`--help` is authoritative on what each flag does; `policy/affinity/signal.go` is
+authoritative on how. What matters when SIZING A RUN:
 
-| signal | enabled by | what it is |
-|---|---|---|
-| `refused` | always on | the backend's own 429 — the only ground truth about a vLLM's capacity. Latched against the in-flight count it happened at, so it clears when load falls rather than on a timer. |
-| `concurrency` | `--max-node-concurrency N` | the router's guess at `--max-num-seqs`. Predicts saturation instead of discovering it a round trip late. |
-| `imbalance` | `--rebalance-ratio R` | `(inflight - fleetMin)/inflight > R`. Off by default: a fleet where affinity is working is SUPPOSED to look imbalanced. |
+- The `refused` signal is always on and needs nothing. **A bare `--backends` router is
+  a valid arm**, and it is the only configuration where a routing mistake is not
+  masked by the router's own guess — worth running whenever a change touches the
+  refusal path.
+- `--max-node-concurrency` is what makes a run comparable to the historical arms
+  below, and what lets you test a lower ceiling than the fleet's real one.
+- `--rebalance-ratio` trades locality for evenness. Leave it off unless that trade is
+  what you are measuring; a fleet where affinity is working is supposed to look
+  imbalanced.
 
 Watch `router_signal_fired_total{signal=...}` to see which one is actually driving
-decisions. An opt-in signal firing far more than `refused` means it is predicting
+decisions. An opt-in signal firing far more often than `refused` is predicting
 saturation the backends do not have.
 
 **Measured (4x32, `--total 30000`, client concurrency 128, 58-day capture):** the
-`refused` signal ALONE, with no router-side limit at all and the mock fleet 429ing at
-its own `--max-concurrency 32`, lands within noise of the concurrency signal —
-avg_copies 1.078 vs 1.085, 5m42s vs 6m6s, 30000/30000 and zero errors either way. You
-can run with no configured limit and lose nothing measurable.
+`refused` signal ALONE, with no router-side limit and the mock fleet 429ing at its own
+`--max-concurrency 32`, landed within noise of the concurrency signal — avg copies
+1.078 vs 1.085, 5m42s vs 6m6s, 30000/30000 and zero errors either way.
 
 ## 4. Readiness-gate BEFORE benchmarking
 

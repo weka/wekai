@@ -40,8 +40,6 @@ tree.
 
 ## Code
 
-`router/internal/viz/` — `viz.go` (types, handlers), `page.html` (embedded via
-`embed.go`), `router/internal/policy/affinity/snapshot.go` (the `viz.DataSource`
-implementation). The shared tree is natively the shape the page wants, so there is no
-per-poll merge step — the second implementation that used to walk N per-backend tries
-went with `policy/cache`.
+`router/internal/viz/` (types, handlers, embedded page) and
+`router/internal/policy/affinity/snapshot.go` (the `viz.DataSource`). The shared tree
+is natively the shape the page wants, so there is no per-poll merge step.

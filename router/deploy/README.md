@@ -2,11 +2,6 @@
 
 Two deliverables: a static Go binary and a Kubernetes-ready container image.
 
-**Migrating from the Rust vllm-router? Read [MIGRATION.md](../docs/MIGRATION.md)
-first.** Metric names, several endpoints, the probe configuration and the API
-key variable all changed, and the first three of those change without producing
-an error.
-
 ## Build
 
 All targets live in the repository-root `Makefile`; run them from the repo root.

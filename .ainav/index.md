@@ -38,7 +38,7 @@ routing gateway. Two things live in one module:
 
 | Directory | Purpose |
 |-----------|---------|
-| `kvcache/` | Shared prefix-cache trie engine (stdlib-only) — chain-hashed blocks, pin/evict, chains. Used by the router's cache policy, the mock vLLM's ground truth, and the benchmark's token estimator. |
+| `kvcache/` | Shared prefix-cache trie engine (stdlib-only leaf). Used by the benchmark and the mock vLLM; NOT by the router, which owns its own shared tree. |
 | `router/cmd/wllm-router/` | The router binary entrypoint |
 | `router/cmd/mock-vllm/` | GPU-less mock vLLM server binary entrypoint |
 | `router/internal/` | Router packages: `gateway` (HTTP surface), `policy`/`policy/affinity` (the one routing flow + its signals), `registry`/`lease` (backend state, in-flight leases), `proxy` (upstream forwarding), `dialect/openai` (wire format), `mockvllm` (mock engine), `viz` (`/router-viz`), `hack` (architectural fence tests) |
