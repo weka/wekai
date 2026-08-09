@@ -252,9 +252,16 @@ func run(args []string) error {
 	srv := gw.HTTPServer(cfg.Listen)
 	errCh := make(chan error, 1)
 	go func() {
+		// Log the SIGNALS, not a policy name. There is one routing flow, so
+		// "policy" said nothing; what actually differs between two deployments
+		// is which capacity signals are on and what they are tuned to, and
+		// that was previously invisible — an operator could not tell from the
+		// router's own output whether --rebalance-ratio was set.
 		log.Info("router listening",
 			"listen", cfg.Listen, "metrics", cfg.MetricsListen,
-			"policy", pol.Name(), "static_backends", len(cfg.Backends),
+			"flow", pol.Name(), "signals", signalSummary(cfg),
+			"split_guard", cfg.Cache.SplitGuard,
+			"static_backends", len(cfg.Backends),
 			"discovery", cfg.Discovery.Enabled, "auth", cfg.APIKey != "",
 			"version", version, "commit", commit)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -338,6 +345,20 @@ func buildFlow(cfg config.Config, clk clock.Clock) (proxy.Selector, cacheLifecyc
 		return nil, nil, err
 	}
 	return p, p, nil
+}
+
+// signalSummary renders the enabled split signals for the startup log.
+// "refused" is always present: a backend's own 429 needs no configuration and
+// cannot be turned off.
+func signalSummary(cfg config.Config) string {
+	out := "refused"
+	if cfg.MaxNodeConcurrency > 0 {
+		out += fmt.Sprintf(",concurrency=%d", cfg.MaxNodeConcurrency)
+	}
+	if cfg.RebalanceRatio > 0 {
+		out += fmt.Sprintf(",imbalance=%.3g", cfg.RebalanceRatio)
+	}
+	return out
 }
 
 // transitionLogger logs every circuit transition with the counters that caused

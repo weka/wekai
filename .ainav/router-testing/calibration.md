@@ -44,49 +44,76 @@ vs output) that drive routing/caching decisions while shrinking wall-clock run t
   the standard speedup for routing-improvement work (see
   [index.md](index.md#validated-standard-recipe-routing-improvement-work)'s recipe).
   Needs a LONG run (`--total 30000`, ~6 min) to be cache-realistic — see below.
-- **×100**: fast logic-smoke loop ONLY — does it route at all, does it 429 correctly,
-  does the tree render. See the measurement below for why it is not a faster version
-  of the same experiment.
+- **×100**: the validated fast loop, ~1 minute. Detects a routing regression reliably
+  but UNDERSTATES its size — see the matrix below. Use it for go/no-go, never for a
+  number you intend to cite.
+- **×1000**: pointless. Elapsed barely moves (50s vs 60s at ×100) because the
+  bottleneck is the harness, not the backends. Nothing above ×100 buys anything.
 
 **Speedup does not scale `--cache-tail-ttl`, and it should.** The TTL is wall-clock
 and purely a memory bound, but leaving it at 5m while multiplying rates by K means the
-SIMULATED retention window grows by K — at ×100 a 43-second run evicts nothing, so the
-tree only accumulates. Divide it like the base latency: `--cache-tail-ttl 3s` at ×100.
-This changes no routing decision (eviction only removes childless runs whose sessions
-are long dead) but it does move `router_cache_avg_copies`, which is a mean over
-whatever is currently in the tree: dead sessions' runs are overwhelmingly
+SIMULATED retention window grows by K — at ×100 a one-minute run evicts nothing, so
+the tree only accumulates. Divide it like the base latency: `--cache-tail-ttl 3s` at
+×100. This changes no routing decision (eviction only removes childless runs whose
+sessions are long dead) but it does move `router_cache_avg_copies`, which is a mean
+over whatever is currently in the tree: dead sessions' runs are overwhelmingly
 single-holder, so retaining them dilutes the mean toward 1.0.
 
-### Measured: ×100 changes the operating point, not just the clock
+### Validated: what a speedup can and cannot tell you
 
-A ×100 arm against the ×10 reference (both `--total 30000`, 4x32, client concurrency
-128, `--max-node-concurrency 32`):
+Two configurations, three speedups, `--total 30000`, 4 instances, client concurrency
+128, mock `--max-concurrency 32` in every arm so only the router config varies.
 
-| | ×10 | ×100 |
-|---|---|---|
-| elapsed | 6m6s | 43s |
-| guard 429s | 17,362 | **637** |
-| `concurrency` signal firings | 56,246 | 4,276 |
-| sessions walked | 1699 | **1059** |
-| requests per session | 17.6 | **28** |
-| output tokens | 12.1M | **6.9M** |
-| `avg_copies` | 1.085 | 1.034 |
+- **good** — no router-side limit at all; the `refused` signal (the backend's own 429)
+  and the default `--cache-split-guard 0.20`.
+- **bad** — `--rebalance-ratio 0.05 --cache-split-guard 0.01`: an imbalance signal that
+  fires constantly, and a guard too low to stop the splits it provokes.
 
-**The fleet is not saturated at ×100.** The speedup compresses backend service time
-but not the harness: the router's lease spans dispatch to body-fully-copied, which at
-×100 is milliseconds, so most of the client's 128 in-flight requests sit in
-client-side work rather than in router leases. Router-side in-flight per backend stays
-well under the cap, and peak 1930 req/s says the bottleneck has moved to the driver.
+| speedup | config | elapsed | `avg_copies` | splits | guard 429s | server cache |
+|---|---|---|---|---|---|---|
+| ×10 | good | 5m51s | 1.069 | 415 | 18,283 | 61.6% |
+| ×10 | **bad** | 5m57s | **1.679** | **10,042** | **0** | **38.4%** |
+| ×100 | good | 1m0s | 1.021 | 42 | 244 | — |
+| ×100 | **bad** | 1m6s | **1.254** | **2,991** | 53 | — |
+| ×1000 | good | 53s | 1.029 | 18 | 14 | — |
+| ×1000 | **bad** | 50s | **1.269** | **3,652** | 36 | — |
 
-The workload sampled also differs — 1059 sessions instead of 1699, nearly twice the
-requests per session, and 43% fewer output tokens — so the two runs are not measuring
-the same traffic either.
+All six completed 30000/30000 with zero client errors.
 
-Restoring saturation would need BOTH a scaled TTL and a client concurrency raised
-until `router_backend_inflight` sits near the cap again, and that combination is
-unvalidated. Until someone does that work, the honest fast loop is
-`go test ./router/internal/policy/affinity/ -run TestFleet` — about a second, drives
-the real flow, and carries per-backend ground truth.
+**Direction survives the speedup; magnitude does not.** The good-to-bad gap on
+`avg_copies` is +0.610 at ×10 but only +0.233 at ×100 and +0.240 at ×1000 — a fast run
+understates the damage by about 2.6x. It would have caught this regression instantly;
+it would also have told you a broken guard costs 0.23 when it really costs 0.61.
+
+**The sharpest discriminator is not `avg_copies` — it is guard 429s inverting.** At
+×10 the healthy config rejects 18,283 requests and the broken one rejects **zero**. A
+guard that never refuses anything is a guard that is not doing its job, and that reads
+as a clean binary. Below ×10 the same inversion is present (244 vs 53) but the
+absolute counts are too small to trust. Read `router_cache_guard_rejects_total` and
+`router_cache_avg_copies` together, always: a misconfiguration lands in one or the
+other depending on where the guard sits, and either one alone misses half the failure
+space.
+
+**Why magnitude shrinks: the fleet is not saturated above ×10.** The speedup
+compresses backend service time but not the harness. The router's lease spans dispatch
+to body-fully-copied, milliseconds at ×100, so most of the client's in-flight requests
+sit in client-side work rather than router leases; router-side in-flight per backend
+stays well under the cap and peak throughput of ~1900 req/s says the driver is the
+bottleneck. The sampled workload shifts with it — a ×100 run walks ~1050 sessions
+instead of ~1730, at nearly twice the requests per session. Everything the split guard
+exists to do happens under saturation, so a fast run exercises it only weakly.
+
+**Sanity anchor.** The `bad` arm at ×10 lands at `avg_copies` 1.679 with 38.4% server
+cache — within noise of the numbers this router produced BEFORE the guard existed
+(1.675 / 38.4%). Setting the guard to 0.01 effectively removes it and the original
+defect returns to two decimal places, which is the clearest confirmation available
+that the guard is the mechanism that fixed it. It doubles as a regression fixture: if
+a future change makes the `good` arm look like the `bad` one, the guard has stopped
+working.
+
+**Use it as:** ×100 for go/no-go on every change; ×10 before citing any number;
+`go test ./router/internal/policy/affinity/ -run TestFleet` (about a second, real flow,
+per-backend ground truth) before either.
 
 ## Depth matters: run length changes what a run is valid evidence for
 
