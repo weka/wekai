@@ -85,6 +85,16 @@ func RequestID(ctx context.Context) string { return str(ctx, keyRequestID) }
 type RouteInfo struct {
 	Class   string
 	Dialect string
+
+	// Pool, Backend and ModelOut are the routing OUTCOME, filled in once the
+	// pool is chosen and the upstream has been picked. Capture reads them from
+	// outside the mux for the same reason the access log reads Class from
+	// there: it wraps the handler, so it cannot see a context derived inside
+	// it, and without these a captured record cannot say where a request
+	// actually went.
+	Pool     string
+	Backend  string
+	ModelOut string
 }
 
 // WithRouteHolder attaches an empty holder for a handler to populate.
@@ -98,6 +108,29 @@ func SetRoute(ctx context.Context, class, dialect string) {
 	if ri, ok := ctx.Value(keyRouteClass).(*RouteInfo); ok {
 		ri.Class, ri.Dialect = class, dialect
 	}
+}
+
+// SetTarget records where this request was routed.
+func SetTarget(ctx context.Context, pool, modelOut string) {
+	if ri, ok := ctx.Value(keyRouteClass).(*RouteInfo); ok {
+		ri.Pool, ri.ModelOut = pool, modelOut
+	}
+}
+
+// SetBackend records which upstream actually served it, which is known only
+// after selection and may differ from the first attempt after a retry.
+func SetBackend(ctx context.Context, url string) {
+	if ri, ok := ctx.Value(keyRouteClass).(*RouteInfo); ok {
+		ri.Backend = url
+	}
+}
+
+// Target reports the routing outcome, or the zero value if nothing routed.
+func Target(ctx context.Context) RouteInfo {
+	if ri, ok := ctx.Value(keyRouteClass).(*RouteInfo); ok {
+		return *ri
+	}
+	return RouteInfo{}
 }
 
 func RouteClass(ctx context.Context) string {

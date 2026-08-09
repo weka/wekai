@@ -54,8 +54,19 @@ func (s *Server) build() http.Handler {
 	// class and the dialect — never sniffed from the body (API-5, API-N1).
 	for _, rt := range s.dialect.Routes() {
 		route := rt
-		mux.Handle(route.Pattern, s.inferenceHandler(route))
+		mux.Handle(route.Pattern, s.inferenceHandler(route, true))
 	}
+
+	// Passthrough. Anything the dialect does not claim is still proxied to the
+	// pool the request's model resolves to — by load, with no prefix affinity,
+	// because there is nothing to be affine to: units are dialect knowledge and
+	// this path has none.
+	//
+	// This is what lets one router front both a local vLLM fleet on
+	// /v1/chat/completions AND a hosted API on its own paths — Anthropic's
+	// /v1/messages, say — which is how captured traffic was collected in the
+	// first place. Dropping it would have made the merge a regression.
+	mux.Handle("/", s.inferenceHandler(dialect.Route{Pattern: "/", Class: "passthrough"}, false))
 
 	// Operational endpoints.
 	mux.HandleFunc("GET /liveness", s.handleLiveness)
@@ -85,7 +96,7 @@ func (s *Server) build() http.Handler {
 }
 
 // inferenceHandler proxies one request class to a selected backend.
-func (s *Server) inferenceHandler(route dialect.Route) http.Handler {
+func (s *Server) inferenceHandler(route dialect.Route, affine bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		obs.SetRoute(ctx, route.Class, s.dialect.ID())
@@ -112,8 +123,10 @@ func (s *Server) inferenceHandler(route dialect.Route) http.Handler {
 			Model:      intro.Model,
 			Stream:     intro.Stream,
 		}
-		if units, ok := s.dialect.ExtractUnits(body, route.Class, nil); ok {
-			rr.Units = units
+		if affine {
+			if units, ok := s.dialect.ExtractUnits(body, route.Class, nil); ok {
+				rr.Units = units
+			}
 		}
 
 		target, ok := s.router.Route(intro.Model)
@@ -133,6 +146,7 @@ func (s *Server) inferenceHandler(route dialect.Route) http.Handler {
 		if target.StripAuth {
 			stripInboundCredentials(r)
 		}
+		obs.SetTarget(ctx, target.Name, target.RewriteModel)
 
 		candidates := s.candidates(target)
 		if len(candidates) == 0 {
@@ -164,6 +178,9 @@ func (s *Server) inferenceHandler(route dialect.Route) http.Handler {
 			}
 		}
 		res := s.px.Serve(w, r, candidates, target.Selector, s.dialect, rr, body, accepted, outcome)
+		if res.Backend != nil {
+			obs.SetBackend(ctx, res.Backend.URL)
+		}
 		switch {
 		case res.Committed || res.Err == nil:
 		case errors.Is(res.Err, policy.ErrSplitGuardBlocked):

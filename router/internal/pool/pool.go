@@ -134,8 +134,18 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Pool, error) {
 		if b.Passive {
 			spec.Health = registry.HealthPassive
 		}
-		if _, err := reg.Add(spec); err != nil {
+		be, err := reg.Add(spec)
+		if err != nil {
 			return nil, fmt.Errorf("pool %q backend %q: %w", cfg.Name, b.URL, err)
+		}
+		if b.Passive {
+			// A passive backend is never probed — its health comes solely from
+			// proxied request outcomes (HLT-12). It must therefore start
+			// ELIGIBLE, or it waits forever for a check that never runs. This
+			// is what a hosted API needs: there is no /health to probe, and
+			// probing one means a 404 every interval and a backend that is
+			// never usable.
+			be.SetHealth(registry.Healthy)
 		}
 	}
 
