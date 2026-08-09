@@ -16,9 +16,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/weka/wekai/router/internal/clock"
@@ -34,6 +36,9 @@ import (
 	"github.com/weka/wekai/router/internal/routing"
 	"github.com/weka/wekai/router/internal/viz"
 )
+
+// registerDialectOnce guards the process-global dialect registry; see Handler.
+var registerDialectOnce sync.Once
 
 // Route is one routing rule as an operator writes it.
 type Route struct {
@@ -53,11 +58,17 @@ type Route struct {
 	// or "default" for the catch-all.
 	Name string
 
-	// Passive skips active health probing. A hosted API has no /health to
-	// probe, so probing one means a 404 every interval and a backend that is
-	// never marked healthy — health is inferred from real traffic instead.
-	// This is the first piece of per-endpoint typing; richer typing (which
-	// upstreams expose vLLM metrics, say) belongs here too.
+	// Passive forces this route's endpoints to skip active health probing.
+	//
+	// Normally this is DISCOVERED rather than declared: a vLLM-style backend
+	// answers GET /v1/models, and one that does is probed actively and gets
+	// prefix affinity. Anything that does not — a hosted API behind a
+	// different surface — falls back to passive automatically.
+	//
+	// Set this when discovery would guess wrong, or to skip the probe entirely
+	// for an upstream you already know is not vLLM. Anthropic is the case that
+	// motivated keeping the override: it answers nothing useful at /v1/models
+	// and there is no reason to ask it twice.
 	Passive bool
 }
 
@@ -195,10 +206,15 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 	}
 	opts = opts.withDefaults()
 
-	// One dialect. Registered here, at the wiring layer, rather than as a
-	// package side effect, so what is compiled in is explicit (API-3).
+	// One dialect, registered at the wiring layer rather than as a package side
+	// effect, so what is compiled in is explicit (API-3).
+	//
+	// Once per process: registration panics on a duplicate, and Handler is
+	// callable more than once — a test builds several routers, and an embedder
+	// may too. The registry is process-global, so this is the one piece of
+	// wiring that cannot be per-router.
 	d := openai.New()
-	dialect.Register(d)
+	registerDialectOnce.Do(func() { dialect.Register(d) })
 
 	clk := clock.Real{}
 	var rules []routing.Rule
@@ -211,7 +227,11 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		}
 		var backends []pool.Backend
 		for _, ep := range rt.Endpoints {
-			backends = append(backends, pool.Backend{URL: ep, Passive: rt.Passive})
+			passive := rt.Passive
+			if !passive {
+				passive = !probeIsVLLM(ctx, ep, log)
+			}
+			backends = append(backends, pool.Backend{URL: ep, Passive: passive})
 		}
 		flow := opts.flowConfig()
 		flow.PoolName = name
@@ -364,6 +384,46 @@ func vizData(pools []*pool.Pool) http.HandlerFunc {
 		}
 		viz.DataHandler(p.Flow)(w, r)
 	}
+}
+
+// probeIsVLLM asks an endpoint, ONCE, whether it looks like a vLLM-style
+// OpenAI backend: it answers GET /v1/models.
+//
+// Once, and never again. A failed probe is latched by simply not being
+// repeated — there is no retry loop and no ticker. An endpoint that is not
+// vLLM will never become vLLM, and a router that kept asking would spend a
+// request per interval per endpoint forever to learn the same thing. That
+// retry-forever shape is exactly what the benchmark's vLLM metrics sampler
+// does today, logging "unavailable — still polling every 1m0s" against an
+// endpoint that will never answer.
+//
+// The consequence of guessing wrong is small and self-correcting in the safe
+// direction: a false negative means passive health, so the endpoint is still
+// served, its health inferred from real traffic instead of probes. A false
+// positive would mean probing /health on something that lacks it, which is why
+// the probe asks for the thing vLLM definitely serves rather than sniffing.
+func probeIsVLLM(ctx context.Context, endpoint string, log *slog.Logger) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, endpoint+"/v1/models", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Info("endpoint did not answer /v1/models; treating as passive",
+			"endpoint", endpoint, "err", err)
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK {
+		log.Info("endpoint did not answer /v1/models; treating as passive",
+			"endpoint", endpoint, "status", resp.StatusCode)
+		return false
+	}
+	return true
 }
 
 func publishFleetLoad(pools []*pool.Pool) {
