@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/weka/wekai/router/internal/clock"
-	"github.com/weka/wekai/router/internal/metrics"
 )
 
 // buildAffinityMode is buildAffinity with the shallow-anchor policy under test.
@@ -37,7 +36,7 @@ var anchorModeNames = map[ladderMode]string{
 // own holders are all at the concurrency cap and have been filtered out of the
 // candidate set by the gateway. Commit then marks the whole path, so a backend
 // that held only the 44-block system prompt is recorded as holding the
-// session's private tail as well. metrics.CacheShallowAnchors counts exactly
+// session's private tail as well. testPoolMetrics().ShallowAnchors counts exactly
 // those decisions.
 
 // copyProfile is one sweep point.
@@ -91,8 +90,8 @@ func sweepSeeded(t *testing.T, nodes, sessions int, mode ladderMode, seed uint64
 	cfg.sessions = sessions
 	cfg.seed = seed
 
-	beforeShallow := readCounter(metrics.CacheShallowAnchors)
-	beforeBlocks := readCounter(metrics.CacheShallowAnchorBlocks)
+	beforeShallow := readCounter(testPoolMetrics().ShallowAnchors)
+	beforeBlocks := readCounter(testPoolMetrics().ShallowAnchorBlocks)
 
 	f := newSimFleet(t, cfg, "prefix-cache-split", buildAffinityMode(mode))
 	st := f.run()
@@ -124,8 +123,8 @@ func sweepSeeded(t *testing.T, nodes, sessions int, mode ladderMode, seed uint64
 		hit:          st.hitRate(),
 		accepted:     st.accepted,
 		rej429:       st.rej429,
-		shallow:      int(readCounter(metrics.CacheShallowAnchors) - beforeShallow),
-		shallowBlock: int(readCounter(metrics.CacheShallowAnchorBlocks) - beforeBlocks),
+		shallow:      int(readCounter(testPoolMetrics().ShallowAnchors) - beforeShallow),
+		shallowBlock: int(readCounter(testPoolMetrics().ShallowAnchorBlocks) - beforeBlocks),
 		byDecision:   st.byDecision,
 		overflows:    st.overflows,
 		runs:         st.treeRuns,

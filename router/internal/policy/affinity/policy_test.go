@@ -105,7 +105,7 @@ func counter(t *testing.T, c interface{ Write(*dto.Metric) error }) float64 {
 
 func decisions(t *testing.T, label string) float64 {
 	t.Helper()
-	return counter(t, metrics.RouteDecisions.WithLabelValues(label))
+	return counter(t, metrics.RouteDecisions.WithLabelValues(DefaultPoolName, label))
 }
 
 // TestSignalsEnabledByBeingSet pins the configuration contract: the refused
@@ -237,13 +237,13 @@ func TestSplitExtendsTheHolderSetWhenEveryHolderIsSaturated(t *testing.T) {
 	load(t, holder, testConcurrency)
 	available := without(cands, holder)
 
-	beforeSplits := counter(t, metrics.CacheSplits)
+	beforeSplits := counter(t, testPoolMetrics().Splits)
 	got := route(t, p, available, req(units(1, 2, 3)))
 
 	if got == holder {
 		t.Fatal("routed to the saturated holder, which was not even a candidate")
 	}
-	if d := counter(t, metrics.CacheSplits) - beforeSplits; d != 1 {
+	if d := counter(t, testPoolMetrics().Splits) - beforeSplits; d != 1 {
 		t.Errorf("%v splits recorded, want 1", d)
 	}
 
@@ -287,8 +287,8 @@ func TestGuardBlockedRejectsRatherThanServingCold(t *testing.T) {
 		load(t, b, 30)
 	}
 
-	beforeRejects := counter(t, metrics.CacheGuardRejects)
-	beforeSplits := counter(t, metrics.CacheSplits)
+	beforeRejects := counter(t, testPoolMetrics().GuardRejects)
+	beforeSplits := counter(t, testPoolMetrics().Splits)
 
 	rr := req(units(1, 2, 3))
 	got, err := p.Select(context.Background(), available, rr)
@@ -299,10 +299,10 @@ func TestGuardBlockedRejectsRatherThanServingCold(t *testing.T) {
 		t.Errorf("Select returned backend %v alongside the rejection", got.URL)
 	}
 
-	if d := counter(t, metrics.CacheGuardRejects) - beforeRejects; d != 1 {
+	if d := counter(t, testPoolMetrics().GuardRejects) - beforeRejects; d != 1 {
 		t.Errorf("%v guard rejects recorded, want 1", d)
 	}
-	if d := counter(t, metrics.CacheSplits) - beforeSplits; d != 0 {
+	if d := counter(t, testPoolMetrics().Splits) - beforeSplits; d != 0 {
 		t.Errorf("%v splits recorded during a guard reject, want 0", d)
 	}
 
@@ -387,13 +387,13 @@ func TestSplitGuardBoundary(t *testing.T) {
 		other := without(cands, holder)[0]
 		load(t, other, tc.inflight)
 
-		beforeSplits := counter(t, metrics.CacheSplits)
-		beforeRejects := counter(t, metrics.CacheGuardRejects)
+		beforeSplits := counter(t, testPoolMetrics().Splits)
+		beforeRejects := counter(t, testPoolMetrics().GuardRejects)
 		rr := req(units(1, 2))
 		_, err = p.Select(context.Background(), []*registry.Backend{other}, rr)
 
-		gotSplit := counter(t, metrics.CacheSplits)-beforeSplits == 1
-		gotReject := counter(t, metrics.CacheGuardRejects)-beforeRejects == 1
+		gotSplit := counter(t, testPoolMetrics().Splits)-beforeSplits == 1
+		gotReject := counter(t, testPoolMetrics().GuardRejects)-beforeRejects == 1
 
 		if gotSplit != tc.wantSplit {
 			t.Errorf("guard=%v inflight=%d: split=%v, want %v", tc.guard, tc.inflight, gotSplit, tc.wantSplit)
@@ -509,10 +509,10 @@ func TestPublishGaugesReportsPerBackendAndFleetTotals(t *testing.T) {
 	route(t, p, cands, req(units(1, 2, 3, 4)))
 	p.PublishGauges()
 
-	if got := counter(t, metrics.CacheAvgCopies); got != 1 {
+	if got := counter(t, testPoolMetrics().AvgCopies); got != 1 {
 		t.Errorf("AvgCopies = %v after one backend served one prefix, want 1", got)
 	}
-	if got := counter(t, metrics.CacheTreeRuns); got != 1 {
+	if got := counter(t, testPoolMetrics().TreeRuns); got != 1 {
 		t.Errorf("TreeRuns = %v, want 1", got)
 	}
 
@@ -538,13 +538,13 @@ func TestSweepReleasesIdleSessionsAndReportsThem(t *testing.T) {
 	cands := fleet(t, 2)
 
 	route(t, p, cands, req(units(1, 2, 3)))
-	before := counter(t, metrics.CacheBlocksExpired)
+	before := counter(t, testPoolMetrics().BlocksExpired)
 
 	clk.Advance(testTTL + time.Minute)
 	if freed := p.Sweep(); freed != 3 {
 		t.Errorf("swept %d blocks, want 3", freed)
 	}
-	if d := counter(t, metrics.CacheBlocksExpired) - before; d != 3 {
+	if d := counter(t, testPoolMetrics().BlocksExpired) - before; d != 3 {
 		t.Errorf("counter moved by %v, want 3", d)
 	}
 	if st := p.tree.stats(); st.Runs != 0 {
@@ -573,3 +573,8 @@ func without(cands []*registry.Backend, drop *registry.Backend) []*registry.Back
 	}
 	return out
 }
+
+// testPoolMetrics resolves the default pool's collectors, which is what a flow
+// built with no explicit PoolName writes to. Tests assert on deltas, so they
+// must read the same child series production wrote.
+func testPoolMetrics() *metrics.PoolMetrics { return metrics.ForPool(DefaultPoolName) }

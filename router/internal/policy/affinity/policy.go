@@ -25,6 +25,9 @@ const (
 	// wasted round trip, not a health verdict, and a success clears it
 	// immediately anyway.
 	DefaultRefusalTTL = 2 * time.Second
+	// DefaultPoolName labels the implicit whole-router pool — the shape a
+	// router has when it fronts one fleet and routes every model to it.
+	DefaultPoolName = "default"
 )
 
 // Config configures the flow. Every field beyond the guard and the TTLs turns
@@ -58,6 +61,11 @@ type Config struct {
 
 	// RefusalTTL is how long a 429 latches a backend out of its own prefixes.
 	RefusalTTL time.Duration
+
+	// PoolName labels this flow's metrics. One router may front several pools —
+	// different models, different fleets — whose trees are unrelated, and whose
+	// duplication and decision counts are meaningless summed together.
+	PoolName string
 
 	// Ladder selects the decision ladder. Default (zero value) is LadderStrict,
 	// the reference design. See ladderMode.
@@ -105,6 +113,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Clock == nil {
 		c.Clock = clock.Real{}
+	}
+	if c.PoolName == "" {
+		c.PoolName = DefaultPoolName
 	}
 	return c
 }
@@ -161,6 +172,9 @@ type Policy struct {
 	refused *refusedSignal
 	signals []signal
 
+	// m is this pool's metrics, resolved once here rather than per request.
+	m *metrics.PoolMetrics
+
 	// backends is the set the registry has told us about, kept only so
 	// /router-viz can render identity, health and load alongside the tree. Not
 	// consulted by routing, which uses the candidate set it is handed.
@@ -183,6 +197,7 @@ func New(cfg Config, fallback policy.Policy) (*Policy, error) {
 		refused:  refused,
 		signals:  []signal{refused},
 		backends: map[string]*registry.Backend{},
+		m:        metrics.ForPool(cfg.PoolName),
 	}
 	if cfg.NodeConcurrency > 0 {
 		p.signals = append(p.signals, concurrencySignal{limit: cfg.NodeConcurrency})
@@ -257,7 +272,7 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 				continue
 			}
 			blocked = true
-			metrics.SignalFired.WithLabelValues(sg.name()).Inc()
+			p.m.Signal(sg.name())
 			if ref > 0 && (guardRef < 0 || ref < guardRef) {
 				guardRef = ref
 			}
@@ -299,7 +314,7 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	if len(rr.Units) == 0 {
 		rr.PolicyState = noMarkDecision
 		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "no_units").Inc()
-		metrics.RouteDecisions.WithLabelValues("load").Inc()
+		p.m.Decision("load")
 		return p.fallback.Select(ctx, usable, rr)
 	}
 
@@ -324,8 +339,8 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	// it falls through to the split, which is guarded.
 	shallow := !a.pool.Empty() && !a.availDeepest
 	if shallow {
-		metrics.CacheShallowAnchors.Inc()
-		metrics.CacheShallowAnchorBlocks.Add(float64(a.heldBlocks - a.anchorBlocks))
+		p.m.ShallowAnchors.Inc()
+		p.m.ShallowAnchorBlocks.Add(float64(a.heldBlocks - a.anchorBlocks))
 	}
 
 	// Tier 1: a usable backend holds the deepest marked run.
@@ -338,10 +353,10 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 		}
 		if len(pool) > 0 {
 			rr.PolicyState = markDecision
-			metrics.RouteDecisions.WithLabelValues("cache").Inc()
-			metrics.CacheAnchorBlocks.Observe(float64(a.anchorBlocks))
-			metrics.CachePoolSize.Observe(float64(len(pool)))
-			metrics.CachePredictedFraction.Observe(fraction(a.anchorBlocks, pth.len()))
+			p.m.Decision("cache")
+			p.m.AnchorBlocks.Observe(float64(a.anchorBlocks))
+			p.m.PoolSize.Observe(float64(len(pool)))
+			p.m.PredictedFraction.Observe(fraction(a.anchorBlocks, pth.len()))
 			return p.fallback.Select(ctx, pool, rr)
 		}
 	}
@@ -361,9 +376,9 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 		}
 		if len(split) > 0 {
 			rr.PolicyState = markDecision
-			metrics.RouteDecisions.WithLabelValues("split").Inc()
-			metrics.CacheSplits.Inc()
-			metrics.CacheAnchorBlocks.Observe(float64(a.matched))
+			p.m.Decision("split")
+			p.m.Splits.Inc()
+			p.m.AnchorBlocks.Observe(float64(a.matched))
 			return p.fallback.Select(ctx, split, rr)
 		}
 
@@ -374,13 +389,13 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 		// only way a backend is ever added to a holder set; there is no
 		// serve-anyway path.
 		if p.cfg.Ladder == LadderStrict {
-			metrics.CacheGuardRejects.Inc()
+			p.m.GuardRejects.Inc()
 			metrics.PolicyFallbacks.WithLabelValues(p.Name(), "guard_blocked").Inc()
 			return nil, policy.ErrSplitGuardBlocked
 		}
 		rr.PolicyState = noMarkDecision
-		metrics.RouteDecisions.WithLabelValues("overflow").Inc()
-		metrics.CacheOverflows.Inc()
+		p.m.Decision("overflow")
+		p.m.Overflows.Inc()
 		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "guard_blocked").Inc()
 		return p.fallback.Select(ctx, cands, rr)
 	}
@@ -390,7 +405,7 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	// load-split, but then every following request will have cache path split
 	// based routing".
 	rr.PolicyState = markDecision
-	metrics.RouteDecisions.WithLabelValues("load").Inc()
+	p.m.Decision("load")
 	metrics.PolicyFallbacks.WithLabelValues(p.Name(), "no_holders").Inc()
 	return p.fallback.Select(ctx, usable, rr)
 }
@@ -451,7 +466,7 @@ func (p *Policy) Flush() { p.tree.flush() }
 func (p *Policy) Sweep() int64 {
 	freed := p.tree.sweep()
 	if freed > 0 {
-		metrics.CacheBlocksExpired.Add(float64(freed))
+		p.m.BlocksExpired.Add(float64(freed))
 	}
 	return freed
 }
@@ -463,9 +478,9 @@ func (p *Policy) TailTTL() time.Duration { return p.cfg.TailTTL }
 // PublishGauges exports tree size and duplication on the health interval.
 func (p *Policy) PublishGauges() {
 	st := p.tree.stats()
-	metrics.CacheTreeRuns.Set(float64(st.Runs))
-	metrics.CacheTailSet.Set(float64(st.Tails))
-	metrics.CacheAvgCopies.Set(st.AvgCopies)
+	p.m.TreeRuns.Set(float64(st.Runs))
+	p.m.TailSet.Set(float64(st.Tails))
+	p.m.AvgCopies.Set(st.AvgCopies)
 	for url, bs := range p.tree.perBackend() {
 		metrics.CacheEntries.WithLabelValues(url).Set(float64(bs.Blocks))
 		metrics.CacheTokens.WithLabelValues(url).Set(float64(bs.Tokens))

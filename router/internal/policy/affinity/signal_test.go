@@ -8,7 +8,6 @@ import (
 
 	"github.com/weka/wekai/router/internal/clock"
 	"github.com/weka/wekai/router/internal/lease"
-	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/policy"
 	"github.com/weka/wekai/router/internal/registry"
 )
@@ -116,7 +115,7 @@ func TestRefusalSplitsRatherThanReturningToTheFullBackend(t *testing.T) {
 	load(t, holder, 4)
 	p.OnRefused(holder)
 
-	beforeSplits := counter(t, metrics.CacheSplits)
+	beforeSplits := counter(t, testPoolMetrics().Splits)
 	rr := req(units(1, 2, 3))
 	got, err := p.Select(context.Background(), cands, rr)
 	if err != nil {
@@ -126,7 +125,7 @@ func TestRefusalSplitsRatherThanReturningToTheFullBackend(t *testing.T) {
 		t.Errorf("Select returned %s, want the split target %s: a refused holder must not "+
 			"receive the request again", got.URL, other.URL)
 	}
-	if d := counter(t, metrics.CacheSplits) - beforeSplits; d != 1 {
+	if d := counter(t, testPoolMetrics().Splits) - beforeSplits; d != 1 {
 		t.Errorf("%v splits recorded, want 1: growing the holder set is the only response to a "+
 			"refusal that keeps affinity", d)
 	}
@@ -280,7 +279,7 @@ func TestAllHoldersTriedBeforeSplitting(t *testing.T) {
 	// at, so its refusal no longer describes it.
 	firstLoad.set(t, 2)
 
-	beforeSplits := counter(t, metrics.CacheSplits)
+	beforeSplits := counter(t, testPoolMetrics().Splits)
 	got, err := p.Select(context.Background(), cands, req(units(4, 5, 6)))
 	if err != nil {
 		t.Fatalf("Select with one usable holder left: %v", err)
@@ -292,7 +291,7 @@ func TestAllHoldersTriedBeforeSplitting(t *testing.T) {
 	if got != first {
 		t.Errorf("Select returned %s, want the recovered holder %s", got.URL, first.URL)
 	}
-	if d := counter(t, metrics.CacheSplits) - beforeSplits; d != 0 {
+	if d := counter(t, testPoolMetrics().Splits) - beforeSplits; d != 0 {
 		t.Errorf("%v splits recorded while a holder was still usable, want 0", d)
 	}
 }

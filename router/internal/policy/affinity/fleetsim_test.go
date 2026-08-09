@@ -583,22 +583,22 @@ var decisionLabels = []string{"cache", "split", "overflow", "load", "other"}
 func (f *simFleet) run() simStats {
 	before := map[string]float64{}
 	for _, l := range decisionLabels {
-		before[l] = readCounter(metrics.RouteDecisions.WithLabelValues(l))
+		before[l] = readCounter(metrics.RouteDecisions.WithLabelValues(DefaultPoolName, l))
 	}
-	beforeSplits := readCounter(metrics.CacheSplits)
-	beforeOverflow := readCounter(metrics.CacheOverflows)
+	beforeSplits := readCounter(testPoolMetrics().Splits)
+	beforeOverflow := readCounter(testPoolMetrics().Overflows)
 
 	for f.now() < f.cfg.duration {
 		f.step()
 	}
 
 	for _, l := range decisionLabels {
-		if d := int(readCounter(metrics.RouteDecisions.WithLabelValues(l)) - before[l]); d > 0 {
+		if d := int(readCounter(metrics.RouteDecisions.WithLabelValues(DefaultPoolName, l)) - before[l]); d > 0 {
 			f.stats.byDecision[l] = d
 		}
 	}
-	f.stats.splits = int(readCounter(metrics.CacheSplits) - beforeSplits)
-	f.stats.overflows = int(readCounter(metrics.CacheOverflows) - beforeOverflow)
+	f.stats.splits = int(readCounter(testPoolMetrics().Splits) - beforeSplits)
+	f.stats.overflows = int(readCounter(testPoolMetrics().Overflows) - beforeOverflow)
 
 	if f.sp.tree != nil {
 		ts := f.sp.tree()

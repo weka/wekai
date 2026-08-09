@@ -103,7 +103,7 @@ var (
 	RouteDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_route_decisions_total",
 		Help: "Selections by decision mechanism: cache, split, overflow, load, or other.",
-	}, []string{"decision"})
+	}, []string{"pool", "decision"})
 
 	// Fleet load. Cache policies already expose per-backend inflight via
 	// BackendInflight; these three summarize it so a dashboard doesn't need a
@@ -168,11 +168,11 @@ var (
 	// usage.prompt_tokens_details.cached_tokens. Emitting both is the only way to
 	// know whether prediction is worth anything, since residency is approximated
 	// rather than observed (RES-3).
-	CachePredictedFraction = prometheus.NewHistogram(prometheus.HistogramOpts{
+	CachePredictedFraction = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "router_cache_predicted_fraction",
 		Help:    "Predicted fraction of a request's prefix already resident on the chosen backend.",
 		Buckets: fractionBuckets,
-	})
+	}, []string{"pool"})
 
 	// CachePrediction{Avg,Max,Min} summarize the predicted-hit-fraction spread
 	// across a single request's queried candidates — not the chosen backend's
@@ -204,20 +204,20 @@ var (
 	// abandoned: every backend holding the prefix was at its cap, so a backend
 	// outside the holder set was chosen and recorded as a new holder. A healthy
 	// system splits during load peaks and then stops.
-	CacheSplits = prometheus.NewCounter(prometheus.CounterOpts{
+	CacheSplits = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_cache_splits_total",
 		Help: "Times the holder set for a prefix was extended onto a new backend under saturation.",
-	})
+	}, []string{"pool"})
 
 	// CacheOverflows counts idle capacity being used WITHOUT recording a
 	// holder, because nothing cleared the split guard. This is the capacity the
 	// reference simulator would instead have rejected with a 429 while nodes
 	// sat idle; the difference between this counter and zero is the reason
 	// premature rejections do not happen here.
-	CacheOverflows = prometheus.NewCounter(prometheus.CounterOpts{
+	CacheOverflows = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_cache_overflows_total",
 		Help: "Requests routed to idle capacity without marking the backend as a prefix holder.",
-	})
+	}, []string{"pool"})
 
 	// SignalFired counts, per signal, how often it called a backend saturated.
 	//
@@ -231,7 +231,7 @@ var (
 	SignalFired = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_signal_fired_total",
 		Help: "Times a split signal judged a backend unable to take more work.",
-	}, []string{"signal"})
+	}, []string{"pool", "signal"})
 
 	// CacheGuardRejects counts the 429s the split guard causes: every backend
 	// holding the prefix was at its limit and no other backend was far enough
@@ -242,10 +242,10 @@ var (
 	// pair to watch together — a rise here with no fall there means the guard
 	// is costing throughput without buying locality. Distinct from
 	// SaturationRejects, which means zero idle slots fleet-wide.
-	CacheGuardRejects = prometheus.NewCounter(prometheus.CounterOpts{
+	CacheGuardRejects = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_cache_guard_rejects_total",
 		Help: "Requests rejected with 429 because no backend cleared the split guard, though idle capacity existed.",
-	})
+	}, []string{"pool"})
 
 	// CacheShallowAnchors counts tier-1 decisions whose anchor was NOT the
 	// deepest marked run: the request's own holders were all unavailable, so
@@ -256,18 +256,18 @@ var (
 	//
 	// Read it against router_cache_splits_total: splits are guarded growth,
 	// these are not.
-	CacheShallowAnchors = prometheus.NewCounter(prometheus.CounterOpts{
+	CacheShallowAnchors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_cache_shallow_anchors_total",
 		Help: "Affinity decisions anchored on a shared ancestor because the deepest holders were unavailable.",
-	})
+	}, []string{"pool"})
 
 	// CacheShallowAnchorBlocks is the block depth those decisions gave up
 	// (deepest marked depth minus anchor depth), i.e. the blocks each one
 	// duplicates onto a new holder. Volume, where CacheShallowAnchors is count.
-	CacheShallowAnchorBlocks = prometheus.NewCounter(prometheus.CounterOpts{
+	CacheShallowAnchorBlocks = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_cache_shallow_anchor_blocks_total",
 		Help: "Blocks of prefix depth forgone by shallow-anchored affinity decisions, and thereby duplicated.",
-	})
+	}, []string{"pool"})
 
 	// CacheAvgCopies is the mean number of backends holding each block, and the
 	// tripwire for the one hazard this design knowingly accepts: a run under
@@ -275,48 +275,48 @@ var (
 	// that removes a holder, so holder sets on hot runs can only grow. Target
 	// is ~1.0. Sustained drift upward means the same context is being
 	// duplicated across GPUs.
-	CacheAvgCopies = prometheus.NewGauge(prometheus.GaugeOpts{
+	CacheAvgCopies = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "router_cache_avg_copies",
 		Help: "Mean number of backends holding each cached block; 1.0 means no duplication.",
-	})
+	}, []string{"pool"})
 
 	// CacheAnchorBlocks is how deep, in blocks, the affinity match ran. It
 	// replaces CachePredictedFraction as the affinity-strength signal for this
 	// policy: a fraction of the whole request shrinks as a session grows even
 	// though the backend still holds everything it has ever seen, which is
 	// precisely the defect this policy exists to fix.
-	CacheAnchorBlocks = prometheus.NewHistogram(prometheus.HistogramOpts{
+	CacheAnchorBlocks = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "router_cache_anchor_blocks",
 		Help:    "Blocks matched at the anchor run when affinity chose the backend.",
 		Buckets: blockBuckets,
-	})
+	}, []string{"pool"})
 
 	// CachePoolSize is how many backends held the anchor. Persistent large
 	// values mean the fleet is converging on "everyone holds everything", which
 	// is the observable form of the CacheAvgCopies hazard.
-	CachePoolSize = prometheus.NewHistogram(prometheus.HistogramOpts{
+	CachePoolSize = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "router_cache_pool_size",
 		Help:    "Number of backends holding the anchor run at selection time.",
 		Buckets: poolBuckets,
-	})
+	}, []string{"pool"})
 
-	CacheTreeRuns = prometheus.NewGauge(prometheus.GaugeOpts{
+	CacheTreeRuns = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "router_cache_tree_runs",
 		Help: "Compressed runs in the shared prefix tree.",
-	})
+	}, []string{"pool"})
 
 	// CacheTailSet is the size of the eviction candidate set. Eviction is
 	// tail-only, so this bounds the sweep's cost and is the evidence for
 	// whether the TTL is set right.
-	CacheTailSet = prometheus.NewGauge(prometheus.GaugeOpts{
+	CacheTailSet = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "router_cache_tail_set",
 		Help: "Runs currently eligible for TTL eviction (leaves of the shared prefix tree).",
-	})
+	}, []string{"pool"})
 
-	CacheBlocksExpired = prometheus.NewCounter(prometheus.CounterOpts{
+	CacheBlocksExpired = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_cache_blocks_expired_total",
 		Help: "Blocks released by TTL eviction of idle tails.",
-	})
+	}, []string{"pool"})
 
 	RequestsShed = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "router_requests_shed_total",
@@ -416,3 +416,63 @@ func StatusClass(code int) string {
 		return "1xx"
 	}
 }
+
+// PoolMetrics is one pool's view of the per-pool collectors, with the `pool`
+// label already applied.
+//
+// Resolved once when a pool is built, never per request — the same reason
+// backend gauges are resolved at add time (R5). A label lookup on the routing
+// path would put a map access and a mutex inside the NFR-2 budget for no
+// reason.
+//
+// It exists because these numbers are meaningless summed across pools. Two
+// pools front different models with unrelated KV caches; adding their
+// avg_copies together produces a figure describing nothing, which is the same
+// defect class as the dashboard panel that silently dropped decision tiers.
+type PoolMetrics struct {
+	Splits              prometheus.Counter
+	Overflows           prometheus.Counter
+	GuardRejects        prometheus.Counter
+	ShallowAnchors      prometheus.Counter
+	ShallowAnchorBlocks prometheus.Counter
+	BlocksExpired       prometheus.Counter
+
+	AvgCopies prometheus.Gauge
+	TreeRuns  prometheus.Gauge
+	TailSet   prometheus.Gauge
+
+	AnchorBlocks      prometheus.Observer
+	PoolSize          prometheus.Observer
+	PredictedFraction prometheus.Observer
+
+	// decisions and signals stay vectors: their second label varies per event.
+	decisions *prometheus.CounterVec
+	signals   *prometheus.CounterVec
+}
+
+// ForPool resolves every per-pool collector for name.
+func ForPool(name string) *PoolMetrics {
+	lbl := prometheus.Labels{"pool": name}
+	return &PoolMetrics{
+		Splits:              CacheSplits.With(lbl),
+		Overflows:           CacheOverflows.With(lbl),
+		GuardRejects:        CacheGuardRejects.With(lbl),
+		ShallowAnchors:      CacheShallowAnchors.With(lbl),
+		ShallowAnchorBlocks: CacheShallowAnchorBlocks.With(lbl),
+		BlocksExpired:       CacheBlocksExpired.With(lbl),
+		AvgCopies:           CacheAvgCopies.With(lbl),
+		TreeRuns:            CacheTreeRuns.With(lbl),
+		TailSet:             CacheTailSet.With(lbl),
+		AnchorBlocks:        CacheAnchorBlocks.With(lbl),
+		PoolSize:            CachePoolSize.With(lbl),
+		PredictedFraction:   CachePredictedFraction.With(lbl),
+		decisions:           RouteDecisions.MustCurryWith(lbl),
+		signals:             SignalFired.MustCurryWith(lbl),
+	}
+}
+
+// Decision counts one routing decision by the tier that made it.
+func (m *PoolMetrics) Decision(tier string) { m.decisions.WithLabelValues(tier).Inc() }
+
+// Signal counts one signal judging a backend unable to take more work.
+func (m *PoolMetrics) Signal(name string) { m.signals.WithLabelValues(name).Inc() }

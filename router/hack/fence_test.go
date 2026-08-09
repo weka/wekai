@@ -231,9 +231,41 @@ func TestNoDeadMetrics(t *testing.T) {
 		t.Fatal("parsed no collectors from internal/metrics/metrics.go")
 	}
 
+	// Per-pool collectors are not named outside the package: they are resolved
+	// once, by pool, inside metrics.ForPool, and callers hold the resolved
+	// child. That indirection is deliberate (a label lookup per request would
+	// sit inside the NFR-2 budget), so a collector ForPool names counts as
+	// emitted — but only while ForPool is itself reachable from outside, which
+	// is checked first. A collector named nowhere at all, ForPool included,
+	// still fails.
+	resolver := string(src)[strings.Index(string(src), "func ForPool("):]
+	if end := strings.Index(resolver, "\n}"); end > 0 {
+		resolver = resolver[:end]
+	}
+	resolverUsed := false
+	for _, rel := range goFiles(t, root, false) {
+		if strings.HasPrefix(filepath.ToSlash(rel), "internal/metrics/") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(b), "metrics.ForPool") {
+			resolverUsed = true
+			break
+		}
+	}
+	if !resolverUsed {
+		t.Error("metrics.ForPool is never called, so every per-pool collector is dead")
+	}
+
 	for _, name := range declared {
-		used := false
+		used := resolverUsed && strings.Contains(resolver, name)
 		for _, rel := range goFiles(t, root, false) {
+			if used {
+				break
+			}
 			if strings.HasPrefix(filepath.ToSlash(rel), "internal/metrics/") {
 				continue
 			}
