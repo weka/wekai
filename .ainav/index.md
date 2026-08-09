@@ -22,6 +22,7 @@
 
 | Doc | What it covers |
 |-----|----------------|
+| **[docs/router.md](../docs/router.md)** | The router: routes, pools, signals, the three supported deployments, CLI and Helm for each |
 | **[README.md](../README.md)** | Build, CLI usage, replay benchmark, coherency eval, deployment — **read this first** |
 | [CLAUDE.md](../CLAUDE.md) | Commit convention (Conventional Commits, gates releases), versioning, build/test policy |
 

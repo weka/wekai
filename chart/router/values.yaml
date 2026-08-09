@@ -26,6 +26,44 @@ router:
   # - "claude => https://api.anthropic.com"
   # - "gpt => https://api.openai.com"
 
+  # Endpoints for the implicit catch-all pool — shorthand for a single
+  # "* => a|b|c" route. Use this for the simplest deployment: one vLLM fleet,
+  # every model routed to it. Ignored if `routes` covers everything you need.
+  backends: []
+  # - http://vllm-a:8000
+  # - http://vllm-b:8000
+
+  # Address for /metrics and the live KV map at /router-viz. Must not be
+  # loopback, or the PodMonitor below can never reach it.
+  metricsListen: "0.0.0.0:29000"
+
+  # Split signals. The backend's own 429 is always on and needs no
+  # configuration; these are opt-in early warnings that save a round trip.
+  signals:
+    # The backends' vLLM --max-num-seqs. Predicts saturation instead of
+    # discovering it one refusal at a time. 0 = off.
+    maxNodeConcurrency: 0
+    # Rebalance once (inflight - fleetMin)/inflight exceeds this. Off by
+    # default: a fleet where prefix affinity is working is SUPPOSED to look
+    # imbalanced, so this trades locality for evenness.
+    rebalanceRatio: 0
+    # A prefix is split onto a backend only while its in-flight is below
+    # limit*(1-this). Lower and every backend ends up holding every prefix.
+    splitGuard: 0.20
+
+  # Aggregate upstream vLLM counters into router-level totals on the metrics
+  # listener. Only endpoints discovered to be vLLM are scraped, and totals
+  # accumulate deltas so they never rewind when a pod restarts.
+  vllmMetrics:
+    enabled: false
+    interval: 30s
+    names: []
+    # - vllm:prompt_tokens_by_source_total
+
+  # Require this key on inference and admin requests. Empty leaves the listener
+  # unauthenticated, which the router logs loudly at startup.
+  apiKey: ""
+
   # Optional catch-all upstream used if no --route matches.
   default: ""
   # default: "https://api.anthropic.com"

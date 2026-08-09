@@ -63,6 +63,33 @@ spec:
             {{- if .Values.router.userPrefix }}
             - "--user-prefix"
             {{- end }}
+            {{- if .Values.router.backends }}
+            - "--backends={{ join "|" .Values.router.backends }}"
+            {{- end }}
+            {{- if .Values.router.metricsListen }}
+            - "--metrics-listen={{ .Values.router.metricsListen }}"
+            {{- end }}
+            {{- with .Values.router.signals }}
+            {{- if .maxNodeConcurrency }}
+            - "--max-node-concurrency={{ .maxNodeConcurrency }}"
+            {{- end }}
+            {{- if .rebalanceRatio }}
+            - "--rebalance-ratio={{ .rebalanceRatio }}"
+            {{- end }}
+            {{- if .splitGuard }}
+            - "--cache-split-guard={{ .splitGuard }}"
+            {{- end }}
+            {{- end }}
+            {{- if .Values.router.vllmMetrics.enabled }}
+            - "--vllm-metrics"
+            - "--vllm-metrics-interval={{ .Values.router.vllmMetrics.interval }}"
+            {{- range .Values.router.vllmMetrics.names }}
+            - "--vllm-metrics-name={{ . }}"
+            {{- end }}
+            {{- end }}
+            {{- if .Values.router.apiKey }}
+            - "--api-key={{ .Values.router.apiKey }}"
+            {{- end }}
             {{- range .Values.extraArgs }}
             - {{ . | quote }}
             {{- end }}
