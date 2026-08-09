@@ -1,11 +1,11 @@
 # Router Mock-Testing Flow
 
-End-to-end loop for developing/evaluating `wllm-router` routing policies (prefix-cache
-affinity, load balancing, `--max-node-concurrency`) against a GPU-less mock vLLM fleet,
-driven by a real captured-traffic replay — no hardware, no real model.
+End-to-end loop for developing and evaluating the router (`wekai router serve`)
+against a GPU-less mock vLLM fleet, driven by a real captured-traffic replay — no
+hardware, no real model.
 
 ```
-mock-vllm fleet (N instances)  <--  wllm-router (prefix-cache affinity)  <--  wekai benchmark auto (replay-v3)
+mock-vllm fleet (N instances)  <--  wekai router serve  <--  wekai benchmark auto (replay-v3)
 ```
 
 See [calibration.md](calibration.md) for tuning the mock's latency/tokenizer rates to
@@ -27,9 +27,8 @@ cache numbers are meaningful (see
 Total runtime ~6 minutes.
 
 ```bash
-# 1. Build (once)
+# 1. Build (once). There is no router binary: the router is `wekai router serve`.
 go build -o /tmp/mock-vllm ./router/cmd/mock-vllm
-go build -o /tmp/wllm-router ./router/cmd/wllm-router
 go build -o /tmp/wekai-local .
 
 # 2. Fleet: 4 instances, ×10 aggregate rates, admission cap stays at the backend default
@@ -38,10 +37,12 @@ go build -o /tmp/wekai-local .
   --chars-per-token 3.729 --output-kv-multiplier 1.0 \
   --cold-input-tps 640000 --cached-input-tps 1330000 --output-tps 740 --base-latency 10ms
 
-# 3. Router: the per-node cap under test lives HERE, not on the mock instances
-/tmp/wllm-router \
+# 3. Router: the per-node cap under test lives HERE, not on the mock instances.
+#    Endpoints are pipe-separated, the same syntax the client uses for a
+#    multi-endpoint model.
+/tmp/wekai-local router serve \
   --listen :8080 --metrics-listen 127.0.0.1:29000 \
-  --backends http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003,http://127.0.0.1:9004 \
+  --backends 'http://127.0.0.1:9001|http://127.0.0.1:9002|http://127.0.0.1:9003|http://127.0.0.1:9004' \
   --max-node-concurrency 32
 
 # 4. Readiness-gate (always — see below)
@@ -73,7 +74,6 @@ until curl -sf http://127.0.0.1:8080/v1/models > /dev/null; do sleep 0.5; done
 ```bash
 cd $WEKAI_DIR   # or submodules/wekai
 go build -o /tmp/mock-vllm ./router/cmd/mock-vllm
-go build -o /tmp/wllm-router ./router/cmd/wllm-router
 go build -o /tmp/wekai-local .
 ```
 
@@ -106,12 +106,29 @@ on consecutive ports:
 ## 3. Launch the router
 
 ```bash
-/tmp/wllm-router \
+/tmp/wekai-local router serve \
   --listen :8080 --metrics-listen 127.0.0.1:29000 \
-  --backends http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003,http://127.0.0.1:9004 \
+  --backends 'http://127.0.0.1:9001|http://127.0.0.1:9002' \
   --max-node-concurrency <N>   # optional: enables the concurrency split signal
   --rebalance-ratio <R>        # optional: enables the imbalance split signal
 ```
+
+- **Routes, not just `--backends`.** `--backends` is shorthand for
+  `--route '* => a|b|c'`. Rules are first-match-wins, so a mixed fleet is
+  expressible: `--route 'llama => http://a:8000|http://b:8000'` with
+  `--default https://api.anthropic.com` sends specific models to a local fleet
+  and everything else to a hosted API. A pool of one endpoint is a plain proxy;
+  several get prefix affinity. Same code path either way.
+- **Endpoint kind is discovered, once.** An endpoint serving `vllm:` metrics at
+  `/metrics` is treated as a vLLM instance: probed actively and eligible for
+  upstream metric aggregation. Anything else falls back to passive health —
+  still served, health inferred from traffic. The probe never repeats; use
+  `--passive-health` to skip it for an upstream already known not to be vLLM.
+  Discovery keys on metric names, NOT wire format, so a vLLM fronted with an
+  Anthropic API is still recognised.
+- **`--vllm-metrics`** aggregates upstream counters into router-level totals on
+  the metrics listener. Only discovered vLLM endpoints are scraped, and totals
+  accumulate deltas so they never rewind when a pod restarts.
 
 - Metrics (`/metrics`), the live KV map (`/router-viz`, `/router-viz/data`), backend
   listing (`/workers`), and readiness (`/readiness`) all live on `--metrics-listen` /
@@ -251,16 +268,16 @@ capacity source:
 
 ```bash
 # Arm A: predict saturation. Mock keeps its own --max-concurrency 256.
-/tmp/wllm-router \
+/tmp/wekai-local router serve \
   --listen :8080 --metrics-listen 127.0.0.1:29000 \
-  --backends http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003,http://127.0.0.1:9004 \
+  --backends 'http://127.0.0.1:9001|http://127.0.0.1:9002|http://127.0.0.1:9003|http://127.0.0.1:9004' \
   --max-node-concurrency 32
 
 # Arm B: discover it. No router-side limit at all; the mock fleet 429s at its own
 # cap instead (--max-concurrency 32), so the `refused` signal drives everything.
-/tmp/wllm-router \
+/tmp/wekai-local router serve \
   --listen :8080 --metrics-listen 127.0.0.1:29000 \
-  --backends http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003,http://127.0.0.1:9004
+  --backends 'http://127.0.0.1:9001|http://127.0.0.1:9002|http://127.0.0.1:9003|http://127.0.0.1:9004'
 ```
 
 Arm B is the one worth running when a change touches the refusal path: it is the only
@@ -275,6 +292,7 @@ Read these after each arm (`curl -s http://127.0.0.1:29000/metrics | grep ...`):
 | Metric | What it tells you |
 |---|---|
 | `router_route_decisions_total` | **Aggregate by label**, never enumerate members — the tiers are `cache`, `split`, `load`, `other` (`overflow` is retired and reads 0). Anton's bar is "absolute majority routed by cache". |
+| all `router_cache_*` / `router_signal_fired_total` | Carry a `pool` label. One router may front several pools whose trees are unrelated; summing across them describes nothing. Aggregate by pool. |
 | `router_cache_avg_copies` | Mean backends holding each block, target ~1.0. **Cheap to read** — a running `blocks x holders` sum divided by blocks, not a tree walk (the O(tree) call on the same ticker is the per-backend `router_cache_entries`/`_tokens` pair). Validated against per-backend ground truth in the fleet sim, so it can be trusted rather than corroborated. |
 | `router_cache_splits_total` | The holder set grew under saturation, guarded. The ONLY way a holder is ever added. |
 | `router_cache_guard_rejects_total` | 429s caused by the guard: idle capacity existed but every backend was inside the guard band. This is the price of holding avg_copies near 1.0 — read the two together. |
@@ -322,3 +340,26 @@ next success, and the TTL is only a re-probe backstop for a backend wedged at th
 level it refused at. When it WAS the sole clearing mechanism it over-excluded badly —
 that arm scored avg_copies 1.162 with 1110 splits against 1.078 and 483 for the
 load-keyed version, same 2s value.
+
+## Mock surfaces: testing every deployment shape offline
+
+`mock-vllm --surface` builds the three shapes the router must tell apart, so no
+permutation needs a real backend:
+
+| surface | serves | what it tests |
+|---|---|---|
+| `vllm` (default) | OpenAI routes, `/health`, `vllm:` metrics | an ordinary fleet member |
+| `anthropic` | `/v1/messages` AND `vllm:` metrics | a vLLM fronted with an Anthropic API — must NOT be misclassified as a hosted API and have its metrics left unread |
+| `hosted` | messages only; no `/metrics`, `/v1/models` or `/health` | discovery must fall back to passive health |
+
+The `anthropic` surface runs the same engine and flattens to the same prompt the
+OpenAI path builds, so a conversation produces identical block hashes through
+either surface — otherwise cache behaviour would differ by wire format and the
+mock would misrepresent the one thing it exists to model.
+
+**Validated end to end** (2 instances, 6 requests sharing a prefix, 20
+max_tokens each): affinity kept all six on ONE instance, leaving the other at
+zero. That instance reported `generation_tokens_total` 120 (6 x 20),
+`prefix_cache_queries_total` 96 (6 x 16 blocks) and `prefix_cache_hits_total` 80
+(5 of 6 requests hitting the shared prefix; the first is cold). The router's
+aggregated totals matched the sum exactly.
