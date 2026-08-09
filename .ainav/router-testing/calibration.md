@@ -44,9 +44,49 @@ vs output) that drive routing/caching decisions while shrinking wall-clock run t
   the standard speedup for routing-improvement work (see
   [index.md](index.md#validated-standard-recipe-routing-improvement-work)'s recipe).
   Needs a LONG run (`--total 30000`, ~6 min) to be cache-realistic — see below.
-- **×100**: fast logic-smoke loop — use for iterating on routing LOGIC itself
-  (does it route at all, does it 429 correctly, does the tree render), not for any
-  cache-hit-rate claim.
+- **×100**: fast logic-smoke loop ONLY — does it route at all, does it 429 correctly,
+  does the tree render. See the measurement below for why it is not a faster version
+  of the same experiment.
+
+**Speedup does not scale `--cache-tail-ttl`, and it should.** The TTL is wall-clock
+and purely a memory bound, but leaving it at 5m while multiplying rates by K means the
+SIMULATED retention window grows by K — at ×100 a 43-second run evicts nothing, so the
+tree only accumulates. Divide it like the base latency: `--cache-tail-ttl 3s` at ×100.
+This changes no routing decision (eviction only removes childless runs whose sessions
+are long dead) but it does move `router_cache_avg_copies`, which is a mean over
+whatever is currently in the tree: dead sessions' runs are overwhelmingly
+single-holder, so retaining them dilutes the mean toward 1.0.
+
+### Measured: ×100 changes the operating point, not just the clock
+
+A ×100 arm against the ×10 reference (both `--total 30000`, 4x32, client concurrency
+128, `--max-node-concurrency 32`):
+
+| | ×10 | ×100 |
+|---|---|---|
+| elapsed | 6m6s | 43s |
+| guard 429s | 17,362 | **637** |
+| `concurrency` signal firings | 56,246 | 4,276 |
+| sessions walked | 1699 | **1059** |
+| requests per session | 17.6 | **28** |
+| output tokens | 12.1M | **6.9M** |
+| `avg_copies` | 1.085 | 1.034 |
+
+**The fleet is not saturated at ×100.** The speedup compresses backend service time
+but not the harness: the router's lease spans dispatch to body-fully-copied, which at
+×100 is milliseconds, so most of the client's 128 in-flight requests sit in
+client-side work rather than in router leases. Router-side in-flight per backend stays
+well under the cap, and peak 1930 req/s says the bottleneck has moved to the driver.
+
+The workload sampled also differs — 1059 sessions instead of 1699, nearly twice the
+requests per session, and 43% fewer output tokens — so the two runs are not measuring
+the same traffic either.
+
+Restoring saturation would need BOTH a scaled TTL and a client concurrency raised
+until `router_backend_inflight` sits near the cap again, and that combination is
+unvalidated. Until someone does that work, the honest fast loop is
+`go test ./router/internal/policy/affinity/ -run TestFleet` — about a second, drives
+the real flow, and carries per-backend ground truth.
 
 ## Depth matters: run length changes what a run is valid evidence for
 
