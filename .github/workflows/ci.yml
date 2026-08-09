@@ -6,8 +6,8 @@ name: ci
 # to be broken once it was already on the default branch and a release was being
 # cut from it.
 #
-# `make verify` is the single definition of "this is good": gofmt, go vet, and the
-# full suite under the race detector. release.yml keeps its own lighter `make test`
+# `task verify` is the single definition of "this is good": gofmt, go vet, and the
+# full suite under the race detector. release.yml keeps its own lighter `task test`
 # so a formatting slip cannot block a release.
 
 on:
@@ -46,8 +46,13 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Verify (gofmt, vet, tests with -race)
-        run: make verify
+        run: task verify
 
   # The router's JSON scanner parses untrusted request bodies, and its seed corpus
   # already found a remote DoS: a 15-byte body looped forever with unbounded
@@ -64,8 +69,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Fuzz the JSON scanner
-        run: make fuzz FUZZTIME=10m
+        run: task fuzz FUZZTIME=10m
       - name: Upload any crashers
         if: failure()
         uses: actions/upload-artifact@v4

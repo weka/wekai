@@ -21,11 +21,11 @@ import (
 	"github.com/weka/wekai/router/internal/policy"
 	"github.com/weka/wekai/router/internal/policy/affinity"
 	"github.com/weka/wekai/router/internal/pool"
-	"github.com/weka/wekai/router/internal/routing"
 	"github.com/weka/wekai/router/internal/proxy"
 	"github.com/weka/wekai/router/internal/registry"
-	"github.com/weka/wekai/router/internal/viz"
+	"github.com/weka/wekai/router/internal/routing"
 	"github.com/weka/wekai/router/internal/testutil/mockvllm"
+	"github.com/weka/wekai/router/internal/viz"
 )
 
 type harness struct {

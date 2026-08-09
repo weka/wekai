@@ -14,10 +14,14 @@ it, so shipping it would make every replica pay pull time and node disk for
 nothing.
 
 ```bash
-make router-image            # quay.io/weka.io/wekai-router:<version>
-make router-image-multiarch  # linux/amd64 + linux/arm64, pushed
-make verify                  # gofmt + vet + full suite under -race
+task router:build   # build the image AND package chart/router, no push, no credentials
+task verify         # gofmt + vet + full suite under -race
 ```
+
+`router:build` goes through the same Dagger code a release uses, so a chart
+checked locally cannot differ from the published one — the version stamping and
+imageRepository sync are the pinning contract, and a local path that
+reimplemented them would drift exactly where it matters.
 
 ## Kubernetes
 

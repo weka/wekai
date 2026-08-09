@@ -162,7 +162,6 @@ func (LeastOutstanding) Select(_ context.Context, cands []*registry.Backend, _ *
 	return pickBest(cands, minimize, (*registry.Backend).NormalizedLoad), nil
 }
 
-
 // ErrAllBackendsSaturated reports that every healthy backend was called
 // saturated by some signal — the backend's own 429, a configured concurrency
 // limit, or an imbalance ratio. There is no capacity to give the request at

@@ -154,6 +154,7 @@ func (c Config) withDefaults() Config {
 //  4. load   — nothing is marked anywhere: a genuinely new prompt, so there is
 //     no holder set to split from and nothing to duplicate. Route by
 //     least-outstanding over the usable set and record the result.
+//
 // Before all of them: if no backend is usable at all, ErrAllBackendsSaturated,
 // answered 429. Distinct from tier 3, which means capacity existed and the
 // guard refused to spend it on a copy.
@@ -399,7 +400,6 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "guard_blocked").Inc()
 		return p.fallback.Select(ctx, cands, rr)
 	}
-
 
 	// Tier 4: a genuinely new prompt. Anton's "a single request going via
 	// load-split, but then every following request will have cache path split

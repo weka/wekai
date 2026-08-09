@@ -54,33 +54,33 @@ type RouterServeCommand struct {
 
 	// --- Fleet routing. A --route with several pipe-separated endpoints, or
 	// --backends, turns on prefix-cache affinity across them.
-	Backends       []string `long:"backends" description:"Endpoints for the implicit catch-all pool, comma- or pipe-separated. Shorthand for --route '* => a|b|c' — the simplest router: route every model to this set."`
-	Passive        bool     `long:"passive-health" description:"Skip active health probing. Required for upstreams with no /health endpoint (a hosted API); their health is inferred from proxied request outcomes."`
-	MetricsListen  string   `long:"metrics-listen" default:"127.0.0.1:29000" description:"Address for /metrics and the live KV map at /router-viz. Separate from the inference listener: diagnostic surface is never reachable on the serving path. Empty disables it."`
-	MaxNodeConc    int64    `long:"max-node-concurrency" description:"Enables the concurrency split signal: treat a backend at or above this many in-flight requests as saturated without waiting for it to say so. Set it to the backends' vLLM --max-num-seqs. 0 = off; the backend's own 429 remains the ultimate signal either way."`
-	RebalanceRatio float64  `long:"rebalance-ratio" description:"Enables the imbalance split signal: a backend is saturated while (inflight - fleetMin)/inflight exceeds this. 0.5 rebalances once the gap is more than half the busier side. 0 = off — a fleet where affinity works is supposed to look imbalanced."`
-	SplitGuard     float64  `long:"cache-split-guard" default:"0.20" description:"A prefix is split onto a backend only while its in-flight is below limit*(1-this). Higher keeps the holder set tighter at the cost of splitting less readily; too low and every backend ends up holding every prefix."`
+	Backends       []string      `long:"backends" description:"Endpoints for the implicit catch-all pool, comma- or pipe-separated. Shorthand for --route '* => a|b|c' — the simplest router: route every model to this set."`
+	Passive        bool          `long:"passive-health" description:"Skip active health probing. Required for upstreams with no /health endpoint (a hosted API); their health is inferred from proxied request outcomes."`
+	MetricsListen  string        `long:"metrics-listen" default:"127.0.0.1:29000" description:"Address for /metrics and the live KV map at /router-viz. Separate from the inference listener: diagnostic surface is never reachable on the serving path. Empty disables it."`
+	MaxNodeConc    int64         `long:"max-node-concurrency" description:"Enables the concurrency split signal: treat a backend at or above this many in-flight requests as saturated without waiting for it to say so. Set it to the backends' vLLM --max-num-seqs. 0 = off; the backend's own 429 remains the ultimate signal either way."`
+	RebalanceRatio float64       `long:"rebalance-ratio" description:"Enables the imbalance split signal: a backend is saturated while (inflight - fleetMin)/inflight exceeds this. 0.5 rebalances once the gap is more than half the busier side. 0 = off — a fleet where affinity works is supposed to look imbalanced."`
+	SplitGuard     float64       `long:"cache-split-guard" default:"0.20" description:"A prefix is split onto a backend only while its in-flight is below limit*(1-this). Higher keeps the holder set tighter at the cost of splitting less readily; too low and every backend ends up holding every prefix."`
 	TailTTL        time.Duration `long:"cache-tail-ttl" default:"5m" description:"How long a leaf of the shared prefix tree may go untouched before eviction. Memory pressure only: eviction never removes a run that still has children."`
 	RefusalTTL     time.Duration `long:"cache-refusal-ttl" default:"2s" description:"How long a backend's own 429 keeps it out of its prefixes. Cleared early by any success from it, and by its in-flight dropping below the level it refused at."`
 
 	// --- Listener behaviour.
-	APIKey          string   `long:"api-key" description:"Require this key on inference and admin requests. Empty leaves the listener unauthenticated, which is logged loudly at startup."`
-	CORSOrigins     []string `long:"cors-origins" description:"Origins permitted to call the inference listener. '*' cannot be combined with --api-key."`
-	PathAllowlist   []string `long:"path-allowlist" description:"Restrict which upstream paths may be proxied. Empty allows every path."`
-	MaxBodyBytes    int64    `long:"max-body-bytes" default:"67108864" description:"Maximum request body. Bodies are buffered whole so a retry can replay them, so this is the real per-request memory bound."`
-	MaxConcurrent   int      `long:"max-concurrent-requests" default:"256" description:"Router-wide in-flight cap protecting the router's own memory; sheds 503 router_at_capacity. Distinct from per-backend capacity, which sheds 429. 0 disables."`
-	MaxAttempts     int      `long:"max-attempts" default:"2" description:"Upstream attempts including the first, after a FAILURE. A 429 does not spend this budget: refusals draw on their own, bounded by the number of endpoints."`
-	RequestTimeout  time.Duration `long:"request-timeout" default:"600s" description:"Overall upstream request deadline."`
-	IdleTimeout     time.Duration `long:"idle-timeout" default:"300s" description:"Abort a stream that has produced nothing for this long."`
-	UpstreamCred    string   `long:"upstream-credential" description:"Credential presented to upstreams, replacing the client's."`
-	HealthInterval  time.Duration `long:"health-interval" default:"10s" description:"Active health probe interval."`
-	HealthTimeout   time.Duration `long:"health-timeout" default:"5s" description:"Health probe timeout. Must be below the interval, or probes fall behind forever."`
-	HealthPath      string   `long:"health-path" default:"/health" description:"Path probed on each backend."`
-	VLLMMetrics     bool     `long:"vllm-metrics" description:"Aggregate upstream vLLM counters into router-level totals served on --metrics-listen. Only endpoints discovered to be vLLM are scraped. Totals accumulate DELTAS, so they never go backwards when a pod restarts or the fleet scales down — a decreasing counter silently breaks rate() and increase()."`
+	APIKey           string        `long:"api-key" description:"Require this key on inference and admin requests. Empty leaves the listener unauthenticated, which is logged loudly at startup."`
+	CORSOrigins      []string      `long:"cors-origins" description:"Origins permitted to call the inference listener. '*' cannot be combined with --api-key."`
+	PathAllowlist    []string      `long:"path-allowlist" description:"Restrict which upstream paths may be proxied. Empty allows every path."`
+	MaxBodyBytes     int64         `long:"max-body-bytes" default:"67108864" description:"Maximum request body. Bodies are buffered whole so a retry can replay them, so this is the real per-request memory bound."`
+	MaxConcurrent    int           `long:"max-concurrent-requests" default:"256" description:"Router-wide in-flight cap protecting the router's own memory; sheds 503 router_at_capacity. Distinct from per-backend capacity, which sheds 429. 0 disables."`
+	MaxAttempts      int           `long:"max-attempts" default:"2" description:"Upstream attempts including the first, after a FAILURE. A 429 does not spend this budget: refusals draw on their own, bounded by the number of endpoints."`
+	RequestTimeout   time.Duration `long:"request-timeout" default:"600s" description:"Overall upstream request deadline."`
+	IdleTimeout      time.Duration `long:"idle-timeout" default:"300s" description:"Abort a stream that has produced nothing for this long."`
+	UpstreamCred     string        `long:"upstream-credential" description:"Credential presented to upstreams, replacing the client's."`
+	HealthInterval   time.Duration `long:"health-interval" default:"10s" description:"Active health probe interval."`
+	HealthTimeout    time.Duration `long:"health-timeout" default:"5s" description:"Health probe timeout. Must be below the interval, or probes fall behind forever."`
+	HealthPath       string        `long:"health-path" default:"/health" description:"Path probed on each backend."`
+	VLLMMetrics      bool          `long:"vllm-metrics" description:"Aggregate upstream vLLM counters into router-level totals served on --metrics-listen. Only endpoints discovered to be vLLM are scraped. Totals accumulate DELTAS, so they never go backwards when a pod restarts or the fleet scales down — a decreasing counter silently breaks rate() and increase()."`
 	VLLMMetricsEvery time.Duration `long:"vllm-metrics-interval" default:"30s" description:"How often each discovered vLLM endpoint is scraped."`
-	VLLMMetricsNames []string `long:"vllm-metrics-name" description:"Upstream counter to aggregate; repeatable. Default: vllm:prompt_tokens_by_source_total. Re-exporting every series would multiply cardinality by the fleet size."`
-	LogLevel        string   `long:"log-level" default:"info" description:"debug, info, warn or error."`
-	LogFormat       string   `long:"log-format" choice:"json" choice:"text" default:"json" description:"Log output format."`
+	VLLMMetricsNames []string      `long:"vllm-metrics-name" description:"Upstream counter to aggregate; repeatable. Default: vllm:prompt_tokens_by_source_total. Re-exporting every series would multiply cardinality by the fleet size."`
+	LogLevel         string        `long:"log-level" default:"info" description:"debug, info, warn or error."`
+	LogFormat        string        `long:"log-format" choice:"json" choice:"text" default:"json" description:"Log output format."`
 }
 
 type routeRule struct {
@@ -197,9 +197,9 @@ func (c *RouterServeCommand) Execute(args []string) error {
 	defer stop()
 
 	return serve.Run(ctx, serve.Options{
-		Listen:        c.Listen,
-		MetricsListen: c.MetricsListen,
-		Routes:        routes,
+		Listen:                c.Listen,
+		MetricsListen:         c.MetricsListen,
+		Routes:                routes,
 		APIKey:                c.APIKey,
 		CORSOrigins:           c.CORSOrigins,
 		PathAllowlist:         c.PathAllowlist,
@@ -217,13 +217,13 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		VLLMMetricsInterval:   c.VLLMMetricsEvery,
 		VLLMMetricsNames:      c.VLLMMetricsNames,
 		MaxAttempts:           c.MaxAttempts,
-		RequestTimeout:     c.RequestTimeout,
-		IdleTimeout:        c.IdleTimeout,
-		UpstreamCredential: c.UpstreamCred,
-		DrainDeadline:      c.DrainTimeout,
-		Capture:            hook,
-		LogLevel:           c.LogLevel,
-		LogFormat:          c.LogFormat,
+		RequestTimeout:        c.RequestTimeout,
+		IdleTimeout:           c.IdleTimeout,
+		UpstreamCredential:    c.UpstreamCred,
+		DrainDeadline:         c.DrainTimeout,
+		Capture:               hook,
+		LogLevel:              c.LogLevel,
+		LogFormat:             c.LogFormat,
 	})
 }
 

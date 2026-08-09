@@ -49,8 +49,8 @@ type copyProfile struct {
 	// in duplicated KV and not just a quieter model.
 	trueCopies float64
 	hit        float64
-	accepted int
-	rej429   int
+	accepted   int
+	rej429     int
 	// shallow is tier-1 decisions that anchored above the deepest marked run,
 	// and shallowBlocks the prefix depth they gave up (and so duplicated).
 	shallow      int
@@ -116,7 +116,7 @@ func sweepSeeded(t *testing.T, nodes, sessions int, mode ladderMode, seed uint64
 	}
 
 	return copyProfile{
-		trueCopies: trueCopies,
+		trueCopies:   trueCopies,
 		sessions:     sessions,
 		peakUtil:     st.peakUtil,
 		copies:       st.avgCopies,

@@ -7,6 +7,10 @@ vars:
   REGISTRY: '{{.REGISTRY | default "quay.io/weka.io/wekai"}}'
   REPLAY_REGISTRY: '{{.REPLAY_REGISTRY | default "quay.io/weka.io/wekai"}}'
   HELM_REGISTRY: '{{.HELM_REGISTRY | default "quay.io/weka.io/helm"}}'
+  BINARY: wekai
+  # First-party Go source. vendor/ is excluded deliberately: it is generated,
+  # not committed, and gofmt has no business rewriting it.
+  GO_DIRS: "benchmark chart cli config kvcache llm router tools"
 
 tasks:
   build:
@@ -14,10 +18,88 @@ tasks:
     cmds:
       - go build -o wekai .
 
-  test:
-    desc: "Run all tests"
+  # --- Developer and CI contract. `task verify` is the single definition of
+  # "this is good"; ci.yml runs it. These were a separate Makefile, which meant
+  # two build vocabularies for one repo.
+
+  help:
+    desc: "List available tasks"
     cmds:
-      - go test ./... -timeout 120s -count=1
+      - task --list
+
+  fmt:
+    desc: "Format first-party Go source in place"
+    cmds:
+      - gofmt -l -w {{.GO_DIRS}} *.go
+
+  fmt-check:
+    desc: "Fail if any first-party Go file is not gofmt'd"
+    cmds:
+      # vendor/ is excluded deliberately: it is generated, not committed, and
+      # gofmt has no business rewriting it.
+      - |
+        out=$(gofmt -l {{.GO_DIRS}} *.go)
+        if [ -n "$out" ]; then echo "not gofmt'd:"; echo "$out"; exit 1; fi
+
+  vet:
+    desc: "go vet the whole module"
+    cmds:
+      - go vet ./...
+
+  test:
+    desc: "Run the test suite (matches what release.yml gates on)"
+    cmds:
+      - go test ./...
+
+  test:race:
+    desc: "Run the test suite with the race detector"
+    cmds:
+      - go test -race ./...
+
+  fences:
+    desc: "Run only the router's architectural invariant fences"
+    cmds:
+      - go test ./router/hack/... -v
+
+  verify:
+    desc: "Everything CI gates on: gofmt, vet, and the suite under -race"
+    cmds:
+      - task: fmt-check
+      - task: vet
+      - task: test:race
+
+  fuzz:
+    desc: "Fuzz the router's JSON scanner, which parses untrusted request bodies (FUZZTIME=60s)"
+    vars:
+      FUZZTIME: '{{.FUZZTIME | default "60s"}}'
+    cmds:
+      # A differential fuzz against encoding/json, plus a termination property.
+      # The seed corpus already caught a remote DoS: a 15-byte body that looped
+      # forever with unbounded allocation.
+      - go test ./router/internal/jsonscan/ -run=NONE -fuzz=FuzzFieldsAgreesWithEncodingJSON -fuzztime={{.FUZZTIME}}
+      - go test ./router/internal/jsonscan/ -run=NONE -fuzz=FuzzArrayTerminates -fuzztime={{.FUZZTIME}}
+
+  bench:
+    desc: "Run benchmarks"
+    cmds:
+      - go test -run=NONE -bench=. -benchmem ./kvcache/ ./router/...
+
+  vulncheck:
+    desc: "Scan dependencies for known vulnerabilities"
+    cmds:
+      - go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  router:run:
+    desc: "Run the router locally against a backend at :8000"
+    cmds:
+      - go run . router serve --listen 127.0.0.1:8080 --metrics-listen 127.0.0.1:29000
+        --backends http://127.0.0.1:8000 --log-format text
+
+  clean:
+    desc: "Remove build artifacts"
+    cmds:
+      - rm -f {{.BINARY}}
+      - rm -rf dist
 
   router:build:
     desc: "Build the router image and package chart/router locally, no push and no credentials (dagger call build-router). Runs the SAME packaging a release does, so a chart checked here cannot differ from the published one."

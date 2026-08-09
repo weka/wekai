@@ -33,8 +33,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Same command as `make test`, kept as one definition so the release gate
-      # and local runs cannot drift. Deliberately NOT `make verify`: that adds
+      # Same command as `task test`, kept as one definition so the release gate
+      # and local runs cannot drift. Deliberately NOT `task verify`: that adds
       # gofmt and -race, and a formatting slip should not block a release. The
       # pull-request gate in ci.yml is where the stricter checks belong.
       - name: Test

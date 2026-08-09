@@ -52,10 +52,10 @@ type replayPoster struct {
 	// rather than a constant so a test can exercise the give-up path without
 	// waiting 30 real seconds.
 	retryBudget time.Duration
-	runID      string
-	dryRun     bool
-	estimator  *cacheEstimator
-	dryRates   struct {
+	runID       string
+	dryRun      bool
+	estimator   *cacheEstimator
+	dryRates    struct {
 		coldTPS   int
 		warmTPS   int
 		outputTPS int
