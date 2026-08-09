@@ -16,7 +16,7 @@ routing gateway. Two things live in one module:
 - `wekai` (root `main.go`, `cli/`) — capture/replay traffic, run coherency evals,
   benchmark real or replayed workloads against any OpenAI-compatible endpoint.
 - `router/` — a standalone Go router (`cmd/wllm-router`) that fronts a vLLM fleet with
-  prefix-cache-aware routing, plus a GPU-less mock vLLM fleet (`cmd/mock-vllm`) for
+  prefix-cache-affinity routing, plus a GPU-less mock vLLM fleet (`cmd/mock-vllm`) for
   developing and load-testing router policies without hardware.
 
 ## Primary Reference Documents
@@ -32,7 +32,7 @@ routing gateway. Two things live in one module:
 |-------|------|--------------|
 | Router mock-testing | [router-testing/](router-testing/index.md) | End-to-end: build the router + mock fleet, run a replay benchmark against it |
 | Live KV map (`/router-viz`) | [viz/](viz/index.md) | The router's live prefix-tree visualization on the metrics listener |
-| Architecture | [architecture/](architecture/index.md) | `kvcache`, `router/internal/policy/cache`, `router/internal/mockvllm`, `router/hack` fences |
+| Architecture | [architecture/](architecture/index.md) | `kvcache`, `router/internal/policy/affinity`, `router/internal/mockvllm`, `router/hack` fences |
 
 ## Key Directories (this repo)
 
@@ -41,7 +41,7 @@ routing gateway. Two things live in one module:
 | `kvcache/` | Shared prefix-cache trie engine (stdlib-only) — chain-hashed blocks, pin/evict, chains. Used by the router's cache policy, the mock vLLM's ground truth, and the benchmark's token estimator. |
 | `router/cmd/wllm-router/` | The router binary entrypoint |
 | `router/cmd/mock-vllm/` | GPU-less mock vLLM server binary entrypoint |
-| `router/internal/` | Router packages: `gateway` (HTTP surface), `policy`/`policy/cache` (routing), `registry`/`lease` (backend state, in-flight leases), `proxy` (upstream forwarding), `dialect/openai` (wire format), `mockvllm` (mock engine), `viz` (`/router-viz`), `hack` (architectural fence tests) |
+| `router/internal/` | Router packages: `gateway` (HTTP surface), `policy`/`policy/affinity` (the one routing flow + its signals), `registry`/`lease` (backend state, in-flight leases), `proxy` (upstream forwarding), `dialect/openai` (wire format), `mockvllm` (mock engine), `viz` (`/router-viz`), `hack` (architectural fence tests) |
 | `benchmark/` | Benchmark and replay engine (`wekai benchmark auto`, router-replay mode) |
 | `cli/` | go-flags command trees for `benchmark`, `router`, `eval` |
 | `llm/` | Raw LLM client layer, dynamic model-spec parsing, mock servers for tests |

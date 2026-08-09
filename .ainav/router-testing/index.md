@@ -5,7 +5,7 @@ affinity, load balancing, `--max-node-concurrency`) against a GPU-less mock vLLM
 driven by a real captured-traffic replay — no hardware, no real model.
 
 ```
-mock-vllm fleet (N instances)  <--  wllm-router (prefix-cache-aware)  <--  wekai benchmark auto (replay-v3)
+mock-vllm fleet (N instances)  <--  wllm-router (prefix-cache affinity)  <--  wekai benchmark auto (replay-v3)
 ```
 
 See [calibration.md](calibration.md) for tuning the mock's latency/tokenizer rates to
@@ -42,7 +42,7 @@ go build -o /tmp/wekai-local .
 /tmp/wllm-router \
   --listen :8080 --metrics-listen 127.0.0.1:29000 \
   --backends http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003,http://127.0.0.1:9004 \
-  --policy prefix-cache-aware --max-node-concurrency 32
+  --max-node-concurrency 32
 
 # 4. Readiness-gate (always — see below)
 until curl -sf http://127.0.0.1:8080/v1/models > /dev/null; do sleep 0.5; done
@@ -109,26 +109,53 @@ on consecutive ports:
 /tmp/wllm-router \
   --listen :8080 --metrics-listen 127.0.0.1:29000 \
   --backends http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003,http://127.0.0.1:9004 \
-  --policy prefix-cache-aware \
-  --max-node-concurrency <N>          # optional: per-backend router-enforced cap; 0 = off
+  --max-node-concurrency <N>   # optional: enables the concurrency split signal
+  --rebalance-ratio <R>        # optional: enables the imbalance split signal
 ```
 
 - Metrics (`/metrics`), the live KV map (`/router-viz`, `/router-viz/data`), backend
   listing (`/workers`), and readiness (`/readiness`) all live on `--metrics-listen` /
   `--listen` respectively — see [../viz/index.md](../viz/index.md) for the KV map.
-- `--policy prefix-cache-aware` is the routing policy under test; `least-outstanding`
-  (default) is the load-only baseline for A/B. `prefix-cache-split` is the newer
-  shared-marked-tree policy — see [A/B'ing prefix-cache-split](#abing-prefix-cache-split)
-  below, and note it REQUIRES `--max-node-concurrency`.
-- `--max-node-concurrency N`: a backend at or above N router-leased in-flight requests
-  is excluded from candidate selection for EVERY policy (affinity and fallback alike —
-  filtered once at the candidate-set level, not per-policy). If every healthy backend
-  is at cap, the router returns `429 all_backends_at_capacity` with `Retry-After: 1`
-  (distinct from `503 no_healthy_backends`, an outage, and from the router-wide
-  `--max-concurrent-requests` `503 router_at_capacity` shed). Use this to test a lower
-  ceiling than the real fleet's own `WEKA_MAX_CONCURRENT_REQUESTS` without restarting
-  vLLM. `/readiness` deliberately ignores the cap (a saturated router still answers
-  ready=true; it just sheds 429s) — only backend health affects readiness.
+- **There is no `--policy` flag.** The router has ONE routing flow; what varies is
+  which split signals are enabled, and each is turned on by setting its own value.
+  `refused` (the backend's own 429) is always on and needs no configuration, so a bare
+  `--backends` router is a valid deployment — see
+  [Signals](#signals-what-replaced-the-policies) below.
+- `--max-node-concurrency N` enables the **concurrency signal**: a backend at or above
+  N router-leased in-flight requests is treated as saturated without waiting for it to
+  say so. Use it to test a lower ceiling than the real fleet's own
+  `WEKA_MAX_CONCURRENT_REQUESTS` without restarting vLLM. It is no longer an admission
+  filter in the gateway and no longer mandatory.
+- The two 429s are distinct and both carry `Retry-After: 1`:
+  `all_backends_saturated` (no backend can take work) and `split_guard_blocked`
+  (capacity exists, but every idle backend is inside the guard band, so spending it
+  would mean a duplicate copy of this prefix). Both differ from
+  `503 no_healthy_backends` (an outage) and the router-wide
+  `--max-concurrent-requests` `503 router_at_capacity` shed.
+- `/readiness` reflects backend HEALTH only — a fully saturated router still answers
+  ready=true and sheds with 429.
+
+### Signals: what replaced the policies
+
+`--policy` and its six values are gone. `least-outstanding` became the flow's selector;
+`prefix-cache-aware`'s spill guard and `prefix-cache-candidates`' `MaxPending` came back
+as signals; `round-robin` and `random` were deleted outright.
+
+| signal | enabled by | what it is |
+|---|---|---|
+| `refused` | always on | the backend's own 429 — the only ground truth about a vLLM's capacity. Latched against the in-flight count it happened at, so it clears when load falls rather than on a timer. |
+| `concurrency` | `--max-node-concurrency N` | the router's guess at `--max-num-seqs`. Predicts saturation instead of discovering it a round trip late. |
+| `imbalance` | `--rebalance-ratio R` | `(inflight - fleetMin)/inflight > R`. Off by default: a fleet where affinity is working is SUPPOSED to look imbalanced. |
+
+Watch `router_signal_fired_total{signal=...}` to see which one is actually driving
+decisions. An opt-in signal firing far more than `refused` means it is predicting
+saturation the backends do not have.
+
+**Measured (4x32, `--total 30000`, client concurrency 128, 58-day capture):** the
+`refused` signal ALONE, with no router-side limit at all and the mock fleet 429ing at
+its own `--max-concurrency 32`, lands within noise of the concurrency signal —
+avg_copies 1.078 vs 1.085, 5m42s vs 6m6s, 30000/30000 and zero errors either way. You
+can run with no configured limit and lose nothing measurable.
 
 ## 4. Readiness-gate BEFORE benchmarking
 
@@ -218,13 +245,29 @@ you run it:
   budget, jittered) rather than recording them as errors, so a run measures the
   fleet and not the harness. `429 backoff` in the run summary is the cost.
 
+The A/B is now between SIGNALS, not policies — same fleet and replay, different
+capacity source:
+
 ```bash
-# Arm B: same fleet and replay as the Validated Standard Recipe, new policy.
+# Arm A: predict saturation. Mock keeps its own --max-concurrency 256.
 /tmp/wllm-router \
   --listen :8080 --metrics-listen 127.0.0.1:29000 \
   --backends http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003,http://127.0.0.1:9004 \
-  --policy prefix-cache-split --max-node-concurrency 32
+  --max-node-concurrency 32
+
+# Arm B: discover it. No router-side limit at all; the mock fleet 429s at its own
+# cap instead (--max-concurrency 32), so the `refused` signal drives everything.
+/tmp/wllm-router \
+  --listen :8080 --metrics-listen 127.0.0.1:29000 \
+  --backends http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003,http://127.0.0.1:9004
 ```
+
+Arm B is the one worth running when a change touches the refusal path: it is the only
+configuration where a routing mistake is not masked by the router's own guess. Note
+the two "32"s are NOT the same instant — the router's lease is taken before the
+upstream request is issued and released only after the response body is fully copied
+(LB-4), while the backend counts from arrival to end of generation, so the router's
+window strictly contains the backend's and a virtual 32 bites earlier than a real one.
 
 Read these after each arm (`curl -s http://127.0.0.1:29000/metrics | grep ...`):
 
@@ -246,13 +289,35 @@ load, not of the policy, and the same code read 1.05 at concurrency 96. The stri
 ladder holds ~1.01-1.09 at both. If you want to measure the POLICY, run below
 saturation; if you want to measure the GUARD, pin it at 100%.
 
-**A short smoke run will not discriminate the policies.** With a large shared system
-prompt, `prefix-cache-candidates`'s 0.5 threshold is satisfied anyway and both arms
-score the same. The regime where they diverge is a MODEST shared prefix inside large
-requests (0 vs 192 cache decisions out of ~200 in one measured run), and saturation
-with skewed load, where tiers 2/3 actually fire. Use the long `--total 30000` recipe.
+**A short smoke run will not discriminate anything.** The regimes where behaviour
+diverges are a MODEST shared prefix inside large requests, and saturation with skewed
+load, where the split and reject tiers actually fire. Use the long `--total 30000`
+recipe.
 
 Offline, `go test ./router/internal/policy/affinity/ -run TestFleet -v` replays the
-same workload against the real policy in-process in about a second, and prints the
+same workload against the real flow in-process in about a second, and prints the
 verdict, the A/B against `least-outstanding`, and the cross-check against the
 reference simulator's own 3-tier ladder. Start there before booting a fleet.
+`-run TestCopiesVsUtilisation -v` sweeps duplication against offered load, and
+`-run TestShallowAnchorModes` A/Bs the ladder against the retired serve-anyway one.
+
+**Note on the `least-outstanding` A/B arm.** It has no signals of its own and the
+gateway no longer caps anything, so that arm now runs unbounded — it reached 206%
+utilisation in the fleet sim. The hit-rate comparison stands; throughput between the
+two arms does not.
+
+## Not yet validated
+
+`--cache-tail-ttl` (default 5m) is the only bound on tree memory, and no run here
+tests it: every arm is 5m42s-6m9s, barely longer than the TTL, so the tree only
+empties after traffic stops rather than reaching a steady state. Its 5m default rests
+on a 15-SIMULATED-minute fleet sim, never a real run. Measuring it needs `--total
+100000` (~20 min) watching `router_cache_tree_runs` / `_tail_set` plateau rather than
+climb.
+
+`--cache-refusal-ttl` (default 2s) is no longer performance-sensitive: since the
+refusal latch became keyed to in-flight, clearing happens when load drops or on the
+next success, and the TTL is only a re-probe backstop for a backend wedged at the
+level it refused at. When it WAS the sole clearing mechanism it over-excluded badly —
+that arm scored avg_copies 1.162 with 1110 splits against 1.078 and 483 for the
+load-keyed version, same 2s value.

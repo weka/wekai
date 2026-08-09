@@ -21,8 +21,7 @@ announce themselves.
 | Allowlist env | `FORWARD_PATH_ALLOWLIST` | `FORWARD_PATH_ALLOWLIST` (kept deliberately) |
 | Probes | required auth → `exec` probe | public by default → use `httpGet` |
 | Base image | `python:3.12-slim` | distroless static, nonroot, **no shell** |
-| Default policy | `cache_aware` family | `least-outstanding` |
-| Policy names | `round_robin`, `cache_aware`, … | `round-robin`, `prefix-cache-aware`, … |
+| Routing | pick a policy by name | **no policy to pick** — one flow, opt-in signals |
 | Config | flags + 3 env vars | JSON file (optional) + flags + `WLLM_*` env |
 | Metrics port | `:29000` | `:29000` (unchanged) |
 | Inference port | image ran `--port 8080` | `:8080` (unchanged in practice) |
@@ -157,18 +156,41 @@ added. Static key only.
 
 These stop the router at startup with a message. Annoying, not dangerous.
 
-### 2.1 Policy names changed
+### 2.1 There is no policy to choose
 
-| v1 | wllm-router | Note |
+wllm-router has ONE routing flow: prefix affinity over a shared marked tree, with a
+guarded split under pressure. **Drop the policy setting entirely.** `--policy`,
+`WLLM_POLICY` and the `policy` config key do not exist, and because an unknown config
+key is a hard error (§2.2), a config that still names one fails startup rather than
+silently routing differently than its author asked.
+
+| v1 | what to do now |
+|---|---|
+| `round_robin` | drop it — a strict rotation is the opposite of prefix affinity |
+| `random` | drop it — ties are already broken uniformly |
+| `cache_aware` | drop it — affinity is the flow, not an option |
+| `power_of_two` | drop it — `least-outstanding` is the flow's tie-break, always active |
+| `consistent_hash` | drop it — the shared tree is what replaces hashing to a node |
+
+What varies instead is which **split signals** are enabled, each by setting its own
+value rather than by naming it in a list:
+
+| signal | enable with | what it does |
 |---|---|---|
-| `round_robin` | `round-robin` | underscore → hyphen |
-| `random` | `random` | unchanged |
-| `cache_aware` | `prefix-cache-aware` | renamed *and* reimplemented |
-| `power_of_two` | `least-outstanding` | closest equivalent, **different algorithm** |
-| `consistent_hash` | — | **no equivalent** |
+| `refused` | always on | treats a backend's own 429 as saturation. Needs no configuration and cannot be turned off — it is the only ground truth about a backend's capacity. |
+| `concurrency` | `--max-node-concurrency N` | predicts saturation at N in-flight instead of discovering it a round trip late. Set it to the backends' vLLM `--max-num-seqs`. |
+| `imbalance` | `--rebalance-ratio R` | treats a backend as saturated while `(inflight - fleetMin)/inflight > R`. Off by default. |
 
-Default is now `least-outstanding`. An unknown policy is a startup error listing
-the valid names, not a silent fallback.
+**A bare `--backends` router is a valid deployment.** Measured on a 4-node mock fleet
+under a 30,000-request replay, running with no configured limit at all landed within
+noise of a configured one. Start there and add `--max-node-concurrency` only to save
+the round trip per saturation event.
+
+Two 429s are new and distinct, both with `Retry-After: 1`:
+`all_backends_saturated` (nothing can take work) and `split_guard_blocked` (capacity
+exists, but every idle backend is close enough to its limit that using it would mean a
+duplicate copy of the prefix). v1 had no equivalent of either. **Clients must retry
+429s** — one that treats them as fatal will see throughput collapse under load.
 
 ### 2.2 Config is stricter
 
@@ -293,8 +315,8 @@ are **served**, independently of auth:
    catch-all (§1.2).
 4. Rename `INBOUND_API_KEY` → `WLLM_API_KEY`, or switch to `-api-key-file`
    (§1.3). Do not skip the 401 assertion below — this step failing is silent.
-5. Translate the policy name (§2.1). `consistent_hash` has no equivalent —
-   decide what replaces it.
+5. DELETE the policy setting (§2.1); a leftover `policy` key fails startup. Decide
+   whether to set `--max-node-concurrency`, and confirm your clients retry 429s.
 6. Switch `exec` probes to `httpGet` (§3.1).
 7. Remove `runAsUser: 0`; check Secret file permissions for `nonroot` (§3.2).
 8. Deploy to one replica behind a canary Service first.

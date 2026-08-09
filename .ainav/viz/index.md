@@ -31,16 +31,17 @@ mechanism the page's own UI inputs use, not the primary interface — default (n
 at all) is the FULL tree, unlimited in every dimension. An explicit huge value is
 clamped (`viz.MaxParamValue`), not passed through unbounded.
 
-## When there's no cache-aware policy
+## When there's no tree to show
 
-`policy_active: false` in the JSON (round-robin/least-outstanding router, or no policy
-configured) — the page shows a full-width banner ("router is not running a cache-aware
-policy — no KV map available") in place of the tiles/tree panel, rather than an empty
-tree or a stat tile with nothing to show.
+`policy_active: false` in the JSON — the page shows a full-width banner in place of
+the tiles/tree panel rather than an empty tree. With one routing flow this is now only
+reachable in tests and in the nil-DataSource case; a shipped router always has a
+tree.
 
 ## Code
 
 `router/internal/viz/` — `viz.go` (types, handlers), `page.html` (embedded via
-`embed.go`), `router/internal/policy/cache/tree.go` + `snapshot.go` (the actual
-merge/compress/depth-accounting walk over each backend's `kvcache.Trie`, shared by
-both `prefix-cache-aware` and `prefix-cache-candidates` policies via `viz.DataSource`).
+`embed.go`), `router/internal/policy/affinity/snapshot.go` (the `viz.DataSource`
+implementation). The shared tree is natively the shape the page wants, so there is no
+per-poll merge step — the second implementation that used to walk N per-backend tries
+went with `policy/cache`.
