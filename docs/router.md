@@ -225,6 +225,19 @@ the deployment's `imageTag | default .Chart.AppVersion` — so a `helm install` 
 a published chart with no further flags deploys exactly the image it was
 packaged with.
 
+## Building and publishing locally
+
+| task | what it needs | what it does |
+|---|---|---|
+| `go test ./chart/` | helm only | renders the chart and asserts on the manifests — the fastest check, and enough for template changes |
+| `task router:image` | docker | plain `docker build` of the router image |
+| `task router:build` | a working Dagger engine | image **and** packaged chart, no push, no credentials — runs the release's own packaging code, so a chart checked here cannot differ from the published one |
+| `task router:push` | Dagger + `QUAY_USERNAME`/`QUAY_PASSWORD` | publishes the image and the chart pinned to it; what the release workflow runs |
+
+If Dagger cannot start — a locked-down Docker Desktop refusing to pull its engine
+image is the usual cause — `go test ./chart/` and `task router:image` still cover
+template and image correctness between them.
+
 ## Observability
 
 `/metrics` and the live KV map at `/router-viz` are on `--metrics-listen`, never

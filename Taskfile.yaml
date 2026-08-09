@@ -8,6 +8,7 @@ vars:
   REPLAY_REGISTRY: '{{.REPLAY_REGISTRY | default "quay.io/weka.io/wekai"}}'
   HELM_REGISTRY: '{{.HELM_REGISTRY | default "quay.io/weka.io/helm"}}'
   BINARY: wekai
+  ROUTER_REGISTRY: '{{.ROUTER_REGISTRY | default "quay.io/weka.io/wekai-router"}}'
   # First-party Go source. vendor/ is excluded deliberately: it is generated,
   # not committed, and gofmt has no business rewriting it.
   GO_DIRS: "benchmark chart cli config kvcache llm router tools"
@@ -101,10 +102,36 @@ tasks:
       - rm -f {{.BINARY}}
       - rm -rf dist
 
+  # Three router build paths, in increasing order of what they need:
+  #
+  #   router:image   plain docker build. No Dagger. Use when Dagger cannot run.
+  #   router:build   image + packaged chart via the release's OWN code, no push,
+  #                  no credentials. Needs a working Dagger engine.
+  #   router:push    the release itself: publishes image and chart. Credentials.
+  #
+  # Chart TEMPLATE correctness needs none of them — `go test ./chart/` renders
+  # and asserts with helm alone.
+
+  router:image:
+    desc: "Build the router image with plain docker build (no Dagger). TAG=... to override."
+    cmds:
+      - docker build -f Dockerfile.router -t {{.ROUTER_REGISTRY}}:{{.TAG}} .
+
   router:build:
-    desc: "Build the router image and package chart/router locally, no push and no credentials (dagger call build-router). Runs the SAME packaging a release does, so a chart checked here cannot differ from the published one."
+    desc: "Build the router image and package chart/router locally — no push, no credentials (dagger call build-router). Runs the SAME packaging a release does, so a chart checked here cannot differ from the published one."
     cmds:
       - dagger call build-router --source=. export --path=./dist
+
+  router:push:
+    desc: "Publish the router image, then package+push chart/router pinned to it (dagger call push-router-helm). Override ROUTER_REGISTRY=... and HELM_REGISTRY=... as needed."
+    cmds:
+      - >-
+        dagger call push-router-helm
+        --source=.
+        --registry="{{.ROUTER_REGISTRY}}"
+        --helm-registry="{{.HELM_REGISTRY}}"
+        --helm-username=env://QUAY_USERNAME
+        --helm-password=env://QUAY_PASSWORD
 
   docker:build:
     desc: "Build the wekai replay image locally (no push). Override TAG=... and REPLAY_IMAGE=... as needed."

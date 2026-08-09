@@ -14,7 +14,9 @@ it, so shipping it would make every replica pay pull time and node disk for
 nothing.
 
 ```bash
-task router:build   # build the image AND package chart/router, no push, no credentials
+task router:image   # plain docker build, no Dagger
+task router:build   # image AND packaged chart via the release's own code, no push
+task router:push    # publish both (needs QUAY_USERNAME / QUAY_PASSWORD)
 task verify         # gofmt + vet + full suite under -race
 ```
 
