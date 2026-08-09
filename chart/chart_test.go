@@ -213,3 +213,29 @@ func TestRouterChartPassesRoutesVerbatim(t *testing.T) {
 		t.Errorf("route did not survive templating verbatim; wanted %q in:\n%s", route, out)
 	}
 }
+
+// TestRouterChartStructuredRoutesSurviveSet is the FIX for helm --set splitting
+// on commas, not merely a note about it.
+//
+// A route written as one string is truncated at its first model pattern when
+// given via --set: it renders without error and fails at runtime, which is the
+// worst shape a config bug can take. Given as lists, no single --set value
+// contains a comma, so the same route arrives intact.
+func TestRouterChartStructuredRoutesSurviveSet(t *testing.T) {
+	out := renderRouter(t,
+		"--set", "router.routes[0].patterns[0]=fast",
+		"--set", "router.routes[0].patterns[1]=small",
+		"--set", "router.routes[0].endpoints[0]=http://a:8000",
+		"--set", "router.routes[0].endpoints[1]=http://b:8000",
+		"--set", "router.routes[0].as=Qwen/Qwen3-32B")
+	const want = `- "--route=fast,small => http://a:8000|http://b:8000 as Qwen/Qwen3-32B"`
+	if !strings.Contains(out, want) {
+		t.Errorf("structured route did not assemble; wanted\n  %s\ngot:\n%s", want, out)
+	}
+
+	// The string form still works, so existing values files keep rendering.
+	str := renderRouter(t, "--set-string", "router.routes[0]=* => http://only:8000")
+	if !strings.Contains(str, `- "--route=* => http://only:8000"`) {
+		t.Errorf("string-form route stopped working:\n%s", str)
+	}
+}

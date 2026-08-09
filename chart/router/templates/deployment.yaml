@@ -41,7 +41,15 @@ spec:
             - "serve"
             - "--listen=:{{ .Values.service.targetPort }}"
             {{- range .Values.router.routes }}
+            {{- if kindIs "string" . }}
             - "--route={{ . }}"
+            {{- else }}
+            {{- /* Structured form: helm --set splits on commas, so a route
+                   written as one string is truncated at its first model
+                   pattern — silently, rendering fine and failing at runtime.
+                   As lists there is no comma inside any single --set value. */}}
+            - "--route={{ join "," .patterns }} => {{ join "|" .endpoints }}{{ if .as }} as {{ .as }}{{ end }}"
+            {{- end }}
             {{- end }}
             {{- if .Values.router.default }}
             - "--default={{ .Values.router.default }}"

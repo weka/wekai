@@ -19,12 +19,20 @@ router:
   # `terminationGracePeriodSeconds` (below) must exceed this.
   drainTimeout: 5m
 
-  # Routing rules, repeated. Syntax: "<pattern> => <upstream>[ as <model>]".
-  # Pattern is comma-separated case-insensitive substrings of the model name,
-  # or "*" for catch-all. First match wins.
+  # Routing rules, first match wins. Two accepted forms.
+  #
+  # As a string, exactly as the CLI takes it:
+  #   - "fast,small => http://a:8000|http://b:8000"
+  #   - "sonnet => http://a:8000 as Qwen/Qwen3-32B"
+  #
+  # Or structured, which is what to use with --set: helm's --set splits values
+  # on commas, so a multi-pattern route given as a string is truncated at its
+  # first pattern — silently, rendering fine and failing at runtime. As lists
+  # there is no comma inside any single value.
+  #   - patterns: [fast, small]
+  #     endpoints: [http://a:8000, http://b:8000]
+  #     as: Qwen/Qwen3-32B            # optional model rewrite
   routes: []
-  # - "claude => https://api.anthropic.com"
-  # - "gpt => https://api.openai.com"
 
   # Endpoints for the implicit catch-all pool — shorthand for a single
   # "* => a|b|c" route. Use this for the simplest deployment: one vLLM fleet,

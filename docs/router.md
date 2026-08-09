@@ -85,10 +85,6 @@ helm upgrade --install my-router oci://quay.io/weka.io/helm/wekai-router \
   --version <release> -f values.yaml
 ```
 
-> **Put routes in a values file, not `--set`.** Helm's `--set` splits values on
-> commas, so `--set 'router.routes[0]=fast,small => http://a:8000'` silently
-> becomes the route `fast` and the rest is lost. It renders without error and
-> fails at runtime.
 
 Covered by `TestUseCase1_SingleFleetAllTraffic`.
 
@@ -132,6 +128,28 @@ router:
     # a route is the same string either way.
     - "sonnet     => http://vllm-a:8000 as Qwen/Qwen3-32B"
 ```
+
+**With `--set`, use the structured form instead.** Helm's `--set` splits values
+on commas, so a multi-pattern route written as one string is truncated at its
+first pattern — it renders without error and fails at runtime. Given as lists,
+no single value contains a comma:
+
+```yaml
+router:
+  routes:
+    - patterns: [fast, small]
+      endpoints: [http://vllm-small-a:8000, http://vllm-small-b:8000]
+    - patterns: [sonnet]
+      endpoints: [http://vllm-a:8000]
+      as: Qwen/Qwen3-32B
+```
+
+```bash
+--set router.routes[0].patterns[0]=fast \
+--set router.routes[0].endpoints[0]=http://vllm-small-a:8000
+```
+
+Both forms are accepted; a values file can use whichever reads better.
 
 Covered by `TestUseCase2_PerModelRoutesAcrossBothAPIs`.
 
