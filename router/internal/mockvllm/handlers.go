@@ -157,3 +157,89 @@ func writeError(w http.ResponseWriter, status int, typ, msg string) {
 		},
 	})
 }
+
+// handleMessages serves Anthropic's /v1/messages against the same engine.
+//
+// Only the wire shape differs. The engine, its cache model and its vllm:
+// metrics are identical, which is the whole point of the surface: a vLLM
+// instance fronted this way must still be discovered as vLLM and measured the
+// same, and the router must route it per model exactly as it does OpenAI
+// traffic.
+func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Model     string `json:"model"`
+		MaxTokens int    `json:"max_tokens"`
+		System    any    `json:"system"`
+		Messages  []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed JSON body: "+err.Error())
+		return
+	}
+
+	// Flatten to the same prompt the OpenAI path builds, so a given
+	// conversation produces the SAME block hashes through either surface. If it
+	// did not, cache behaviour would differ by wire format and the mock would
+	// be lying about the thing it exists to model.
+	var sb strings.Builder
+	if req.System != nil {
+		sb.WriteString(flattenContent(req.System))
+	}
+	for _, m := range req.Messages {
+		sb.WriteString(m.Role)
+		sb.WriteString(flattenContent(m.Content))
+	}
+
+	units := s.engine.Tokenize(sb.String())
+	release, cached, total, ok := s.admitOrReject(w, units)
+	if !ok {
+		return
+	}
+	defer release()
+
+	maxTok := s.engine.MaxTokensOrDefault(req.MaxTokens)
+	if !s.engine.AwaitTTFT(r.Context(), s.engine.PrefillWork(cached, total)) {
+		return
+	}
+	if !sleepCtx(r.Context(), s.engine.DecodeDuration(maxTok)) {
+		return
+	}
+	s.engine.RecordOutput(maxTok)
+	content := strings.Join(syntheticTokens(maxTok), " ")
+	s.engine.AppendOutputBlocks(units, maxTok, content)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":      s.newID("msg"),
+		"type":    "message",
+		"role":    "assistant",
+		"model":   req.Model,
+		"content": []map[string]any{{"type": "text", "text": content}},
+		"usage": map[string]any{
+			"input_tokens":            total - cached,
+			"cache_read_input_tokens": cached,
+			"output_tokens":           maxTok,
+		},
+	})
+}
+
+// flattenContent renders Anthropic's string-or-block-array content shape.
+func flattenContent(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case []any:
+		var sb strings.Builder
+		for _, item := range t {
+			if m, ok := item.(map[string]any); ok {
+				if s, ok := m["text"].(string); ok {
+					sb.WriteString(s)
+				}
+			}
+		}
+		return sb.String()
+	}
+	return ""
+}

@@ -84,6 +84,10 @@ func run(args []string) error {
 	outputTPS := fs.Float64("output-tps", 500, "tokens/sec decode, per request — also paces SSE chunk spacing")
 	outputKVMultiplier := fs.Float64("output-kv-multiplier", 1.0, "models real vLLM writing decode KV into the same pool as prompt KV: on completion, ceil(output_tokens*multiplier/block-size-tokens) blocks are appended to the request's own chain, occupying capacity and evictable like prompt blocks. 0 disables this (outputs stay invisible to the cache, the historical behavior)")
 	logLevel := fs.String("log-level", "info", "debug, info, warn, or error")
+	surface := fs.String("surface", "vllm", "which HTTP surface to expose: 'vllm' (OpenAI routes + /health + /metrics), "+
+		"'anthropic' (a vLLM fronted with /v1/messages, still serving vllm: metrics — the case that must not be "+
+		"misclassified as a hosted API), or 'hosted' (messages only: no /metrics, /v1/models or /health, so the "+
+		"router must fall back to passive health)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -131,6 +135,16 @@ func run(args []string) error {
 		// one cache behind N listeners.
 		engine := mockvllm.NewEngine(cfg)
 		srv := mockvllm.NewServer(engine)
+		switch *surface {
+		case "vllm":
+			srv.Surface = mockvllm.SurfaceVLLM
+		case "anthropic":
+			srv.Surface = mockvllm.SurfaceAnthropic
+		case "hosted":
+			srv.Surface = mockvllm.SurfaceHosted
+		default:
+			return fmt.Errorf("unknown -surface %q: want vllm, anthropic or hosted", *surface)
+		}
 		servers[i] = &http.Server{Addr: fmt.Sprintf(":%d", p), Handler: srv.Handler()}
 	}
 
