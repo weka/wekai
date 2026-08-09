@@ -81,8 +81,20 @@ router:
 ```
 
 ```bash
-helm upgrade --install my-router oci://quay.io/weka.io/helm/wekai-router \
-  --version <release> -f values.yaml
+helm upgrade --install my-router \
+  oci://quay.io/weka.io/helm/wekai-router --version v1.2.3 \
+  -f values.yaml
+```
+
+Backend URLs contain no commas, so `--set` is safe here and no values file is
+needed:
+
+```bash
+helm upgrade --install my-router \
+  oci://quay.io/weka.io/helm/wekai-router --version v1.2.3 \
+  --set router.backends[0]=http://vllm-a:8000 \
+  --set router.backends[1]=http://vllm-b:8000 \
+  --set router.signals.maxNodeConcurrency=32
 ```
 
 
@@ -193,6 +205,25 @@ router:
 Covered by `TestUseCase3_SelfHostedModelsWithHostedFallback`.
 
 ---
+
+## What is published
+
+Every release publishes two images and two charts from the same commit under the
+same semver, so a benchmark and a router from one release are known to agree.
+
+| | image | chart |
+|---|---|---|
+| router | `quay.io/weka.io/wekai-router:<version>` | `oci://quay.io/weka.io/helm/wekai-router:<version>` |
+| benchmark | `quay.io/weka.io/wekai:<version>` | `oci://quay.io/weka.io/helm/wekai:<version>` |
+
+The two images are the same `wekai` binary. The benchmark one additionally
+embeds a multi-GB replay artifact so a benchmark pod can replay captured traffic
+with no volume; the router never reads it, so the router image does not carry it.
+
+The chart pins its image purely by propagation — `Chart.yaml` `appVersion` feeds
+the deployment's `imageTag | default .Chart.AppVersion` — so a `helm install` of
+a published chart with no further flags deploys exactly the image it was
+packaged with.
 
 ## Observability
 
