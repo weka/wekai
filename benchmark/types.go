@@ -26,4 +26,11 @@ type RequestMetrics struct {
 	CachedPrompt      string  // Full system prompt text (only populated on error/empty for diagnostics)
 	Question          string  // The user question sent with the request (only populated on error/empty)
 	RawResponseTail   string  // raw SSE tail (last bytes); only populated on error/empty for diagnostics
+	// Retries429 / RetryWait record the client-side backoff a request spent
+	// waiting out 429s before it was served (or gave up). TimeToFirstToken
+	// measures the attempt that actually ran, so it stays a server-latency
+	// number; TotalResponseTime INCLUDES RetryWait, because that is how long
+	// the caller really waited.
+	Retries429 int
+	RetryWait  time.Duration
 }

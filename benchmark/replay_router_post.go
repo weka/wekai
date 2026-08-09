@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"strings"
@@ -46,6 +47,11 @@ type replayPoster struct {
 	epFellBack bool
 	apiType    string // "anthropic", "openai", or "openai_vllm"
 	client     *http.Client
+	// retryBudget is the total time a request may spend waiting out 429s
+	// before the shed stands as an error. Defaults to retry429Budget; a field
+	// rather than a constant so a test can exercise the give-up path without
+	// waiting 30 real seconds.
+	retryBudget time.Duration
 	runID      string
 	dryRun     bool
 	estimator  *cacheEstimator
@@ -152,7 +158,8 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 			warmTPS   int
 			outputTPS int
 		}{coldTPS, warmTPS, outputTPS},
-		client: &http.Client{},
+		client:      &http.Client{},
+		retryBudget: retry429Budget,
 	}, nil
 }
 
@@ -292,6 +299,45 @@ func (p *replayPoster) latchEndpoint(url string) {
 	}
 }
 
+// 429 backoff schedule.
+//
+// A router under a per-backend concurrency cap sheds with 429 and expects the
+// caller to come back — vLLM slots free continuously as requests finish, so the
+// wait is usually milliseconds, not seconds. Recording that shed as a fatal
+// error (what this client did before) makes a run measure the harness: the
+// benchmark reported ~68% "errors" and stalled at active=7 against a router
+// whose backends were healthy and whose fleet was simply full.
+//
+// Starting at 10ms rather than honouring the router's Retry-After: 1 is
+// deliberate. Retry-After is a coarse, fixed hint; the real recovery time is
+// one request completion away, and a fixed one-second floor would turn a 20ms
+// wait into a 1s one on every shed and understate the fleet's throughput.
+const (
+	retry429Initial = 10 * time.Millisecond
+	retry429Max     = 3 * time.Second
+	retry429Budget  = 30 * time.Second
+)
+
+// backoff429 returns how long to wait before the next attempt, and false when
+// the total budget is spent and the 429 should stand as an error.
+//
+// Jittered by +/-30%. Without it, a fleet-wide shed puts every waiting client
+// on the same schedule and they return in a synchronised burst, which sheds
+// them again — the backoff would convert one overload into a standing wave.
+func backoff429(base, spent, budget time.Duration) (time.Duration, bool) {
+	if budget <= 0 {
+		budget = retry429Budget
+	}
+	if spent >= budget {
+		return 0, false
+	}
+	wait := time.Duration(float64(base) * (0.7 + 0.6*rand.Float64()))
+	if remaining := budget - spent; wait > remaining {
+		wait = remaining
+	}
+	return wait, true
+}
+
 // sendOnce POSTs bodyBytes to url with the poster's auth/accept headers.
 func (p *replayPoster) sendOnce(ctx context.Context, url string, bodyBytes []byte, stream bool) (*http.Response, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
@@ -369,28 +415,73 @@ func (p *replayPoster) do(
 	// Attempt-then-fallback: try the operator's path verbatim; ONLY a 404
 	// (path-level error) triggers one retry of the same request with /v1
 	// inserted. Transport errors and non-404 statuses return as-is.
+	//
+	// Wrapped in the 429 backoff loop: a router that sheds under load expects
+	// the client to come back, and a benchmark that instead records the shed as
+	// a fatal error measures the harness rather than the fleet. See
+	// backoff429.
 	var resp *http.Response
 	var attemptURL string
-	attempts := p.endpointAttempts()
-	for i, u := range attempts {
-		resp, err = p.sendOnce(ctx, u, bodyBytes, req.Stream)
-		if err != nil {
+	var retryWait time.Duration
+	var retries int
+	attemptStart := startTime
+	backoff := retry429Initial
+
+	for {
+		attemptStart = time.Now()
+		attempts := p.endpointAttempts()
+		for i, u := range attempts {
+			resp, err = p.sendOnce(ctx, u, bodyBytes, req.Stream)
+			if err != nil {
+				return RequestMetrics{
+					RequestNum:        int(st.totalCompleted.Load()) + 1,
+					SeriesNum:         seriesNum,
+					CycleNum:          turnIdx,
+					SeriesGUID:        sessionID + ":" + instanceID,
+					Error:             err,
+					Retries429:        retries,
+					RetryWait:         retryWait,
+					TotalResponseTime: time.Since(startTime),
+				}
+			}
+			attemptURL = u
+			if resp.StatusCode == http.StatusNotFound && i+1 < len(attempts) {
+				io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+				resp.Body.Close()
+				continue
+			}
+			break
+		}
+
+		if resp.StatusCode != http.StatusTooManyRequests {
+			break
+		}
+		wait, ok := backoff429(backoff, retryWait, p.retryBudget)
+		if !ok {
+			// Budget exhausted: keep this 429 and let it be recorded as the
+			// error it now genuinely is.
+			break
+		}
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+
+		select {
+		case <-ctx.Done():
 			return RequestMetrics{
 				RequestNum:        int(st.totalCompleted.Load()) + 1,
 				SeriesNum:         seriesNum,
 				CycleNum:          turnIdx,
 				SeriesGUID:        sessionID + ":" + instanceID,
-				Error:             err,
+				Error:             ctx.Err(),
+				Retries429:        retries,
+				RetryWait:         retryWait,
 				TotalResponseTime: time.Since(startTime),
 			}
+		case <-time.After(wait):
 		}
-		attemptURL = u
-		if resp.StatusCode == http.StatusNotFound && i+1 < len(attempts) {
-			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-			continue
-		}
-		break
+		retryWait += wait
+		retries++
+		backoff = min(2*backoff, retry429Max)
 	}
 	defer resp.Body.Close()
 
@@ -404,28 +495,44 @@ func (p *replayPoster) do(
 	if resp.StatusCode/100 != 2 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		m.Error = fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		if resp.StatusCode == http.StatusTooManyRequests {
+			// Only reachable once the whole budget is spent, so say so: a 429
+			// here means the fleet stayed saturated for 30s, not that it shed
+			// once.
+			m.Error = fmt.Errorf("status 429 after %v of backoff over %d retries: %s",
+				retryWait.Round(time.Millisecond), retries, strings.TrimSpace(string(body)))
+		}
+		m.Retries429, m.RetryWait = retries, retryWait
 		m.TotalResponseTime = time.Since(startTime)
 		return m
 	}
 	p.latchEndpoint(attemptURL)
 
+	// Timed from attemptStart, not startTime: TTFT and the response time the
+	// consumers compute must describe the attempt the server actually ran, so
+	// that backoff cannot make a healthy fleet look slow. The client-side wait
+	// is added back into TotalResponseTime below, where it belongs.
 	if p.apiType == "openai" || p.apiType == "openai_vllm" {
 		if req.Stream {
-			consumeOpenAISSE(resp.Body, startTime, &m)
+			consumeOpenAISSE(resp.Body, attemptStart, &m)
 		} else {
-			consumeOpenAIPlain(resp.Body, startTime, &m)
+			consumeOpenAIPlain(resp.Body, attemptStart, &m)
 		}
 	} else {
 		if req.Stream {
-			consumeSSE(resp.Body, startTime, &m)
+			consumeSSE(resp.Body, attemptStart, &m)
 		} else {
-			consumePlain(resp.Body, startTime, &m)
+			consumePlain(resp.Body, attemptStart, &m)
 		}
 	}
 
 	if m.TotalResponseTime == 0 {
-		m.TotalResponseTime = time.Since(startTime)
+		m.TotalResponseTime = time.Since(attemptStart)
 	}
+	// End to end, as the caller experienced it: server time plus every 429 it
+	// waited out.
+	m.Retries429, m.RetryWait = retries, retryWait
+	m.TotalResponseTime += retryWait
 	if m.Error == nil && strings.TrimSpace(m.Response) == "" && m.UsageData.OutputTokens.Count == 0 {
 		m.IsEmpty = true
 		m.Error = fmt.Errorf("empty response from model")

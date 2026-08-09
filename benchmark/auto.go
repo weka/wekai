@@ -897,6 +897,14 @@ type autoState struct {
 	totalEmitted   atomic.Int64
 	totalErrors    atomic.Int64
 
+	// Client-side 429 backoff: how many sheds were waited out, and the total
+	// time spent waiting. A router with a per-backend concurrency cap sheds by
+	// design, so these say how much of the run's wall time was the client
+	// queueing rather than the fleet working. Errors count only the sheds that
+	// outlasted the whole retry budget.
+	totalRetries429  atomic.Int64
+	totalRetryWaitNs atomic.Int64
+
 	// Unix-nano timestamp of last error printed via --print-errors-threshold.
 	// 0 means no error printed yet. Used to rate-limit error stderr output.
 	lastErrorPrintNs atomic.Int64
@@ -1032,6 +1040,8 @@ type autoBenchmarkResult struct {
 	cacheWarning      bool
 	totalCompleted    int64
 	totalErrors       int64
+	totalRetries429   int64
+	totalRetryWait    time.Duration
 	ttftP50           time.Duration
 	ttftP95           time.Duration
 	inputTokPerSec    float64
@@ -1063,6 +1073,8 @@ type displaySnapshot struct {
 	ttftDegradedCount    int64         // requests disqualified by TTFT cutoff
 	totalCompleted       int64
 	totalErrors          int64
+	totalRetries429      int64
+	totalRetryWait       time.Duration
 	elapsed              time.Duration
 	cacheWarning         bool
 	bothDone             bool
@@ -1191,6 +1203,15 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 	fmt.Println(strings.Repeat("-", 62))
 	fmt.Printf(" Total completed    : %d\n", res.totalCompleted)
 	fmt.Printf(" Total errors       : %d\n", res.totalErrors)
+	if res.totalRetries429 > 0 {
+		// A router enforcing a per-backend concurrency cap sheds on purpose, so
+		// this is the run's cost of that policy: sheds waited out, and the wall
+		// time the client spent queueing for them. Errors above count only the
+		// sheds that outlasted the entire retry budget.
+		mean := res.totalRetryWait / time.Duration(res.totalRetries429)
+		fmt.Printf(" 429 backoff        : %d retries, %s total wait (mean %s/retry)\n",
+			res.totalRetries429, formatDur(res.totalRetryWait), formatDur(mean))
+	}
 	fmt.Println(strings.Repeat("=", 62))
 }
 
@@ -1449,6 +1470,8 @@ func runSingleModelBenchmark(
 
 		total := st.totalCompleted.Load()
 		errors := st.totalErrors.Load()
+		retries429 := st.totalRetries429.Load()
+		retryWait := time.Duration(st.totalRetryWaitNs.Load())
 
 		// Use CacheWindowSize for both cache and throughput so all displayed
 		// metrics reflect the same recent-request window.
@@ -1492,6 +1515,8 @@ func runSingleModelBenchmark(
 			ttftDegradedCount:    st.ttftDegradedCount.Load(),
 			totalCompleted:       total,
 			totalErrors:          errors,
+			totalRetries429:      retries429,
+			totalRetryWait:       retryWait,
 			elapsed:              time.Since(startTime),
 			cacheWarning:         cacheWarning,
 			bothDone:             seriesDone,
@@ -1939,6 +1964,10 @@ func runSingleModelBenchmark(
 				})
 
 				st.totalCompleted.Add(1)
+				if metrics.Retries429 > 0 {
+					st.totalRetries429.Add(int64(metrics.Retries429))
+					st.totalRetryWaitNs.Add(int64(metrics.RetryWait))
+				}
 				if isErr {
 					st.totalErrors.Add(1)
 					st.consecutiveFailures.Add(1)
@@ -2362,6 +2391,8 @@ func runSingleModelBenchmark(
 	res.elapsed = time.Since(startTime)
 	res.totalCompleted = st.totalCompleted.Load()
 	res.totalErrors = st.totalErrors.Load()
+	res.totalRetries429 = st.totalRetries429.Load()
+	res.totalRetryWait = time.Duration(st.totalRetryWaitNs.Load())
 	res.ttftP50 = tm.ttftP50
 	res.ttftP95 = tm.ttftP95
 	tt := st.stream.TokenTotals()
