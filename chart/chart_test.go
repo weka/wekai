@@ -113,3 +113,46 @@ func TestSleepMessagePointsAtTheData(t *testing.T) {
 		t.Errorf("sleep message does not point at %q", want)
 	}
 }
+
+// renderRouter templates the router chart. It is a separate chart from
+// ./wekai for a reason worth stating: the benchmark image embeds a multi-GB
+// replay artifact, and a router that never reads it should not pay to pull it.
+func renderRouter(t *testing.T, args ...string) string {
+	t.Helper()
+	helm, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("helm not installed; chart render test skipped")
+	}
+	base := []string{"template", "t", "router"}
+	out, err := exec.Command(helm, append(base, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template failed: %v\n%s", err, out)
+	}
+	return string(out)
+}
+
+// TestRouterChartUsesTheReplaylessImage is the tripwire for the mistake this
+// split exists to prevent: pointing the router chart back at the benchmark
+// image would silently add gigabytes to every router pull.
+func TestRouterChartUsesTheReplaylessImage(t *testing.T) {
+	out := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000")
+	if !strings.Contains(out, "quay.io/weka.io/wekai-router:") {
+		t.Errorf("rendered router deployment does not use the wekai-router image:\n%s", out)
+	}
+	if strings.Contains(out, "quay.io/weka.io/wekai:") ||
+		strings.Contains(out, "wekai-benchmark") {
+		t.Errorf("router chart references a replay-carrying image:\n%s", out)
+	}
+}
+
+// TestRouterChartRunsTheSubcommand: the router is `wekai router serve`, not a
+// standalone binary. If the args stop saying so, the pod runs the image's
+// default and serves nothing.
+func TestRouterChartRunsTheSubcommand(t *testing.T) {
+	out := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000")
+	for _, want := range []string{`- "router"`, `- "serve"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered args missing %s:\n%s", want, out)
+		}
+	}
+}

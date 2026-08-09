@@ -1,0 +1,468 @@
+{
+  "_editing_note": "VERSIONING POLICY: bump the bottom 'version' field by exactly 1 on every modification of this file. Current version below must reflect this rule.",
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "wekai router — per-user request, token, and cost observability scraped from /metrics. Pair with the wekai-router PodMonitor.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 7,
+      "title": "Input:output token ratio (range)",
+      "description": "Total input tokens (uncached + cache reads + cache writes) divided by total output tokens over the selected range.",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none", "textMode": "auto"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}, "unit": "none", "decimals": 2}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(increase(wekai_router_input_tokens_total{user=~\"$user\", model=~\"$model\"}[$__range]) + increase(wekai_router_cache_read_tokens_total{user=~\"$user\", model=~\"$model\"}[$__range]) + increase(wekai_router_cache_creation_tokens_total{user=~\"$user\", model=~\"$model\"}[$__range])) / clamp_min(sum(increase(wekai_router_output_tokens_total{user=~\"$user\", model=~\"$model\"}[$__range])), 1)",
+          "legendFormat": "in:out",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "title": "Active users (range)",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 4, "w": 3, "x": 6, "y": 0},
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "count(count by (user) (increase(wekai_router_requests_total{user!=\"unknown\"}[$__range]) > 0))",
+          "instant": true,
+          "legendFormat": "users",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Active sessions (range)",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 4, "w": 3, "x": 9, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "purple", "value": null}]}}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "count(count by (session_id) (increase(wekai_router_requests_total{session_id!=\"unknown\"}[$__range]) > 0))",
+          "instant": true,
+          "legendFormat": "sessions",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Request rate",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 4, "w": 3, "x": 12, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "reqps"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(wekai_router_requests_total[5m]))",
+          "legendFormat": "req/s",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Cost rate ($/h)",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 4, "w": 3, "x": 15, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "yellow", "value": null}, {"color": "orange", "value": 10}, {"color": "red", "value": 100}]}, "unit": "currencyUSD"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(wekai_router_cost_usd_total[5m])) * 3600",
+          "legendFormat": "$/h",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Total cost (range)",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 4, "w": 3, "x": 18, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "yellow", "value": null}]}, "unit": "currencyUSD"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(increase(wekai_router_cost_usd_total[$__range]))",
+          "legendFormat": "total $",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Error rate (5m)",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 4, "w": 3, "x": 21, "y": 0},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.01}, {"color": "red", "value": 0.05}]}, "unit": "percentunit"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(wekai_router_requests_total{status!~\"2..\"}[5m])) / clamp_min(sum(rate(wekai_router_requests_total[5m])), 1)",
+          "legendFormat": "errors",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Requests over time by status",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "bars", "stacking": {"mode": "normal"}, "lineWidth": 0, "fillOpacity": 80}, "unit": "reqps"}},
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (status) (rate(wekai_router_requests_total{user=~\"$user\", model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "{{status}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Cumulative cost by user (range)",
+      "description": "Per-user cumulative cost since the start of the selected range. Each user is its own stacked layer; layer height at time t = that user's total spend from range-start through t. Top of stack at the right edge = total spend across all users in the range.",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "stacking": {"mode": "normal"}, "lineWidth": 1, "fillOpacity": 50}, "unit": "currencyUSD"}},
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull"], "sortBy": "Last *", "sortDesc": true}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (user) (wekai_router_cost_usd_total{user=~\"$user\", model=~\"$model\"}) - (sum by (user) (wekai_router_cost_usd_total{user=~\"$user\", model=~\"$model\"} @ start()) or sum by (user) (wekai_router_cost_usd_total{user=~\"$user\", model=~\"$model\"}) * 0)",
+          "legendFormat": "{{user}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Tokens over time (stacked)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "stacking": {"mode": "normal"}, "lineWidth": 1, "fillOpacity": 40}, "unit": "short"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "sum"]}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(wekai_router_input_tokens_total{user=~\"$user\", model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "input (uncached)",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(wekai_router_cache_read_tokens_total{user=~\"$user\", model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "cache read",
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(wekai_router_cache_creation_tokens_total{user=~\"$user\", model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "cache write",
+          "refId": "C"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(wekai_router_output_tokens_total{user=~\"$user\", model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "output",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "Total tokens (range)",
+      "description": "Cumulative token counts since the start of the selected range, stacked by token type. Each layer height at time t = total tokens of that type from range-start through t. Same pure-PromQL pattern as 'Cumulative cost by user (range)'.",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "stacking": {"mode": "normal"}, "lineWidth": 1, "fillOpacity": 40}, "unit": "short"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(wekai_router_input_tokens_total{user=~\"$user\", model=~\"$model\"}) - (sum(wekai_router_input_tokens_total{user=~\"$user\", model=~\"$model\"} @ start()) or sum(wekai_router_input_tokens_total{user=~\"$user\", model=~\"$model\"}) * 0)",
+          "legendFormat": "input (uncached)",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(wekai_router_cache_read_tokens_total{user=~\"$user\", model=~\"$model\"}) - (sum(wekai_router_cache_read_tokens_total{user=~\"$user\", model=~\"$model\"} @ start()) or sum(wekai_router_cache_read_tokens_total{user=~\"$user\", model=~\"$model\"}) * 0)",
+          "legendFormat": "cache read",
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(wekai_router_cache_creation_tokens_total{user=~\"$user\", model=~\"$model\"}) - (sum(wekai_router_cache_creation_tokens_total{user=~\"$user\", model=~\"$model\"} @ start()) or sum(wekai_router_cache_creation_tokens_total{user=~\"$user\", model=~\"$model\"}) * 0)",
+          "legendFormat": "cache write",
+          "refId": "C"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(wekai_router_output_tokens_total{user=~\"$user\", model=~\"$model\"}) - (sum(wekai_router_output_tokens_total{user=~\"$user\", model=~\"$model\"} @ start()) or sum(wekai_router_output_tokens_total{user=~\"$user\", model=~\"$model\"}) * 0)",
+          "legendFormat": "output",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "title": "Top users by cost (range)",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 20},
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "left"}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "cost"}, "properties": [{"id": "unit", "value": "currencyUSD"}, {"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}]},
+          {"matcher": {"id": "byName", "options": "cache_pct"}, "properties": [{"id": "unit", "value": "percentunit"}, {"id": "max", "value": 1}]}
+        ]
+      },
+      "options": {"sortBy": [{"displayName": "cost", "desc": true}], "footer": {"show": true, "reducer": ["sum"], "fields": ["Value #cost", "Value #requests", "Value #input", "Value #output"]}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (user) (increase(wekai_router_cost_usd_total[$__range]))",
+          "format": "table",
+          "instant": true,
+          "refId": "cost"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (user) (increase(wekai_router_requests_total[$__range]))",
+          "format": "table",
+          "instant": true,
+          "refId": "requests"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (user) (increase(wekai_router_input_tokens_total[$__range]) + increase(wekai_router_cache_read_tokens_total[$__range]) + increase(wekai_router_cache_creation_tokens_total[$__range]))",
+          "format": "table",
+          "instant": true,
+          "refId": "input"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (user) (increase(wekai_router_output_tokens_total[$__range]))",
+          "format": "table",
+          "instant": true,
+          "refId": "output"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (user) (increase(wekai_router_cache_read_tokens_total[$__range])) / clamp_min(sum by (user) (increase(wekai_router_input_tokens_total[$__range]) + increase(wekai_router_cache_read_tokens_total[$__range]) + increase(wekai_router_cache_creation_tokens_total[$__range])), 1)",
+          "format": "table",
+          "instant": true,
+          "refId": "cache_pct"
+        }
+      ],
+      "transformations": [
+        {"id": "joinByField", "options": {"byField": "user", "mode": "outer"}},
+        {"id": "organize", "options": {
+          "excludeByName": {"Time 1": true, "Time 2": true, "Time 3": true, "Time 4": true, "Time 5": true},
+          "renameByName": {
+            "Value #cost": "cost",
+            "Value #requests": "requests",
+            "Value #input": "input_tokens",
+            "Value #output": "output_tokens",
+            "Value #cache_pct": "cache_pct"
+          }
+        }}
+      ]
+    },
+    {
+      "id": 31,
+      "title": "Top sessions by cost (range)",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 20},
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "left"}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "cost"}, "properties": [{"id": "unit", "value": "currencyUSD"}, {"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}]}
+        ]
+      },
+      "options": {"sortBy": [{"displayName": "cost", "desc": true}], "footer": {"show": false}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "topk(20, sum by (session_id, user) (increase(wekai_router_cost_usd_total{session_id!=\"unknown\"}[$__range])))",
+          "format": "table",
+          "instant": true,
+          "refId": "cost"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (session_id) (increase(wekai_router_requests_total{session_id!=\"unknown\"}[$__range]))",
+          "format": "table",
+          "instant": true,
+          "refId": "requests"
+        }
+      ],
+      "transformations": [
+        {"id": "joinByField", "options": {"byField": "session_id", "mode": "outer"}},
+        {"id": "organize", "options": {
+          "excludeByName": {"Time 1": true, "Time 2": true},
+          "renameByName": {
+            "Value #cost": "cost",
+            "Value #requests": "requests"
+          }
+        }}
+      ]
+    },
+    {
+      "id": 40,
+      "title": "Cost by model (stacked, $/h)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "stacking": {"mode": "normal"}, "lineWidth": 1, "fillOpacity": 40}, "unit": "currencyUSD"}},
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "sum"], "sortBy": "Sum", "sortDesc": true}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (model) (rate(wekai_router_cost_usd_total{user=~\"$user\", model=~\"$model\"}[$__rate_interval])) * 3600",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 41,
+      "title": "Unknown models seen (no pricing)",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 30},
+      "description": "Models that hit the router but aren't in the llm registry. Their cost is reported as 0. Add an entry in internal/llm/models.go to fix.",
+      "fieldConfig": {"defaults": {"custom": {"align": "left"}}, "overrides": []},
+      "options": {"sortBy": [{"displayName": "Value", "desc": true}]},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (model) (increase(wekai_router_unknown_model_total[$__range]))",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"excludeByName": {"Time": true}, "renameByName": {"Value": "requests"}}}
+      ]
+    },
+    {
+      "id": 21,
+      "title": "Cache hit rate (of total input)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 38},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}, "unit": "percentunit", "min": 0, "max": 1}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean"]}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(wekai_router_cache_read_tokens_total{user=~\"$user\", model=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(wekai_router_input_tokens_total{user=~\"$user\", model=~\"$model\"}[$__rate_interval])) + sum(rate(wekai_router_cache_read_tokens_total{user=~\"$user\", model=~\"$model\"}[$__rate_interval])) + sum(rate(wekai_router_cache_creation_tokens_total{user=~\"$user\", model=~\"$model\"}[$__rate_interval])), 1)",
+          "legendFormat": "cache hit %",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["wekai", "router", "llm"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "regex": "",
+        "refresh": 1
+      },
+      {
+        "name": "user",
+        "label": "User",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": {"qryType": 1, "query": "label_values(wekai_router_requests_total, user)", "refId": "PrometheusVariableQueryEditor-VariableQuery"},
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": {"qryType": 1, "query": "label_values(wekai_router_requests_total, model)", "refId": "PrometheusVariableQueryEditor-VariableQuery"},
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "wekai router — users, tokens, cost",
+  "uid": "wekai-router",
+  "version": 22,
+  "weekStart": ""
+}

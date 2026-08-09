@@ -1,0 +1,17 @@
+{{- if .Values.datastore.sharedPvc.enabled -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "app.fullname" . }}-router-capture
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.datastore.sharedPvc.storageClass }}
+  storageClassName: {{ .Values.datastore.sharedPvc.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.datastore.sharedPvc.size }}
+{{- end }}

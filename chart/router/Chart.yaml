@@ -1,0 +1,6 @@
+apiVersion: v2
+name: wekai-router
+description: Model-aware LLM router with prefix-cache affinity (wekai router serve)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

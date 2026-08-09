@@ -1,0 +1,155 @@
+# Default values for wekai-router.
+#
+# Deploys `wekai router serve` from the REPLAY-LESS image. The benchmark image
+# carries a multi-GB embedded replay artifact that a router never reads; this
+# chart deliberately does not use it. Both images are published from the same
+# commit under the same semver on every release.
+
+imageRepository: quay.io/weka.io/wekai-router
+imageTag: ""  # defaults to .Chart.AppVersion
+imagePullSecrets: []
+nameOverride: ""
+
+replicaCount: 2
+
+# Router CLI flags (see `wekai-benchmark router serve --help`).
+router:
+  # Grace period after SIGTERM: readiness flips to 503 so k8s stops routing new
+  # traffic, in-flight requests are allowed to finish, then force shutdown.
+  # `terminationGracePeriodSeconds` (below) must exceed this.
+  drainTimeout: 5m
+
+  # Routing rules, repeated. Syntax: "<pattern> => <upstream>[ as <model>]".
+  # Pattern is comma-separated case-insensitive substrings of the model name,
+  # or "*" for catch-all. First match wins.
+  routes: []
+  # - "claude => https://api.anthropic.com"
+  # - "gpt => https://api.openai.com"
+
+  # Optional catch-all upstream used if no --route matches.
+  default: ""
+  # default: "https://api.anthropic.com"
+
+  # Patterns that trigger stripping of Authorization/x-api-key/anthropic-beta
+  # headers before forwarding (useful for unauth'd internal upstreams).
+  stripAuthWhen: []
+
+  # Log full request/response headers. Verbose; may leak tokens. Leave off
+  # unless debugging.
+  logHeaders: false
+
+  # Capture mode: "", "raw", or "redacted". See command_router.go for schema.
+  # Default redacted: captures the per-request structured metadata (block
+  # hashes, byte/token counts, tool-use ids, prompt/seed hashes) without
+  # storing original prompt or response content. Operators that want full
+  # raw bodies can override to "raw"; "" disables capture entirely.
+  capture: redacted
+
+  # Optional override for capture directory. Defaults to
+  # /data/router/capture/<mode> when datastore PVC is enabled; otherwise to
+  # the binary default (~/.wekai/router/capture/<mode>).
+  captureDir: ""
+
+  # Async capture channel buffer size.
+  captureBuffer: 512
+
+  # Per-user path-prefix routing (opt-in). When true, requests at
+  # /<user>/v1/<rest> route to /v1/<rest> upstream and the leading
+  # segment is captured as `user` on each record. Lets clients
+  # distinguish themselves by setting their ANTHROPIC_BASE_URL to
+  # http://router-host/<user>. Default off — behavior is unchanged
+  # unless this is enabled.
+  userPrefix: false
+
+# Extra CLI args appended after the standard router flags. Use for anything
+# not yet surfaced in values (e.g. new flags added in the binary).
+extraArgs: []
+
+service:
+  type: ClusterIP
+  port: 80
+  # Container listen port. Must match --listen below (just the port).
+  targetPort: 25201
+
+# Ingress: off by default. Set `domain` to expose externally.
+# `className` is optional — omit to let the cluster default IngressClass take
+# over (matches wekai/wekai-restricted behavior).
+ingress:
+  enabled: false
+  className: ""
+  # Defaults tuned for an nginx ingress controller in front of the router.
+  # Harmless (ignored) on other ingress classes. Override/clear as needed.
+  annotations:
+    # nginx-ingress caps request bodies at 1m by default → large requests get
+    # a 413 before reaching the router. "0" = no limit; set e.g. "32m" to cap.
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    # By default nginx buffers the *entire* request body (spilling to disk past
+    # client-body-buffer-size) before opening the upstream connection. "off"
+    # streams the body straight through to the router as it arrives.
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+  tls: []
+  # - secretName: wekai-router-tls
+  #   hosts:
+  #     - router.example.com
+
+# Domain name for the ingress host. Required when ingress.enabled is true.
+domain: ""
+
+# Optional persistent storage for capture output. When disabled the pod uses
+# an emptyDir and captures vanish on restart.
+datastore:
+  sharedPvc:
+    enabled: false
+    storageClass: ""   # empty = cluster default
+    size: "10Gi"
+
+# Name of a Kubernetes secret with upstream API keys. Populated as env vars
+# so the router process can forward them if a route needs it. Typically the
+# router only proxies — leave empty unless an upstream rewrite needs a key.
+llmApiKeySecretName: ""
+
+resources:
+  requests:
+    memory: "64Mi"
+    cpu: "50m"
+  limits:
+    memory: "512Mi"
+    cpu: "1"
+
+podSecurityContext: {}
+securityContext: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Must exceed router.drainTimeout so the pod gets to drain in-flight requests
+# before kubelet force-kills it. Default covers 5m drain + small buffer.
+terminationGracePeriodSeconds: 330
+
+# HTTP probe tuning. The router exposes /healthz (readiness — returns 503 when
+# draining) and /livez (liveness — 200 while the process is up).
+probes:
+  readiness:
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    failureThreshold: 2
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 20
+    failureThreshold: 3
+
+# PodMonitor for Prometheus Operator scrapes. /metrics is on the same router
+# port (no separate listener), so scrape uses the pod's `http` port.
+# Auto-disabled in clusters without the PodMonitor CRD installed (we check
+# .Capabilities.APIVersions.Has at template time).
+podMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  # Additional labels to attach to the PodMonitor resource — most clusters
+  # need at least one label to select PodMonitors into the Prometheus Operator.
+  # Typical values: { release: kube-prometheus-stack } or { prometheus: main }
+  additionalLabels: {}
+  # MetricRelabelings applied to scraped samples. Use to drop high-cardinality
+  # labels in production (e.g. session_id) if active series count gets large.
+  metricRelabelings: []

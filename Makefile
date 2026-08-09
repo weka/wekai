@@ -10,10 +10,10 @@
 
 GO         ?= go
 BINARY     := wekai
-ROUTER     := wllm-router
-ROUTER_PKG := ./router/cmd/wllm-router
-
-IMAGE_REPO ?= quay.io/weka.io/vllm-router
+# The router is `wekai router serve`; there is no separate router binary. What
+# differs is the IMAGE: the router one carries no replay artifact.
+IMAGE_REPO   ?= quay.io/weka.io/wekai
+ROUTER_IMAGE ?= quay.io/weka.io/wekai-router
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -94,34 +94,30 @@ vulncheck: ## Scan dependencies for known vulnerabilities
 build: ## Build the wekai CLI
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(BINARY) .
 
-.PHONY: router-build
-router-build: ## Build the router binary
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(ROUTER) $(ROUTER_PKG)
-
 .PHONY: router-image
-router-image: ## Build the router container image
-	docker build -f Dockerfile.wllm-router \
+router-image: ## Build the replay-less router container image
+	docker build -f Dockerfile.router \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg COMMIT=$(COMMIT) \
 		--build-arg BUILD_DATE=$(BUILD_DATE) \
-		-t $(IMAGE_REPO):$(VERSION) .
+		-t $(ROUTER_IMAGE):$(VERSION) .
 
 .PHONY: router-image-multiarch
 router-image-multiarch: ## Build and push a multi-arch router image
-	docker buildx build -f Dockerfile.wllm-router --platform $(PLATFORMS) \
+	docker buildx build -f Dockerfile.router --platform $(PLATFORMS) \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg COMMIT=$(COMMIT) \
 		--build-arg BUILD_DATE=$(BUILD_DATE) \
-		-t $(IMAGE_REPO):$(VERSION) --push .
+		-t $(ROUTER_IMAGE):$(VERSION) --push .
 
 .PHONY: router-image-smoke
-router-image-smoke: router-image ## Build the image and check the binary reports its version
-	docker run --rm $(IMAGE_REPO):$(VERSION) -version
+router-image-smoke: router-image ## Build the image and check it runs
+	docker run --rm $(ROUTER_IMAGE):$(VERSION) --version
 
 .PHONY: router-run
-router-run: router-build ## Run the router locally against a backend at :8000
-	./$(ROUTER) -listen 127.0.0.1:8080 -metrics-listen 127.0.0.1:29000 \
-		-backends http://127.0.0.1:8000 -log-format text
+router-run: build ## Run the router locally against a backend at :8000
+	./$(BINARY) router serve --listen 127.0.0.1:8080 --metrics-listen 127.0.0.1:29000 \
+		--backends http://127.0.0.1:8000 --log-format text
 
 .PHONY: router-deploy
 router-deploy: ## Apply the router's Kubernetes manifests
@@ -145,5 +141,5 @@ router-image-size: ## Report router image size, uncompressed and compressed
 
 .PHONY: clean
 clean: ## Remove build artifacts
-	rm -f $(BINARY) $(ROUTER)
+	rm -f $(BINARY)
 	$(GO) clean -testcache

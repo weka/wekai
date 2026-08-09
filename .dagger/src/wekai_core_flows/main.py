@@ -28,6 +28,17 @@ SOURCE_IGNORE = [
 CHART_DIR = "chart/wekai"
 CHART_NAME = "wekai"
 
+# The router ships as a SECOND image and chart from the same commit. It is the
+# same wekai binary; what differs is that the router image carries no embedded
+# replay artifact. That artifact is multi-GB and exists so a benchmark pod can
+# replay captured traffic without a volume — a router never opens it, and making
+# every router replica pull it would be pure cost. Two Dockerfiles rather than a
+# build arg, so a router image that accidentally includes it is impossible
+# rather than merely unlikely.
+ROUTER_DOCKERFILE = "Dockerfile.router"
+ROUTER_CHART_DIR = "chart/router"
+ROUTER_CHART_NAME = "wekai-router"
+
 
 async def _calc_version(src: dagger.Directory) -> str:
     """Ported verbatim from wekai's .dagger/src/wekai_flows/main.py."""
@@ -63,6 +74,67 @@ async def _publish_image(
     image_name = f"{registry}:{version}"
     await container.publish(image_name)
     return image_name, version
+
+
+async def _publish_router_image(
+    source: dagger.Directory,
+    registry: str,
+    version: str = "",
+) -> tuple[str, str]:
+    """Builds and publishes the replay-less router image.
+
+    Same source, same binary, different Dockerfile — see ROUTER_DOCKERFILE.
+
+    Returns (image_name, version).
+    """
+    if not version:
+        version = await _calc_version(source)
+    container = source.docker_build(
+        platform=LINUX_AMD64,
+        dockerfile=ROUTER_DOCKERFILE,
+    )
+    image_name = f"{registry}:{version}"
+    await container.publish(image_name)
+    return image_name, version
+
+
+async def _package_and_push_chart(
+    chart: dagger.Directory,
+    chart_name: str,
+    registry: str,
+    version: str,
+    helm_registry: str,
+    helm_username: dagger.Secret,
+    helm_password: dagger.Secret,
+) -> str:
+    """Packages one chart pinned to one just-published image and pushes it.
+
+    Version pinning is pure propagation: only Chart.yaml is stamped, and the
+    deployment template resolves the tag via `imageTag | default
+    .Chart.AppVersion`, so values.yaml never carries a hardcoded version.
+    imageRepository IS synced to the real push destination, so publishing to a
+    custom registry cannot yield a chart pointing at the default one.
+    """
+    registry_host = helm_registry.split("/")[0]
+    packaged = (
+        dag.container(platform=LINUX_AMD64)
+        .from_("alpine:latest")
+        .with_exec(["apk", "add", "--no-cache", "helm"])
+        .with_directory("/chart", chart)
+        .with_exec(["sed", "-i", f"s/^version:.*/version: {version}/", "/chart/Chart.yaml"])
+        .with_exec(["sed", "-i", f's/^appVersion:.*/appVersion: "{version}"/', "/chart/Chart.yaml"])
+        .with_exec(["sed", "-i", f"s|^imageRepository:.*|imageRepository: {registry}|", "/chart/values.yaml"])
+        .with_exec(["helm", "package", "/chart", "--destination", "/out"])
+    )
+    await (
+        packaged
+        .with_secret_variable("HELM_USER", helm_username)
+        .with_secret_variable("HELM_PASS", helm_password)
+        .with_exec(["sh", "-c",
+                    f"echo $HELM_PASS | helm registry login {registry_host} -u $HELM_USER --password-stdin && "
+                    f"helm push /out/{chart_name}-*.tgz oci://{helm_registry}"])
+    ).stdout()
+    return f"oci://{helm_registry}/{chart_name}:{version}"
 
 
 @object_type
@@ -173,38 +245,50 @@ class WekaiCoreFlows:
         """
         image_name, version = await _publish_image(source, registry, replay_image, version)
 
-        chart = source.directory(CHART_DIR)
-        registry_host = helm_registry.split("/")[0]  # e.g. "quay.io"
-
-        packaged = (
-            dag.container(platform=LINUX_AMD64)
-            .from_("alpine:latest")
-            .with_exec(["apk", "add", "--no-cache", "helm"])
-            .with_directory("/chart", chart)
-            # Version pinning is pure propagation (same pattern as wekai's
-            # push_restricted): only Chart.yaml is stamped, and the deployment
-            # template resolves the image tag via `imageTag | default
-            # .Chart.AppVersion`. values.yaml imageTag stays "" — no hardcoded
-            # version in the packaged chart. imageRepository IS synced to the
-            # actual push destination so a custom registry never yields a
-            # chart pointing at the default repo.
-            .with_exec(["sed", "-i", f"s/^version:.*/version: {version}/", "/chart/Chart.yaml"])
-            .with_exec(["sed", "-i", f's/^appVersion:.*/appVersion: "{version}"/', "/chart/Chart.yaml"])
-            .with_exec(["sed", "-i", f"s|^imageRepository:.*|imageRepository: {registry}|", "/chart/values.yaml"])
-            .with_exec(["helm", "package", "/chart", "--destination", "/out"])
+        chart_ref = await _package_and_push_chart(
+            source.directory(CHART_DIR), CHART_NAME, registry, version,
+            helm_registry, helm_username, helm_password,
         )
-
-        await (
-            packaged
-            .with_secret_variable("HELM_USER", helm_username)
-            .with_secret_variable("HELM_PASS", helm_password)
-            .with_exec(["sh", "-c",
-                        f"echo $HELM_PASS | helm registry login {registry_host} -u $HELM_USER --password-stdin && "
-                        f"helm push /out/{CHART_NAME}-*.tgz oci://{helm_registry}"])
-        ).stdout()
 
         return (
             f"Published wekai image: {image_name}\n"
-            f"Published Helm chart: oci://{helm_registry}/{CHART_NAME}:{version} "
-            f"(pinned to image {image_name})"
+            f"Published Helm chart: {chart_ref} (pinned to image {image_name})"
+        )
+
+    @function
+    async def push_router_helm(
+        self,
+        source: Annotated[dagger.Directory, Ignore(SOURCE_IGNORE)],
+        helm_username: dagger.Secret,
+        helm_password: dagger.Secret,
+        registry: str = "quay.io/weka.io/wekai-router",
+        helm_registry: str = "quay.io/weka.io/helm",
+        version: str = "",
+    ) -> str:
+        """Publishes the REPLAY-LESS router image, then packages and pushes
+        chart/router pinned to it.
+
+        The mirror of `push_helm` for the router half of a release. Both run
+        from the same commit under the same semver, so a release yields two
+        images and two charts that are known to agree: the benchmark pair
+        carries the embedded replay artifact, the router pair does not.
+
+        Args:
+            helm_username: OCI Helm registry username.
+            helm_password: OCI Helm registry password.
+            registry: Image registry:repo for the router image.
+            helm_registry: OCI Helm registry base.
+            version: Explicit version stamp for both image tag and chart
+                version/appVersion. Empty = content-hash scheme.
+        """
+        image_name, version = await _publish_router_image(source, registry, version)
+
+        chart_ref = await _package_and_push_chart(
+            source.directory(ROUTER_CHART_DIR), ROUTER_CHART_NAME, registry, version,
+            helm_registry, helm_username, helm_password,
+        )
+
+        return (
+            f"Published router image: {image_name}\n"
+            f"Published Helm chart: {chart_ref} (pinned to image {image_name})"
         )

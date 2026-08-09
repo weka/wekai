@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+
+# wekai router image — the same wekai binary as the benchmark image, WITHOUT
+# the embedded replay artifact.
+#
+# That artifact is several GB uncompressed and exists so a benchmark pod can
+# replay captured traffic with no external volume. A router serves live traffic
+# and never reads it, so shipping it would multiply pull time and node disk for
+# every router replica to carry a file none of them opens. Same binary, same
+# build, different layer set — which is why this is a separate Dockerfile
+# rather than a build arg: the difference is what is COPYed, and a router image
+# that could accidentally include a multi-GB layer is worth making impossible
+# rather than merely unlikely.
+#
+# It replaces the former Dockerfile.wllm-router, which built a standalone router
+# binary. There is no standalone router any more; the router is `wekai router
+# serve`.
+FROM golang:1.25.7-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+# Trimpath and stripped symbols: this image is shipped, and neither the build
+# host's paths nor the DWARF tables belong in it.
+RUN go build -trimpath -ldflags="-s -w" -o /out/wekai .
+
+FROM alpine:latest
+LABEL org.opencontainers.image.title="wekai-router" \
+      org.opencontainers.image.description="Model-aware LLM router with prefix-cache affinity (wekai router serve)" \
+      org.opencontainers.image.source="https://github.com/weka/wekai"
+RUN apk add --no-cache ca-certificates
+# Runs unprivileged: the router needs no filesystem beyond its own binary, and
+# capture (when enabled) writes to a mounted volume the operator owns.
+RUN addgroup -g 65532 -S nonroot && adduser -u 65532 -S nonroot -G nonroot
+COPY --link --from=builder /out/wekai /usr/local/bin/wekai
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/wekai"]
+CMD ["router", "serve"]

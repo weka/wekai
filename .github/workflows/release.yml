@@ -93,13 +93,29 @@ jobs:
           done
           ls -lh dist/*.tar.gz
 
-      - name: Publish image + chart under semver (dagger push-helm)
+      # Two images and two charts from one commit under one semver. The
+      # benchmark pair embeds the multi-GB replay artifact; the router pair does
+      # not, because a router never reads it. Publishing both here is what keeps
+      # them from drifting: a release either ships a matched set or fails.
+      - name: Publish benchmark image + chart under semver (dagger push-helm)
         if: steps.semver.outputs.new_tag != ''
         env:
           QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
         run: |
           dagger call push-helm \
+            --source=. \
+            --helm-username=env://QUAY_USERNAME \
+            --helm-password=env://QUAY_PASSWORD \
+            --version "${{ steps.semver.outputs.new_tag }}"
+
+      - name: Publish router image + chart under semver (dagger push-router-helm)
+        if: steps.semver.outputs.new_tag != ''
+        env:
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+        run: |
+          dagger call push-router-helm \
             --source=. \
             --helm-username=env://QUAY_USERNAME \
             --helm-password=env://QUAY_PASSWORD \
@@ -122,7 +138,10 @@ jobs:
             curl -fsSL https://github.com/weka/wekai/releases/download/${{ steps.semver.outputs.new_tag }}/wekai_${{ steps.semver.outputs.new_tag }}_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz | tar -xz
             ```
 
-            Helm (replay benchmark against your endpoint — see README for all values):
+            ### Benchmark
+
+            Replay benchmark against your endpoint (see chart README for all values).
+            This image embeds the replay artifact, so no volume or fetch step is needed:
 
             ```
             helm upgrade --install my-replay oci://quay.io/weka.io/helm/wekai \
@@ -130,10 +149,24 @@ jobs:
               --set endpoint=http://YOUR-LLM-HOST:8000
             ```
 
-            Container image:
-
             ```
             docker pull quay.io/weka.io/wekai:${{ steps.semver.outputs.new_tag }}
+            ```
+
+            ### Router
+
+            Model-aware LLM router with prefix-cache affinity. Separate,
+            replay-less image — same binary, without the multi-GB replay layer a
+            router never reads:
+
+            ```
+            helm upgrade --install my-router oci://quay.io/weka.io/helm/wekai-router \
+              --version ${{ steps.semver.outputs.new_tag }} \
+              --set router.routes[0]="* => http://vllm-a:8000|http://vllm-b:8000"
+            ```
+
+            ```
+            docker pull quay.io/weka.io/wekai-router:${{ steps.semver.outputs.new_tag }}
             ```
 
             CLI (binary is named `wekai`):
