@@ -35,6 +35,7 @@ import (
 	"github.com/weka/wekai/router/internal/registry"
 	"github.com/weka/wekai/router/internal/routing"
 	"github.com/weka/wekai/router/internal/viz"
+	"github.com/weka/wekai/router/internal/vllmmetrics"
 )
 
 // registerDialectOnce guards the process-global dialect registry; see Handler.
@@ -98,6 +99,14 @@ type Options struct {
 	HealthInterval time.Duration
 	HealthTimeout  time.Duration
 	HealthPath     string
+
+	// VLLMMetrics turns on upstream vLLM counter aggregation. Only endpoints
+	// DISCOVERED to be vLLM are scraped, so a hosted API in the same router is
+	// never asked for metrics it does not have — the probe already answered
+	// that, once, and the answer is reused rather than rediscovered per cycle.
+	VLLMMetrics         bool
+	VLLMMetricsInterval time.Duration
+	VLLMMetricsNames    []string
 
 	MaxAttempts    int
 	RequestTimeout time.Duration
@@ -219,6 +228,8 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 	clk := clock.Real{}
 	var rules []routing.Rule
 	var pools []*pool.Pool
+	// Endpoints discovery identified as vLLM instances, and so worth scraping.
+	var vllmEndpoints []string
 
 	for i, rt := range opts.Routes {
 		name := rt.Name
@@ -229,7 +240,11 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		for _, ep := range rt.Endpoints {
 			passive := rt.Passive
 			if !passive {
-				passive = !probeIsVLLM(ctx, ep, log)
+				isVLLM := probeIsVLLM(ctx, ep, log)
+				passive = !isVLLM
+				if isVLLM {
+					vllmEndpoints = append(vllmEndpoints, ep)
+				}
 			}
 			backends = append(backends, pool.Backend{URL: ep, Passive: passive})
 		}
@@ -298,11 +313,32 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		}
 	}()
 
+	var agg *vllmmetrics.Aggregator
+	if opts.VLLMMetrics && len(vllmEndpoints) > 0 {
+		agg = vllmmetrics.New(vllmmetrics.Config{
+			Interval: opts.VLLMMetricsInterval,
+			Names:    opts.VLLMMetricsNames,
+		})
+		eps := vllmEndpoints
+		log.Info("aggregating upstream vLLM metrics",
+			"endpoints", len(eps), "interval", agg.Interval())
+		go agg.Run(ctx, func() []string { return eps })
+	}
+
 	// Metrics and the live KV map on their own listener: diagnostic surface,
 	// never reachable on the inference path (GW-13).
 	if opts.MetricsListen != "" {
 		mux := http.NewServeMux()
-		mux.Handle("/metrics", metrics.Handler(metrics.Registry()))
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			metrics.Handler(metrics.Registry()).ServeHTTP(w, r)
+			// Upstream totals are appended to the router's own exposition, so
+			// one scrape target covers both. They are rendered rather than
+			// registered as collectors because their names and labels come from
+			// the upstreams, not from anything declared here.
+			if agg != nil {
+				_ = agg.WriteTo(w)
+			}
+		})
 		mux.HandleFunc("/router-viz", viz.PageHandler())
 		// One KV map per pool; the page takes ?pool=, defaulting to the first.
 		mux.HandleFunc("/router-viz/data", vizData(pools))

@@ -76,6 +76,9 @@ type RouterServeCommand struct {
 	HealthInterval  time.Duration `long:"health-interval" default:"10s" description:"Active health probe interval."`
 	HealthTimeout   time.Duration `long:"health-timeout" default:"5s" description:"Health probe timeout. Must be below the interval, or probes fall behind forever."`
 	HealthPath      string   `long:"health-path" default:"/health" description:"Path probed on each backend."`
+	VLLMMetrics     bool     `long:"vllm-metrics" description:"Aggregate upstream vLLM counters into router-level totals served on --metrics-listen. Only endpoints discovered to be vLLM are scraped. Totals accumulate DELTAS, so they never go backwards when a pod restarts or the fleet scales down — a decreasing counter silently breaks rate() and increase()."`
+	VLLMMetricsEvery time.Duration `long:"vllm-metrics-interval" default:"30s" description:"How often each discovered vLLM endpoint is scraped."`
+	VLLMMetricsNames []string `long:"vllm-metrics-name" description:"Upstream counter to aggregate; repeatable. Default: vllm:prompt_tokens_by_source_total. Re-exporting every series would multiply cardinality by the fleet size."`
 	LogLevel        string   `long:"log-level" default:"info" description:"debug, info, warn or error."`
 	LogFormat       string   `long:"log-format" choice:"json" choice:"text" default:"json" description:"Log output format."`
 }
@@ -210,6 +213,9 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		HealthInterval:        c.HealthInterval,
 		HealthTimeout:         c.HealthTimeout,
 		HealthPath:            c.HealthPath,
+		VLLMMetrics:           c.VLLMMetrics,
+		VLLMMetricsInterval:   c.VLLMMetricsEvery,
+		VLLMMetricsNames:      c.VLLMMetricsNames,
 		MaxAttempts:           c.MaxAttempts,
 		RequestTimeout:     c.RequestTimeout,
 		IdleTimeout:        c.IdleTimeout,
