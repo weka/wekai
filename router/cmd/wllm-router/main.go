@@ -24,6 +24,8 @@ import (
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/obs"
 	"github.com/weka/wekai/router/internal/policy"
+	"github.com/weka/wekai/router/internal/pool"
+	"github.com/weka/wekai/router/internal/routing"
 	"github.com/weka/wekai/router/internal/policy/affinity"
 	"github.com/weka/wekai/router/internal/proxy"
 	"github.com/weka/wekai/router/internal/registry"
@@ -130,7 +132,21 @@ func run(args []string) error {
 		IdleTimeout:        cfg.IdleTimeout.D(),
 	})
 
-	gw := gateway.New(cfg, rtr, pol, px, d)
+	tbl, err := routing.NewTable([]routing.Rule{{Pool: &pool.Pool{
+		Name: affinity.DefaultPoolName, Registry: rtr, Flow: cachePol.(*affinity.Policy),
+	}}})
+	if err != nil {
+		return err
+	}
+	gw := gateway.New(gateway.Config{
+		APIKey:                cfg.APIKey,
+		RequireAuthForProbes:  cfg.RequireAuthForProbes,
+		MaxBodyBytes:          cfg.MaxBodyBytes,
+		MaxConcurrentRequests: cfg.MaxConcurrentRequests,
+		PathAllowlist:         cfg.PathAllowlist,
+		CORSOrigins:           cfg.CORSOrigins,
+		DefaultCapacity:       cfg.MaxInflightPerBackend,
+	}, tbl, px, d)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

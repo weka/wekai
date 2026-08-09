@@ -14,13 +14,14 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/weka/wekai/router/internal/config"
 	"github.com/weka/wekai/router/internal/dialect/openai"
 	"github.com/weka/wekai/router/internal/gateway"
 	"github.com/weka/wekai/router/internal/lease"
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/policy"
 	"github.com/weka/wekai/router/internal/policy/affinity"
+	"github.com/weka/wekai/router/internal/pool"
+	"github.com/weka/wekai/router/internal/routing"
 	"github.com/weka/wekai/router/internal/proxy"
 	"github.com/weka/wekai/router/internal/registry"
 	"github.com/weka/wekai/router/internal/viz"
@@ -34,12 +35,52 @@ type harness struct {
 	workers []*mockvllm.Worker
 }
 
-func newHarness(t *testing.T, nWorkers int, mutate func(*config.Config)) *harness {
+// harnessConfig spans what the tests configure across three now-separate
+// structs: the gateway's own listener knobs, the pool's capacity signal, and
+// the proxy's upstream behaviour. Splitting them in production was the point —
+// each package's real dependencies are visible — but a test harness reads
+// better with one knob bag.
+type harnessConfig struct {
+	APIKey                string
+	RequireAuthForProbes  bool
+	MaxBodyBytes          int64
+	MaxConcurrentRequests int
+	PathAllowlist         []string
+	CORSOrigins           []string
+
+	MaxNodeConcurrency int64
+	RebalanceRatio     float64
+
+	MaxAttempts        int
+	UpstreamCredential string
+	StreamBufferBytes  int
+}
+
+func defaultHarnessConfig() harnessConfig {
+	return harnessConfig{
+		MaxBodyBytes:      64 << 20,
+		MaxAttempts:       2,
+		StreamBufferBytes: 64 << 10,
+	}
+}
+
+func (c harnessConfig) gateway() gateway.Config {
+	return gateway.Config{
+		APIKey:                c.APIKey,
+		RequireAuthForProbes:  c.RequireAuthForProbes,
+		MaxBodyBytes:          c.MaxBodyBytes,
+		MaxConcurrentRequests: c.MaxConcurrentRequests,
+		PathAllowlist:         c.PathAllowlist,
+		CORSOrigins:           c.CORSOrigins,
+		DefaultCapacity:       1,
+	}
+}
+
+func newHarness(t *testing.T, nWorkers int, mutate func(*harnessConfig)) *harness {
 	t.Helper()
 	lease.ResetAccountingErrors()
 
-	cfg := config.Default()
-	cfg.MaxAttempts = 2
+	cfg := defaultHarnessConfig()
 	if mutate != nil {
 		mutate(&cfg)
 	}
@@ -64,10 +105,10 @@ func newHarness(t *testing.T, nWorkers int, mutate func(*config.Config)) *harnes
 		UpstreamCredential: cfg.UpstreamCredential,
 		StreamBufferBytes:  cfg.StreamBufferBytes,
 	})
-	gw := gateway.New(cfg, reg, mustFlow(t, affinity.Config{
+	gw := gateway.New(cfg.gateway(), mustTable(t, reg, mustFlow(t, affinity.Config{
 		NodeConcurrency: cfg.MaxNodeConcurrency,
 		RebalanceRatio:  cfg.RebalanceRatio,
-	}), px, d)
+	})), px, d)
 	h.gw = gw
 	h.srv = httptest.NewServer(gw)
 	t.Cleanup(h.srv.Close)
@@ -83,6 +124,19 @@ func mustFlow(t *testing.T, cfg affinity.Config) *affinity.Policy {
 		t.Fatalf("affinity.New: %v", err)
 	}
 	return p
+}
+
+// mustTable wraps one registry and flow as the single implicit pool — the
+// shape a router has when it fronts one fleet and routes every model to it.
+func mustTable(t *testing.T, reg *registry.Registry, flow *affinity.Policy) *routing.Table {
+	t.Helper()
+	tbl, err := routing.NewTable([]routing.Rule{{
+		Pool: &pool.Pool{Name: affinity.DefaultPoolName, Registry: reg, Flow: flow},
+	}})
+	if err != nil {
+		t.Fatalf("routing.NewTable: %v", err)
+	}
+	return tbl
 }
 
 func (h *harness) post(t *testing.T, path, body string, hdr map[string]string) *http.Response {
@@ -167,7 +221,7 @@ func TestRequestBodyForwardedByteIdentical(t *testing.T) {
 // Authorization header — got a 401 before the CORS layer could answer it. Any
 // browser client was unusable whenever an API key was set.
 func TestPreflightSucceedsWithAuthEnabled(t *testing.T) {
-	h := newHarness(t, 1, func(c *config.Config) {
+	h := newHarness(t, 1, func(c *harnessConfig) {
 		c.APIKey = "secret-key"
 		c.CORSOrigins = []string{"https://app.example.com"}
 	})
@@ -190,7 +244,7 @@ func TestPreflightSucceedsWithAuthEnabled(t *testing.T) {
 }
 
 func TestAuthRejectsMissingAndWrongKey(t *testing.T) {
-	h := newHarness(t, 1, func(c *config.Config) { c.APIKey = "secret-key" })
+	h := newHarness(t, 1, func(c *harnessConfig) { c.APIKey = "secret-key" })
 
 	for _, tc := range []struct {
 		name string
@@ -225,7 +279,7 @@ func TestAuthRejectsMissingAndWrongKey(t *testing.T) {
 // AUTH-N4: the client's credential must never reach a backend. v1 forwarded the
 // inbound Authorization header verbatim to every worker and its logs.
 func TestWorkerReceivesNoClientCredential(t *testing.T) {
-	h := newHarness(t, 1, func(c *config.Config) { c.APIKey = "secret-key" })
+	h := newHarness(t, 1, func(c *harnessConfig) { c.APIKey = "secret-key" })
 	resp := h.post(t, "/v1/chat/completions", `{"model":"m"}`,
 		map[string]string{"Authorization": "Bearer secret-key"})
 	defer resp.Body.Close()
@@ -246,7 +300,7 @@ func TestWorkerReceivesNoClientCredential(t *testing.T) {
 }
 
 func TestUpstreamCredentialIsInjected(t *testing.T) {
-	h := newHarness(t, 1, func(c *config.Config) {
+	h := newHarness(t, 1, func(c *harnessConfig) {
 		c.APIKey = "inbound"
 		c.UpstreamCredential = "outbound"
 	})
@@ -263,7 +317,7 @@ func TestUpstreamCredentialIsInjected(t *testing.T) {
 // GW-N1: v1's catch-all read its body with an unbounded limit, an
 // unauthenticated memory-exhaustion DoS. Here the limit is armed on every path.
 func TestOversizeBodyIsRejected(t *testing.T) {
-	h := newHarness(t, 1, func(c *config.Config) { c.MaxBodyBytes = 1024 })
+	h := newHarness(t, 1, func(c *harnessConfig) { c.MaxBodyBytes = 1024 })
 	big := `{"model":"m","pad":"` + strings.Repeat("x", 8192) + `"}`
 	resp := h.post(t, "/v1/chat/completions", big, nil)
 	defer resp.Body.Close()
@@ -278,7 +332,7 @@ func TestOversizeBodyIsRejected(t *testing.T) {
 
 // AUTH-N3: allowlist matching must respect segment boundaries.
 func TestAllowlistSegmentBoundary(t *testing.T) {
-	h := newHarness(t, 1, func(c *config.Config) {
+	h := newHarness(t, 1, func(c *harnessConfig) {
 		c.PathAllowlist = []string{"/v1/chat/completions", "/v1/models"}
 	})
 	cases := []struct {
@@ -317,7 +371,7 @@ func TestAllowlistSegmentBoundary(t *testing.T) {
 // makes that false — with no allowlist at all, an uncredentialed request to a
 // normal inference path is still 401, not 200.
 func TestEmptyAllowlistServesAllPathsUnderAuth(t *testing.T) {
-	h := newHarness(t, 1, func(c *config.Config) {
+	h := newHarness(t, 1, func(c *harnessConfig) {
 		c.APIKey = "secret"
 		c.PathAllowlist = nil // the case under test
 	})
@@ -348,7 +402,7 @@ func TestEmptyAllowlistServesAllPathsUnderAuth(t *testing.T) {
 // the requirement is that reachable still means authenticated. Unlisted admin
 // paths 404 instead, which is the other half.
 func TestAdminNotExemptibleByAllowlist(t *testing.T) {
-	h := newHarness(t, 1, func(c *config.Config) {
+	h := newHarness(t, 1, func(c *harnessConfig) {
 		c.APIKey = "secret"
 		// Deliberately list an admin path and a mutating one.
 		c.PathAllowlist = []string{"/get_loads", "/add_worker"}
@@ -400,7 +454,7 @@ func TestAdminNotExemptibleByAllowlist(t *testing.T) {
 // AUTH-5: GET /liveness is the one public endpoint, even with auth and an
 // allowlist configured, so a kubelet httpGet probe still works.
 func TestLivenessIsPublic(t *testing.T) {
-	h := newHarness(t, 1, func(c *config.Config) {
+	h := newHarness(t, 1, func(c *harnessConfig) {
 		c.APIKey = "secret"
 		c.PathAllowlist = []string{"/v1/chat/completions"}
 	})
@@ -557,7 +611,7 @@ func TestReadinessReflectsHealthyBackends(t *testing.T) {
 // SEC-6/CFG-7: /get_server_info must not leak secrets, and must state plainly
 // that residency is predicted rather than observed (RES-4).
 func TestServerInfoRedactsSecretsAndStatesResidencySource(t *testing.T) {
-	h := newHarness(t, 1, func(c *config.Config) {
+	h := newHarness(t, 1, func(c *harnessConfig) {
 		c.APIKey = "super-secret-value"
 		c.UpstreamCredential = "upstream-secret-value"
 	})
@@ -698,7 +752,7 @@ func TestMetricsCarryTheMatchedRouteClass(t *testing.T) {
 // replace httpGet with an exec probe, an instruction that cannot be followed on a
 // distroless image with no shell.
 func TestKubeletProbesWorkWithAuthEnabled(t *testing.T) {
-	h := newHarness(t, 1, func(c *config.Config) { c.APIKey = "secret-key" })
+	h := newHarness(t, 1, func(c *harnessConfig) { c.APIKey = "secret-key" })
 
 	for _, path := range []string{"/liveness", "/readiness", "/health"} {
 		resp, err := h.srv.Client().Get(h.srv.URL + path)
@@ -718,7 +772,7 @@ func TestKubeletProbesWorkWithAuthEnabled(t *testing.T) {
 // The fleet size is operational detail: an unauthenticated probe gets only the
 // boolean it needs.
 func TestUnauthenticatedReadinessDisclosesOnlyReadiness(t *testing.T) {
-	h := newHarness(t, 3, func(c *config.Config) { c.APIKey = "secret-key" })
+	h := newHarness(t, 3, func(c *harnessConfig) { c.APIKey = "secret-key" })
 
 	resp, err := h.srv.Client().Get(h.srv.URL + "/readiness")
 	if err != nil {
@@ -751,7 +805,7 @@ func TestUnauthenticatedReadinessDisclosesOnlyReadiness(t *testing.T) {
 // An operator who wants probes locked down can have that, at the cost of needing
 // probes that can authenticate.
 func TestRequireAuthForProbesIsHonoured(t *testing.T) {
-	h := newHarness(t, 1, func(c *config.Config) {
+	h := newHarness(t, 1, func(c *harnessConfig) {
 		c.APIKey = "secret-key"
 		c.RequireAuthForProbes = true
 	})
@@ -882,7 +936,7 @@ func TestRealPanicStillBecomes500(t *testing.T) {
 // accepted it.
 func TestPrefixCacheAffinityEndToEnd(t *testing.T) {
 	lease.ResetAccountingErrors()
-	cfg := config.Default()
+	cfg := defaultHarnessConfig()
 	cfg.MaxAttempts = 2
 
 	reg := registry.New(registry.Options{})
@@ -901,7 +955,7 @@ func TestPrefixCacheAffinityEndToEnd(t *testing.T) {
 	}
 	d := openai.New()
 	px := proxy.New(proxy.Config{MaxAttempts: cfg.MaxAttempts, StreamBufferBytes: cfg.StreamBufferBytes})
-	srv := httptest.NewServer(gateway.New(cfg, reg, cp, px, d))
+	srv := httptest.NewServer(gateway.New(cfg.gateway(), mustTable(t, reg, cp), px, d))
 	defer srv.Close()
 
 	// One long shared system prompt plus a per-turn suffix — the shape of a real
@@ -959,7 +1013,7 @@ func TestPrefixCacheAffinityEndToEnd(t *testing.T) {
 // R3: a backend that never accepted the request must not be credited with its
 // prefix. Committing at selection time would poison it permanently.
 func TestFailedAttemptDoesNotCommit(t *testing.T) {
-	cfg := config.Default()
+	cfg := defaultHarnessConfig()
 	cfg.MaxAttempts = 2
 
 	reg := registry.New(registry.Options{})
@@ -980,7 +1034,7 @@ func TestFailedAttemptDoesNotCommit(t *testing.T) {
 
 	d := openai.New()
 	px := proxy.New(proxy.Config{MaxAttempts: cfg.MaxAttempts, StreamBufferBytes: cfg.StreamBufferBytes})
-	srv := httptest.NewServer(gateway.New(cfg, reg, cp, px, d))
+	srv := httptest.NewServer(gateway.New(cfg.gateway(), mustTable(t, reg, cp), px, d))
 	defer srv.Close()
 
 	resp, err := srv.Client().Post(srv.URL+"/v1/chat/completions", "application/json",
@@ -1004,7 +1058,7 @@ func TestFailedAttemptDoesNotCommit(t *testing.T) {
 // The chain documented this at position 7 and it did not exist.
 func TestConcurrencyCapShedsWith503(t *testing.T) {
 	release := make(chan struct{})
-	h := newHarness(t, 1, func(c *config.Config) { c.MaxConcurrentRequests = 2 })
+	h := newHarness(t, 1, func(c *harnessConfig) { c.MaxConcurrentRequests = 2 })
 	h.workers[0].Behave(func(*http.Request) mockvllm.Script {
 		<-release // hold the slot until the test lets go
 		return mockvllm.Script{Status: 200, Body: `{"ok":true}`}
@@ -1077,7 +1131,7 @@ func TestObservedCacheFractionIsRecorded(t *testing.T) {
 // MaxConcurrentRequests shed — and once one backend's request completes, the
 // next request is admitted again.
 func TestMaxNodeConcurrencyRejects429WhenAllBackendsAtCap(t *testing.T) {
-	h := newHarness(t, 2, func(c *config.Config) { c.MaxNodeConcurrency = 1 })
+	h := newHarness(t, 2, func(c *harnessConfig) { c.MaxNodeConcurrency = 1 })
 
 	// Which backend a fresh, idle-tied request lands on is an intentionally
 	// unspecified 50/50 tie-break (policy.pickBest's reservoir sample over
@@ -1197,7 +1251,7 @@ func TestMaxNodeConcurrencyRejects429WhenAllBackendsAtCap(t *testing.T) {
 // Select is even given, so the request falls to the cold backend instead.
 func TestMaxNodeConcurrencyExcludesAtCapBackendFromCacheAffinity(t *testing.T) {
 	lease.ResetAccountingErrors()
-	cfg := config.Default()
+	cfg := defaultHarnessConfig()
 	cfg.MaxAttempts = 1
 	cfg.MaxNodeConcurrency = 1
 
@@ -1217,7 +1271,7 @@ func TestMaxNodeConcurrencyExcludesAtCapBackendFromCacheAffinity(t *testing.T) {
 	}
 	d := openai.New()
 	px := proxy.New(proxy.Config{MaxAttempts: cfg.MaxAttempts, StreamBufferBytes: cfg.StreamBufferBytes})
-	srv := httptest.NewServer(gateway.New(cfg, reg, cp, px, d))
+	srv := httptest.NewServer(gateway.New(cfg.gateway(), mustTable(t, reg, cp), px, d))
 	defer srv.Close()
 
 	system := strings.Repeat("you are a helpful assistant. ", 200)
@@ -1285,7 +1339,7 @@ func TestMaxNodeConcurrencyExcludesAtCapBackendFromCacheAffinity(t *testing.T) {
 // there too, not just in the affinity scorer.
 func TestMaxNodeConcurrencyExcludesAtCapBackendFromFallback(t *testing.T) {
 	lease.ResetAccountingErrors()
-	cfg := config.Default()
+	cfg := defaultHarnessConfig()
 	cfg.MaxAttempts = 1
 	cfg.MaxNodeConcurrency = 1
 
@@ -1321,7 +1375,7 @@ func TestMaxNodeConcurrencyExcludesAtCapBackendFromFallback(t *testing.T) {
 
 	d := openai.New()
 	px := proxy.New(proxy.Config{MaxAttempts: cfg.MaxAttempts, StreamBufferBytes: cfg.StreamBufferBytes})
-	srv := httptest.NewServer(gateway.New(cfg, reg, cp, px, d))
+	srv := httptest.NewServer(gateway.New(cfg.gateway(), mustTable(t, reg, cp), px, d))
 	defer srv.Close()
 
 	post := func() *http.Response {

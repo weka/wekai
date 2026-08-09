@@ -8,10 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strconv"
 	"net/http"
 	"time"
 
-	"github.com/weka/wekai/router/internal/config"
 	"github.com/weka/wekai/router/internal/dialect"
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/obs"
@@ -21,9 +21,8 @@ import (
 )
 
 type Server struct {
-	cfg     config.Config
-	reg     *registry.Registry
-	pol     proxy.Selector
+	cfg     Config
+	router  Router
 	px      *proxy.Proxy
 	dialect dialect.Dialect
 	apiKey  []byte
@@ -32,8 +31,10 @@ type Server struct {
 	handler http.Handler
 }
 
-func New(cfg config.Config, reg *registry.Registry, pol proxy.Selector, px *proxy.Proxy, d dialect.Dialect) *Server {
-	s := &Server{cfg: cfg, reg: reg, pol: pol, px: px, dialect: d}
+// New builds the HTTP surface over a Router, which decides which pool serves a
+// given model.
+func New(cfg Config, rt Router, px *proxy.Proxy, d dialect.Dialect) *Server {
+	s := &Server{cfg: cfg, router: rt, px: px, dialect: d}
 	if cfg.APIKey != "" {
 		s.apiKey = []byte(cfg.APIKey)
 	}
@@ -115,7 +116,25 @@ func (s *Server) inferenceHandler(route dialect.Route) http.Handler {
 			rr.Units = units
 		}
 
-		candidates := s.candidates()
+		target, ok := s.router.Route(intro.Model)
+		if !ok {
+			// Nothing serves this model. A 404 naming it, not a 503: no amount
+			// of retrying will make a route appear, and telling the caller
+			// which name failed is the difference between a typo found in
+			// seconds and one found in a support thread.
+			s.dialect.WriteError(w, http.StatusNotFound, "no_route_for_model",
+				"no route matches model "+strconv.Quote(intro.Model))
+			return
+		}
+		if target.RewriteModel != "" {
+			body = rewriteModelField(body, target.RewriteModel)
+			rr.Model = target.RewriteModel
+		}
+		if target.StripAuth {
+			stripInboundCredentials(r)
+		}
+
+		candidates := s.candidates(target)
 		if len(candidates) == 0 {
 			// Never route to a known-bad backend to avoid an error (HLT-11).
 			// Capacity is no longer judged here — the flow's signals do that and
@@ -127,11 +146,11 @@ func (s *Server) inferenceHandler(route dialect.Route) http.Handler {
 		}
 
 		var accepted proxy.OnAccepted
-		if c, ok := s.pol.(policy.Committer); ok {
+		if c, ok := target.Selector.(policy.Committer); ok {
 			accepted = func(b *registry.Backend) { c.Commit(b, rr) }
 		}
 		var outcome proxy.OnOutcome
-		if o, ok := s.pol.(policy.Observer); ok {
+		if o, ok := target.Selector.(policy.Observer); ok {
 			outcome = func(b *registry.Backend, status int) {
 				// A 429 is the ultimate signal; anything the backend actually
 				// served proves it is taking work again.
@@ -144,7 +163,7 @@ func (s *Server) inferenceHandler(route dialect.Route) http.Handler {
 				}
 			}
 		}
-		res := s.px.Serve(w, r, candidates, s.pol, s.dialect, rr, body, accepted, outcome)
+		res := s.px.Serve(w, r, candidates, target.Selector, s.dialect, rr, body, accepted, outcome)
 		switch {
 		case res.Committed || res.Err == nil:
 		case errors.Is(res.Err, policy.ErrSplitGuardBlocked):
@@ -187,8 +206,8 @@ func (s *Server) inferenceHandler(route dialect.Route) http.Handler {
 //
 // Filtering reads circuit State() only and never Allow(), so it cannot consume a
 // half-open probe token for a backend it does not select (R2, LB-9).
-func (s *Server) candidates() []*registry.Backend {
-	snap := s.reg.Snapshot()
+func (s *Server) candidates(t Target) []*registry.Backend {
+	snap := t.Registry.Snapshot()
 	cands := make([]*registry.Backend, 0, len(snap.Backends))
 	for _, b := range snap.Backends {
 		if !b.Available() || b.DialectID != s.dialect.ID() {
@@ -197,6 +216,67 @@ func (s *Server) candidates() []*registry.Backend {
 		cands = append(cands, b)
 	}
 	return cands
+}
+
+// poolByName resolves an admin request's ?pool=. Empty means the first target,
+// which is the only one on a single-pool router — the common case, and the one
+// where making an operator name it would be pure ceremony.
+// poolNames lists the configured pools for /get_server_info. It replaces the
+// old "policy" field: there is one routing flow now, so what an operator
+// actually needs to see is which pools exist.
+func (s *Server) poolNames() []string {
+	targets := s.router.Targets()
+	out := make([]string, 0, len(targets))
+	for _, t := range targets {
+		out = append(out, t.Name)
+	}
+	return out
+}
+
+func (s *Server) poolByName(name string) (Target, bool) {
+	targets := s.router.Targets()
+	if len(targets) == 0 {
+		return Target{}, false
+	}
+	if name == "" {
+		return targets[0], true
+	}
+	for _, t := range targets {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return Target{}, false
+}
+
+// stripInboundCredentials removes client credentials before forwarding, for a
+// route marked as pointing at an unauthenticated upstream. Forwarding them
+// there leaks a caller's key into someone else's logs.
+func stripInboundCredentials(r *http.Request) {
+	for _, h := range []string{"Authorization", "X-Api-Key", "Anthropic-Beta"} {
+		r.Header.Del(h)
+	}
+}
+
+// rewriteModelField replaces the JSON body's "model" so a client's name for a
+// model can differ from the backend's. Returns the body unchanged on any parse
+// failure: a route rewrite is not worth failing a request the upstream might
+// well have accepted.
+func rewriteModelField(body []byte, model string) []byte {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body
+	}
+	enc, err := json.Marshal(model)
+	if err != nil {
+		return body
+	}
+	doc["model"] = enc
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func (s *Server) handleLiveness(w http.ResponseWriter, r *http.Request) {
@@ -211,7 +291,10 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	// Readiness reflects backend HEALTH, and candidates() is now health-only, so
 	// this is simply its size. A fully saturated router is still ready to
 	// receive traffic — it sheds with 429, not by going NotReady.
-	n := len(s.candidates())
+	n := 0
+	for _, t := range s.router.Targets() {
+		n += len(s.candidates(t))
+	}
 	body := map[string]any{"ready": n > 0}
 	// The fleet size is operational detail, so it is disclosed only to an
 	// authenticated caller. An unauthenticated kubelet probe gets the boolean it
@@ -232,7 +315,7 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"config":   s.cfg.Redacted(),
-		"policy":   s.pol.Name(),
+		"pools":    s.poolNames(),
 		"dialects": []string{s.dialect.ID()},
 		// FR-RTR-01 is served by prediction, not by observed residency. Saying so
 		// here is RES-4: nobody should mistake one for the other.
@@ -244,6 +327,7 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 type workerView struct {
+	Pool     string  `json:"pool"`
 	URL      string  `json:"url"`
 	Kind     string  `json:"kind"`
 	Dialect  string  `json:"dialect"`
@@ -260,27 +344,33 @@ type workerView struct {
 
 // handleListWorkers returns backends in deterministic snapshot order (WRK-8).
 func (s *Server) handleListWorkers(w http.ResponseWriter, r *http.Request) {
-	snap := s.reg.Snapshot()
-	out := make([]workerView, 0, len(snap.Backends))
-	for _, b := range snap.Backends {
-		out = append(out, workerView{
-			URL: b.URL, Kind: b.Kind().String(), Dialect: b.DialectID,
-			Health: b.Health().String(), Circuit: b.CB.State().String(),
-			Inflight: b.Inflight(), Capacity: b.Capacity(),
-			Load: b.NormalizedLoad(), Draining: b.Draining(),
-			Prov:   b.Prov.String(),
-			Served: b.Served.Load(), Failed: b.Failed.Load(),
-		})
+	var out []workerView
+	version := uint64(0)
+	for _, t := range s.router.Targets() {
+		snap := t.Registry.Snapshot()
+		version += snap.Version
+		for _, b := range snap.Backends {
+			out = append(out, workerView{
+				Pool: t.Name,
+				URL:  b.URL, Kind: b.Kind().String(), Dialect: b.DialectID,
+				Health: b.Health().String(), Circuit: b.CB.State().String(),
+				Inflight: b.Inflight(), Capacity: b.Capacity(),
+				Load: b.NormalizedLoad(), Draining: b.Draining(),
+				Prov:   b.Prov.String(),
+				Served: b.Served.Load(), Failed: b.Failed.Load(),
+			})
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"workers": out, "version": snap.Version})
+	_ = json.NewEncoder(w).Encode(map[string]any{"workers": out, "version": version})
 }
 
 func (s *Server) handleGetLoads(w http.ResponseWriter, r *http.Request) {
-	snap := s.reg.Snapshot()
-	loads := make(map[string]int64, len(snap.Backends))
-	for _, b := range snap.Backends {
-		loads[b.URL] = b.Inflight()
+	loads := map[string]int64{}
+	for _, t := range s.router.Targets() {
+		for _, b := range t.Registry.Snapshot().Backends {
+			loads[b.URL] = b.Inflight()
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"loads": loads})
@@ -300,7 +390,13 @@ func (s *Server) handleAddWorker(w http.ResponseWriter, r *http.Request) {
 			url, kind, cap = req.URL, req.Kind, req.Capacity
 		}
 	}
-	spec := registry.Spec{URL: url, Prov: registry.ProvStatic, Capacity: s.cfg.MaxInflightPerBackend}
+	target, ok := s.poolByName(r.URL.Query().Get("pool"))
+	if !ok {
+		s.dialect.WriteError(w, http.StatusNotFound, "unknown_pool",
+			"no pool named "+strconv.Quote(r.URL.Query().Get("pool")))
+		return
+	}
+	spec := registry.Spec{URL: url, Prov: registry.ProvStatic, Capacity: s.cfg.DefaultCapacity}
 	if cap != 0 {
 		spec.Capacity = cap
 	}
@@ -309,20 +405,30 @@ func (s *Server) handleAddWorker(w http.ResponseWriter, r *http.Request) {
 	}
 	// Canonical() rejects non-http(s) schemes, which is the SSRF guard on this
 	// endpoint (SEC-5).
-	b, err := s.reg.Add(spec)
+	b, err := target.Registry.Add(spec)
 	if err != nil {
 		s.dialect.WriteError(w, http.StatusBadRequest, "invalid_worker", err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(map[string]any{"url": b.URL, "health": b.Health().String()})
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"pool": target.Name, "url": b.URL, "health": b.Health().String()})
 }
 
 func (s *Server) handleRemoveWorker(w http.ResponseWriter, r *http.Request) {
 	url := r.URL.Query().Get("url")
-	if err := s.reg.Remove(url); err != nil {
-		s.dialect.WriteError(w, http.StatusNotFound, "unknown_worker", err.Error())
+	// Removal searches every pool: an operator draining a node knows its URL,
+	// not which pool it was filed under.
+	removed := false
+	for _, t := range s.router.Targets() {
+		if err := t.Registry.Remove(url); err == nil {
+			removed = true
+		}
+	}
+	if !removed {
+		s.dialect.WriteError(w, http.StatusNotFound, "unknown_worker",
+			"no pool holds "+strconv.Quote(url))
 		return
 	}
 	// Removal is a graceful drain, not a hard delete (WRK-6).
