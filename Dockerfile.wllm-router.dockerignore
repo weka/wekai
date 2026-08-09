@@ -1,0 +1,21 @@
+# Router-image-ONLY context trim (BuildKit per-Dockerfile ignore: applies
+# solely to `-f Dockerfile.wllm-router` builds). vendor/ alone is 80+ MB and
+# the router image is built with -mod=mod against the module cache instead.
+# Do NOT rename this back to a generic .dockerignore: the parent repo's
+# create_release.sh mounts this directory as the `wekai-src` named build
+# context to compile the full wekai CLI, and a generic ignore that strips
+# main.go/cli/benchmark empties that context ("no Go files" build failure,
+# 2026-08-09).
+vendor
+.git
+.github
+chart
+tools
+cli
+benchmark
+llm
+config
+*.md
+main.go
+Dockerfile*
+.dockerignore
