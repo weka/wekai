@@ -1,15 +1,28 @@
-# Keep the router build context small. vendor/ alone is 80+ MB and the router
-# image is built with -mod=mod against the module cache instead.
+# Build context for both images. Excludes only what a build cannot use.
+#
+# It previously excluded main.go, cli/, benchmark/, llm/, config/, chart/ and
+# tools/, which was right when the router was its own small binary under
+# router/cmd/ needing only router/ and kvcache/. The router is now `wekai router
+# serve` — the whole wekai binary, built from the ROOT package — so excluding
+# those left the build with no Go files in the context at all.
+#
+# vendor/ stays out on size grounds: 80+ MB, and both images build against the
+# module cache via `go mod download`.
 vendor
+
+# Not inputs to a build.
 .git
 .github
-chart
-tools
-cli
-benchmark
-llm
-config
+.dagger
+.idea
+docs
 *.md
-main.go
-Dockerfile*
-.dockerignore
+
+# Build outputs, which would otherwise be copied in over a fresh build.
+dist
+/wekai
+/wekai-core
+/bin
+results
+*.log
+*.out
