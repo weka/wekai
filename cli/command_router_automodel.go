@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -38,6 +39,14 @@ const (
 	// k8s, not scheduled yet), so a failure at startup is not a permanent one.
 	autoModelRetryInterval = 15 * time.Second
 )
+
+// joinPaths joins a base path with a leaf, tolerating a trailing or leading
+// slash on either side.
+func joinPaths(base, extra string) string {
+	base = strings.TrimRight(base, "/")
+	extra = "/" + strings.TrimLeft(extra, "/")
+	return base + extra
+}
 
 // discoverUpstreamModels fetches <upstream>/v1/models and returns the served
 // model IDs in the order the server listed them.
@@ -136,19 +145,25 @@ func probeAndApply(r *routeRule, mode string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), modelsProbeTimeout)
 	defer cancel()
 
-	models, err := discoverUpstreamModels(ctx, r.upstream)
+	ep, err := url.Parse(r.endpoints[0])
 	if err != nil {
-		log.Printf("auto-model: %s — probe failed (%v); retrying every %s", r.upstream.Redacted(), err, autoModelRetryInterval)
+		return false
+	}
+	// Endpoints in a pool are interchangeable by definition — they serve the
+	// same model — so probing the first answers for all of them.
+	models, err := discoverUpstreamModels(ctx, ep)
+	if err != nil {
+		log.Printf("auto-model: %s — probe failed (%v); retrying every %s", ep.Redacted(), err, autoModelRetryInterval)
 		return false
 	}
 	picked := pickAutoModel(mode, models)
 	if picked == "" {
 		log.Printf("auto-model: %s serves %d models %v — leaving request models untouched (use 'as <model>' or --auto-model force to pin one)",
-			r.upstream.Redacted(), len(models), models)
+			ep.Redacted(), len(models), models)
 		return true
 	}
 	r.autoModel.Store(&picked)
-	log.Printf("auto-model: %s serves %q — rewriting every matching request's model to it", r.upstream.Redacted(), picked)
+	log.Printf("auto-model: %s serves %q — rewriting every matching request's model to it", ep.Redacted(), picked)
 	return true
 }
 

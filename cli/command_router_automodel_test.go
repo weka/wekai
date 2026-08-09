@@ -132,7 +132,7 @@ func TestResolveAutoModels(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse test server URL: %v", err)
 		}
-		return &routeRule{upstream: u, rewriteModel: rewrite}
+		return &routeRule{endpoints: []string{u.String()}, rewriteModel: rewrite}
 	}
 
 	t.Run("adopts upstream model", func(t *testing.T) {

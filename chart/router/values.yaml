@@ -153,3 +153,13 @@ podMonitor:
   # MetricRelabelings applied to scraped samples. Use to drop high-cardinality
   # labels in production (e.g. session_id) if active series count gets large.
   metricRelabelings: []
+
+# Kubernetes endpoint discovery. Off by default: a static endpoint list is the
+# common case and needs no RBAC at all. Enabling this creates a ServiceAccount,
+# a namespace-scoped Role and a RoleBinding — never a ClusterRole, because
+# discovery is namespace-scoped and cluster-wide read is not needed.
+discovery:
+  enabled: false
+  # "endpointslice" (recommended) or "pod". Pod mode additionally grants pod
+  # read, so it is gated rather than granted unconditionally.
+  mode: endpointslice

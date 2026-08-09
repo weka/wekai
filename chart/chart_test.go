@@ -156,3 +156,36 @@ func TestRouterChartRunsTheSubcommand(t *testing.T) {
 		}
 	}
 }
+
+// TestRouterChartRBACIsOptedInto: discovery needs a ServiceAccount, Role and
+// RoleBinding, and granting them unconditionally would hand every router
+// deployment namespace read it does not use. The pod rule is gated separately
+// again, because pod-mode discovery is the only thing that needs it.
+func TestRouterChartRBACIsOptedInto(t *testing.T) {
+	off := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000")
+	for _, kind := range []string{"kind: Role", "kind: RoleBinding", "kind: ServiceAccount"} {
+		if strings.Contains(off, kind) {
+			t.Errorf("%s is created with discovery disabled; RBAC must be opted into", kind)
+		}
+	}
+
+	on := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000",
+		"--set", "discovery.enabled=true")
+	for _, kind := range []string{"kind: Role", "kind: RoleBinding", "kind: ServiceAccount"} {
+		if !strings.Contains(on, kind) {
+			t.Errorf("%s missing when discovery is enabled:\n%s", kind, on)
+		}
+	}
+	if strings.Contains(on, "kind: ClusterRole") {
+		t.Error("discovery is namespace-scoped; a ClusterRole grants more than it needs")
+	}
+	if strings.Contains(on, `resources: ["pods"]`) {
+		t.Error("pod read granted in endpointslice mode, which does not use it")
+	}
+
+	podMode := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000",
+		"--set", "discovery.enabled=true", "--set", "discovery.mode=pod")
+	if !strings.Contains(podMode, `resources: ["pods"]`) {
+		t.Error("pod-mode discovery did not grant pod read, so it cannot work")
+	}
+}

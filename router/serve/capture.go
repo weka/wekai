@@ -61,6 +61,7 @@ func captureMiddleware(hook CaptureHook, next http.Handler) http.Handler {
 	var seq atomic.Uint64
 	keepBody := hook.WantsResponseBody()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		//clockexempt: measures the exchange for the capture record, not a decision
 		started := time.Now()
 		id := seq.Add(1)
 		// Snapshotted before anything downstream can strip credentials: a
@@ -84,6 +85,7 @@ func captureMiddleware(hook CaptureHook, next http.Handler) http.Handler {
 			ID: id, Started: started, Request: r, InboundHeaders: inbound,
 			ReqBody: reqBody, RespHeaders: cw.Header(), RespBody: cw.body.Bytes(),
 			Status: cw.statusOr(http.StatusOK), Pool: ri.Pool, Backend: ri.Backend,
+			//clockexempt: measures the exchange for the capture record, not a decision
 			ModelOut: ri.ModelOut, Total: time.Since(started),
 		})
 	})

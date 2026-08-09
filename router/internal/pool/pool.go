@@ -23,8 +23,10 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/weka/wekai/router/internal/circuit"
 	"github.com/weka/wekai/router/internal/clock"
 	"github.com/weka/wekai/router/internal/health"
+	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/policy"
 	"github.com/weka/wekai/router/internal/policy/affinity"
 	"github.com/weka/wekai/router/internal/registry"
@@ -138,6 +140,13 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Pool, error) {
 		if err != nil {
 			return nil, fmt.Errorf("pool %q backend %q: %w", cfg.Name, b.URL, err)
 		}
+		be.CB.OnTransition(func(from, to circuit.State, ok, fail int) {
+			// An operator needs to tell an overload from an outage, and the
+			// counters that caused the transition are the only way to.
+			metrics.CircuitTransitions.WithLabelValues(be.URL, from.String(), to.String()).Inc()
+			p.log.Warn("circuit breaker transition", "backend", be.URL,
+				"from", from.String(), "to", to.String(), "window_ok", ok, "window_fail", fail)
+		})
 		if b.Passive {
 			// A passive backend is never probed — its health comes solely from
 			// proxied request outcomes (HLT-12). It must therefore start

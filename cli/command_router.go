@@ -6,7 +6,6 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -21,7 +20,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/weka/wekai/router/serve"
 )
 
 // RouterServeCommand implements the `wekai router serve` subcommand: a model-aware HTTP
@@ -52,13 +51,47 @@ type RouterServeCommand struct {
 	CaptureBuffer int           `long:"capture-buffer" default:"512" description:"Async capture channel buffer size; overflow records are dropped and counted."`
 	DrainTimeout  time.Duration `long:"drain-timeout" default:"5m" description:"Grace period on SIGTERM/SIGINT: readiness flips to 503 (pod is removed from Service endpoints) and in-flight requests are allowed to finish. Forced shutdown after this deadline."`
 	UserPrefix    bool          `long:"user-prefix" description:"Enable per-user path prefix routing. When set, requests at /<user>/v1/<rest> route as /v1/<rest> upstream and the leading path segment is captured as the request's user. Lets clients distinguish themselves by setting ANTHROPIC_BASE_URL=http://router:port/<user>. Default off — behavior is unchanged unless this is enabled."`
+
+	// --- Fleet routing. A --route with several pipe-separated endpoints, or
+	// --backends, turns on prefix-cache affinity across them.
+	Backends       []string `long:"backends" description:"Endpoints for the implicit catch-all pool, comma- or pipe-separated. Shorthand for --route '* => a|b|c' — the simplest router: route every model to this set."`
+	Passive        bool     `long:"passive-health" description:"Skip active health probing. Required for upstreams with no /health endpoint (a hosted API); their health is inferred from proxied request outcomes."`
+	MetricsListen  string   `long:"metrics-listen" default:"127.0.0.1:29000" description:"Address for /metrics and the live KV map at /router-viz. Separate from the inference listener: diagnostic surface is never reachable on the serving path. Empty disables it."`
+	MaxNodeConc    int64    `long:"max-node-concurrency" description:"Enables the concurrency split signal: treat a backend at or above this many in-flight requests as saturated without waiting for it to say so. Set it to the backends' vLLM --max-num-seqs. 0 = off; the backend's own 429 remains the ultimate signal either way."`
+	RebalanceRatio float64  `long:"rebalance-ratio" description:"Enables the imbalance split signal: a backend is saturated while (inflight - fleetMin)/inflight exceeds this. 0.5 rebalances once the gap is more than half the busier side. 0 = off — a fleet where affinity works is supposed to look imbalanced."`
+	SplitGuard     float64  `long:"cache-split-guard" default:"0.20" description:"A prefix is split onto a backend only while its in-flight is below limit*(1-this). Higher keeps the holder set tighter at the cost of splitting less readily; too low and every backend ends up holding every prefix."`
+	TailTTL        time.Duration `long:"cache-tail-ttl" default:"5m" description:"How long a leaf of the shared prefix tree may go untouched before eviction. Memory pressure only: eviction never removes a run that still has children."`
+	RefusalTTL     time.Duration `long:"cache-refusal-ttl" default:"2s" description:"How long a backend's own 429 keeps it out of its prefixes. Cleared early by any success from it, and by its in-flight dropping below the level it refused at."`
+
+	// --- Listener behaviour.
+	APIKey          string   `long:"api-key" description:"Require this key on inference and admin requests. Empty leaves the listener unauthenticated, which is logged loudly at startup."`
+	CORSOrigins     []string `long:"cors-origins" description:"Origins permitted to call the inference listener. '*' cannot be combined with --api-key."`
+	PathAllowlist   []string `long:"path-allowlist" description:"Restrict which upstream paths may be proxied. Empty allows every path."`
+	MaxBodyBytes    int64    `long:"max-body-bytes" default:"67108864" description:"Maximum request body. Bodies are buffered whole so a retry can replay them, so this is the real per-request memory bound."`
+	MaxConcurrent   int      `long:"max-concurrent-requests" default:"256" description:"Router-wide in-flight cap protecting the router's own memory; sheds 503 router_at_capacity. Distinct from per-backend capacity, which sheds 429. 0 disables."`
+	MaxAttempts     int      `long:"max-attempts" default:"2" description:"Upstream attempts including the first, after a FAILURE. A 429 does not spend this budget: refusals draw on their own, bounded by the number of endpoints."`
+	RequestTimeout  time.Duration `long:"request-timeout" default:"600s" description:"Overall upstream request deadline."`
+	IdleTimeout     time.Duration `long:"idle-timeout" default:"300s" description:"Abort a stream that has produced nothing for this long."`
+	UpstreamCred    string   `long:"upstream-credential" description:"Credential presented to upstreams, replacing the client's."`
+	HealthInterval  time.Duration `long:"health-interval" default:"10s" description:"Active health probe interval."`
+	HealthTimeout   time.Duration `long:"health-timeout" default:"5s" description:"Health probe timeout. Must be below the interval, or probes fall behind forever."`
+	HealthPath      string   `long:"health-path" default:"/health" description:"Path probed on each backend."`
+	LogLevel        string   `long:"log-level" default:"info" description:"debug, info, warn or error."`
+	LogFormat       string   `long:"log-format" choice:"json" choice:"text" default:"json" description:"Log output format."`
 }
 
 type routeRule struct {
-	patterns     []string // lowercased substrings; empty means catch-all
-	upstream     *url.URL
+	patterns []string // lowercased substrings; empty means catch-all
+	// endpoints are the interchangeable upstreams serving these models. One is
+	// a plain proxy; several and the affinity flow routes between them. The
+	// pipe-separated form is the same syntax the client already accepts for a
+	// multi-endpoint model, so `a|b|c` means the same thing on both sides.
+	endpoints    []string
 	rewriteModel string
 	stripAuth    bool
+	// passive skips active health probing, for an upstream with no /health —
+	// a hosted API. Its health is inferred from proxied request outcomes.
+	passive bool
 
 	// autoModel holds the model discovered from the upstream's /v1/models when
 	// the rule carries no explicit `as <model>` (see command_router_automodel.go).
@@ -99,7 +132,7 @@ func (r *routeRule) describe() string {
 	if len(r.patterns) > 0 {
 		pat = strings.Join(r.patterns, ",")
 	}
-	out := fmt.Sprintf("%s => %s", pat, r.upstream.String())
+	out := fmt.Sprintf("%s => %s", pat, strings.Join(r.endpoints, "|"))
 	if r.rewriteModel != "" {
 		out += " as " + r.rewriteModel
 	} else if m := r.autoModel.Load(); m != nil {
@@ -117,7 +150,7 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		return err
 	}
 	if len(rules) == 0 {
-		return fmt.Errorf("no routes configured: provide at least one --route or --default")
+		return fmt.Errorf("no routes configured: provide --backends, --route or --default")
 	}
 
 	stripPatterns := normalizePatternList(c.StripAuth)
@@ -127,94 +160,90 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		}
 	}
 
-	// Probe before the listener opens so the route lines logged below already
+	// Probe before the listener opens, so the routes logged at startup already
 	// name whatever was discovered.
 	resolveAutoModels(rules, c.AutoModel)
 
-	handler := &routerHandler{rules: rules, logHeaders: c.LogHeaders, userPrefix: c.UserPrefix}
-
+	var hook serve.CaptureHook
 	if c.Capture != "" {
 		dir := resolveCaptureDir(c.CaptureDir, c.Capture)
 		sink, err := newCaptureSink(captureMode(c.Capture), dir, c.CaptureBuffer)
 		if err != nil {
 			return fmt.Errorf("init capture: %w", err)
 		}
-		handler.capture = sink
+		hook = &captureAdapter{sink: sink, userPrefix: c.UserPrefix}
 		log.Printf("capture: mode=%s dir=%s buffer=%d", c.Capture, dir, c.CaptureBuffer)
 	}
 
-	// Drain state: on shutdown signal we flip `draining` so readiness probes
-	// fail (k8s removes the pod from Service endpoints) while in-flight
-	// requests are tracked by `inFlight` and given DrainTimeout to finish.
-	var draining atomic.Bool
-	var inFlight sync.WaitGroup
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if draining.Load() {
-			http.Error(w, "draining", http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ok")
-	})
-	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ok")
-	})
-	// /metrics on the same listener — Prometheus PodMonitor scrapes the
-	// router's regular port. promhttp uses the global default registerer,
-	// which is what the auto-registered counters in
-	// command_router_metrics.go write to.
-	mux.Handle("/metrics", promhttp.Handler())
-	mux.Handle("/", trackInFlight(&inFlight, handler))
-
-	srv := &http.Server{Addr: c.Listen, Handler: mux}
-
-	log.Printf("wekai router listening on %s (drain-timeout=%s)", c.Listen, c.DrainTimeout)
+	routes := make([]serve.Route, 0, len(rules))
 	for _, r := range rules {
-		log.Printf("  route: %s", r.describe())
+		pat := "*"
+		if len(r.patterns) > 0 {
+			pat = strings.Join(r.patterns, ",")
+		}
+		routes = append(routes, serve.Route{
+			Patterns:     pat,
+			Endpoints:    r.endpoints,
+			RewriteModel: r.effectiveRewrite(),
+			StripAuth:    r.stripAuth,
+			Passive:      c.Passive,
+		})
 	}
 
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.ListenAndServe() }()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	return serve.Run(ctx, serve.Options{
+		Listen:        c.Listen,
+		MetricsListen: c.MetricsListen,
+		Routes:        routes,
+		APIKey:                c.APIKey,
+		CORSOrigins:           c.CORSOrigins,
+		PathAllowlist:         c.PathAllowlist,
+		MaxBodyBytes:          c.MaxBodyBytes,
+		MaxConcurrentRequests: c.MaxConcurrent,
+		NodeConcurrency:       c.MaxNodeConc,
+		RebalanceRatio:        c.RebalanceRatio,
+		SplitGuard:            c.SplitGuard,
+		TailTTL:               c.TailTTL,
+		RefusalTTL:            c.RefusalTTL,
+		HealthInterval:        c.HealthInterval,
+		HealthTimeout:         c.HealthTimeout,
+		HealthPath:            c.HealthPath,
+		MaxAttempts:           c.MaxAttempts,
+		RequestTimeout:     c.RequestTimeout,
+		IdleTimeout:        c.IdleTimeout,
+		UpstreamCredential: c.UpstreamCred,
+		DrainDeadline:      c.DrainTimeout,
+		Capture:            hook,
+		LogLevel:           c.LogLevel,
+		LogFormat:          c.LogFormat,
+	})
+}
 
-	select {
-	case err := <-serveErr:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
-		return nil
-	case sig := <-sigCh:
-		log.Printf("received %s: draining (timeout=%s) — readiness now reports 503", sig, c.DrainTimeout)
-		draining.Store(true)
+// captureAdapter turns serve's routing-outcome view into the capture record
+// schema the replay tooling reads. serve knows nothing about that schema, and
+// this file knows nothing about routing — which is the point of the seam.
+type captureAdapter struct {
+	sink       *captureSink
+	userPrefix bool
+}
 
-		done := make(chan struct{})
-		go func() { inFlight.Wait(); close(done) }()
+func (a *captureAdapter) WantsResponseBody() bool { return a.sink.mode != captureRedacted }
 
-		select {
-		case <-done:
-			log.Printf("in-flight requests drained; shutting down")
-		case <-time.After(c.DrainTimeout):
-			log.Printf("drain timeout exceeded; forcing shutdown (in-flight requests will be cut)")
-		}
-
-		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutCtx); err != nil {
-			log.Printf("graceful shutdown error: %v (closing)", err)
-			_ = srv.Close()
-		}
-		<-serveErr
-		return nil
+func (a *captureAdapter) Record(ev serve.Captured) {
+	user := ""
+	if a.userPrefix {
+		user, _ = stripUserPrefix(ev.Request.URL.Path)
+	}
+	rec := buildCaptureRecord(a.sink.mode, ev.ID, ev.Started, ev.Request,
+		ev.InboundHeaders, ev.ReqBody, ev.Backend, ev.Pool, ev.ModelOut,
+		ev.Status, ev.RespHeaders, ev.RespBody, ev.Total, ev.Total, nil, user)
+	if rec != nil {
+		a.sink.offer(rec)
 	}
 }
 
-// trackInFlight counts active proxy requests so the drain path can wait for
-// them to finish. Health endpoints are handled elsewhere and are not counted.
 func trackInFlight(wg *sync.WaitGroup, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
@@ -229,6 +258,18 @@ func (c *RouterServeCommand) buildRules() ([]*routeRule, error) {
 		r, err := parseRoute(spec)
 		if err != nil {
 			return nil, fmt.Errorf("invalid --route %q: %w", spec, err)
+		}
+		rules = append(rules, r)
+	}
+	// --backends is the simplest form: route every model to this set. It is
+	// shorthand for "* => a|b|c", which is why it produces a rule rather than a
+	// special case downstream.
+	if len(c.Backends) > 0 {
+		joined := strings.Join(c.Backends, "|")
+		joined = strings.ReplaceAll(joined, ",", "|")
+		r, err := parseRoute("* => " + joined)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --backends %q: %w", joined, err)
 		}
 		rules = append(rules, r)
 	}
@@ -261,20 +302,31 @@ func parseRoute(spec string) (*routeRule, error) {
 		return nil, fmt.Errorf("empty pattern or upstream")
 	}
 
-	upstream, rewrite := splitAsModel(rhs)
-	u, err := url.Parse(upstream)
-	if err != nil {
-		return nil, fmt.Errorf("bad upstream URL %q: %w", upstream, err)
+	upstreams, rewrite := splitAsModel(rhs)
+	var endpoints []string
+	for _, raw := range strings.Split(upstreams, "|") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("bad upstream URL %q: %w", raw, err)
+		}
+		if u.Scheme == "" || u.Host == "" {
+			return nil, fmt.Errorf("upstream must include scheme and host: %q", raw)
+		}
+		endpoints = append(endpoints, strings.TrimRight(u.String(), "/"))
 	}
-	if u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("upstream must include scheme and host: %q", upstream)
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("no upstream endpoints")
 	}
 
 	var patterns []string
 	if lhs != "*" {
 		patterns = normalizePatternList([]string{lhs})
 	}
-	return &routeRule{patterns: patterns, upstream: u, rewriteModel: rewrite}, nil
+	return &routeRule{patterns: patterns, endpoints: endpoints, rewriteModel: rewrite}, nil
 }
 
 // splitAsModel separates "<upstream> as <model>" (case-insensitive " as ").
@@ -335,31 +387,6 @@ var inferencePaths = map[string]bool{
 
 // isInferencePath reports whether path (after user-prefix stripping) is an
 // Anthropic inference endpoint qualifying for full per-user routing.
-func isInferencePath(path string) bool {
-	return inferencePaths[path]
-}
-
-type routerHandler struct {
-	rules      []*routeRule
-	logHeaders bool
-	userPrefix bool // when true, extract leading /<user>/ from request paths
-	reqCounter atomic.Uint64
-	capture    *captureSink
-}
-
-// stripUserPrefix strips the leading /<user>/ segment from p and returns
-// (user, remainingPath). The caller only invokes this when user-prefix mode
-// is configured, in which case every request is prefixed by construction, so
-// the first path segment is definitionally the user.
-//
-// Special cases:
-//   - Empty path or path not starting with '/': returned unchanged, user="".
-//   - Single-segment path (e.g. /healthz, /metrics, /): returned unchanged,
-//     user="". A lone segment cannot be "user + API path" (nothing left to
-//     forward), and this keeps infra health probes working.
-//
-// For all other paths the first segment is taken as the user and the
-// remainder becomes the new path.
 func stripUserPrefix(p string) (user, newPath string) {
 	if len(p) == 0 || p[0] != '/' {
 		return "", p
@@ -374,249 +401,6 @@ func stripUserPrefix(p string) (user, newPath string) {
 	return first, tail
 }
 
-// Hop-by-hop headers per RFC 7230, plus Anthropic-specific stripping handled
-// elsewhere. Stripped from both directions.
-var hopByHopHeaders = []string{
-	"Connection",
-	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"TE",
-	"Trailer",
-	"Transfer-Encoding",
-	"Upgrade",
-}
-
-func (h *routerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	reqID := h.reqCounter.Add(1)
-	started := time.Now()
-
-	// Optional user-prefix extraction: strip the leading /<user>/ segment
-	// unconditionally when user-prefix mode is on. By contract every client
-	// request carries this prefix in that mode, so the first segment is always
-	// the user. Default off (no-op). When on, the user shows up in capture
-	// records and log lines, and the upstream sees the canonical path.
-	user := ""
-	if h.userPrefix {
-		user, r.URL.Path = stripUserPrefix(r.URL.Path)
-	}
-
-	// Classify the request: inference paths get full per-user model-based routing;
-	// everything else is forwarded via the catch-all rule with no user-prefix
-	// semantics. Single-segment paths (e.g. HEAD /<user>) are not stripped by
-	// stripUserPrefix, so user="" and they land in the catch-all unchanged.
-	inference := isInferencePath(r.URL.Path)
-	if !inference {
-		log.Printf("[#%d] >> non-inference path %s %s (user=%q) — using catch-all rule", reqID, r.Method, r.URL.Path, user)
-	}
-
-	// Snapshot inbound headers up front — later we mutate upReq.Header.
-	inboundHeaders := r.Header.Clone()
-
-	body, err := io.ReadAll(r.Body)
-	_ = r.Body.Close()
-	if err != nil {
-		log.Printf("[#%d] !! read body: %v", reqID, err)
-		http.Error(w, "read body: "+err.Error(), http.StatusBadGateway)
-		h.captureError(reqID, started, r, inboundHeaders, body, "", nil, "", 0, err, user, inference)
-		return
-	}
-
-	var rule *routeRule
-	var model string
-	if inference {
-		model = extractModel(body)
-		rule = h.match(model)
-		if rule == nil {
-			log.Printf("[#%d] !! no route matches model=%q method=%s path=%s", reqID, model, r.Method, r.URL.Path)
-			http.Error(w, fmt.Sprintf("no route matches model %q", model), http.StatusBadGateway)
-			h.captureError(reqID, started, r, inboundHeaders, body, "", nil, "", 0, fmt.Errorf("no route matches model %q", model), user, inference)
-			return
-		}
-	} else {
-		// Non-inference: force catch-all routing (match "" model, first catch-all wins).
-		// Any user prefix has already been stripped above; the path here is canonical.
-		rule = h.match("")
-		if rule == nil {
-			log.Printf("[#%d] !! no catch-all route for non-inference path method=%s path=%s", reqID, r.Method, r.URL.Path)
-			http.Error(w, "no catch-all route configured", http.StatusBadGateway)
-			return
-		}
-	}
-
-	outBody := body
-	rewroteTo := ""
-	if rw := rule.effectiveRewrite(); rw != "" && len(body) > 0 {
-		if rewritten, ok := rewriteModelField(body, rw); ok {
-			outBody = rewritten
-			rewroteTo = rw
-		}
-	}
-
-	target := *rule.upstream
-	target.Path = joinPaths(target.Path, r.URL.Path)
-	if r.URL.RawQuery != "" {
-		if target.RawQuery == "" {
-			target.RawQuery = r.URL.RawQuery
-		} else {
-			target.RawQuery += "&" + r.URL.RawQuery
-		}
-	}
-
-	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), bytes.NewReader(outBody))
-	if err != nil {
-		log.Printf("[#%d] !! build upstream request: %v", reqID, err)
-		http.Error(w, "build upstream request: "+err.Error(), http.StatusBadGateway)
-		h.captureError(reqID, started, r, inboundHeaders, body, target.String(), rule, rewroteTo, 0, err, user, inference)
-		return
-	}
-
-	copyHeadersExcept(upReq.Header, r.Header, hopByHopHeaders)
-	upReq.Host = target.Host
-	upReq.ContentLength = int64(len(outBody))
-	upReq.Header.Set("Content-Length", fmt.Sprintf("%d", len(outBody)))
-
-	authNote := "auth=passthrough"
-	if rule.stripAuth {
-		upReq.Header.Del("Authorization")
-		upReq.Header.Del("X-Api-Key")
-		upReq.Header.Del("Anthropic-Beta")
-		authNote = "auth=STRIPPED"
-	}
-
-	rewriteNote := ""
-	if rewroteTo != "" {
-		rewriteNote = fmt.Sprintf(", model rewritten to %q", rewroteTo)
-	}
-	userNote := ""
-	if user != "" {
-		userNote = fmt.Sprintf("  user=%q", user)
-	}
-	log.Printf("[#%d] >> %s %s  model=%q%s  ROUTE→ %s://%s%s  %s%s",
-		reqID, r.Method, r.URL.Path, model, userNote,
-		rule.upstream.Scheme, rule.upstream.Host, rule.upstream.Path,
-		authNote, rewriteNote)
-	if h.logHeaders {
-		for k, v := range redactHeaders(upReq.Header) {
-			log.Printf("[#%d]    req hdr %s: %v", reqID, k, v)
-		}
-	}
-
-	resp, err := http.DefaultClient.Do(upReq)
-	if err != nil {
-		log.Printf("[#%d] !! upstream error after %s: %v", reqID, time.Since(started).Truncate(time.Millisecond), err)
-		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
-		// 502 is what we send to the client; record it that way in metrics
-		// so failures aren't silently invisible on the dashboard.
-		metricModelErr := model
-		if rewroteTo != "" {
-			metricModelErr = rewroteTo
-		}
-		recordRequestMetric(user, r.Header.Get("X-Claude-Code-Session-Id"), metricModelErr, http.StatusBadGateway, inference)
-		h.captureError(reqID, started, r, inboundHeaders, body, target.String(), rule, rewroteTo, 0, err, user, inference)
-		return
-	}
-	defer resp.Body.Close()
-
-	upstreamLatency := time.Since(started)
-	copyHeadersExcept(w.Header(), resp.Header, hopByHopHeaders)
-	w.WriteHeader(resp.StatusCode)
-	log.Printf("[#%d] << %d from %s://%s in %s", reqID, resp.StatusCode, rule.upstream.Scheme, rule.upstream.Host, upstreamLatency.Truncate(time.Millisecond))
-	if h.logHeaders {
-		for k, v := range redactHeaders(resp.Header) {
-			log.Printf("[#%d]    resp hdr %s: %v", reqID, k, v)
-		}
-	}
-
-	sessionID := r.Header.Get("X-Claude-Code-Session-Id")
-	metricModel := model
-	if rewroteTo != "" {
-		metricModel = rewroteTo
-	}
-
-	// respTee needs to be on whenever capture wants the body OR when metrics
-	// want to extract token usage from an inference 2xx response. Otherwise
-	// allocating a buffer on every request would waste memory.
-	captureWantsBody := h.capture != nil && (inference || h.capture.mode != captureRedacted)
-	metricsWantsUsage := inference && resp.StatusCode >= 200 && resp.StatusCode < 300
-
-	var respTee *bytes.Buffer
-	if captureWantsBody || metricsWantsUsage {
-		respTee = &bytes.Buffer{}
-	}
-	streamCopy(w, resp.Body, respTee)
-	total := time.Since(started)
-	log.Printf("[#%d] -- done in %s", reqID, total.Truncate(time.Millisecond))
-
-	recordRequestMetric(user, sessionID, metricModel, resp.StatusCode, inference)
-	if metricsWantsUsage && respTee != nil {
-		plain := respTee.Bytes()
-		if ce := resp.Header.Get("Content-Encoding"); ce != "" {
-			if decomp, err := decompressBody(plain, ce); err == nil {
-				plain = decomp
-			}
-		}
-		var rresp redactedResponse
-		parseSSEResponse(plain, &rresp)
-		if rresp.Usage != nil {
-			recordTokenMetrics(user, sessionID, metricModel,
-				rresp.Usage.InputTokens,
-				rresp.Usage.CacheReadInputTokens,
-				rresp.Usage.CacheCreationInputTokens,
-				rresp.Usage.OutputTokens)
-		}
-	}
-
-	if h.capture != nil {
-		// In redacted mode, skip non-inference paths entirely: they have no
-		// usage data and produce only noise (404s, 0-token records). Raw mode
-		// is the forensic/debug mode and captures everything unchanged.
-		if !inference && h.capture.mode == captureRedacted {
-			log.Printf("[#%d] capture: skipping non-inference path in redacted mode", reqID)
-		} else {
-			capHeader := resp.Header.Clone()
-			capBody := respTee.Bytes()
-			// Client got the compressed response unchanged; for capture we decompress
-			// so the stored body is plaintext (Go's json.Marshal would otherwise
-			// destroy non-UTF-8 gzip bytes via U+FFFD replacement). Content-Encoding
-			// is cleared on the captured headers so the record doesn't lie about
-			// the stored body's encoding.
-			if ce := capHeader.Get("Content-Encoding"); ce != "" {
-				if decomp, err := decompressBody(capBody, ce); err != nil {
-					log.Printf("[#%d] capture decompress (%s) failed: %v (storing raw)", reqID, ce, err)
-				} else {
-					capBody = decomp
-					capHeader.Del("Content-Encoding")
-				}
-			}
-			rec := buildCaptureRecord(h.capture.mode, reqID, started, r, inboundHeaders, body, target.String(), rule, rewroteTo, resp.StatusCode, capHeader, capBody, upstreamLatency, total, nil, user)
-			h.capture.offer(rec)
-		}
-	}
-}
-
-func (h *routerHandler) captureError(reqID uint64, started time.Time, r *http.Request, inboundHeaders http.Header, body []byte, upstreamURL string, rule *routeRule, rewroteTo string, status int, err error, user string, inference bool) {
-	if h.capture == nil {
-		return
-	}
-	// Mirror the same gate as the success path: skip non-inference errors in
-	// redacted mode — they're just noise with no usage data.
-	if !inference && h.capture.mode == captureRedacted {
-		return
-	}
-	rec := buildCaptureRecord(h.capture.mode, reqID, started, r, inboundHeaders, body, upstreamURL, rule, rewroteTo, status, nil, nil, 0, time.Since(started), err, user)
-	h.capture.offer(rec)
-}
-
-func (h *routerHandler) match(model string) *routeRule {
-	for _, r := range h.rules {
-		if r.matches(model) {
-			return r
-		}
-	}
-	return nil
-}
-
 func extractModel(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -626,76 +410,6 @@ func extractModel(body []byte) string {
 	}
 	_ = json.Unmarshal(body, &probe)
 	return probe.Model
-}
-
-func rewriteModelField(body []byte, newModel string) ([]byte, bool) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, false
-	}
-	encoded, err := json.Marshal(newModel)
-	if err != nil {
-		return nil, false
-	}
-	raw["model"] = encoded
-	out, err := json.Marshal(raw)
-	if err != nil {
-		return nil, false
-	}
-	return out, true
-}
-
-func copyHeadersExcept(dst, src http.Header, drop []string) {
-	dropSet := make(map[string]struct{}, len(drop))
-	for _, k := range drop {
-		dropSet[strings.ToLower(k)] = struct{}{}
-	}
-	// Drop anything listed in the inbound Connection header too.
-	for _, c := range src.Values("Connection") {
-		for _, h := range strings.Split(c, ",") {
-			dropSet[strings.ToLower(strings.TrimSpace(h))] = struct{}{}
-		}
-	}
-	for k, vs := range src {
-		if _, skip := dropSet[strings.ToLower(k)]; skip {
-			continue
-		}
-		for _, v := range vs {
-			dst.Add(k, v)
-		}
-	}
-}
-
-func joinPaths(base, extra string) string {
-	if extra == "" || extra == "/" {
-		return base
-	}
-	if base == "" {
-		return extra
-	}
-	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(extra, "/")
-}
-
-func streamCopy(w http.ResponseWriter, src io.Reader, tee *bytes.Buffer) {
-	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, 4096)
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
-			}
-			if tee != nil {
-				tee.Write(buf[:n])
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
 }
 
 type captureMode string
@@ -871,7 +585,7 @@ func redactQuery(raw string) string {
 	return values.Encode()
 }
 
-func buildCaptureRecord(mode captureMode, reqID uint64, started time.Time, r *http.Request, inboundHeaders http.Header, reqBody []byte, upstreamURL string, rule *routeRule, rewroteTo string, status int, respHeader http.Header, respBody []byte, upstreamLatency, total time.Duration, callErr error, user string) *captureRecord {
+func buildCaptureRecord(mode captureMode, reqID uint64, started time.Time, r *http.Request, inboundHeaders http.Header, reqBody []byte, upstreamURL string, routePattern string, rewroteTo string, status int, respHeader http.Header, respBody []byte, upstreamLatency, total time.Duration, callErr error, user string) *captureRecord {
 	rec := &captureRecord{
 		ID:                reqID,
 		Ts:                started.UTC().Format(time.RFC3339Nano),
@@ -887,11 +601,7 @@ func buildCaptureRecord(mode captureMode, reqID uint64, started time.Time, r *ht
 		TotalMs:           total.Milliseconds(),
 		User:              user,
 	}
-	if rule != nil && len(rule.patterns) > 0 {
-		rec.RoutePattern = strings.Join(rule.patterns, ",")
-	} else if rule == nil {
-		rec.RoutePattern = ""
-	}
+	rec.RoutePattern = routePattern
 	if callErr != nil {
 		rec.Error = callErr.Error()
 	}

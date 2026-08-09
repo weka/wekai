@@ -68,14 +68,26 @@ type Options struct {
 
 	Routes []Route
 
-	// Gateway carries the listener's own behaviour: auth, CORS, body limits.
-	Gateway gateway.Config
+	// --- Listener behaviour.
+	APIKey                string
+	RequireAuthForProbes  bool
+	CORSOrigins           []string
+	PathAllowlist         []string
+	MaxBodyBytes          int64
+	MaxConcurrentRequests int
 
-	// Flow tunes the routing flow shared by every pool — the split guard and
-	// which capacity signals are enabled.
-	Flow affinity.Config
+	// --- The routing flow, shared by every pool.
+	NodeConcurrency int64
+	RebalanceRatio  float64
+	SplitGuard      float64
+	TailTTL         time.Duration
+	RefusalTTL      time.Duration
 
-	Health         health.Config
+	// --- Health probing.
+	HealthInterval time.Duration
+	HealthTimeout  time.Duration
+	HealthPath     string
+
 	MaxAttempts    int
 	RequestTimeout time.Duration
 	IdleTimeout    time.Duration
@@ -89,7 +101,43 @@ type Options struct {
 	// the routing gateway rather than being wired through it.
 	Capture CaptureHook
 
-	Log *slog.Logger
+	// LogLevel and LogFormat configure the router's own logger when Log is nil.
+	LogLevel  string
+	LogFormat string
+	Log       *slog.Logger
+}
+
+// gatewayConfig, flowConfig and healthConfig translate the public Options into
+// the internal structs. Options deliberately names no internal type: cli/
+// cannot import them, and a facade whose signature leaks what it is hiding
+// would not be one.
+func (o Options) gatewayConfig() gateway.Config {
+	return gateway.Config{
+		APIKey:                o.APIKey,
+		RequireAuthForProbes:  o.RequireAuthForProbes,
+		MaxBodyBytes:          o.MaxBodyBytes,
+		MaxConcurrentRequests: o.MaxConcurrentRequests,
+		PathAllowlist:         o.PathAllowlist,
+		CORSOrigins:           o.CORSOrigins,
+		DefaultCapacity:       1,
+	}
+}
+
+func (o Options) flowConfig() affinity.Config {
+	return affinity.Config{
+		NodeConcurrency: o.NodeConcurrency,
+		RebalanceRatio:  o.RebalanceRatio,
+		SplitGuard:      o.SplitGuard,
+		TailTTL:         o.TailTTL,
+		RefusalTTL:      o.RefusalTTL,
+	}
+}
+
+func (o Options) healthConfig() health.Config {
+	return health.Config{
+		Interval: o.HealthInterval, Timeout: o.HealthTimeout, Path: o.HealthPath,
+		FailureThreshold: 3, SuccessThreshold: 2,
+	}
 }
 
 // withDefaults fills what an operator did not set. These used to live in the
@@ -99,22 +147,16 @@ type Options struct {
 // The health defaults in particular are not optional: a zero probe interval
 // panics the ticker, which is a poor way to learn a field was missed.
 func (o Options) withDefaults() Options {
-	if o.Health.Interval <= 0 {
-		o.Health.Interval = 10 * time.Second
+	if o.HealthInterval <= 0 {
+		o.HealthInterval = 10 * time.Second
 	}
-	if o.Health.Timeout <= 0 || o.Health.Timeout >= o.Health.Interval {
+	if o.HealthTimeout <= 0 || o.HealthTimeout >= o.HealthInterval {
 		// A timeout at or above the interval lets probes fall behind forever,
 		// which is how v1's health state went stale indefinitely (HLT-2).
-		o.Health.Timeout = o.Health.Interval / 2
+		o.HealthTimeout = o.HealthInterval / 2
 	}
-	if o.Health.Path == "" {
-		o.Health.Path = "/health"
-	}
-	if o.Health.FailureThreshold <= 0 {
-		o.Health.FailureThreshold = 3
-	}
-	if o.Health.SuccessThreshold <= 0 {
-		o.Health.SuccessThreshold = 2
+	if o.HealthPath == "" {
+		o.HealthPath = "/health"
 	}
 	if o.MaxAttempts < 1 {
 		o.MaxAttempts = 2
@@ -125,11 +167,8 @@ func (o Options) withDefaults() Options {
 	if o.DrainDeadline <= 0 {
 		o.DrainDeadline = 60 * time.Second
 	}
-	if o.Gateway.MaxBodyBytes <= 0 {
-		o.Gateway.MaxBodyBytes = 64 << 20
-	}
-	if o.Gateway.DefaultCapacity <= 0 {
-		o.Gateway.DefaultCapacity = 1
+	if o.MaxBodyBytes <= 0 {
+		o.MaxBodyBytes = 64 << 20
 	}
 	return o
 }
@@ -174,7 +213,7 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		for _, ep := range rt.Endpoints {
 			backends = append(backends, pool.Backend{URL: ep, Passive: rt.Passive})
 		}
-		flow := opts.Flow
+		flow := opts.flowConfig()
 		flow.PoolName = name
 		flow.Clock = clk
 
@@ -182,7 +221,7 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			Name:            name,
 			Backends:        backends,
 			Flow:            flow,
-			Health:          opts.Health,
+			Health:          opts.healthConfig(),
 			DefaultCapacity: 1,
 			DefaultDialect:  d.ID(),
 			DrainDeadline:   opts.DrainDeadline,
@@ -215,13 +254,29 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		IdleTimeout:        opts.IdleTimeout,
 	})
 
-	gw := gateway.New(opts.Gateway, tbl, px, d)
+	gw := gateway.New(opts.gatewayConfig(), tbl, px, d)
 
 	handler := captureMiddleware(opts.Capture, gw)
 
 	for _, p := range pools {
 		p.Run(ctx)
 	}
+	// Fleet load, summarised across every pool so a dashboard does not need a
+	// PromQL aggregation just to see whether the fleet is balanced. Computed
+	// over AVAILABLE backends only — the same set routing chooses among — so a
+	// dead or draining one holding stale load cannot skew it.
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				publishFleetLoad(pools)
+			}
+		}
+	}()
 
 	// Metrics and the live KV map on their own listener: diagnostic surface,
 	// never reachable on the inference path (GW-13).
@@ -240,7 +295,12 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 				log.Error("metrics listener failed", "err", err)
 			}
 		}()
-		defer func() {
+		// Shut down on ctx, NOT on a defer here: Handler returns as soon as the
+		// handler is built, so a deferred Shutdown would close this listener
+		// immediately and /metrics would answer nothing for the process's whole
+		// life.
+		go func() {
+			<-ctx.Done()
 			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = srv.Shutdown(shutCtx)
@@ -266,7 +326,7 @@ func runServers(ctx context.Context, opts Options, handler http.Handler) error {
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info("router listening", "listen", opts.Listen,
-			"metrics", opts.MetricsListen, "signals", signalSummary(opts.Flow))
+			"metrics", opts.MetricsListen, "signals", signalSummary(opts.flowConfig()))
 		errCh <- srv.ListenAndServe()
 	}()
 
@@ -304,6 +364,33 @@ func vizData(pools []*pool.Pool) http.HandlerFunc {
 		}
 		viz.DataHandler(p.Flow)(w, r)
 	}
+}
+
+func publishFleetLoad(pools []*pool.Pool) {
+	var sum, max, min float64
+	n := 0
+	for _, p := range pools {
+		for _, b := range p.Registry.Snapshot().Backends {
+			if !b.Available() {
+				continue
+			}
+			l := b.NormalizedLoad()
+			if n == 0 || l > max {
+				max = l
+			}
+			if n == 0 || l < min {
+				min = l
+			}
+			sum += l
+			n++
+		}
+	}
+	if n == 0 {
+		return
+	}
+	metrics.WorkerLoadAvg.Set(sum / float64(n))
+	metrics.WorkerLoadMax.Set(max)
+	metrics.WorkerLoadMin.Set(min)
 }
 
 func poolName(patterns string, i int) string {

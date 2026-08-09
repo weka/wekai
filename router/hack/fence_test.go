@@ -32,7 +32,11 @@ func repoRoot(t *testing.T) string {
 func goFiles(t *testing.T, root string, includeTests bool) []string {
 	t.Helper()
 	var out []string
-	for _, dir := range []string{"internal", "cmd"} {
+	// serve/ is first-party router code and now the entrypoint — every fence
+	// below must see it. It was missed when it was added, which is exactly the
+	// failure mode these tests exist to prevent: an invariant that quietly
+	// stops covering the code that moved.
+	for _, dir := range []string{"internal", "cmd", "serve"} {
 		base := filepath.Join(root, dir)
 		if _, err := os.Stat(base); os.IsNotExist(err) {
 			continue

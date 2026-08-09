@@ -119,11 +119,6 @@ router-run: build ## Run the router locally against a backend at :8000
 	./$(BINARY) router serve --listen 127.0.0.1:8080 --metrics-listen 127.0.0.1:29000 \
 		--backends http://127.0.0.1:8000 --log-format text
 
-.PHONY: router-deploy
-router-deploy: ## Apply the router's Kubernetes manifests
-	kubectl apply -f router/deploy/k8s/rbac.yaml
-	kubectl apply -f router/deploy/k8s/deployment.yaml
-
 .PHONY: router-manifests-validate
 router-manifests-validate: ## Server-side dry-run of the router manifests
 	kubectl apply --dry-run=server -f router/deploy/k8s/rbac.yaml
