@@ -19,6 +19,11 @@ tasks:
     cmds:
       - go test ./... -timeout 120s -count=1
 
+  router:build:
+    desc: "Build the router image and package chart/router locally, no push and no credentials (dagger call build-router). Runs the SAME packaging a release does, so a chart checked here cannot differ from the published one."
+    cmds:
+      - dagger call build-router --source=. export --path=./dist
+
   docker:build:
     desc: "Build the wekai replay image locally (no push). Override TAG=... and REPLAY_IMAGE=... as needed."
     cmds:

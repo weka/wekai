@@ -98,25 +98,25 @@ async def _publish_router_image(
     return image_name, version
 
 
-async def _package_and_push_chart(
+def _package_chart(
     chart: dagger.Directory,
-    chart_name: str,
     registry: str,
     version: str,
-    helm_registry: str,
-    helm_username: dagger.Secret,
-    helm_password: dagger.Secret,
-) -> str:
-    """Packages one chart pinned to one just-published image and pushes it.
+) -> dagger.Container:
+    """Packages one chart pinned to one image, WITHOUT pushing.
+
+    Split from pushing so a local build can exercise the identical packaging —
+    the stamping below IS the pinning contract, and a local path that
+    reimplemented it with its own `helm package` would drift from the released
+    artifact precisely where it matters.
 
     Version pinning is pure propagation: only Chart.yaml is stamped, and the
     deployment template resolves the tag via `imageTag | default
     .Chart.AppVersion`, so values.yaml never carries a hardcoded version.
-    imageRepository IS synced to the real push destination, so publishing to a
+    imageRepository IS synced to the real destination, so publishing to a
     custom registry cannot yield a chart pointing at the default one.
     """
-    registry_host = helm_registry.split("/")[0]
-    packaged = (
+    return (
         dag.container(platform=LINUX_AMD64)
         .from_("alpine:latest")
         .with_exec(["apk", "add", "--no-cache", "helm"])
@@ -126,6 +126,20 @@ async def _package_and_push_chart(
         .with_exec(["sed", "-i", f"s|^imageRepository:.*|imageRepository: {registry}|", "/chart/values.yaml"])
         .with_exec(["helm", "package", "/chart", "--destination", "/out"])
     )
+
+
+async def _package_and_push_chart(
+    chart: dagger.Directory,
+    chart_name: str,
+    registry: str,
+    version: str,
+    helm_registry: str,
+    helm_username: dagger.Secret,
+    helm_password: dagger.Secret,
+) -> str:
+    """Packages a chart and pushes it. See _package_chart for the pinning."""
+    registry_host = helm_registry.split("/")[0]
+    packaged = _package_chart(chart, registry, version)
     await (
         packaged
         .with_secret_variable("HELM_USER", helm_username)
@@ -254,6 +268,38 @@ class WekaiCoreFlows:
             f"Published wekai image: {image_name}\n"
             f"Published Helm chart: {chart_ref} (pinned to image {image_name})"
         )
+
+    @function
+    async def build_router(
+        self,
+        source: Annotated[dagger.Directory, Ignore(SOURCE_IGNORE)],
+        registry: str = "quay.io/weka.io/wekai-router",
+        version: str = "",
+    ) -> dagger.Directory:
+        """Builds the router image and packages chart/router WITHOUT pushing,
+        returning a directory holding the packaged .tgz.
+
+        The point is that it runs the same code as a release. Testing a chart by
+        hand means reimplementing the version stamping and imageRepository sync
+        that _package_chart does, and a local check that reimplements the
+        pinning contract will agree with the released artifact right up until it
+        matters. Needs no registry credentials.
+
+            dagger call build-router --source=. export --path=./dist
+
+        Args:
+            registry: Image repo the chart is pinned to, as a release would.
+            version: Explicit stamp; empty = content-hash scheme.
+        """
+        if not version:
+            version = await _calc_version(source)
+        # Built, not published: this proves the Dockerfile still builds, which
+        # is the other half of what a pre-merge check is for.
+        await source.docker_build(
+            platform=LINUX_AMD64, dockerfile=ROUTER_DOCKERFILE,
+        ).sync()
+        packaged = _package_chart(source.directory(ROUTER_CHART_DIR), registry, version)
+        return packaged.directory("/out")
 
     @function
     async def push_router_helm(

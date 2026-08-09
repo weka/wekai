@@ -8,6 +8,17 @@
 # likewise aspirational — see .github/workflows/release.yml for what actually
 # runs on a release.
 
+# What lives here vs in Taskfile.yaml, since both exist:
+#
+#   Makefile   — the DEVELOPER and CI contract. `make verify` is the single
+#                definition of "this is good" and ci.yml runs it, along with
+#                `make fuzz`. Local builds and quick image checks live here.
+#   Taskfile   — PUBLISHING, wrapping the Dagger module. Anything that needs
+#                credentials or produces a released artifact.
+#
+# The one place they meet is a local image build, and Taskfile's `router:build`
+# deliberately goes through Dagger rather than `docker build`: it packages the
+# chart with the same code a release uses, which a plain docker build cannot do.
 GO         ?= go
 BINARY     := wekai
 # The router is `wekai router serve`; there is no separate router binary. What
