@@ -341,10 +341,17 @@ func (f *simFleet) growSession(s *simSession) {
 // candidates reproduces gateway.candidates(): healthy backends strictly below
 // the per-node concurrency limit. This is the admission boundary, and the
 // reason a rejection by THIS harness means zero idle slots fleet-wide.
+// candidates reproduces gateway.candidates(): HEALTH ONLY.
+//
+// It used to also apply the --max-node-concurrency cap, because the gateway
+// did. Capacity is now judged entirely by the flow's signals, so a harness that
+// kept filtering here would be testing a gateway that no longer exists — and
+// would hide the case the refused signal is for, where the router hands over a
+// backend that turns out to be full.
 func (f *simFleet) candidates() []*registry.Backend {
 	out := make([]*registry.Backend, 0, len(f.nodes))
 	for _, n := range f.nodes {
-		if n.b.Available() && n.b.Inflight() < f.cfg.conc {
+		if n.b.Available() {
 			out = append(out, n.b)
 		}
 	}

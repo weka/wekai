@@ -108,18 +108,47 @@ func decisions(t *testing.T, label string) float64 {
 	return counter(t, metrics.RouteDecisions.WithLabelValues(label))
 }
 
-// TestNewRequiresAConcurrencyLimit is the loud failure that replaces a silent
-// one. With the shipped defaults every capacity source reads 1 (--backends
-// carries no capacity, MaxInflightPerBackend defaults to 1, and
-// Backend.Capacity clamps up to 1), so a policy that quietly accepted the
-// default would compute its split guard against nonsense and nobody would know.
-func TestNewRequiresAConcurrencyLimit(t *testing.T) {
-	if _, err := New(Config{}, nil); !errors.Is(err, ErrNoConcurrencyLimit) {
-		t.Fatalf("New with no concurrency limit: err = %v, want ErrNoConcurrencyLimit", err)
+// TestSignalsEnabledByBeingSet pins the configuration contract: the refused
+// signal is always on because a backend's own 429 is the only ground truth the
+// router gets, and each optional signal is enabled by setting its own value
+// rather than by naming it in a list.
+//
+// A concurrency limit used to be MANDATORY here, because it was simultaneously
+// the gateway's admission filter and the guard's reference and had to mean one
+// thing. It is now one opinion among several, backstopped by the real 429, so
+// running without it is a valid deployment rather than a misconfiguration.
+func TestSignalsEnabledByBeingSet(t *testing.T) {
+	bare, err := New(Config{}, nil)
+	if err != nil {
+		t.Fatalf("New with no signals configured: %v", err)
 	}
-	if _, err := New(Config{NodeConcurrency: 32}, nil); err != nil {
-		t.Fatalf("New with a limit: %v", err)
+	if got := signalNames(bare); len(got) != 1 || got[0] != "refused" {
+		t.Errorf("signals = %v, want [refused] alone", got)
 	}
+
+	full, err := New(Config{NodeConcurrency: 32, RebalanceRatio: 0.5}, nil)
+	if err != nil {
+		t.Fatalf("New with both optional signals: %v", err)
+	}
+	want := []string{"refused", "concurrency", "imbalance"}
+	got := signalNames(full)
+	if len(got) != len(want) {
+		t.Fatalf("signals = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("signals = %v, want %v", got, want)
+			break
+		}
+	}
+}
+
+func signalNames(p *Policy) []string {
+	out := make([]string, 0, len(p.signals))
+	for _, s := range p.signals {
+		out = append(out, s.name())
+	}
+	return out
 }
 
 // TestSelectReturnsErrNoCandidatesOnEmptyInput: this policy never rejects.

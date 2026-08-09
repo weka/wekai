@@ -129,7 +129,15 @@ func pickBest(cands []*registry.Backend, dir direction, score func(*registry.Bac
 	return best
 }
 
-// LeastOutstanding is the default policy.
+// LeastOutstanding is the router's selector: the tie-break the one routing flow
+// uses whenever it has narrowed the field and must choose among equals — the
+// holders of a prefix, the legal split targets, or the whole usable set for a
+// brand-new prompt.
+//
+// It used to also be a top-level policy, one of six. The others are gone;
+// round-robin and random went with them, random because pickBest already draws
+// uniformly over ties and round-robin because a strict rotation is the opposite
+// of what a cache-affinity flow wants.
 //
 // It compares NormalizedLoad — in-flight divided by capacity — rather than raw
 // in-flight counts, so heterogeneous backends compare meaningfully (HIER-5). On
@@ -154,15 +162,25 @@ func (LeastOutstanding) Select(_ context.Context, cands []*registry.Backend, _ *
 	return pickBest(cands, minimize, (*registry.Backend).NormalizedLoad), nil
 }
 
-// Random selects uniformly. Kept as a predictable baseline for tests and small
-// deployments.
-type Random struct{}
 
-func (Random) Name() string { return "random" }
+// ErrAllBackendsSaturated reports that every healthy backend was called
+// saturated by some signal — the backend's own 429, a configured concurrency
+// limit, or an imbalance ratio. There is no capacity to give the request at
+// all, which is a different answer from ErrSplitGuardBlocked: that one means
+// capacity existed and the guard refused to spend it on a duplicate copy.
+//
+// Callers turn this into a 429. It replaces the gateway's former
+// all_backends_at_capacity, which derived the same conclusion from a
+// router-side concurrency filter before any policy ran.
+var ErrAllBackendsSaturated = errors.New("policy: every backend is saturated")
 
-func (Random) Select(_ context.Context, cands []*registry.Backend, _ *RoutingRequest) (*registry.Backend, error) {
-	if len(cands) == 0 {
-		return nil, ErrNoCandidates
-	}
-	return cands[rand.IntN(len(cands))], nil
+// Observer receives the outcome of each upstream attempt so a flow's signals
+// can learn from it. Implemented by the routing flow; wired by the gateway.
+//
+// OnRefused carries the ultimate signal — the backend answered 429, which is
+// the only ground truth about a vLLM's capacity the router ever gets.
+// OnAccepted says it is taking work again, so a refusal need not be waited out.
+type Observer interface {
+	OnRefused(b *registry.Backend)
+	OnAccepted(b *registry.Backend)
 }

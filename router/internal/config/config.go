@@ -31,7 +31,6 @@ type Backend struct {
 type Config struct {
 	Listen        string    `json:"listen"`
 	MetricsListen string    `json:"metrics_listen"`
-	Policy        string    `json:"policy"`
 	MaxBodyBytes  int64     `json:"max_body_bytes"`
 	Backends      []Backend `json:"backends"`
 
@@ -88,6 +87,18 @@ type Config struct {
 	// authoritative only when it is the sole source of a backend's load.
 	MaxNodeConcurrency int64 `json:"max_node_concurrency"`
 
+	// RebalanceRatio enables the imbalance split signal by being set. A backend
+	// is treated as unable to take more work while
+	// (inflight - fleetMin) / inflight exceeds it, so 0.5 means "rebalance once
+	// the gap is more than half the busier side". 0 (the default) leaves the
+	// signal off, because a fleet where prefix affinity is working is SUPPOSED
+	// to look imbalanced — turning this on trades locality for evenness.
+	//
+	// It replaces the retired prefix-cache-aware policy's paired
+	// balance_abs_threshold / balance_rel_threshold, which needed retuning per
+	// deployment because one half was an absolute request count.
+	RebalanceRatio float64 `json:"rebalance_ratio"`
+
 	HealthInterval Duration `json:"health_interval"`
 	HealthTimeout  Duration `json:"health_timeout"`
 	HealthPath     string   `json:"health_path"`
@@ -108,20 +119,6 @@ type Config struct {
 // prediction's accuracy is measured against the worker's reported cached_tokens
 // rather than assumed (RES-3).
 type CacheConfig struct {
-	// CacheThreshold is the matched fraction below which affinity is not worth
-	// overriding load balance.
-	CacheThreshold float64 `json:"cache_threshold"`
-	// Spill guard: prefer affinity until the fleet is measurably imbalanced.
-	BalanceAbsThreshold int64   `json:"balance_abs_threshold"`
-	BalanceRelThreshold float64 `json:"balance_rel_threshold"`
-	// Per-backend model bounds. MaxTokens is the binding one in practice.
-	MaxNodes  int64 `json:"max_nodes_per_backend"`
-	MaxTokens int64 `json:"max_tokens_per_backend"`
-	// ChunkBytes is the prefix-unit granularity; see prefix.DefaultChunkBytes.
-	ChunkBytes int `json:"chunk_bytes"`
-
-	// --- prefix-cache-split only ---
-
 	// SplitGuard keeps a split from landing on a backend nearly as loaded as
 	// the saturated holders it is relieving, which is what stops every backend
 	// from ending up marked as holding every prefix. A candidate qualifies
@@ -130,6 +127,10 @@ type CacheConfig struct {
 	// TailTTL is how long a leaf of the shared prefix tree may go untouched
 	// before eviction. Eviction is tail-only: the middle is never removed.
 	TailTTL Duration `json:"tail_ttl"`
+	// RefusalTTL is how long a backend's own 429 keeps it out of its prefixes.
+	// A hint that saves the next request a wasted round trip, not a health
+	// verdict — a success from that backend clears it immediately.
+	RefusalTTL Duration `json:"refusal_ttl"`
 }
 
 // Discovery configures Kubernetes-based backend discovery. Disabled by default:
@@ -149,19 +150,10 @@ type Discovery struct {
 	ResyncInterval Duration `json:"resync_interval"`
 }
 
-// ValidPolicies is the closed set. An unknown name fails startup with this list
-// rather than silently falling back, which is how v1 lost `consistent_hash` in
-// one of its two divergent name tables.
-var ValidPolicies = []string{
-	"least-outstanding", "round-robin", "random", "prefix-cache-aware",
-	"prefix-cache-candidates", "prefix-cache-split",
-}
-
 func Default() Config {
 	return Config{
 		Listen:                ":8080",
 		MetricsListen:         "127.0.0.1:29000",
-		Policy:                "least-outstanding",
 		MaxBodyBytes:          64 << 20,
 		MaxConcurrentRequests: 256,
 		MaxAttempts:           2,
@@ -176,14 +168,9 @@ func Default() Config {
 		LogLevel:              "info",
 		LogFormat:             "json",
 		Cache: CacheConfig{
-			CacheThreshold:      0.5,
-			BalanceAbsThreshold: 32,
-			BalanceRelThreshold: 1.5,
-			MaxNodes:            100_000,
-			MaxTokens:           2_000_000,
-			ChunkBytes:          1024,
-			SplitGuard:          0.20,
-			TailTTL:             Duration(5 * time.Minute),
+			SplitGuard: 0.20,
+			TailTTL:    Duration(5 * time.Minute),
+			RefusalTTL: Duration(2 * time.Second),
 		},
 		Discovery: Discovery{
 			Mode:           "endpointslice",
@@ -227,16 +214,21 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	fs.StringVar(&configPath, "config", configPath, "path to a JSON config file")
 	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "inference listener address")
 	fs.StringVar(&cfg.MetricsListen, "metrics-listen", cfg.MetricsListen, "metrics listener address")
-	fs.StringVar(&cfg.Policy, "policy", cfg.Policy,
-		"routing policy: "+strings.Join(ValidPolicies, ", "))
 	fs.Int64Var(&cfg.MaxBodyBytes, "max-body-bytes", cfg.MaxBodyBytes, "maximum request body size")
 	fs.IntVar(&cfg.MaxConcurrentRequests, "max-concurrent-requests", cfg.MaxConcurrentRequests, "in-flight request cap (0 disables)")
 	fs.IntVar(&cfg.MaxAttempts, "max-attempts", cfg.MaxAttempts, "total upstream attempts including the first")
 	fs.Int64Var(&cfg.MaxNodeConcurrency, "max-node-concurrency", cfg.MaxNodeConcurrency,
-		"per-backend concurrency cap enforced by the router (0 disables): approximates the level at which "+
-			"vLLM itself would 429, for testing a lower ceiling without restarting the backend. A backend at "+
-			"or above this many router-leased in-flight requests is excluded from candidate selection; if "+
-			"every healthy backend is at cap, the router returns 429 instead of 503")
+		"enables the concurrency split signal (0 = off): the router's own guess at the backends' vLLM "+
+			"--max-num-seqs. A backend at or above this many in-flight requests is treated as saturated "+
+			"without waiting for it to say so, which saves a wasted round trip per saturation event. The "+
+			"backend's own 429 remains the ultimate signal and backstops this one, which is why it is optional")
+	fs.Float64Var(&cfg.RebalanceRatio, "rebalance-ratio", cfg.RebalanceRatio,
+		"enables the imbalance split signal (0 = off): a backend is treated as saturated while "+
+			"(inflight - fleetMin) / inflight exceeds this. 0.5 means rebalance once the gap is more than "+
+			"half the busier side. Off by default: a fleet where affinity is working is supposed to look "+
+			"imbalanced, so this trades locality for evenness")
+	fs.Var(&cfg.Cache.RefusalTTL, "cache-refusal-ttl",
+		"how long a backend's own 429 keeps it out of its prefixes; cleared early by any success from it")
 	fs.Float64Var(&cfg.Cache.SplitGuard, "cache-split-guard", cfg.Cache.SplitGuard,
 		"prefix-cache-split only: a saturated prefix is split onto a backend whose in-flight is below "+
 			"max-node-concurrency * (1 - this). Higher values keep the holder set tighter at the cost of "+
@@ -300,7 +292,6 @@ func applyEnv(cfg *Config, getenv func(string) string) {
 	}
 	set(&cfg.Listen, "WLLM_LISTEN")
 	set(&cfg.MetricsListen, "WLLM_METRICS_LISTEN")
-	set(&cfg.Policy, "WLLM_POLICY")
 	set(&cfg.APIKey, "WLLM_API_KEY")
 	set(&cfg.APIKeyFile, "WLLM_API_KEY_FILE")
 	set(&cfg.UpstreamCredential, "WLLM_UPSTREAM_CREDENTIAL")
@@ -347,10 +338,6 @@ func applyEnv(cfg *Config, getenv func(string) string) {
 func (c Config) Validate() error {
 	var errs []error
 
-	if !contains(ValidPolicies, c.Policy) {
-		errs = append(errs, fmt.Errorf("unknown policy %q; valid: %s",
-			c.Policy, strings.Join(ValidPolicies, ", ")))
-	}
 	if c.MaxBodyBytes <= 0 {
 		errs = append(errs, errors.New("max_body_bytes must be > 0: an unbounded body limit is a memory-exhaustion DoS"))
 	}
@@ -387,46 +374,18 @@ func (c Config) Validate() error {
 			errs = append(errs, errors.New(`cors_origins "*" cannot be combined with an API key (SEC-10)`))
 		}
 	}
-	if c.Policy == "prefix-cache-aware" || c.Policy == "prefix-cache-candidates" {
-		if c.Cache.CacheThreshold <= 0 || c.Cache.CacheThreshold > 1 {
-			errs = append(errs, fmt.Errorf("cache.cache_threshold %v must be in (0,1]", c.Cache.CacheThreshold))
-		}
-		if c.Cache.MaxTokens <= 0 || c.Cache.MaxNodes <= 0 {
-			errs = append(errs, errors.New("cache.max_tokens_per_backend and max_nodes_per_backend must be > 0"))
-		}
-		if c.Cache.ChunkBytes <= 0 {
-			errs = append(errs, errors.New("cache.chunk_bytes must be > 0"))
-		}
+	if c.RebalanceRatio < 0 || c.RebalanceRatio >= 1 {
+		errs = append(errs, fmt.Errorf("rebalance_ratio %v must be in [0,1); 0 disables the imbalance signal", c.RebalanceRatio))
 	}
-	if c.Policy == "prefix-cache-aware" {
-		if c.Cache.BalanceRelThreshold < 1 {
-			errs = append(errs, fmt.Errorf("cache.balance_rel_threshold %v must be >= 1", c.Cache.BalanceRelThreshold))
-		}
-	}
-	if c.Policy == "prefix-cache-candidates" {
-		if c.Cache.BalanceAbsThreshold <= 0 {
-			errs = append(errs, fmt.Errorf("cache.balance_abs_threshold %v must be > 0 (used as the pending-tasks threshold)", c.Cache.BalanceAbsThreshold))
-		}
-	}
-	if c.Policy == "prefix-cache-split" {
-		// The one setting this policy cannot infer. Left unset, the gateway
-		// applies no admission cap at all while every other capacity source
-		// reads 1 (--backends carries no capacity field, max_inflight_per_backend
-		// defaults to 1, and Backend.Capacity clamps below 1 up to 1) — so the
-		// split guard would be computed against a number that means nothing.
-		// Failing loudly beats a second default that could disagree with the
-		// gateway's own filter; one number has to mean one thing.
-		if c.MaxNodeConcurrency <= 0 {
-			errs = append(errs, errors.New(
-				"max_node_concurrency (--max-node-concurrency) must be > 0 for policy prefix-cache-split: "+
-					"it is both the gateway's admission cap and the limit the split guard is measured against; "+
-					"set it to the backends' vLLM --max-num-seqs"))
-		}
+	{
 		if c.Cache.SplitGuard <= 0 || c.Cache.SplitGuard >= 1 {
 			errs = append(errs, fmt.Errorf("cache.split_guard %v must be in (0,1)", c.Cache.SplitGuard))
 		}
 		if time.Duration(c.Cache.TailTTL) <= 0 {
 			errs = append(errs, errors.New("cache.tail_ttl must be > 0"))
+		}
+		if time.Duration(c.Cache.RefusalTTL) <= 0 {
+			errs = append(errs, errors.New("cache.refusal_ttl must be > 0"))
 		}
 	}
 	if c.Discovery.Enabled {

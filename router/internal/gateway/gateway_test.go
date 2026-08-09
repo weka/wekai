@@ -20,9 +20,10 @@ import (
 	"github.com/weka/wekai/router/internal/lease"
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/policy"
-	cachepolicy "github.com/weka/wekai/router/internal/policy/cache"
+	"github.com/weka/wekai/router/internal/policy/affinity"
 	"github.com/weka/wekai/router/internal/proxy"
 	"github.com/weka/wekai/router/internal/registry"
+	"github.com/weka/wekai/router/internal/viz"
 	"github.com/weka/wekai/router/internal/testutil/mockvllm"
 )
 
@@ -63,11 +64,25 @@ func newHarness(t *testing.T, nWorkers int, mutate func(*config.Config)) *harnes
 		UpstreamCredential: cfg.UpstreamCredential,
 		StreamBufferBytes:  cfg.StreamBufferBytes,
 	})
-	gw := gateway.New(cfg, reg, policy.LeastOutstanding{}, px, d)
+	gw := gateway.New(cfg, reg, mustFlow(t, affinity.Config{
+		NodeConcurrency: cfg.MaxNodeConcurrency,
+		RebalanceRatio:  cfg.RebalanceRatio,
+	}), px, d)
 	h.gw = gw
 	h.srv = httptest.NewServer(gw)
 	t.Cleanup(h.srv.Close)
 	return h
+}
+
+// mustFlow builds the router's one routing flow. Signals are enabled by being
+// set in cfg; the refused signal is always on.
+func mustFlow(t *testing.T, cfg affinity.Config) *affinity.Policy {
+	t.Helper()
+	p, err := affinity.New(cfg, policy.LeastOutstanding{})
+	if err != nil {
+		t.Fatalf("affinity.New: %v", err)
+	}
+	return p
 }
 
 func (h *harness) post(t *testing.T, path, body string, hdr map[string]string) *http.Response {
@@ -871,7 +886,7 @@ func TestPrefixCacheAffinityEndToEnd(t *testing.T) {
 	cfg.MaxAttempts = 2
 
 	reg := registry.New(registry.Options{})
-	cp := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	cp := mustFlow(t, affinity.Config{})
 	var workers []*mockvllm.Worker
 	for i := 0; i < 4; i++ {
 		w := mockvllm.New()
@@ -948,7 +963,7 @@ func TestFailedAttemptDoesNotCommit(t *testing.T) {
 	cfg.MaxAttempts = 2
 
 	reg := registry.New(registry.Options{})
-	cp := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	cp := mustFlow(t, affinity.Config{})
 	var workers []*mockvllm.Worker
 	for i := 0; i < 2; i++ {
 		w := mockvllm.New()
@@ -975,10 +990,10 @@ func TestFailedAttemptDoesNotCommit(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	for url, st := range cp.Stats() {
-		if st[0] != 0 {
-			t.Errorf("%s was credited with %d nodes despite never accepting the "+
-				"request — it will look warm for a prefix it never received", url, st[0])
+	for _, bm := range cp.Snapshot(viz.SnapshotOptions{}).Backends {
+		if bm.Nodes != 0 {
+			t.Errorf("%s was credited with %d blocks despite never accepting the "+
+				"request — it will look warm for a prefix it never received", bm.URL, bm.Nodes)
 		}
 	}
 }
@@ -1123,9 +1138,9 @@ func TestMaxNodeConcurrencyRejects429WhenAllBackendsAtCap(t *testing.T) {
 		Error struct{ Code string } `json:"error"`
 	}
 	_ = json.Unmarshal(body3, &env)
-	if env.Error.Code != "all_backends_at_capacity" {
-		t.Errorf("error code = %q, want all_backends_at_capacity (distinguishable from "+
-			"no_healthy_backends and router_at_capacity)", env.Error.Code)
+	if env.Error.Code != "all_backends_saturated" {
+		t.Errorf("error code = %q, want all_backends_saturated (distinguishable from "+
+			"no_healthy_backends, router_at_capacity and split_guard_blocked)", env.Error.Code)
 	}
 	if got := testutil.ToFloat64(metrics.SaturationRejects); got != shedBefore+1 {
 		t.Errorf("router_saturation_rejects_total went %v -> %v, want +1", shedBefore, got)
@@ -1187,7 +1202,7 @@ func TestMaxNodeConcurrencyExcludesAtCapBackendFromCacheAffinity(t *testing.T) {
 	cfg.MaxNodeConcurrency = 1
 
 	reg := registry.New(registry.Options{})
-	cp := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	cp := mustFlow(t, affinity.Config{NodeConcurrency: cfg.MaxNodeConcurrency})
 	var workers []*mockvllm.Worker
 	for i := 0; i < 2; i++ {
 		w := mockvllm.New()
@@ -1275,7 +1290,7 @@ func TestMaxNodeConcurrencyExcludesAtCapBackendFromFallback(t *testing.T) {
 	cfg.MaxNodeConcurrency = 1
 
 	reg := registry.New(registry.Options{})
-	cp := cachepolicy.New(cachepolicy.DefaultConfig(), policy.LeastOutstanding{})
+	cp := mustFlow(t, affinity.Config{NodeConcurrency: cfg.MaxNodeConcurrency})
 	var workers []*mockvllm.Worker
 	for i := 0; i < 2; i++ {
 		w := mockvllm.New()

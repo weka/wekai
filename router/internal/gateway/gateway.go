@@ -115,23 +115,12 @@ func (s *Server) inferenceHandler(route dialect.Route) http.Handler {
 			rr.Units = units
 		}
 
-		candidates, healthy := s.candidates()
+		candidates := s.candidates()
 		if len(candidates) == 0 {
-			if healthy > 0 {
-				// Healthy backends exist but every one is at the router-enforced
-				// --max-node-concurrency cap: a distinguishable 429, not the 503
-				// below (that means an outage; this means "saturated, retry
-				// shortly") and not the router-wide MaxConcurrentRequests shed
-				// (that means the router itself is full; this means every
-				// backend is).
-				metrics.SaturationRejects.Inc()
-				w.Header().Set("Retry-After", "1")
-				s.dialect.WriteError(w, http.StatusTooManyRequests,
-					"all_backends_at_capacity",
-					"all healthy backends are at their router-enforced concurrency cap; retry shortly")
-				return
-			}
 			// Never route to a known-bad backend to avoid an error (HLT-11).
+			// Capacity is no longer judged here — the flow's signals do that and
+			// answer 429 themselves — so an empty candidate set now means one
+			// thing only: nothing is healthy.
 			s.dialect.WriteError(w, http.StatusServiceUnavailable,
 				"no_healthy_backends", "no healthy backend is available")
 			return
@@ -141,20 +130,42 @@ func (s *Server) inferenceHandler(route dialect.Route) http.Handler {
 		if c, ok := s.pol.(policy.Committer); ok {
 			accepted = func(b *registry.Backend) { c.Commit(b, rr) }
 		}
-		res := s.px.Serve(w, r, candidates, s.pol, s.dialect, rr, body, accepted)
+		var outcome proxy.OnOutcome
+		if o, ok := s.pol.(policy.Observer); ok {
+			outcome = func(b *registry.Backend, status int) {
+				// A 429 is the ultimate signal; anything the backend actually
+				// served proves it is taking work again.
+				if status == http.StatusTooManyRequests {
+					o.OnRefused(b)
+					return
+				}
+				if status >= 200 && status < 500 {
+					o.OnAccepted(b)
+				}
+			}
+		}
+		res := s.px.Serve(w, r, candidates, s.pol, s.dialect, rr, body, accepted, outcome)
 		switch {
 		case res.Committed || res.Err == nil:
 		case errors.Is(res.Err, policy.ErrSplitGuardBlocked):
-			// The policy declined on purpose: every backend holding this
-			// prefix is at its limit and none of the rest is far enough below
-			// it to be worth a duplicate copy. Idle capacity may exist, which
-			// is what makes this a distinct code from all_backends_at_capacity
-			// above — retrying shortly is still the right client behavior, so
-			// the status and Retry-After match.
+			// Declined on purpose: every backend holding this prefix is
+			// saturated and none of the rest is far enough below to be worth a
+			// duplicate copy. Idle capacity may well exist — that is what makes
+			// this distinct from all_backends_saturated below.
 			w.Header().Set("Retry-After", "1")
 			s.dialect.WriteError(w, http.StatusTooManyRequests,
 				"split_guard_blocked",
-				"every backend holding this prefix is at its concurrency cap and no other is far enough below it; retry shortly")
+				"every backend holding this prefix is saturated and no other is far enough below it to take a copy; retry shortly")
+		case errors.Is(res.Err, policy.ErrAllBackendsSaturated):
+			// Every healthy backend is saturated by some signal. Replaces the
+			// old gateway-side all_backends_at_capacity, which reached the same
+			// conclusion from a router-side concurrency filter before any
+			// routing ran.
+			metrics.SaturationRejects.Inc()
+			w.Header().Set("Retry-After", "1")
+			s.dialect.WriteError(w, http.StatusTooManyRequests,
+				"all_backends_saturated",
+				"every healthy backend is saturated; retry shortly")
 		default:
 			s.dialect.WriteError(w, http.StatusBadGateway,
 				"upstream_unavailable", "all upstream attempts failed")
@@ -163,35 +174,29 @@ func (s *Server) inferenceHandler(route dialect.Route) http.Handler {
 }
 
 // candidates filters the snapshot to backends eligible for new traffic:
-// healthy, non-draining, closed-circuit, matching dialect, and — when
-// --max-node-concurrency is configured — under the router-enforced
-// per-backend concurrency cap. Filtering here, once, at the single site every
-// policy's candidate set is built from, is what makes the cap apply to EVERY
-// policy (affinity and fallback alike) without any policy needing to know it
-// exists.
+// healthy, non-draining, closed-circuit, matching dialect. HEALTH ONLY.
 //
-// healthy reports the count BEFORE the cap filter, so a caller can
-// distinguish "no healthy backend at all" (503, an outage) from "healthy
-// backends exist but are all saturated" (429, transient — see
-// inferenceHandler).
+// Capacity is deliberately not judged here any more. It used to be — a
+// --max-node-concurrency filter sat in front of every policy — and that split
+// the answer to "is this backend full" across two components: a router-side
+// guess here, and a policy downstream that re-derived the same thing from
+// in-flight counts and could not tell "saturated" from "does not exist". The
+// judgement now lives in exactly one place, the flow's signals, where the
+// backend's own 429 is available as ground truth and a configured limit is just
+// one opt-in opinion alongside it.
 //
 // Filtering reads circuit State() only and never Allow(), so it cannot consume a
 // half-open probe token for a backend it does not select (R2, LB-9).
-func (s *Server) candidates() (cands []*registry.Backend, healthy int) {
+func (s *Server) candidates() []*registry.Backend {
 	snap := s.reg.Snapshot()
-	cands = make([]*registry.Backend, 0, len(snap.Backends))
+	cands := make([]*registry.Backend, 0, len(snap.Backends))
 	for _, b := range snap.Backends {
 		if !b.Available() || b.DialectID != s.dialect.ID() {
 			continue
 		}
-		healthy++
-		if s.cfg.MaxNodeConcurrency > 0 && b.Inflight() >= s.cfg.MaxNodeConcurrency {
-			metrics.BackendCapExceeded.WithLabelValues(b.URL).Inc()
-			continue
-		}
 		cands = append(cands, b)
 	}
-	return cands, healthy
+	return cands
 }
 
 func (s *Server) handleLiveness(w http.ResponseWriter, r *http.Request) {
@@ -203,11 +208,10 @@ func (s *Server) handleLiveness(w http.ResponseWriter, r *http.Request) {
 // handleReadiness fails when there is no healthy backend, so an orchestrator
 // drains this instance through the ordinary path (HIER-7).
 func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
-	// Readiness reflects backend HEALTH, not the transient --max-node-concurrency
-	// throttle: a fully saturated router is still ready to receive traffic (it
-	// sheds with 429, not by going NotReady) — so this deliberately uses the
-	// pre-cap healthy count, not len(candidates()).
-	_, n := s.candidates()
+	// Readiness reflects backend HEALTH, and candidates() is now health-only, so
+	// this is simply its size. A fully saturated router is still ready to
+	// receive traffic — it sheds with 429, not by going NotReady.
+	n := len(s.candidates())
 	body := map[string]any{"ready": n > 0}
 	// The fleet size is operational detail, so it is disclosed only to an
 	// authenticated caller. An unauthenticated kubelet probe gets the boolean it

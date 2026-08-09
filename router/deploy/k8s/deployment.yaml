@@ -11,7 +11,6 @@ data:
     {
       "listen": ":8080",
       "metrics_listen": "0.0.0.0:29000",
-      "policy": "least-outstanding",
       "max_body_bytes": 67108864,
       "max_attempts": 2,
       "max_inflight_per_backend": 1,

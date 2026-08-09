@@ -100,7 +100,7 @@ func TestUnknownKeyIsRejected(t *testing.T) {
 // deployment takes one round trip to fix rather than N.
 func TestValidationAggregatesAllProblems(t *testing.T) {
 	_, err := load(t, `{
-      "policy": "nonsense",
+      "rebalance_ratio": 2,
       "max_body_bytes": 0,
       "health_interval": "1s",
       "health_timeout": "5s",
@@ -113,7 +113,7 @@ func TestValidationAggregatesAllProblems(t *testing.T) {
 	}
 	msg := err.Error()
 	for _, want := range []string{
-		"unknown policy",
+		"rebalance_ratio",
 		"max_body_bytes",
 		"health_timeout",
 		"max_attempts",
@@ -209,57 +209,53 @@ func TestAPIKeyFromFileAndEnv(t *testing.T) {
 }
 
 // CFG-1: flag beats env beats file beats default.
+//
+// Carried on log_level since --policy was retired: the router has one routing
+// flow, so there is no policy name left to layer.
 func TestPrecedenceFlagOverEnvOverFileOverDefault(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
-	if err := os.WriteFile(path, []byte(`{"policy":"random","backends":[{"url":"http://w:8000"}]}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"log_level":"warn","backends":[{"url":"http://w:8000"}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
-	// default
-	base, err := config.Load([]string{"-backends", "http://w:8000"}, func(string) string { return "" })
-	if err != nil {
-		t.Fatal(err)
-	}
-	if base.Policy != "least-outstanding" {
-		t.Errorf("default policy = %q, want least-outstanding", base.Policy)
-	}
-
-	// file beats default
-	fromFile, err := config.Load([]string{"-config", path}, func(string) string { return "" })
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fromFile.Policy != "random" {
-		t.Errorf("file policy = %q, want random", fromFile.Policy)
-	}
-
-	// env beats file
-	fromEnv, err := config.Load([]string{"-config", path}, func(k string) string {
-		if k == "WLLM_POLICY" {
-			return "round-robin"
+	noEnv := func(string) string { return "" }
+	envDebug := func(k string) string {
+		if k == "WLLM_LOG_LEVEL" {
+			return "debug"
 		}
 		return ""
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fromEnv.Policy != "round-robin" {
-		t.Errorf("env policy = %q, want round-robin", fromEnv.Policy)
 	}
 
-	// flag beats env
-	fromFlag, err := config.Load([]string{"-config", path, "-policy", "least-outstanding"}, func(k string) string {
-		if k == "WLLM_POLICY" {
-			return "round-robin"
-		}
-		return ""
-	})
+	base, err := config.Load([]string{"-backends", "http://w:8000"}, noEnv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fromFlag.Policy != "least-outstanding" {
-		t.Errorf("flag policy = %q, want least-outstanding", fromFlag.Policy)
+	if base.LogLevel != "info" {
+		t.Errorf("default log_level = %q, want info", base.LogLevel)
+	}
+
+	fromFile, err := config.Load([]string{"-config", path}, noEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromFile.LogLevel != "warn" {
+		t.Errorf("file log_level = %q, want warn", fromFile.LogLevel)
+	}
+
+	fromEnv, err := config.Load([]string{"-config", path}, envDebug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromEnv.LogLevel != "debug" {
+		t.Errorf("env log_level = %q, want debug", fromEnv.LogLevel)
+	}
+
+	fromFlag, err := config.Load([]string{"-config", path, "-log-level", "error"}, envDebug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromFlag.LogLevel != "error" {
+		t.Errorf("flag log_level = %q, want error", fromFlag.LogLevel)
 	}
 }
 
@@ -311,35 +307,29 @@ func load(t *testing.T, body string) (config.Config, error) {
 	return config.Load([]string{"-config", path}, func(string) string { return "" })
 }
 
-// TestSplitPolicyRequiresNodeConcurrency is the loud failure that replaces a
-// silent one. With --backends alone, the gateway applies no admission cap and
-// every other capacity source reads 1 (--backends carries no capacity field,
-// max_inflight_per_backend defaults to 1, Backend.Capacity clamps below 1 up to
-// 1) — so prefix-cache-split would compute its split guard against a number
-// that means nothing, and route plausibly-but-wrongly forever without a signal.
-func TestSplitPolicyRequiresNodeConcurrency(t *testing.T) {
-	_, err := load(t, `{"backends":[{"url":"http://w:8000"}],"policy":"prefix-cache-split"}`)
-	if err == nil {
-		t.Fatal("prefix-cache-split with no max_node_concurrency should be rejected")
-	}
-	if !strings.Contains(err.Error(), "max_node_concurrency") {
-		t.Errorf("the error must name the setting to fix:\n%s", err)
-	}
-
-	if _, err := load(t, `{"backends":[{"url":"http://w:8000"}],
-	    "policy":"prefix-cache-split","max_node_concurrency":32}`); err != nil {
-		t.Errorf("a configured concurrency limit should be accepted: %v", err)
+// TestNoSignalConfiguredStillStarts is the inverse of what this file used to
+// assert. max_node_concurrency was MANDATORY, because it was simultaneously the
+// gateway's admission filter and the split guard's reference and so had to mean
+// one thing. It is now one opt-in signal alongside the backend's own 429, which
+// is always on and needs no configuration, so a bare --backends deployment is
+// valid rather than a silent misconfiguration.
+func TestNoSignalConfiguredStillStarts(t *testing.T) {
+	if _, err := load(t, `{"backends":[{"url":"http://w:8000"}]}`); err != nil {
+		t.Errorf("a router with no optional signals configured should start: %v", err)
 	}
 }
 
-// TestSplitPolicyKnobsAreValidated: both have defaults, so reaching these
-// errors means an operator set something meaningless on purpose.
-func TestSplitPolicyKnobsAreValidated(t *testing.T) {
-	base := `{"backends":[{"url":"http://w:8000"}],"policy":"prefix-cache-split","max_node_concurrency":32,`
+// TestSignalKnobsAreValidated: all have defaults, so reaching these errors
+// means an operator set something meaningless on purpose.
+func TestSignalKnobsAreValidated(t *testing.T) {
+	const base = `{"backends":[{"url":"http://w:8000"}],`
 	for _, tc := range []struct{ frag, want string }{
-		{`"cache":{"split_guard":0,"tail_ttl":"5m"}}`, "split_guard"},
-		{`"cache":{"split_guard":1,"tail_ttl":"5m"}}`, "split_guard"},
-		{`"cache":{"split_guard":0.2,"tail_ttl":"0s"}}`, "tail_ttl"},
+		{`"cache":{"split_guard":0,"tail_ttl":"5m","refusal_ttl":"2s"}}`, "split_guard"},
+		{`"cache":{"split_guard":1,"tail_ttl":"5m","refusal_ttl":"2s"}}`, "split_guard"},
+		{`"cache":{"split_guard":0.2,"tail_ttl":"0s","refusal_ttl":"2s"}}`, "tail_ttl"},
+		{`"cache":{"split_guard":0.2,"tail_ttl":"5m","refusal_ttl":"0s"}}`, "refusal_ttl"},
+		{`"rebalance_ratio":1,"cache":{"split_guard":0.2,"tail_ttl":"5m","refusal_ttl":"2s"}}`, "rebalance_ratio"},
+		{`"rebalance_ratio":-0.1,"cache":{"split_guard":0.2,"tail_ttl":"5m","refusal_ttl":"2s"}}`, "rebalance_ratio"},
 	} {
 		_, err := load(t, base+tc.frag)
 		if err == nil {
@@ -352,13 +342,15 @@ func TestSplitPolicyKnobsAreValidated(t *testing.T) {
 	}
 }
 
-// TestOtherPoliciesDoNotRequireNodeConcurrency: the new requirement must not
-// leak onto the policies that shipped without it.
-func TestOtherPoliciesDoNotRequireNodeConcurrency(t *testing.T) {
-	for _, p := range []string{"least-outstanding", "round-robin", "random",
-		"prefix-cache-aware", "prefix-cache-candidates"} {
-		if _, err := load(t, `{"backends":[{"url":"http://w:8000"}],"policy":"`+p+`"}`); err != nil {
-			t.Errorf("policy %s should still start without max_node_concurrency: %v", p, err)
-		}
+// TestRetiredPolicyKeyIsRejected: the router has one routing flow, so `policy`
+// is not merely ignored — DisallowUnknownFields means a config still naming one
+// fails loudly rather than silently routing differently than its author asked.
+func TestRetiredPolicyKeyIsRejected(t *testing.T) {
+	_, err := load(t, `{"backends":[{"url":"http://w:8000"}],"policy":"prefix-cache-aware"}`)
+	if err == nil {
+		t.Fatal("a config naming a retired policy should fail startup, not be ignored")
+	}
+	if !strings.Contains(err.Error(), "policy") {
+		t.Errorf("the error must name the offending key:\n%s", err)
 	}
 }

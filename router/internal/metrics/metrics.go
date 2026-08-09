@@ -91,13 +91,10 @@ var (
 	//   split    — every backend holding the prefix was saturated, so affinity
 	//              was EXTENDED onto a backend outside the holder set, which
 	//              then becomes a holder too (prefix-cache-split only).
-	//   overflow — holders were saturated and nothing cleared the split guard,
-	//              so idle capacity was used without recording a new holder:
-	//              served cold on purpose, leaving the tree unpolluted
-	//              (prefix-cache-split only).
-	//   load     — least-outstanding decided, either because that is the
-	//              configured policy or because a cache policy declined.
-	//   other    — round-robin/random.
+	//   overflow — retired with the serve-anyway ladder; reads 0.
+	//   load     — no prefix was marked anywhere, so the selector decided: a
+	//              genuinely new prompt, or a route with no routable prefix.
+	//   other    — unused; kept so the enum stays closed.
 	//
 	// A closed enum, so this stays cheap to keep forever (API-14). Consumers
 	// must aggregate by label rather than enumerating members: the dashboard
@@ -185,31 +182,6 @@ var (
 	// spike in worker_load_max is exactly how you'd tell whether cache
 	// affinity is buying anything or just riding along with load.
 	//
-	// Histograms, not gauges: a gauge here would be overwritten by every
-	// concurrent request's Observe, so a scrape would sample whichever
-	// request happened to finish last — one random data point per scrape
-	// interval, not a trend (this is exactly what v1's gauge version did,
-	// and it read as noise at any real concurrency). _sum/_count let a query
-	// compute a genuine rate()-windowed mean across every request in the
-	// window instead of stroboscopically sampling one of them.
-	CachePredictionAvg = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "router_cache_prediction_avg",
-		Help:    "Average predicted-hit fraction across a request's queried candidates.",
-		Buckets: fractionBuckets,
-	})
-
-	CachePredictionMax = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "router_cache_prediction_max",
-		Help:    "Maximum predicted-hit fraction across a request's queried candidates.",
-		Buckets: fractionBuckets,
-	})
-
-	CachePredictionMin = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "router_cache_prediction_min",
-		Help:    "Minimum predicted-hit fraction across a request's queried candidates.",
-		Buckets: fractionBuckets,
-	})
-
 	CacheObservedFraction = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "router_cache_observed_fraction",
 		Help:    "Observed cached fraction from the worker's usage.prompt_tokens_details.cached_tokens.",
@@ -246,6 +218,20 @@ var (
 		Name: "router_cache_overflows_total",
 		Help: "Requests routed to idle capacity without marking the backend as a prefix holder.",
 	})
+
+	// SignalFired counts, per signal, how often it called a backend saturated.
+	//
+	// The router has one routing flow; what varies between deployments is which
+	// signals are enabled. This is how you tell which one is actually driving
+	// decisions. `refused` is the ultimate signal and always on — a backend's
+	// own 429. `concurrency` and `imbalance` are opt-in early warnings, enabled
+	// by --max-node-concurrency and --rebalance-ratio respectively; each firing
+	// far more often than `refused` means it is predicting saturation the
+	// backends do not actually have.
+	SignalFired = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_signal_fired_total",
+		Help: "Times a split signal judged a backend unable to take more work.",
+	}, []string{"signal"})
 
 	// CacheGuardRejects counts the 429s the split guard causes: every backend
 	// holding the prefix was at its limit and no other backend was far enough
@@ -393,9 +379,8 @@ func All() []prometheus.Collector {
 		LoadAccountingErrors, DiscoveryConflicts,
 		CachePredictedFraction, CacheObservedFraction, CacheEntries, CacheTokens,
 		CacheSplits, CacheOverflows, CacheAvgCopies, CacheAnchorBlocks,
-		CacheShallowAnchors, CacheShallowAnchorBlocks, CacheGuardRejects,
+		CacheShallowAnchors, CacheShallowAnchorBlocks, CacheGuardRejects, SignalFired,
 		CachePoolSize, CacheTreeRuns, CacheTailSet, CacheBlocksExpired,
-		CachePredictionAvg, CachePredictionMax, CachePredictionMin,
 		RequestsShed, SaturationRejects, BackendCapExceeded, observedShadow,
 	}
 }

@@ -2,7 +2,6 @@ package affinity
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"time"
 
@@ -13,45 +12,52 @@ import (
 	"github.com/weka/wekai/router/internal/registry"
 )
 
-// PolicyName is the --policy value that selects this policy.
-const PolicyName = "prefix-cache-split"
+// FlowName identifies the router's one routing flow in metrics and logs. It is
+// no longer selectable: there is nothing to select between.
+const FlowName = "prefix-cache-split"
 
 // Defaults.
 const (
 	DefaultSplitGuard = 0.20
 	DefaultTailTTL    = 5 * time.Minute
+	// DefaultRefusalTTL is how long a backend's 429 keeps it out of its own
+	// prefixes. Short on purpose: it is a hint that saves the next request a
+	// wasted round trip, not a health verdict, and a success clears it
+	// immediately anyway.
+	DefaultRefusalTTL = 2 * time.Second
 )
 
-// ErrNoConcurrencyLimit reports the one configuration this policy cannot run
-// without. See Config.NodeConcurrency.
-var ErrNoConcurrencyLimit = errors.New(
-	"affinity: --max-node-concurrency must be set for policy " + PolicyName +
-		"; it is the per-backend concurrency limit the split guard is measured against, " +
-		"and it should match the backends' vLLM --max-num-seqs")
-
-// Config configures Policy.
+// Config configures the flow. Every field beyond the guard and the TTLs turns
+// an optional signal on by being set.
 type Config struct {
-	// NodeConcurrency is each backend's concurrency limit — the signal Anton
-	// calls ultimate: "if we throw out everything else, system behaves well".
+	// NodeConcurrency enables the concurrency signal: the router's own guess at
+	// the backend's vLLM --max-num-seqs, used to predict saturation instead of
+	// discovering it one wasted round trip at a time. Zero (the default) leaves
+	// the signal off and the refused signal alone decides.
 	//
-	// It MUST be set. Every other capacity source in the shipped configuration
-	// degrades to 1 (--backends carries no capacity field,
-	// MaxInflightPerBackend defaults to 1, and Backend.Capacity clamps
-	// anything below 1 up to 1), which would make the guard arithmetic
-	// meaningless without saying so. New returns ErrNoConcurrencyLimit rather
-	// than inventing a second default that could disagree with the gateway's
-	// own admission filter — one number has to mean one thing.
+	// It is no longer mandatory and no longer an admission filter. The backend's
+	// own 429 is the ultimate signal; this one is an early warning.
 	NodeConcurrency int64
+
+	// RebalanceRatio enables the imbalance signal: a backend is unusable while
+	// (inflight - fleetMin) / inflight exceeds this. 0.5 means "rebalance once
+	// the gap is more than half the busier side". Zero leaves it off, which is
+	// the default because a fleet where affinity is working is supposed to look
+	// imbalanced.
+	RebalanceRatio float64
 
 	// SplitGuard keeps a split from landing on a backend that is nearly as
 	// loaded as the ones it is relieving, which is what stops every backend
 	// from eventually being marked as holding every prefix. A candidate
-	// qualifies while its in-flight count is below
-	// NodeConcurrency * (1 - SplitGuard).
+	// qualifies while its in-flight count is below ref*(1-SplitGuard), where
+	// ref is supplied by whichever signal made the holders unusable.
 	SplitGuard float64
 
 	// TailTTL is how long a leaf run may go untouched before eviction.
 	TailTTL time.Duration
+
+	// RefusalTTL is how long a 429 latches a backend out of its own prefixes.
+	RefusalTTL time.Duration
 
 	// Ladder selects the decision ladder. Default (zero value) is LadderStrict,
 	// the reference design. See ladderMode.
@@ -94,6 +100,9 @@ func (c Config) withDefaults() Config {
 	if c.TailTTL <= 0 {
 		c.TailTTL = DefaultTailTTL
 	}
+	if c.RefusalTTL <= 0 {
+		c.RefusalTTL = DefaultRefusalTTL
+	}
 	if c.Clock == nil {
 		c.Clock = clock.Real{}
 	}
@@ -105,39 +114,52 @@ func (c Config) withDefaults() Config {
 // The ladder, in order. limit is Config.NodeConcurrency; candidates arrive
 // already filtered by the gateway to healthy backends BELOW that limit.
 //
-//  1. cache  — the DEEPEST marked run on the request's path is held by a
-//     candidate. Route to the least-loaded holder. No threshold: the
+// This is the router's ONE flow. There is no policy to choose; what varies is
+// which signals are enabled, and a signal only shrinks the usable set and sets
+// the guard's reference — it never routes. The ladder below is the same
+// whichever are on.
+//
+// First, `usable` = candidates that no enabled signal calls saturated. Then:
+//
+//  1. cache  — the DEEPEST marked run on the request's path is held by a usable
+//     backend. Route to the least-loaded holder. No threshold: the
 //     deepest run wins however small a share of the request it is.
 //     The anchor must be the deepest marked run, not merely some
 //     ancestor a candidate happens to hold; anchoring on an ancestor
 //     is how a backend ends up marked as holding a session tail it
 //     never had, which is the whole of the duplication problem.
-//  2. split  — holders exist but none is available, i.e. they are all at the
-//     limit or gone. Route to the least-loaded backend outside the
-//     holder set whose in-flight is under limit*(1-guard), and record
-//     it as a new holder. The holder set GROWS under pressure instead
-//     of affinity being thrown away.
-//  3. reject — holders exist and nothing clears the guard. Return
-//     ErrSplitGuardBlocked; the gateway answers 429. Idle capacity
-//     may exist and is deliberately left unused: spending it would
-//     mean a duplicate copy of this prefix, and the guard says that
-//     copy is not worth it. This is Anton's call, taken with the
-//     numbers in front of him — mean holders per block near 1.05 is
-//     worth 429s and worth nodes not always reaching full
-//     concurrency.
+//  2. split  — holders exist but none is usable. Route to the least-loaded
+//     backend outside the holder set whose in-flight is under
+//     ref*(1-guard), where ref comes from the signal that made the
+//     holders unusable, and record it as a new holder. The holder set
+//     GROWS under pressure instead of affinity being thrown away.
+//  3. reject — holders exist and nothing clears the guard:
+//     ErrSplitGuardBlocked, answered 429. Idle capacity may exist and
+//     is deliberately left unused, because spending it would mean a
+//     duplicate copy of this prefix and the guard says that copy is
+//     not worth it. Anton's call, taken with the numbers in front of
+//     him: mean holders per block near 1.05 is worth 429s and worth
+//     nodes not always reaching full concurrency.
 //  4. load   — nothing is marked anywhere: a genuinely new prompt, so there is
 //     no holder set to split from and nothing to duplicate. Route by
-//     least-outstanding and record the result.
+//     least-outstanding over the usable set and record the result.
+// Before all of them: if no backend is usable at all, ErrAllBackendsSaturated,
+// answered 429. Distinct from tier 3, which means capacity existed and the
+// guard refused to spend it on a copy.
 //
-// The gateway's own admission is unchanged and sits outside this: it filters
-// candidates to healthy backends under the limit and returns 429
-// all_backends_at_capacity when none are left. That rejection means zero idle
-// slots fleet-wide; tier 3's means idle slots existed but every one of them
-// was too close to the limit to be worth a copy.
+// Admission is no longer the gateway's. It filters for health only; every
+// capacity judgement is a signal here, so that "is this backend full" has one
+// answer in one place rather than a router-side guess in front of a policy that
+// re-derives it.
 type Policy struct {
 	cfg      Config
 	tree     *tree
 	fallback policy.Policy
+
+	// refused is the ultimate signal and always present; signals holds it
+	// alongside whatever else is enabled, so the flow iterates one list.
+	refused *refusedSignal
+	signals []signal
 
 	// backends is the set the registry has told us about, kept only so
 	// /router-viz can render identity, health and load alongside the tree. Not
@@ -146,25 +168,40 @@ type Policy struct {
 	backends map[string]*registry.Backend
 }
 
-// New builds the policy. It returns ErrNoConcurrencyLimit when
-// cfg.NodeConcurrency is unset; see that field.
+// New builds the flow. The refused signal is always on; NodeConcurrency and
+// RebalanceRatio each enable one more by being set.
 func New(cfg Config, fallback policy.Policy) (*Policy, error) {
-	if cfg.NodeConcurrency <= 0 {
-		return nil, ErrNoConcurrencyLimit
-	}
 	cfg = cfg.withDefaults()
 	if fallback == nil {
 		fallback = policy.LeastOutstanding{}
 	}
-	return &Policy{
+	refused := newRefusedSignal(cfg.Clock, cfg.RefusalTTL)
+	p := &Policy{
 		cfg:      cfg,
 		tree:     newTree(cfg.Clock, cfg.TailTTL),
 		fallback: fallback,
+		refused:  refused,
+		signals:  []signal{refused},
 		backends: map[string]*registry.Backend{},
-	}, nil
+	}
+	if cfg.NodeConcurrency > 0 {
+		p.signals = append(p.signals, concurrencySignal{limit: cfg.NodeConcurrency})
+	}
+	if cfg.RebalanceRatio > 0 {
+		p.signals = append(p.signals, imbalanceSignal{ratio: cfg.RebalanceRatio})
+	}
+	return p, nil
 }
 
-func (p *Policy) Name() string { return PolicyName }
+// OnRefused latches a backend's 429 as the ultimate signal. Called by the proxy
+// once the upstream status is known.
+func (p *Policy) OnRefused(b *registry.Backend) { p.refused.record(b) }
+
+// OnAccepted clears a backend's refusal latch. Called by the proxy on a
+// successful response, so recovery costs no waiting.
+func (p *Policy) OnAccepted(b *registry.Backend) { p.refused.clear(b) }
+
+func (p *Policy) Name() string { return FlowName }
 
 // decision is what Select tells Commit. Stored in RoutingRequest.PolicyState.
 type decision struct {
@@ -193,33 +230,92 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	if len(cands) == 0 {
 		return nil, policy.ErrNoCandidates
 	}
-	// No routable prefix: decline rather than guess (CU-11).
-	if len(rr.Units) == 0 {
-		rr.PolicyState = noMarkDecision
-		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "no_units").Inc()
-		metrics.RouteDecisions.WithLabelValues("load").Inc()
-		return p.fallback.Select(ctx, cands, rr)
-	}
 
-	pth := path{units: rr.Units, modelKey: modelKey(rr.Model)}
+	// Ask the signals once, before anything else, and route only over what they
+	// leave usable. Doing it here rather than in the gateway is what collapses
+	// the old policy zoo into one flow: "is this backend full" gets one answer
+	// in one place, and every tier below inherits it.
+	//
+	// guardRef is the reference the split guard is measured against — the
+	// in-flight level of the thing being relieved. When several signals fire,
+	// the SMALLEST wins: it is the strictest, and a guard that is too strict
+	// costs a 429 while one that is too loose costs a permanent extra copy of
+	// the prefix.
+	view := loadView{minInflight: cands[0].Inflight()}
+	for _, c := range cands[1:] {
+		if l := c.Inflight(); l < view.minInflight {
+			view.minInflight = l
+		}
+	}
+	usable := make([]*registry.Backend, 0, len(cands))
+	guardRef := int64(-1)
+	for _, c := range cands {
+		blocked := false
+		for _, sg := range p.signals {
+			hit, ref := sg.saturated(c, view)
+			if !hit {
+				continue
+			}
+			blocked = true
+			metrics.SignalFired.WithLabelValues(sg.name()).Inc()
+			if ref > 0 && (guardRef < 0 || ref < guardRef) {
+				guardRef = ref
+			}
+		}
+		if !blocked {
+			usable = append(usable, c)
+		}
+	}
 
 	// Slots are resolved once and reused, so the candidate mask and the
 	// per-candidate membership test cost one map read each rather than two.
 	var slotBuf [64]int
 	slots := slotBuf[:0]
-	if len(cands) > cap(slots) {
-		slots = make([]int, 0, len(cands))
+	if len(usable) > cap(slots) {
+		slots = make([]int, 0, len(usable))
 	}
 	var candMask markSet
-	for _, c := range cands {
+	for _, c := range usable {
 		s := p.tree.slotOrCreate(c.URL)
 		slots = append(slots, s)
 		candMask.Add(s)
 	}
 
+	// Nothing is usable: every backend is saturated by some signal. This is the
+	// rejection the gateway used to issue as all_backends_at_capacity, moved
+	// here so one component decides capacity.
+	if len(usable) == 0 {
+		// Counted by the gateway when it writes the 429, not here: one
+		// rejection must be one increment, and Select can run twice for one
+		// request when the proxy retries.
+		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "all_saturated").Inc()
+		return nil, policy.ErrAllBackendsSaturated
+	}
+
+	// No routable prefix — an embeddings call, an unparseable body: there is
+	// nothing to be affine to, so the selector decides (CU-11). It decides over
+	// the USABLE set, not every candidate: a request without a prefix still may
+	// not be sent to a backend that has already said it is full.
+	if len(rr.Units) == 0 {
+		rr.PolicyState = noMarkDecision
+		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "no_units").Inc()
+		metrics.RouteDecisions.WithLabelValues("load").Inc()
+		return p.fallback.Select(ctx, usable, rr)
+	}
+
+	pth := path{units: rr.Units, modelKey: modelKey(rr.Model)}
 	a := p.tree.walk(pth, candMask)
 
-	threshold := float64(p.cfg.NodeConcurrency) * (1 - p.cfg.SplitGuard)
+	// No signal fired, so nothing is being relieved and the guard has no
+	// observed reference. Fall back to the configured limit when there is one;
+	// otherwise the fleet's own busiest backend is the only scale available.
+	if guardRef <= 0 {
+		guardRef = p.cfg.NodeConcurrency
+	}
+	if guardRef <= 0 {
+		guardRef = view.minInflight + 1
+	}
+	threshold := float64(guardRef) * (1 - p.cfg.SplitGuard)
 
 	// shallow means the anchor is NOT the deepest marked run: this request's own
 	// holders are unavailable and only a shared ancestor is left. Serving it
@@ -232,10 +328,10 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 		metrics.CacheShallowAnchorBlocks.Add(float64(a.heldBlocks - a.anchorBlocks))
 	}
 
-	// Tier 1: a candidate holds the deepest marked run.
+	// Tier 1: a usable backend holds the deepest marked run.
 	if !a.pool.Empty() && !(shallow && p.cfg.Ladder == LadderStrict) {
-		pool := make([]*registry.Backend, 0, len(cands))
-		for i, c := range cands {
+		pool := make([]*registry.Backend, 0, len(usable))
+		for i, c := range usable {
 			if a.pool.Has(slots[i]) {
 				pool = append(pool, c)
 			}
@@ -254,8 +350,8 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	// available. Either they are all at their concurrency limit or they have
 	// left the fleet.
 	if !a.held.Empty() {
-		split := make([]*registry.Backend, 0, len(cands))
-		for i, c := range cands {
+		split := make([]*registry.Backend, 0, len(usable))
+		for i, c := range usable {
 			if a.held.Has(slots[i]) {
 				continue // already a holder, and unavailable
 			}
@@ -289,13 +385,14 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 		return p.fallback.Select(ctx, cands, rr)
 	}
 
+
 	// Tier 4: a genuinely new prompt. Anton's "a single request going via
 	// load-split, but then every following request will have cache path split
 	// based routing".
 	rr.PolicyState = markDecision
 	metrics.RouteDecisions.WithLabelValues("load").Inc()
 	metrics.PolicyFallbacks.WithLabelValues(p.Name(), "no_holders").Inc()
-	return p.fallback.Select(ctx, cands, rr)
+	return p.fallback.Select(ctx, usable, rr)
 }
 
 func fraction(part, whole int) float64 {

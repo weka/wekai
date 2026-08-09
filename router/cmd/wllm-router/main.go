@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/weka/wekai/kvcache"
 	"github.com/weka/wekai/router/internal/circuit"
 	"github.com/weka/wekai/router/internal/clock"
 	"github.com/weka/wekai/router/internal/config"
@@ -26,7 +25,6 @@ import (
 	"github.com/weka/wekai/router/internal/obs"
 	"github.com/weka/wekai/router/internal/policy"
 	"github.com/weka/wekai/router/internal/policy/affinity"
-	cachepolicy "github.com/weka/wekai/router/internal/policy/cache"
 	"github.com/weka/wekai/router/internal/proxy"
 	"github.com/weka/wekai/router/internal/registry"
 	"github.com/weka/wekai/router/internal/viz"
@@ -83,7 +81,7 @@ func run(args []string) error {
 	reg := metrics.Registry()
 	clk := clock.Real{}
 
-	pol, cachePol, err := buildPolicy(cfg, clk)
+	pol, cachePol, err := buildFlow(cfg, clk)
 	if err != nil {
 		return err
 	}
@@ -313,57 +311,33 @@ func sweepInterval(ttl time.Duration) time.Duration {
 	return min(max(d, time.Second), time.Minute)
 }
 
-func buildPolicy(cfg config.Config, clk clock.Clock) (proxy.Selector, cacheLifecycle, error) {
-	switch cfg.Policy {
-	case "least-outstanding":
-		return policy.LeastOutstanding{}, nil, nil
-	case "round-robin":
-		return policy.NewRoundRobin(), nil, nil
-	case "random":
-		return policy.Random{}, nil, nil
-	case "prefix-cache-aware":
-		// Falls back to least-outstanding whenever affinity is not decisive, so
-		// the cache policy can never be worse than the load policy by much.
-		p := cachepolicy.New(cachepolicy.Config{
-			CacheThreshold:      cfg.Cache.CacheThreshold,
-			BalanceAbsThreshold: cfg.Cache.BalanceAbsThreshold,
-			BalanceRelThreshold: cfg.Cache.BalanceRelThreshold,
-			Trie: kvcache.Config{
-				MaxNodes:  cfg.Cache.MaxNodes,
-				MaxTokens: cfg.Cache.MaxTokens,
-			},
-		}, policy.LeastOutstanding{})
-		return p, p, nil
-	case "prefix-cache-candidates":
-		// Filters candidates to those predicted to hold the prefix, then picks
-		// among that filtered set rather than a single best-scoring backend;
-		// see ThresholdPolicy's doc comment for the full decision tree.
-		p := cachepolicy.NewThreshold(cachepolicy.ThresholdConfig{
-			CacheThreshold: cfg.Cache.CacheThreshold,
-			MaxPending:     cfg.Cache.BalanceAbsThreshold,
-			Trie: kvcache.Config{
-				MaxNodes:  cfg.Cache.MaxNodes,
-				MaxTokens: cfg.Cache.MaxTokens,
-			},
-		}, policy.LeastOutstanding{})
-		return p, p, nil
-	case affinity.PolicyName:
-		// One shared tree whose runs record WHICH backends hold them, with no
-		// threshold, a split that grows the holder set under saturation rather
-		// than abandoning affinity, and tail-only TTL eviction. Admission stays
-		// with the gateway: this policy never rejects.
-		p, err := affinity.New(affinity.Config{
-			NodeConcurrency: cfg.MaxNodeConcurrency,
-			SplitGuard:      cfg.Cache.SplitGuard,
-			TailTTL:         cfg.Cache.TailTTL.D(),
-			Clock:           clk,
-		}, policy.LeastOutstanding{})
-		if err != nil {
-			return nil, nil, err
-		}
-		return p, p, nil
+// buildFlow builds the router's one routing flow.
+//
+// There is no policy switch any more. Five other policies used to live here —
+// least-outstanding, round-robin, random, prefix-cache-aware,
+// prefix-cache-candidates — and the parts of them worth keeping are now signals
+// or the selector inside this flow: prefix-cache-aware's load-imbalance spill
+// guard became the imbalance signal, prefix-cache-candidates' MaxPending became
+// the concurrency signal, and least-outstanding became the tie-break the flow
+// uses throughout. The threshold both cache policies gated on is gone
+// deliberately: it is the defect that made a long session's fixed shared prefix
+// a shrinking fraction of its own growing request.
+//
+// What varies between deployments is which signals are on, and each is enabled
+// by setting its own value rather than by naming it in a list.
+func buildFlow(cfg config.Config, clk clock.Clock) (proxy.Selector, cacheLifecycle, error) {
+	p, err := affinity.New(affinity.Config{
+		NodeConcurrency: cfg.MaxNodeConcurrency,
+		RebalanceRatio:  cfg.RebalanceRatio,
+		SplitGuard:      cfg.Cache.SplitGuard,
+		TailTTL:         cfg.Cache.TailTTL.D(),
+		RefusalTTL:      cfg.Cache.RefusalTTL.D(),
+		Clock:           clk,
+	}, policy.LeastOutstanding{})
+	if err != nil {
+		return nil, nil, err
 	}
-	return nil, nil, fmt.Errorf("unknown policy %q", cfg.Policy)
+	return p, p, nil
 }
 
 // transitionLogger logs every circuit transition with the counters that caused
