@@ -207,10 +207,16 @@ you run it:
   `--max-num-seqs`. Every other capacity source in the shipped config reads 1.
 - **Two extra knobs:** `--cache-split-guard` (default `0.20`) and `--cache-tail-ttl`
   (default `5m`).
-- **It never returns 429 itself.** Admission stays with the gateway, so a
-  `429 all_backends_at_capacity` means every healthy backend was at the cap — which
-  is exactly the acceptance criterion, and is why `router_saturation_rejects_total`
-  is the metric to watch.
+- **The guard is an absolute rule, and the policy DOES reject.** A split onto a
+  backend whose in-flight is at or above `max-node-concurrency * (1 - guard)`
+  (25.6 at 32/0.20) is refused, and if nothing clears the guard the request gets
+  `429 split_guard_blocked` — even though idle capacity exists. There is no
+  serve-anyway path: a guarded split is the only way a backend is ever recorded as
+  holding a prefix. Watch `router_cache_guard_rejects_total`; it is distinct from
+  `router_saturation_rejects_total`, which means zero idle slots fleet-wide.
+- **The replay client waits 429s out** (10ms doubling to a 3s cap, 30s total
+  budget, jittered) rather than recording them as errors, so a run measures the
+  fleet and not the harness. `429 backoff` in the run summary is the cost.
 
 ```bash
 # Arm B: same fleet and replay as the Validated Standard Recipe, new policy.
@@ -224,12 +230,21 @@ Read these after each arm (`curl -s http://127.0.0.1:29000/metrics | grep ...`):
 
 | Metric | What it tells you |
 |---|---|
-| `router_route_decisions_total` | **Aggregate by label**, never enumerate members — the tiers are `cache`, `split`, `overflow`, `load`, `other`. Anton's bar is "absolute majority routed by cache". |
-| `router_cache_avg_copies` | Mean backends holding each block, target ~1.0. A high value at LOW utilisation is the one to investigate; under oversubscription it rises legitimately because bouncing sessions really are on several nodes. |
-| `router_cache_splits_total` | The holder set grew under saturation. Should track load peaks, not be constant. |
-| `router_cache_overflows_total` | Idle capacity used without marking. These are the requests the reference design would have 429'd while backends sat under their limit. |
-| `router_saturation_rejects_total` | The only rejections. Compare against `router_backend_inflight`: a reject while any backend is under the cap would be a bug. |
+| `router_route_decisions_total` | **Aggregate by label**, never enumerate members — the tiers are `cache`, `split`, `load`, `other` (`overflow` is retired and reads 0). Anton's bar is "absolute majority routed by cache". |
+| `router_cache_avg_copies` | Mean backends holding each block, target ~1.0. **Cheap to read** — a running `blocks x holders` sum divided by blocks, not a tree walk (the O(tree) call on the same ticker is the per-backend `router_cache_entries`/`_tokens` pair). Validated against per-backend ground truth in the fleet sim, so it can be trusted rather than corroborated. |
+| `router_cache_splits_total` | The holder set grew under saturation, guarded. The ONLY way a holder is ever added. |
+| `router_cache_guard_rejects_total` | 429s caused by the guard: idle capacity existed but every backend was inside the guard band. This is the price of holding avg_copies near 1.0 — read the two together. |
+| `router_cache_shallow_anchors_total` | Requests whose own holders were unavailable so only a shared ancestor matched. These used to be served and marked, unguarded, and were the entire source of duplication (~50-60% of cache decisions at 100% utilisation, ~0% below it). They now fall through to the guard. |
+| `router_saturation_rejects_total` | Rejections with zero idle slots fleet-wide. Distinct from the guard rejects above. |
 | `router_cache_tree_runs` / `_tail_set` / `_blocks_expired_total` | Whether the TTL is right for the workload's session lifetime. |
+
+**Sizing the arm decides what `avg_copies` measures.** The recipe above sets client
+concurrency to the fleet's total capacity (128 = 4 x 32), which pins utilisation at
+100% by construction. Under the previous serve-anyway ladder that alone drove
+`avg_copies` to 1.68 on this replay — the duplication was a property of the offered
+load, not of the policy, and the same code read 1.05 at concurrency 96. The strict
+ladder holds ~1.01-1.09 at both. If you want to measure the POLICY, run below
+saturation; if you want to measure the GUARD, pin it at 100%.
 
 **A short smoke run will not discriminate the policies.** With a large shared system
 prompt, `prefix-cache-candidates`'s 0.5 threshold is satisfied anyway and both arms
