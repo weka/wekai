@@ -14,8 +14,9 @@ wekai ships three command groups:
 
 - **benchmark** — throughput/latency benchmarking against embedded documentation,
   auto-scaling load tests, and result visualization.
-- **router** — a model-aware HTTP reverse proxy with request/response capture,
-  redaction, analysis, and replay simulation.
+- **router** — a model-aware LLM router with prefix-cache affinity across a vLLM
+  fleet, plus request/response capture, redaction, analysis and replay
+  simulation. See **[docs/router.md](docs/router.md)**.
 - **eval** — model capability evaluations (tool-calling, cache coherency).
 
 It works against any endpoint reachable via a dynamic model spec
@@ -39,7 +40,32 @@ wekai router serve --help
 wekai eval simple-tool --help
 ```
 
-## Run the router locally
+## Run the router
+
+Route every model across a vLLM fleet, choosing among endpoints by prefix-cache
+affinity so a conversation keeps landing on the backend that already holds its
+KV cache:
+
+```
+wekai router serve \
+  --listen :8080 --metrics-listen 0.0.0.0:29000 \
+  --backends 'http://vllm-a:8000|http://vllm-b:8000|http://vllm-c:8000'
+```
+
+Endpoints are pipe-separated, the same syntax the client uses for a
+multi-endpoint model. One endpoint is a plain proxy; several get affinity.
+
+Two further shapes are supported, both covered in
+**[docs/router.md](docs/router.md)** with CLI and Helm for each:
+
+- **Per-model routes** — `--route 'big,70b => http://a:8000|http://b:8000'`.
+  Routing is by model name, so OpenAI-format and Anthropic-format requests
+  follow the same rules.
+- **Self-hosted models with a hosted fallback** — named models to your fleet,
+  everything else through `--default https://api.anthropic.com`, so one base URL
+  serves both.
+
+### Fronting a single local endpoint
 
 Front a local model endpoint on `http://127.0.0.1:25201` with the router on
 `http://127.0.0.1:25202`, sending every model to that one upstream:
