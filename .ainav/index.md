@@ -10,12 +10,11 @@
 
 ## What is this project?
 
-**wekai** is Weka's LLM benchmarking/replay CLI plus the `wllm-router` OpenAI-compatible
-routing gateway. Two things live in one module:
+**wekai** is Weka's LLM benchmarking/replay CLI and its routing gateway. One binary:
 
 - `wekai` (root `main.go`, `cli/`) — capture/replay traffic, run coherency evals,
   benchmark real or replayed workloads against any OpenAI-compatible endpoint.
-- `router/` — a standalone Go router (`cmd/wllm-router`) that fronts a vLLM fleet with
+- `router/` — the routing gateway behind `wekai router serve`, fronting a vLLM fleet with
   prefix-cache-affinity routing, plus a GPU-less mock vLLM fleet (`cmd/mock-vllm`) for
   developing and load-testing router policies without hardware.
 
@@ -39,7 +38,7 @@ routing gateway. Two things live in one module:
 | Directory | Purpose |
 |-----------|---------|
 | `kvcache/` | Shared prefix-cache trie engine (stdlib-only leaf). Used by the benchmark and the mock vLLM; NOT by the router, which owns its own shared tree. |
-| `router/cmd/wllm-router/` | The router binary entrypoint |
+| `router/serve/` | The router entrypoint (`wekai router serve`); the only part of `router/` visible outside it |
 | `router/cmd/mock-vllm/` | GPU-less mock vLLM server binary entrypoint |
 | `router/internal/` | Router packages: `gateway` (HTTP surface), `policy`/`policy/affinity` (the one routing flow + its signals), `registry`/`lease` (backend state, in-flight leases), `proxy` (upstream forwarding), `dialect/openai` (wire format), `mockvllm` (mock engine), `viz` (`/router-viz`), `hack` (architectural fence tests) |
 | `benchmark/` | Benchmark and replay engine (`wekai benchmark auto`, router-replay mode) |

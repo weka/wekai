@@ -39,7 +39,7 @@
 //
 //	go run ./router/cmd/mock-vllm --instances 4 --base-port 9001
 //
-// Point wllm-router's static backend list at http://localhost:9001..9004 and
+// Point the router's --backends at http://localhost:9001|..|9004 and
 // its cache-aware policy, retry logic, and circuit breaker all exercise
 // exactly as they would against real workers.
 package main

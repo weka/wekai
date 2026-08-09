@@ -325,22 +325,6 @@ gateway no longer caps anything, so that arm now runs unbounded — it reached 2
 utilisation in the fleet sim. The hit-rate comparison stands; throughput between the
 two arms does not.
 
-## Not yet validated
-
-`--cache-tail-ttl` (default 5m) is the only bound on tree memory, and no run here
-tests it: every arm is 5m42s-6m9s, barely longer than the TTL, so the tree only
-empties after traffic stops rather than reaching a steady state. Its 5m default rests
-on a 15-SIMULATED-minute fleet sim, never a real run. Measuring it needs `--total
-100000` (~20 min) watching `router_cache_tree_runs` / `_tail_set` plateau rather than
-climb.
-
-`--cache-refusal-ttl` (default 2s) is no longer performance-sensitive: since the
-refusal latch became keyed to in-flight, clearing happens when load drops or on the
-next success, and the TTL is only a re-probe backstop for a backend wedged at the
-level it refused at. When it WAS the sole clearing mechanism it over-excluded badly —
-that arm scored avg_copies 1.162 with 1110 splits against 1.078 and 483 for the
-load-keyed version, same 2s value.
-
 ## Mock surfaces: testing every deployment shape offline
 
 `mock-vllm --surface` builds the three shapes the router must tell apart, so no
