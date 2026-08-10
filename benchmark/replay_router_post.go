@@ -453,6 +453,20 @@ func (p *replayPoster) do(
 			break
 		}
 
+		// Latch as soon as the path is PROVEN, which a 429 does as well as a
+		// 200: it means the router recognised the route and applied capacity
+		// logic to it. Only a 404 says the path is wrong.
+		//
+		// Latching solely on success meant a fleet that stayed saturated never
+		// resolved at all, so every request re-probed the operator's bare base
+		// first and ate a 404 before the real attempt — doubling inbound
+		// requests exactly when the fleet could least afford it, and filling the
+		// router's log with 404s on a path nobody configured. Visible as a
+		// perfect alternation of passthrough 404 and chat 429.
+		if resp.StatusCode != http.StatusNotFound {
+			p.latchEndpoint(attemptURL)
+		}
+
 		if resp.StatusCode != http.StatusTooManyRequests {
 			break
 		}
@@ -506,8 +520,6 @@ func (p *replayPoster) do(
 		m.TotalResponseTime = time.Since(startTime)
 		return m
 	}
-	p.latchEndpoint(attemptURL)
-
 	// Timed from attemptStart, not startTime: TTFT and the response time the
 	// consumers compute must describe the attempt the server actually ran, so
 	// that backoff cannot make a healthy fleet look slow. The client-side wait
