@@ -61,6 +61,16 @@ var providers = []provider{
 // TestMergedModelsWithRealHostedProviders is the mixed deployment: a local mock
 // fleet plus every hosted provider whose key is present, all behind one router.
 func TestMergedModelsWithRealHostedProviders(t *testing.T) {
+	// Opt-in, not merely key-gated. Keys live in a developer's shell, so
+	// gating on the key alone quietly made `task verify` depend on three
+	// third-party APIs answering within a timeout — which under -race they
+	// intermittently do not, failing the suite for reasons that have nothing
+	// to do with the change under test. Verification has to be deterministic;
+	// run these on purpose with `task test:live`.
+	if os.Getenv("WEKAI_LIVE") == "" {
+		t.Skip("set WEKAI_LIVE=1 to run live hosted-provider tests (task test:live)")
+	}
+
 	local, _ := mockFleet(t, 1, mockvllm.SurfaceVLLM)
 
 	routes := []serve.Route{{Patterns: "local", Endpoints: local}}

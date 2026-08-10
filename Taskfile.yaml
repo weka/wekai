@@ -69,6 +69,14 @@ tasks:
       - task: vet
       - task: test:race
 
+  test:live:
+    desc: "Live tests against real hosted providers (needs OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY)"
+    cmds:
+      # Kept out of `verify` on purpose: these call third-party APIs, so they
+      # are neither hermetic nor deterministic. Each pool skips if its key is
+      # absent. Only /models is called, never a completion.
+      - WEKAI_LIVE=1 go test ./router/serve/ -run 'RealHosted|Hosted' -count=1 -v
+
   fuzz:
     desc: "Fuzz the router's JSON scanner, which parses untrusted request bodies (FUZZTIME=60s)"
     vars:
