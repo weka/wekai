@@ -164,8 +164,17 @@ spec:
             initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
             failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- if or .Values.resources.requests .Values.resources.limits }}
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- with .Values.resources.requests }}
+            requests:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+            {{- with .Values.resources.limits }}
+            limits:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+          {{- end }}
           {{- if or .Values.datastore.sharedPvc.enabled .Values.router.capture .Values.router.secretMounts }}
           volumeMounts:
             {{- range .Values.router.secretMounts }}

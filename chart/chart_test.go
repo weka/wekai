@@ -356,3 +356,61 @@ func TestRouterChartCredentials(t *testing.T) {
 		t.Error("apiKeyFile given but --api-key also rendered, putting the secret in the pod spec")
 	}
 }
+
+// TestRouterChartShipsNoDefaultLimits guards a trap rather than a bug.
+//
+// Shipping default limits alongside default requests makes the natural
+// override — setting only resources.requests, which is what an operator sizing
+// a pod actually does — a hard rejection: Helm MERGES the maps, so the chart's
+// old limits survive underneath the new requests and the pod is refused for
+// requesting more than it is allowed. The API error names the limit, not the
+// merge, so nothing in it points at the chart.
+func TestRouterChartShipsNoDefaultLimits(t *testing.T) {
+	out := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000")
+	if strings.Contains(out, "limits:") {
+		t.Errorf("router chart ships default resource limits; a requests-only override "+
+			"then merges into requests above limits and the pod is rejected:\n%s", out)
+	}
+	// Requests are still expressed, because they are the scheduling floor.
+	for _, want := range []string{"requests:", `cpu: "4"`, "memory: 8Gi"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered deployment is missing %q from its resource requests:\n%s", want, out)
+		}
+	}
+}
+
+// Both halves must be overridable on their own, and either must be able to go
+// away entirely.
+func TestRouterChartResourcesAreIndependentlyOverridable(t *testing.T) {
+	t.Run("requests only, limits stay absent", func(t *testing.T) {
+		out := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000",
+			"--set", "resources.requests.cpu=8")
+		if !strings.Contains(out, "cpu: 8") {
+			t.Errorf("cpu request override did not take:\n%s", out)
+		}
+		if !strings.Contains(out, "memory: 8Gi") {
+			t.Errorf("overriding cpu dropped the default memory request; Helm merges "+
+				"maps, so the untouched key must survive:\n%s", out)
+		}
+		if strings.Contains(out, "limits:") {
+			t.Errorf("a requests-only override introduced limits:\n%s", out)
+		}
+	})
+
+	t.Run("limits can be added", func(t *testing.T) {
+		out := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000",
+			"--set", "resources.limits.memory=16Gi")
+		if !strings.Contains(out, "limits:") || !strings.Contains(out, "memory: 16Gi") {
+			t.Errorf("limits override did not take:\n%s", out)
+		}
+	})
+
+	t.Run("resources can be dropped entirely", func(t *testing.T) {
+		out := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000",
+			"--set", "resources.requests=null")
+		if strings.Contains(out, "resources:") {
+			t.Errorf("emptying every section must omit the resources block rather than "+
+				"emit an empty one:\n%s", out)
+		}
+	})
+}

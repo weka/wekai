@@ -68,6 +68,8 @@ Key values (see `values.yaml` for the full list):
 | `imageRepository` | `quay.io/weka.io/wekai-router` | Replay-less router image |
 | `imageTag` | `""` (falls back to `.Chart.AppVersion`) | Pin to a specific build |
 | `replicaCount` | `1` | Cache-affinity state is per-pod and unshared; see `values.yaml` before scaling |
+| `resources.requests` | `cpu: 4`, `memory: 8Gi` | Scheduling floor — lower it for a small or test cluster |
+| `resources.limits` | `{}` (unset) | Deliberately empty; a default limit breaks requests-only overrides |
 | `service.targetPort` | `25201` | Container listen port (`--listen`) |
 | `router.routes` | `[]` | Repeated `--route` flags |
 | `router.default` | `""` | Catch-all `--default` flag |

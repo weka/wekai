@@ -194,13 +194,24 @@ datastore:
 # router only proxies — leave empty unless an upstream rewrite needs a key.
 llmApiKeySecretName: ""
 
+# Both sections are overridable independently, and either may be emptied.
+#
+# No limits by default. A default limit turns the natural override — setting
+# only `resources.requests` — into a hard rejection: Helm merges the maps, so
+# the shipped limit survives underneath the new requests and the pod is refused
+# for requests exceeding limits. The error names the limit rather than the
+# merge, so the cause is not obvious from it. Unset lets a cluster's own
+# LimitRange govern, which is the usual convention for a proxy.
+#
+# The requests are sized for a router doing real work: the prefix-affinity tree
+# is held in memory and the routing decision is on every request's hot path.
+# They are a scheduling floor, so a node has to have this much free for the pod
+# to be placed at all — lower them for a small cluster or a test install.
 resources:
   requests:
-    memory: "64Mi"
-    cpu: "50m"
-  limits:
-    memory: "512Mi"
-    cpu: "1"
+    memory: "8Gi"
+    cpu: "4"
+  limits: {}
 
 podSecurityContext: {}
 securityContext: {}
