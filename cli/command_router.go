@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,9 +76,6 @@ type RouterServeCommand struct {
 	IdleTimeout        time.Duration `long:"idle-timeout" default:"300s" description:"Abort a stream that has produced nothing for this long."`
 	UpstreamCred       string        `long:"upstream-credential" description:"Credential presented to upstreams, replacing the client's."`
 	HealthInterval     time.Duration `long:"health-interval" default:"15s" description:"How often a HEALTHY backend is re-probed. Can be slow: a healthy backend that breaks is caught by real traffic failing, since an upstream 5xx trips its circuit and removes it from selection."`
-	DiscoverNamespace  string        `long:"discover-namespace" description:"Namespace searched by pods:<selector> routes. Empty means the router's own namespace in-cluster."`
-	DiscoverPort       int           `long:"discover-port" default:"8000" description:"Port used for a discovered pod that declares none of its own. Each pod's declared containerPort wins over this, which is what lets several DaemonSets on different ports be one pool."`
-	DiscoverPortName   string        `long:"discover-port-name" description:"Name of the containerPort to use when a pod declares several, e.g. 'http'."`
 	DiscoverKubeconfig string        `long:"discover-kubeconfig" description:"Kubeconfig path for out-of-cluster discovery. In-cluster credentials are used when empty."`
 	HealthUnhealthy    time.Duration `long:"health-unhealthy-interval" default:"1s" description:"How often a backend that is NOT healthy is re-probed. Much shorter on purpose: a recovered backend stays out of rotation for this long, and every request that could have used its warm cache goes somewhere colder."`
 	HealthTimeout      time.Duration `long:"health-timeout" default:"5s" description:"Health probe timeout. Must be below the interval, or probes fall behind forever."`
@@ -99,6 +97,11 @@ type routeRule struct {
 	// discoverSelector populates the pool from Kubernetes pods by label,
 	// written as an endpoint of the form pods:<selector>.
 	discoverSelector string
+	// discoverPort and discoverPortName come from the same token, as
+	// "pods:<selector>:<port|name>". Per route, because two pools may live on
+	// different ports and a single global flag could not say so.
+	discoverPort     int
+	discoverPortName string
 	rewriteModel     string
 	// credentialFile holds the router's own key for this pool, from
 	// "<upstream> using <file>".
@@ -198,6 +201,8 @@ func (c *RouterServeCommand) Execute(args []string) error {
 			Patterns:                pat,
 			Endpoints:               r.endpoints,
 			DiscoverySelector:       r.discoverSelector,
+			DiscoveryPort:           r.discoverPort,
+			DiscoveryPortName:       r.discoverPortName,
 			CredentialFile:          r.credentialFile,
 			ForwardClientCredential: r.forwardClient,
 			RewriteModel:            r.rewriteModel,
@@ -225,9 +230,6 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		SplitGuard:            c.SplitGuard,
 		TailTTL:               c.TailTTL,
 		RefusalTTL:            c.RefusalTTL,
-		DiscoveryNamespace:    c.DiscoverNamespace,
-		DiscoveryPort:         c.DiscoverPort,
-		DiscoveryPortName:     c.DiscoverPortName,
 		DiscoveryKubeconfig:   c.DiscoverKubeconfig,
 		HealthInterval:        c.HealthInterval,
 		HealthUnhealthy:       c.HealthUnhealthy,
@@ -278,6 +280,37 @@ func trackInFlight(wg *sync.WaitGroup, next http.Handler) http.Handler {
 	})
 }
 
+// joinBackends turns the --backends shorthand into the endpoint half of a
+// route. Commas separate endpoints, EXCEPT inside a pods: token, where a comma
+// separates labels:
+//
+//	--backends pods:app=vllm,tier=prod
+//
+// Rewriting every comma to a pipe — which is what this did — split that
+// selector into two endpoints, one of them the nonsense "tier=prod". The
+// shorthand has to survive the syntax it is shorthand for.
+func joinBackends(backends []string) string {
+	var out []string
+	for _, b := range backends {
+		for _, part := range strings.Split(b, "|") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if strings.HasPrefix(part, "pods:") {
+				out = append(out, part) // commas here are label separators
+				continue
+			}
+			for _, ep := range strings.Split(part, ",") {
+				if ep = strings.TrimSpace(ep); ep != "" {
+					out = append(out, ep)
+				}
+			}
+		}
+	}
+	return strings.Join(out, "|")
+}
+
 func (c *RouterServeCommand) buildRules() ([]*routeRule, error) {
 	var rules []*routeRule
 	for _, spec := range c.Routes {
@@ -291,8 +324,7 @@ func (c *RouterServeCommand) buildRules() ([]*routeRule, error) {
 	// shorthand for "* => a|b|c", which is why it produces a rule rather than a
 	// special case downstream.
 	if len(c.Backends) > 0 {
-		joined := strings.Join(c.Backends, "|")
-		joined = strings.ReplaceAll(joined, ",", "|")
+		joined := joinBackends(c.Backends)
 		r, err := parseRoute("* => " + joined)
 		if err != nil {
 			return nil, fmt.Errorf("invalid --backends %q: %w", joined, err)
@@ -337,6 +369,8 @@ func parseRoute(spec string) (*routeRule, error) {
 	upstreams, rewrite := splitAsModel(upstreams)
 	var endpoints []string
 	var selector string
+	var discPort int
+	var discPortName string
 	for _, raw := range strings.Split(upstreams, "|") {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
@@ -347,7 +381,11 @@ func parseRoute(spec string) (*routeRule, error) {
 		// one route still describes one pool, and so a pool can mix discovered
 		// pods with statically named ones during a migration.
 		if rest, ok := strings.CutPrefix(raw, "pods:"); ok {
-			selector = strings.TrimSpace(rest)
+			sel, port, portName, err := parsePodsToken(rest)
+			if err != nil {
+				return nil, err
+			}
+			selector, discPort, discPortName = sel, port, portName
 			continue
 		}
 		u, err := url.Parse(raw)
@@ -368,8 +406,49 @@ func parseRoute(spec string) (*routeRule, error) {
 		patterns = normalizePatternList([]string{lhs})
 	}
 	return &routeRule{patterns: patterns, endpoints: endpoints,
-		discoverSelector: selector, rewriteModel: rewrite,
+		discoverSelector: selector, discoverPort: discPort, discoverPortName: discPortName,
+		rewriteModel:   rewrite,
 		credentialFile: credFile, forwardClient: forwardClient}, nil
+}
+
+// parsePodsToken reads the endpoint form
+//
+//	pods:<label-selector>[:<port>|:<port-name>]
+//
+// The port lives in the route rather than in a flag of its own because it
+// belongs to the pool being described, not to the router. A router fronting two
+// fleets on different ports had no way to say so when this was one global flag,
+// which defeated the reason pod discovery exists.
+//
+// A colon is safe as the separator: Kubernetes label keys and values admit
+// alphanumerics, '-', '_', '.' and a '/' in the key, and never ':'.
+//
+// Discovery always searches the router's OWN namespace. There is no syntax for
+// another one, deliberately — reading pods across namespaces needs a ClusterRole,
+// and a standing cluster-wide read for every router is a poor trade for a case
+// that a second router in the other namespace covers.
+func parsePodsToken(rest string) (selector string, port int, portName string, err error) {
+	rest = strings.TrimSpace(rest)
+	if i := strings.LastIndexByte(rest, ':'); i >= 0 {
+		selector, rest = strings.TrimSpace(rest[:i]), strings.TrimSpace(rest[i+1:])
+		if rest == "" {
+			return "", 0, "", fmt.Errorf("pods:%s — empty port after ':'", selector)
+		}
+		if n, convErr := strconv.Atoi(rest); convErr == nil {
+			if n <= 0 || n > 65535 {
+				return "", 0, "", fmt.Errorf("pods:%s — port %d out of range", selector, n)
+			}
+			port = n
+		} else {
+			portName = rest
+		}
+	} else {
+		selector = rest
+	}
+	if selector == "" {
+		return "", 0, "", fmt.Errorf("pods: needs a label selector")
+	}
+	return selector, port, portName, nil
 }
 
 // splitUsing separates "<upstream> using <ref>", how this pool authenticates.

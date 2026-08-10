@@ -362,6 +362,13 @@ A route's endpoints can be discovered from pod labels instead of listed:
 --route '* => pods:app=vllm'
 ```
 
+The tidiest form is `--backends`, which is shorthand for the same catch-all
+route and takes the same token:
+
+```
+--backends pods:app=vllm:http
+```
+
 Each discovered pod contributes **its own declared `containerPort`**. That is
 the reason to prefer pod discovery over a Service, and it is not a detail: a
 fleet run as several DaemonSets — one per GPU topology, or per model — commonly
@@ -369,11 +376,29 @@ listens on a different port per set. A Service maps ONE port, so covering three
 DaemonSets needs three Services, and the router loses the single label selector
 that made them one pool. Pod discovery keeps them one pool.
 
-Port precedence: the pod's named port when `--discover-port-name` is set, then
-its sole declared port, then `--discover-port` as a floor. The pod is the
-authority on what it listens on — a flag silently overriding it would send
-traffic to a port nothing is bound to. A pod declaring several unnamed ports
-with no `--discover-port-name` falls back to the flag rather than guessing.
+The port travels in the token, after the selector:
+
+```
+--route '* => pods:app=vllm:http'      # containerPort named "http"
+--route '* => pods:app=vllm:8000'      # for a pod declaring no port of its own
+```
+
+It belongs to the route rather than to the router because it describes the POOL.
+A router fronting two fleets on different ports could not say so while this was
+one global flag — which is the very case pod discovery exists for. A colon is
+safe as the separator: Kubernetes label keys and values never contain one.
+
+Port precedence: the pod's named port when a name is given, then its sole
+declared port, then the number as a floor. The pod is the authority on what it
+listens on — configuration silently overriding it would send traffic to a port
+nothing is bound to. A pod declaring several unnamed ports with no name given
+falls back to the number rather than guessing.
+
+Discovery always searches the router's **own namespace**. There is no syntax for
+another one, deliberately: reading pods across namespaces needs a ClusterRole,
+and a standing cluster-wide pod read on every router is a poor trade for a case
+that a second router in the other namespace covers. It is what keeps the chart's
+RBAC a plain Role.
 
 Discovery only ever PROPOSES backends. The registry decides admission and health
 decides eligibility, so a discovered pod is not routed to until it passes the
@@ -392,9 +417,7 @@ migration looks like:
 ```bash
 wekai router serve \
   --listen :8080 --metrics-listen 0.0.0.0:29000 \
-  --route '* => pods:app=vllm' \
-  --discover-namespace inference \
-  --discover-port-name http
+  --backends pods:app=vllm:http
 ```
 
 ### Helm
@@ -402,22 +425,21 @@ wekai router serve \
 Discovery needs RBAC, which the chart creates only when asked — a
 namespace-scoped Role, never a ClusterRole:
 
-Note the two blocks. Top-level `discovery` carries one field and it is a
-permission: it creates the ServiceAccount, Role and RoleBinding and mounts the
-API token. Everything about HOW to look pods up lives under `router.discovery`,
-because those become CLI flags.
+RBAC is created by default, because a `pods:` route fails without it and the
+runtime error names nothing about the chart. It is a namespace-scoped Role,
+never a ClusterRole. A router with only static endpoints can decline it with
+`discovery.enabled: false`.
+
+Give the selector as a **map**, not a string: a label selector is
+comma-separated and `--set` splits on commas, so a string arrives truncated at
+its first label — silently, rendering fine and failing at runtime.
 
 ```yaml
-discovery:
-  enabled: true      # the ONLY field here; grants API access
-
 router:
   routes:
-    - "* => pods:app=vllm"
-  discovery:
-    namespace: ""      # empty: the router's own namespace
-    portName: http     # which containerPort serves inference
-    port: 8000         # only for a pod declaring none of its own
+    - patterns: ["*"]
+      pods: {app: vllm, tier: prod}
+      port: http            # containerPort name, or a number as a floor
 ```
 
 Several DaemonSets on different ports, as one pool:
@@ -425,9 +447,9 @@ Several DaemonSets on different ports, as one pool:
 ```yaml
 router:
   routes:
-    - "* => pods:app=vllm"      # matches every set
-  discovery:
-    portName: http              # each set names its own port `http`
+    - patterns: ["*"]           # matches every set
+      pods: {app: vllm}
+      port: http                # each set names its own port `http`
 ```
 
 ## Readiness

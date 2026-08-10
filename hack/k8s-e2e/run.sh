@@ -106,9 +106,9 @@ echo "==> helm install a second router using pod discovery"
 helm install router-disc "$ROOT/chart/router" "${SMALL[@]}" \
   --set imageRepository=wekai-router \
   --set imageTag="$TAG" \
-  --set-string 'router.routes[0]=* => pods:app=mock-vllm' \
-  --set router.discovery.portName=http \
-  --set discovery.enabled=true \
+  --set-string 'router.routes[0].patterns[0]=*' \
+  --set-string 'router.routes[0].pods.app=mock-vllm' \
+  --set-string 'router.routes[0].port=http' \
   --set service.port=8080 --set service.targetPort=8080 \
   --set replicaCount=1 >/dev/null
 

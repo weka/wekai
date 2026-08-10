@@ -1,5 +1,5 @@
 {{- if .Values.discovery.enabled }}
-# Kubernetes endpoint discovery, off by default.
+# Kubernetes endpoint discovery, ON by default.
 #
 # A Role, not a ClusterRole: discovery is namespace-scoped, so the router never
 # needs cluster-wide read. v1 defaulted to all-namespaces when none was

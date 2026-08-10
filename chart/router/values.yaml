@@ -38,6 +38,17 @@ router:
   #   - patterns: [fast, small]
   #     endpoints: [http://a:8000, http://b:8000]
   #     as: Qwen/Qwen3-32B            # optional model rewrite
+  #
+  # Endpoints discovered from pod labels, in the router's own namespace. Given
+  # as a MAP for the same reason: a label selector is comma-separated, and
+  # --set would split it and keep only the first label.
+  #   - patterns: ["*"]
+  #     pods: {app: vllm, tier: prod}
+  #     port: http                    # containerPort name, or a number for a
+  #                                   # pod that declares none of its own
+  #
+  # Discovered and static endpoints mix in one route, which is what a migration
+  # looks like: give both `endpoints` and `pods`.
   routes: []
 
   # Endpoints for the implicit catch-all pool — shorthand for a single
@@ -82,14 +93,6 @@ router:
   # GPU topology or model, commonly listens on a different port per set, and
   # covering that with Services needs one per set — losing the single label
   # selector that made them one pool.
-  discovery:
-    # Namespace searched. Empty means the router's own.
-    namespace: ""
-    # Port for a pod that declares none of its own; a declared port always wins.
-    port: 8000
-    # Which containerPort to use when a pod declares several, e.g. "http".
-    portName: ""
-
   # Secrets the router itself presents upstream, or its own inbound key.
   # Mounted read-only; a route then references the file with "using <path>".
   #
@@ -255,9 +258,15 @@ podMonitor:
 # common case and needs no RBAC at all. Enabling this creates a ServiceAccount,
 # a namespace-scoped Role and a RoleBinding — never a ClusterRole, because
 # discovery is namespace-scoped and cluster-wide read is not needed.
-# Grants the router read access to pods in its own namespace, which any route
-# written as "<patterns> => pods:<selector>" needs. Off by default: a static
-# endpoint list needs no API access at all, and a serving router should not hold
-# a Kubernetes credential it does not use.
+# Grants the router read access to pods IN ITS OWN NAMESPACE, which any route
+# written as "<patterns> => pods:<selector>" needs. On by default, so pod
+# discovery just works: it was previously off, and a route using pods: then
+# failed at runtime with a permissions error that named nothing about this
+# value. Set false for a router with only static endpoints, which needs no API
+# access at all.
+#
+# There is no way to discover across namespaces, and that is what keeps this a
+# plain Role. A ClusterRole would be a standing cluster-wide pod read on every
+# router, which is a poor trade for a case a second router covers.
 discovery:
-  enabled: false
+  enabled: true

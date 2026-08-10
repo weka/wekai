@@ -84,6 +84,16 @@ type Route struct {
 	// cannot express: a fleet run as several DaemonSets, one per GPU topology,
 	// commonly listens on a different port per set.
 	DiscoverySelector string
+	// DiscoveryPort is used for a discovered pod that declares no port of its
+	// own; a declared containerPort always wins. DiscoveryPortName picks among
+	// several declared ports by name.
+	//
+	// Both are per route rather than per router, because they describe the POOL
+	// being discovered. A router fronting two fleets on different ports could
+	// not say so while these were global flags, which defeated the reason pod
+	// discovery exists at all.
+	DiscoveryPort     int
+	DiscoveryPortName string
 
 	// Passive forces this route's endpoints to skip active health probing.
 	//
@@ -130,9 +140,6 @@ type Options struct {
 	RefusalTTL time.Duration
 
 	// --- Kubernetes discovery, applied to any route carrying a selector.
-	DiscoveryNamespace  string
-	DiscoveryPort       int
-	DiscoveryPortName   string
 	DiscoveryKubeconfig string
 
 	// --- Health probing.
@@ -665,24 +672,31 @@ func startPodDiscovery(ctx context.Context, opts Options, rt Route, p *pool.Pool
 	if err != nil {
 		return err
 	}
-	ns := opts.DiscoveryNamespace
-	if ns == "" {
-		// "Empty means my own namespace" is what an operator expects, and it is
-		// the only value that is right by default: a router discovers the fleet
-		// it is deployed beside. Kubernetes publishes it to every pod through
-		// the service account, which is the same place the token comes from.
-		b, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-		if err != nil {
-			return fmt.Errorf("no --discover-namespace given and this is not a pod: %w", err)
-		}
-		ns = strings.TrimSpace(string(b))
+	// Always the router's OWN namespace. There is no option for another one:
+	// reading pods across namespaces needs a ClusterRole, and a standing
+	// cluster-wide read for every router is a poor trade for a case that a
+	// second router in the other namespace covers. Keeping it namespaced is
+	// what keeps the RBAC a plain Role.
+	//
+	// Kubernetes publishes the namespace to every pod through the service
+	// account, the same place the token comes from.
+	b, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err != nil {
+		return fmt.Errorf("pod discovery needs to run in a pod: %w", err)
+	}
+	ns := strings.TrimSpace(string(b))
+	// The historical default, kept: a pod that declares no port of its own
+	// still needs one, and 8000 is what a vLLM listens on.
+	port := rt.DiscoveryPort
+	if port <= 0 {
+		port = 8000
 	}
 	d, err := k8sdisc.New(k8sdisc.Config{
 		Mode:            k8sdisc.ModePod,
 		Namespace:       ns,
 		Selector:        rt.DiscoverySelector,
-		Port:            opts.DiscoveryPort,
-		PortName:        opts.DiscoveryPortName,
+		Port:            port,
+		PortName:        rt.DiscoveryPortName,
 		Scheme:          "http",
 		DefaultCapacity: 1,
 		DefaultDialect:  "openai",

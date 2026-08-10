@@ -59,7 +59,19 @@ spec:
                    written as one string is truncated at its first model
                    pattern — silently, rendering fine and failing at runtime.
                    As lists there is no comma inside any single --set value. */}}
-            - "--route={{ join "," .patterns }} => {{ join "|" .endpoints }}{{ if .as }} as {{ .as }}{{ end }}{{ if .using }} using {{ .using }}{{ end }}"
+            {{- $eps := .endpoints | default list }}
+            {{- if .pods }}
+            {{- /* Pod discovery as a MAP, so --set never sees a comma: a label
+                   selector is comma-separated, and --set would split it into
+                   separate values and drop all but the first. Helm renders map
+                   keys in sorted order, so the flag is stable across renders. */}}
+            {{- $sel := list }}
+            {{- range $k, $v := .pods }}{{ $sel = append $sel (printf "%s=%s" $k (toString $v)) }}{{ end }}
+            {{- $tok := printf "pods:%s" (join "," $sel) }}
+            {{- if .port }}{{ $tok = printf "%s:%v" $tok .port }}{{ end }}
+            {{- $eps = append $eps $tok }}
+            {{- end }}
+            - "--route={{ join "," .patterns }} => {{ join "|" $eps }}{{ if .as }} as {{ .as }}{{ end }}{{ if .using }} using {{ .using }}{{ end }}"
             {{- end }}
             {{- end }}
             {{- if .Values.router.default }}
@@ -104,17 +116,6 @@ spec:
             - "--vllm-metrics-interval={{ .Values.router.vllmMetrics.interval }}"
             {{- range .Values.router.vllmMetrics.names }}
             - "--vllm-metrics-name={{ . }}"
-            {{- end }}
-            {{- end }}
-            {{- with .Values.router.discovery }}
-            {{- if .namespace }}
-            - "--discover-namespace={{ .namespace }}"
-            {{- end }}
-            {{- if .port }}
-            - "--discover-port={{ .port }}"
-            {{- end }}
-            {{- if .portName }}
-            - "--discover-port-name={{ .portName }}"
             {{- end }}
             {{- end }}
             {{- if .Values.router.apiKeyFile }}

@@ -162,40 +162,41 @@ func TestRouterChartRunsTheSubcommand(t *testing.T) {
 // TestRouterChartRBACIsOptedInto: discovery needs a ServiceAccount, Role and
 // RoleBinding, and granting them unconditionally would hand every router
 // deployment namespace read it does not use. The pod rule is gated separately
-// again, because pod-mode discovery is the only thing that needs it.
-func TestRouterChartRBACIsOptedInto(t *testing.T) {
-	off := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000")
-	for _, kind := range []string{"kind: Role", "kind: RoleBinding", "kind: ServiceAccount"} {
-		if strings.Contains(off, kind) {
-			t.Errorf("%s is created with discovery disabled; RBAC must be opted into", kind)
+// Pod discovery needs API access, and needing it is not a detail an operator
+// should have to discover from a runtime permissions error that names nothing
+// about the chart. RBAC is created by default, and can be declined.
+//
+// It stays a Role and never a ClusterRole: discovery only ever searches the
+// router's own namespace, so cluster-wide pod read would be a standing
+// privilege for a capability that does not exist.
+func TestRouterChartRBACIsOnByDefaultAndNamespaced(t *testing.T) {
+	out := renderRouter(t, "--set-string", "router.routes[0]=* => pods:app=vllm")
+	for _, want := range []string{"kind: ServiceAccount", "kind: Role", "kind: RoleBinding"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("%s is not created by default; a pods: route would fail at runtime "+
+				"with a permissions error that names nothing about this chart", want)
 		}
+	}
+	if strings.Contains(out, "kind: ClusterRole") {
+		t.Error("chart creates a ClusterRole; discovery is namespace-scoped, so " +
+			"cluster-wide pod read is a standing privilege for nothing")
+	}
+	if !strings.Contains(out, "automountServiceAccountToken: true") {
+		t.Error("the API token is not mounted, so discovery has no credential")
 	}
 
-	on := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000",
-		"--set", "discovery.enabled=true")
-	for _, kind := range []string{"kind: Role", "kind: RoleBinding", "kind: ServiceAccount"} {
-		if !strings.Contains(on, kind) {
-			t.Errorf("%s missing when discovery is enabled:\n%s", kind, on)
+	off := renderRouter(t, "--set-string", "router.routes[0]=* => http://vllm:8000",
+		"--set", "discovery.enabled=false")
+	for _, unwanted := range []string{"kind: Role", "kind: RoleBinding"} {
+		if strings.Contains(off, unwanted) {
+			t.Errorf("%s is still created with discovery.enabled=false; a router with "+
+				"static endpoints needs no API access at all", unwanted)
 		}
 	}
-	if strings.Contains(on, "kind: ClusterRole") {
-		t.Error("discovery is namespace-scoped; a ClusterRole grants more than it needs")
-	}
-	// Pods, and only pods: discovery is by label selector so each pod
-	// contributes its own port, and there is no other mode to grant for.
-	if !strings.Contains(on, `resources: ["pods"]`) {
-		t.Error("discovery enabled but pod read not granted, so it cannot list anything")
-	}
-	if strings.Contains(on, "endpointslices") {
-		t.Error("endpointslice read granted for a mode the router does not have")
+	if !strings.Contains(off, "automountServiceAccountToken: false") {
+		t.Error("a router that does not discover should not hold a Kubernetes credential")
 	}
 }
-
-// TestRouterChartPassesRoutesVerbatim: a route is one string, and every part of
-// its syntax — pipe-separated endpoints for a pool, and `as <model>` to rewrite
-// before forwarding — must survive templating unchanged. Helm quoting is the
-// obvious place for a route to arrive subtly different from what the operator
-// wrote, and it would fail at runtime rather than at render.
 func TestRouterChartPassesRoutesVerbatim(t *testing.T) {
 	const route = "sonnet,big => http://a:8000|http://b:8000 as Qwen/Qwen3-32B"
 	// A values FILE, not --set: helm's --set splits on commas, so a route with
@@ -301,31 +302,40 @@ func TestRouterChartCaptureGetsWritableStorage(t *testing.T) {
 
 // TestRouterChartDiscoveryFlags: pod discovery is configured through the chart,
 // and it is the case a Service cannot cover — several DaemonSets on different
-// ports behind one label selector.
-func TestRouterChartDiscoveryFlags(t *testing.T) {
+// Everything about a discovered pool travels in the route string. The port
+// used to be a router-wide --discover-port flag, which by construction could
+// not describe a router fronting two fleets on different ports — the very case
+// pod discovery exists for.
+func TestRouterChartDiscoveryTravelsInTheRoute(t *testing.T) {
+	// The selector is a MAP, which is the only form --set can express: a label
+	// selector is comma-separated, and --set splits on commas, so the string
+	// form silently arrives truncated at its first label.
 	out := renderRouter(t,
-		"--set-string", "router.routes[0]=* => pods:app=vllm",
-		"--set", "router.discovery.namespace=inference",
-		"--set", "router.discovery.portName=http",
-		"--set", "discovery.enabled=true")
+		"--set-string", "router.routes[0].patterns[0]=fast",
+		"--set-string", "router.routes[0].pods.app=vllm",
+		"--set-string", "router.routes[0].pods.tier=prod",
+		"--set-string", "router.routes[0].port=http",
+		// A migration: static and discovered endpoints in one pool.
+		"--set-string", "router.routes[1].patterns[0]=slow",
+		"--set-string", "router.routes[1].endpoints[0]=http://legacy:8000",
+		"--set-string", "router.routes[1].pods.app=vllm-cpu",
+		"--set-string", "router.routes[1].port=9000")
 	for _, want := range []string{
-		`- "--route=* => pods:app=vllm"`,
-		`- "--discover-namespace=inference"`,
-		`- "--discover-port-name=http"`,
-		"kind: Role",
+		`- "--route=fast => pods:app=vllm,tier=prod:http"`,
+		`- "--route=slow => http://legacy:8000|pods:app=vllm-cpu:9000"`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered manifest missing %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "kind: ClusterRole") {
-		t.Error("pod discovery is namespace-scoped; a ClusterRole grants more than it needs")
+	// The flags these replaced must be gone, not merely unused: leaving them
+	// renderable would give two ways to say one thing and let them disagree.
+	for _, gone := range []string{"--discover-namespace", "--discover-port", "--discover-port-name"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("chart still emits %s; discovery config belongs in the route", gone)
+		}
 	}
 }
-
-// TestRouterChartCredentials: the two-router deployment must be expressible —
-// a mounted secret the router presents upstream, and an inbound key read from
-// a file rather than set as a value.
 func TestRouterChartCredentials(t *testing.T) {
 	out := renderRouter(t,
 		"--set-string", "router.routes[0].patterns[0]=llama",
@@ -408,9 +418,12 @@ func TestRouterChartResourcesAreIndependentlyOverridable(t *testing.T) {
 	t.Run("resources can be dropped entirely", func(t *testing.T) {
 		out := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000",
 			"--set", "resources.requests=null")
-		if strings.Contains(out, "resources:") {
-			t.Errorf("emptying every section must omit the resources block rather than "+
-				"emit an empty one:\n%s", out)
+		// The container's block specifically: the RBAC Role has a
+		// `resources: ["pods"]` of its own, and matching that instead would
+		// make this assertion permanently true for the wrong reason.
+		if strings.Contains(out, "\n          resources:") {
+			t.Errorf("emptying every section must omit the container resources block "+
+				"rather than emit an empty one:\n%s", out)
 		}
 	})
 }
