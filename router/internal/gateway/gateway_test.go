@@ -1192,9 +1192,17 @@ func TestMaxNodeConcurrencyRejects429WhenAllBackendsAtCap(t *testing.T) {
 		Error struct{ Code string } `json:"error"`
 	}
 	_ = json.Unmarshal(body3, &env)
-	if env.Error.Code != "all_backends_saturated" {
-		t.Errorf("error code = %q, want all_backends_saturated (distinguishable from "+
-			"no_healthy_backends, router_at_capacity and split_guard_blocked)", env.Error.Code)
+	// Every capacity rejection looks the same to a caller. Which mechanism
+	// declined — the split guard, fleet-wide saturation, the router's own cap —
+	// is internal bookkeeping, and a caller can act on exactly one thing
+	// regardless: back off and retry. The distinction lives in the log and in
+	// router_saturation_rejects_total, asserted just below.
+	if env.Error.Code != "rate_limit_error" {
+		t.Errorf("error code = %q, want rate_limit_error; capacity rejections must not "+
+			"publish which internal mechanism declined", env.Error.Code)
+	}
+	if strings.Contains(string(body3), "prefix") || strings.Contains(string(body3), "backend") {
+		t.Errorf("429 body describes the router's internals to the caller: %s", body3)
 	}
 	if got := testutil.ToFloat64(metrics.SaturationRejects); got != shedBefore+1 {
 		t.Errorf("router_saturation_rejects_total went %v -> %v, want +1", shedBefore, got)

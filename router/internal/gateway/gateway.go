@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -206,20 +207,27 @@ func (s *Server) inferenceHandler(route dialect.Route, affine bool) http.Handler
 			// saturated and none of the rest is far enough below to be worth a
 			// duplicate copy. Idle capacity may well exist — that is what makes
 			// this distinct from all_backends_saturated below.
-			w.Header().Set("Retry-After", "1")
-			s.dialect.WriteError(w, http.StatusTooManyRequests,
-				"split_guard_blocked",
-				"every backend holding this prefix is saturated and no other is far enough below it to take a copy; retry shortly")
+			//
+			// The WHY goes to the log, not to the caller. A client can do
+			// exactly one thing with a 429 — back off and retry — and the
+			// router's prefix bookkeeping is not the caller's business to
+			// reason about, nor something to expose on a public endpoint.
+			slog.Warn("rejected: every backend holding this prefix is saturated and none "+
+				"of the rest is far enough below it to take a copy. Idle capacity may "+
+				"exist; this is the split guard declining to duplicate the prefix.",
+				"request_id", obs.RequestID(ctx), "pool", target.Name,
+				"reason", "split_guard_blocked")
+			writeBusy(w, s.dialect)
 		case errors.Is(res.Err, policy.ErrAllBackendsSaturated):
 			// Every healthy backend is saturated by some signal. Replaces the
 			// old gateway-side all_backends_at_capacity, which reached the same
 			// conclusion from a router-side concurrency filter before any
 			// routing ran.
 			metrics.SaturationRejects.Inc()
-			w.Header().Set("Retry-After", "1")
-			s.dialect.WriteError(w, http.StatusTooManyRequests,
-				"all_backends_saturated",
-				"every healthy backend is saturated; retry shortly")
+			slog.Warn("rejected: every healthy backend in the pool is saturated",
+				"request_id", obs.RequestID(ctx), "pool", target.Name,
+				"reason", "all_backends_saturated")
+			writeBusy(w, s.dialect)
 		default:
 			s.dialect.WriteError(w, http.StatusBadGateway,
 				"upstream_unavailable", "all upstream attempts failed")
@@ -620,4 +628,16 @@ func (s *Server) HTTPServer(addr string) *http.Server {
 		// No WriteTimeout: it would cap long streaming generations.
 		IdleTimeout: 120 * time.Second,
 	}
+}
+
+// writeBusy answers a capacity rejection.
+//
+// One shape for every reason the router ran out of room, because a caller can
+// act on exactly one thing — back off and retry — and the reason is internal
+// bookkeeping. The specific cause is logged and counted; it is not published on
+// what may well be a public endpoint.
+func writeBusy(w http.ResponseWriter, d dialect.Dialect) {
+	w.Header().Set("Retry-After", "1")
+	d.WriteError(w, http.StatusTooManyRequests,
+		"rate_limit_error", "server is busy; retry shortly")
 }
