@@ -17,7 +17,20 @@ func TestCanonicalizationTable(t *testing.T) {
 		{"a:8000", "http://a:8000"},
 		{"HTTP://A:8000", "http://a:8000"},
 		{"http://a:8000/", "http://a:8000"},
-		{"http://a:8000/v1/", "http://a:8000"}, // path is not part of identity
+		// The PATH is part of identity, reversing an earlier contract. An
+		// endpoint can live behind a base path — Google's OpenAI-compatible
+		// surface is /v1beta/openai, a vLLM behind an ingress prefix is the same
+		// shape — and dropping it rewrites the backend to a different service on
+		// the same host, for every request rather than just model listings.
+		//
+		// The trade this accepts: a backend written as http://a:8000/v1 now
+		// MEANS that, so the router appends its own /v1/chat/completions to it.
+		// Under the old rule that mistake normalised away silently. It is worth
+		// the swap because the failure is loud (404 from a doubled prefix) where
+		// the other one was silent (traffic to the wrong service), but it is a
+		// behaviour change for anyone who wrote /v1 into a backend URL.
+		{"http://a:8000/v1/", "http://a:8000/v1"},
+		{"http://a:8000/", "http://a:8000"}, // a bare trailing slash still normalises
 		{"http://a", "http://a:80"},            // port made explicit
 		{"https://a", "https://a:443"},
 		{"  http://a:8000  ", "http://a:8000"},
