@@ -5,8 +5,10 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -54,6 +56,16 @@ func (s *Server) build() http.Handler {
 	// class and the dialect — never sniffed from the body (API-5, API-N1).
 	for _, rt := range s.dialect.Routes() {
 		route := rt
+		if route.Class == "models" {
+			// Model listing is answered by the router, not proxied to one pool.
+			// A router fronting several pools serves several models, and
+			// forwarding the question to whichever pool matched the empty model
+			// name would advertise a fraction of what it can actually serve —
+			// so a client discovering models through the router would never see
+			// the others exist.
+			mux.Handle(route.Pattern, s.handleMergedModels())
+			continue
+		}
 		mux.Handle(route.Pattern, s.inferenceHandler(route, true))
 	}
 
@@ -245,6 +257,91 @@ func (s *Server) candidates(t Target) []*registry.Backend {
 // poolByName resolves an admin request's ?pool=. Empty means the first target,
 // which is the only one on a single-pool router — the common case, and the one
 // where making an operator name it would be pure ceremony.
+// handleMergedModels answers /v1/models by asking one live backend in EVERY
+// pool and merging the results.
+//
+// One backend per pool, not all of them: endpoints within a pool are
+// interchangeable and serve the same models, so asking more is redundant load.
+// A pool with nothing healthy contributes nothing rather than failing the whole
+// listing — a partial answer is more useful than none, and the unhealthy pool
+// is visible in /readiness and the metrics.
+func (s *Server) handleMergedModels() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		type model struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			OwnedBy string `json:"owned_by,omitempty"`
+			Pool    string `json:"pool,omitempty"`
+		}
+		var out []model
+		seen := map[string]bool{}
+
+		for _, t := range s.router.Targets() {
+			cands := s.candidates(t)
+			if len(cands) == 0 {
+				continue
+			}
+			body, err := s.fetchModels(r.Context(), cands[0].URL)
+			if err != nil {
+				continue
+			}
+			for _, m := range body.Data {
+				// A model served by two pools is listed once. Which pool wins
+				// is rule order, the same thing that decides where a request
+				// for it goes, so the label cannot disagree with the routing.
+				if seen[m.ID] {
+					continue
+				}
+				seen[m.ID] = true
+				out = append(out, model{ID: m.ID, Object: orString(m.Object, "model"),
+					OwnedBy: m.OwnedBy, Pool: t.Name})
+			}
+		}
+		if out == nil {
+			out = []model{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": out})
+	})
+}
+
+type modelsResponse struct {
+	Data []struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		OwnedBy string `json:"owned_by"`
+	} `json:"data"`
+}
+
+func (s *Server) fetchModels(ctx context.Context, base string) (*modelsResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("models: status %d", resp.StatusCode)
+	}
+	var out modelsResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func orString(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
 // poolNames lists the configured pools for /get_server_info. It replaces the
 // old "policy" field: there is one routing flow now, so what an operator
 // actually needs to see is which pools exist.

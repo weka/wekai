@@ -73,7 +73,8 @@ type RouterServeCommand struct {
 	RequestTimeout   time.Duration `long:"request-timeout" default:"600s" description:"Overall upstream request deadline."`
 	IdleTimeout      time.Duration `long:"idle-timeout" default:"300s" description:"Abort a stream that has produced nothing for this long."`
 	UpstreamCred     string        `long:"upstream-credential" description:"Credential presented to upstreams, replacing the client's."`
-	HealthInterval   time.Duration `long:"health-interval" default:"10s" description:"Active health probe interval."`
+	HealthInterval   time.Duration `long:"health-interval" default:"15s" description:"How often a HEALTHY backend is re-probed. Can be slow: a healthy backend that breaks is caught by real traffic failing, since an upstream 5xx trips its circuit and removes it from selection."`
+	HealthUnhealthy  time.Duration `long:"health-unhealthy-interval" default:"1s" description:"How often a backend that is NOT healthy is re-probed. Much shorter on purpose: a recovered backend stays out of rotation for this long, and every request that could have used its warm cache goes somewhere colder."`
 	HealthTimeout    time.Duration `long:"health-timeout" default:"5s" description:"Health probe timeout. Must be below the interval, or probes fall behind forever."`
 	HealthPath       string        `long:"health-path" default:"/health" description:"Path probed on each backend."`
 	VLLMMetrics      bool          `long:"vllm-metrics" description:"Aggregate upstream vLLM counters into router-level totals served on --metrics-listen. Only endpoints discovered to be vLLM are scraped. Totals accumulate DELTAS, so they never go backwards when a pod restarts or the fleet scales down — a decreasing counter silently breaks rate() and increase()."`
@@ -211,6 +212,7 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		TailTTL:               c.TailTTL,
 		RefusalTTL:            c.RefusalTTL,
 		HealthInterval:        c.HealthInterval,
+		HealthUnhealthy:       c.HealthUnhealthy,
 		HealthTimeout:         c.HealthTimeout,
 		HealthPath:            c.HealthPath,
 		VLLMMetrics:           c.VLLMMetrics,

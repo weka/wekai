@@ -96,9 +96,13 @@ type Options struct {
 	RefusalTTL      time.Duration
 
 	// --- Health probing.
-	HealthInterval time.Duration
-	HealthTimeout  time.Duration
-	HealthPath     string
+	// HealthInterval is how often a HEALTHY backend is re-probed;
+	// HealthUnhealthy how often one that is not. They are asymmetric on
+	// purpose — see health.Config.
+	HealthInterval  time.Duration
+	HealthUnhealthy time.Duration
+	HealthTimeout   time.Duration
+	HealthPath      string
 
 	// VLLMMetrics turns on upstream vLLM counter aggregation. Only endpoints
 	// DISCOVERED to be vLLM are scraped, so a hosted API in the same router is
@@ -155,7 +159,8 @@ func (o Options) flowConfig() affinity.Config {
 
 func (o Options) healthConfig() health.Config {
 	return health.Config{
-		Interval: o.HealthInterval, Timeout: o.HealthTimeout, Path: o.HealthPath,
+		Interval: o.HealthInterval, UnhealthyInterval: o.HealthUnhealthy,
+		Timeout: o.HealthTimeout, Path: o.HealthPath,
 		FailureThreshold: 3, SuccessThreshold: 2,
 	}
 }
@@ -168,7 +173,10 @@ func (o Options) healthConfig() health.Config {
 // panics the ticker, which is a poor way to learn a field was missed.
 func (o Options) withDefaults() Options {
 	if o.HealthInterval <= 0 {
-		o.HealthInterval = 10 * time.Second
+		o.HealthInterval = 15 * time.Second
+	}
+	if o.HealthUnhealthy <= 0 || o.HealthUnhealthy > o.HealthInterval {
+		o.HealthUnhealthy = min(time.Second, o.HealthInterval)
 	}
 	if o.HealthTimeout <= 0 || o.HealthTimeout >= o.HealthInterval {
 		// A timeout at or above the interval lets probes fall behind forever,
