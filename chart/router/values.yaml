@@ -78,10 +78,18 @@ router:
     # The backends' vLLM --max-num-seqs. Predicts saturation instead of
     # discovering it one refusal at a time. 0 = off.
     maxNodeConcurrency: 0
-    # Rebalance once (inflight - fleetMin)/inflight exceeds this. Off by
-    # default: a fleet where prefix affinity is working is SUPPOSED to look
-    # imbalanced, so this trades locality for evenness.
-    rebalanceRatio: 0
+    # Rebalance once (inflight - fleetMin)/inflight exceeds this — at 0.5, once
+    # a backend carries more than twice the fleet minimum.
+    #
+    # This trades locality for evenness, so it is a real trade: a fleet where
+    # prefix affinity is working is SUPPOSED to look imbalanced. Set 0 to turn
+    # it off and let affinity concentrate work as far as it will.
+    #
+    # Note the arithmetic when a backend is fully idle: the fleet minimum is
+    # then 0, so (inflight - 0)/inflight is 1.0 for every backend carrying
+    # anything at all, and all of them are treated as saturated until the idle
+    # one picks up work.
+    rebalanceRatio: 0.5
     # A prefix is split onto a backend only while its in-flight is below
     # limit*(1-this). Lower and every backend ends up holding every prefix.
     splitGuard: 0.20

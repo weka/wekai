@@ -71,8 +71,17 @@ the same checks a statically named one does, and a pod going NotReady leaves the
 pool on its own.
 
 **Capacity is signalled, not assumed.** The backend's own `429` is the ultimate
-signal and is always on. `--max-node-concurrency` and `--rebalance-ratio` are
-opt-in early warnings that save a round trip.
+signal and is always on. `--max-node-concurrency` is an opt-in early warning
+that saves a round trip: set it to the backends' vLLM `--max-num-seqs` and
+saturation is predicted rather than discovered one refusal at a time.
+
+`--rebalance-ratio` defaults to `0.5`, so a backend carrying more than twice the
+fleet minimum stops taking new work. It trades locality for evenness — a fleet
+where affinity is working is *supposed* to look imbalanced — so set it to `0`
+when locality matters more. Note the arithmetic against an idle backend: the
+fleet minimum is then 0, `(inflight - 0)/inflight` is 1.0 for anything carrying
+work at all, and every busy backend is treated as saturated until the idle one
+picks up traffic.
 
 ---
 
