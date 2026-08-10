@@ -2,6 +2,7 @@ package affinity
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 
@@ -264,23 +265,37 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 		}
 	}
 	usable := make([]*registry.Backend, 0, len(cands))
-	guardRef := int64(-1)
+	// Saturated backends and the reference each supplies, kept PER BACKEND.
+	// Reducing them to one fleet-wide number here was the bug: the guard would
+	// then measure this prefix against whichever backend anywhere in the pool
+	// happened to refuse at the lowest in-flight, including backends that hold
+	// nothing of this prefix. One node that refused while carrying 2 — a vLLM
+	// out of KV cache rather than out of sequence slots — set a threshold of
+	// 1.6 for every request in the pool, so no candidate could ever clear it
+	// and the flow rejected with the fleet nearly idle.
+	saturated := make(map[string]int64, len(cands))
 	for _, c := range cands {
-		blocked := false
+		ref := int64(-1)
 		for _, sg := range p.signals {
-			hit, ref := sg.saturated(c, view)
+			hit, r := sg.saturated(c, view)
 			if !hit {
 				continue
 			}
-			blocked = true
 			p.m.Signal(sg.name())
-			if ref > 0 && (guardRef < 0 || ref < guardRef) {
-				guardRef = ref
+			// Smallest across the SIGNALS on one backend: refused says 48,
+			// concurrency says 32, and the strictest of them describes it.
+			if r > 0 && (ref < 0 || r < ref) {
+				ref = r
+			}
+			if ref < 0 {
+				ref = 0 // saturated, but this signal named no level
 			}
 		}
-		if !blocked {
+		if ref < 0 {
 			usable = append(usable, c)
+			continue
 		}
+		saturated[c.URL] = ref
 	}
 
 	// Slots are resolved once and reused, so the candidate mask and the
@@ -322,16 +337,36 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	pth := path{units: rr.Units, modelKey: modelKey(rr.Model)}
 	a := p.tree.walk(pth, candMask)
 
-	// No signal fired, so nothing is being relieved and the guard has no
-	// observed reference. Fall back to the configured limit when there is one;
-	// otherwise the fleet's own busiest backend is the only scale available.
+	// The guard measures a candidate against THE THING BEING RELIEVED — the
+	// saturated holders of this prefix — and nothing else. Among them the
+	// busiest defines "as loaded as it": that is the load a copy is being made
+	// to escape.
+	guardRef := int64(-1)
+	for url, ref := range saturated {
+		if ref > guardRef && a.held.Has(p.tree.slotOrCreate(url)) {
+			guardRef = ref
+		}
+	}
 	if guardRef <= 0 {
+		// No saturated holder named a level. Either the configured limit is the
+		// only capacity model available, or there is none.
 		guardRef = p.cfg.NodeConcurrency
 	}
-	if guardRef <= 0 {
-		guardRef = view.minInflight + 1
+
+	// No reference at all means the holders are ABSENT rather than full — they
+	// left the fleet, or they are unhealthy. Nothing is being relieved, so
+	// placing this prefix somewhere is relocation, not duplication, and there is
+	// nothing for the guard to protect. It does not apply.
+	//
+	// The previous fallback here was the fleet's own minimum in-flight plus one,
+	// which manufactured a threshold just under the least-loaded backend. In any
+	// evenly-loaded fleet that is below every candidate, so the guard rejected
+	// everything except a completely idle node — a 429 to the client with the
+	// fleet at a third of capacity.
+	threshold := math.Inf(1)
+	if guardRef > 0 {
+		threshold = float64(guardRef) * (1 - p.cfg.SplitGuard)
 	}
-	threshold := float64(guardRef) * (1 - p.cfg.SplitGuard)
 
 	// shallow means the anchor is NOT the deepest marked run: this request's own
 	// holders are unavailable and only a shared ancestor is left. Serving it
