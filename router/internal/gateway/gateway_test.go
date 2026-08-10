@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -720,8 +721,29 @@ func TestConcurrentRequestsLeaveNoInflight(t *testing.T) {
 // middleware that wrapped it. The handler must therefore write into a holder the
 // middleware installed. Without this, the `route` dimension — the one operators
 // slice dashboards by — is worthless.
+//
+// Asserted on the emitted log line, NOT on a delta of the global counter this
+// test used to read. Both come from one `class` variable in the middleware, so
+// they prove the same thing — but the counter is process-global and bucketed by
+// status, so a delta on it fails identically whether the label was wrong or the
+// request merely did not return 2xx.
+//
+// And it was RACY, which is what failed in CI. The middleware records both the
+// metric and the log line AFTER the response has gone back to the client, so a
+// test that reads the counter the instant its request returns can read it
+// before the middleware has touched it. That is precisely the reported symptom
+// — the counter unchanged rather than double-counted — and it is why the
+// failure looked like a routing bug. The observation has to be awaited.
+//
+// The log line is matched by this request's own X-Request-Id, so nothing another
+// test emits can satisfy it.
 func TestMetricsCarryTheMatchedRouteClass(t *testing.T) {
 	h := newHarness(t, 1, nil)
+
+	var logged syncBuffer
+	restore := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(restore) })
 
 	before := testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("chat", "openai", "2xx"))
 	unmatchedBefore := testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("unmatched", "", "2xx"))
@@ -730,31 +752,83 @@ func TestMetricsCarryTheMatchedRouteClass(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	// Check the response BEFORE the counter. This assertion is about a label
-	// reaching the middleware, and it is read from a delta on a process-global
-	// counter — so a request that simply failed shows up as "the label did not
-	// arrive", which sends the reader hunting through middleware for a routing
-	// bug that is not there. Ask the direct question first.
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("request returned %d, want 200 — nothing can be concluded about the "+
-			"route label from a request that did not succeed. Body: %s",
-			resp.StatusCode, body)
+		t.Fatalf("request returned %d, want 200; nothing can be concluded about the "+
+			"route label from a request that did not succeed. Body: %s", resp.StatusCode, body)
+	}
+	id := resp.Header.Get("X-Request-Id")
+	if id == "" {
+		t.Fatal("no X-Request-Id on the response, so this request's access-log line " +
+			"cannot be told apart from any other")
 	}
 
-	after := testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("chat", "openai", "2xx"))
-	unmatchedAfter := testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("unmatched", "", "2xx"))
+	// The access-log line for THIS request, once the middleware has written it.
+	var line string
+	if !eventuallyTrue(func() bool {
+		for _, l := range strings.Split(logged.String(), "\n") {
+			if strings.Contains(l, id) {
+				line = l
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("no access-log line for request %s:\n%s", id, logged.String())
+	}
+	if !strings.Contains(line, "route=chat") {
+		t.Errorf("the handler's route match did not reach the middleware's holder:\n%s", line)
+	}
 
-	if after != before+1 {
-		t.Errorf("router_requests_total{route=chat,dialect=openai,status=2xx} went %v -> %v, "+
-			"want +1: the request succeeded, so the matched route class did not reach the "+
-			"access-log middleware. unmatched went %v -> %v",
-			before, after, unmatchedBefore,
-			testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("unmatched", "", "2xx")))
+	// The metric carries the same `class`, plus the dialect the log line does not
+	// record. Compared with >= because this counter is process-global: another
+	// test's in-flight request may land in the same bucket, and that is not this
+	// test's business.
+	if !eventuallyTrue(func() bool {
+		return testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("chat", "openai", "2xx")) >= before+1
+	}) {
+		t.Errorf("router_requests_total{route=chat,dialect=openai,status=2xx} stayed at %v "+
+			"for a request logged as %q; the metric and the log disagree, so the dialect "+
+			"label is not reaching the middleware", before, line)
 	}
-	if unmatchedAfter != unmatchedBefore {
-		t.Errorf("a matched request was counted as route=unmatched (%v -> %v)",
-			unmatchedBefore, unmatchedAfter)
+	if got := testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("unmatched", "", "2xx")); got != unmatchedBefore {
+		t.Errorf("a matched request was counted as route=unmatched (%v -> %v)", unmatchedBefore, got)
 	}
+}
+
+// eventuallyTrue polls f briefly. The access log and the request metrics are
+// both written after the response has reached the client, so a test that
+// observes them the instant its request returns is racing the middleware.
+func eventuallyTrue(f func() bool) bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if f() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// syncBuffer is a concurrency-safe log sink: the router logs from background
+// goroutines, and a bare bytes.Buffer written from two of them is a data race
+// that surfaces as an unrelated test failing under -race.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // TestKubeletProbesWorkWithAuthEnabled is a regression test for a bug found by
