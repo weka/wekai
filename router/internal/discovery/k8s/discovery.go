@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -139,6 +140,17 @@ type Discoverer struct {
 	client Client
 	reg    *registry.Registry
 	log    *slog.Logger
+
+	// lastCount is the endpoint count of the previous reconcile, so a change is
+	// logged once rather than on every event and every resync.
+	//
+	// Atomic because Run reconciles once after cache sync on its own goroutine
+	// while the informer's handlers reconcile on theirs.
+	lastCount atomic.Int64
+	// reported guards the first log line, so a pool that starts empty and stays
+	// empty still says so once — the case that matters most, and the one a
+	// change-only rule would never report.
+	reported atomic.Bool
 }
 
 // NewInClusterOrKubeconfig builds a client from the in-cluster service account,
@@ -297,6 +309,7 @@ func (d *Discoverer) reconcileFrom(store cache.Store) {
 		d.log.Error("discovery reconcile failed", "err", err)
 		return
 	}
+	d.reportCount(len(desired))
 	for _, url := range conflicts {
 		// A discovered endpoint colliding with a static backend is ignored, not
 		// merged: static wins (HIER-19). Surfacing it is how an operator finds a
@@ -304,6 +317,36 @@ func (d *Discoverer) reconcileFrom(store cache.Store) {
 		metrics.DiscoveryConflicts.WithLabelValues(url).Inc()
 		d.log.Warn("discovered endpoint collides with a statically configured backend; ignoring",
 			"backend", url)
+	}
+}
+
+// reportCount says what discovery found, on the first reconcile and whenever
+// the count changes.
+//
+// A selector that matches nothing used to be completely silent: the log said
+// "kubernetes discovery synced" and nothing else, the pool sat at zero
+// endpoints, and the only symptom was a pod that never became ready and a
+// /readiness returning 503 with no reason in it. A label typo cost an
+// investigation across three components; the router knew the answer the whole
+// time — it had the selector, the namespace, and the count.
+func (d *Discoverer) reportCount(n int) {
+	prev := d.lastCount.Swap(int64(n))
+	if d.reported.Swap(true) && prev == int64(n) {
+		return // unchanged since the last reconcile; the resync is not news
+	}
+	switch {
+	case n == 0:
+		d.log.Warn("discovery matched NO endpoints; this pool has nothing to route to "+
+			"and the router will stay NotReady. Check the label selector against the "+
+			"pods' own labels — `kubectl get pods -n <ns> --show-labels`.",
+			"selector", d.cfg.Selector, "namespace", d.cfg.Namespace,
+			"mode", d.cfg.Mode, "service", d.cfg.Service)
+	case prev == 0:
+		d.log.Info("discovery found endpoints",
+			"count", n, "selector", d.cfg.Selector, "namespace", d.cfg.Namespace)
+	default:
+		d.log.Info("discovered endpoint count changed",
+			"from", prev, "to", n, "selector", d.cfg.Selector, "namespace", d.cfg.Namespace)
 	}
 }
 

@@ -1554,3 +1554,83 @@ func TestProbePathsNeverReachABackend(t *testing.T) {
 		}
 	}
 }
+
+// A router that is NotReady has to say WHY, to an operator who can ask.
+//
+// From a live incident: a pod stayed NotReady and the only evidence was the
+// kubelet's "Readiness probe failed: HTTP probe failed with statuscode: 503".
+// The body was `{"ready": false}` — true, and useless. Two very different
+// faults produce it: a pool with no backends at all is a configuration mistake,
+// most often a label selector matching nothing, while a pool whose backends are
+// all unhealthy is a fleet problem. They need opposite responses.
+func TestReadinessSaysWhyItIsNotReady(t *testing.T) {
+	read := func(t *testing.T, h *harness, key string) (int, map[string]any) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, h.srv.URL+"/readiness", nil)
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		resp, err := h.srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("readiness: %v", err)
+		}
+		defer resp.Body.Close()
+		var body map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return resp.StatusCode, body
+	}
+
+	t.Run("no backends at all names the configuration", func(t *testing.T) {
+		h := newHarness(t, 0, func(c *harnessConfig) { c.APIKey = "k" })
+		code, body := read(t, h, "k")
+		if code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", code)
+		}
+		reason, _ := body["reason"].(string)
+		if !strings.Contains(reason, "discovered") {
+			t.Errorf("reason %q does not point at configuration; an empty pool is a "+
+				"selector or route mistake, not a sick fleet", reason)
+		}
+		if got := body["registered_backends"]; got != float64(0) {
+			t.Errorf("registered_backends = %v, want 0", got)
+		}
+	})
+
+	t.Run("registered but unhealthy names the fleet", func(t *testing.T) {
+		h := newHarness(t, 2, func(c *harnessConfig) { c.APIKey = "k" })
+		for _, b := range h.reg.Snapshot().Backends {
+			b.SetHealth(registry.Unhealthy)
+		}
+		code, body := read(t, h, "k")
+		if code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", code)
+		}
+		reason, _ := body["reason"].(string)
+		if !strings.Contains(reason, "none is healthy") {
+			t.Errorf("reason %q does not point at the fleet; backends ARE registered, so "+
+				"this is not a configuration fault", reason)
+		}
+		if got := body["registered_backends"]; got != float64(2) {
+			t.Errorf("registered_backends = %v, want 2", got)
+		}
+	})
+
+	// On a router WITH a key, an uncredentialed probe — the kubelet's view —
+	// gets the boolean it needs and nothing else. (On a keyless router there is
+	// no such distinction to make: the whole listener is open, so `Authed` is
+	// true for everyone and the counts are disclosed. That is how
+	// healthy_backends has always behaved.)
+	t.Run("an unauthenticated probe still learns nothing", func(t *testing.T) {
+		h := newHarness(t, 0, func(c *harnessConfig) { c.APIKey = "k" })
+		_, body := read(t, h, "")
+		if _, leaked := body["reason"]; leaked {
+			t.Errorf("the reason is operational detail and must not reach an "+
+				"unauthenticated caller: %v", body)
+		}
+		if _, leaked := body["registered_backends"]; leaked {
+			t.Errorf("backend counts must not reach an unauthenticated caller: %v", body)
+		}
+	})
+}

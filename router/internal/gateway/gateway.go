@@ -474,9 +474,10 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	// Readiness reflects backend HEALTH, and candidates() is now health-only, so
 	// this is simply its size. A fully saturated router is still ready to
 	// receive traffic — it sheds with 429, not by going NotReady.
-	n := 0
+	n, registered := 0, 0
 	for _, t := range s.router.Targets() {
 		n += len(s.candidates(t))
+		registered += len(t.Registry.Snapshot().Backends)
 	}
 	body := map[string]any{"ready": n > 0}
 	// The fleet size is operational detail, so it is disclosed only to an
@@ -484,6 +485,21 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	// needs and nothing more.
 	if Authed(r.Context()) {
 		body["healthy_backends"] = n
+		body["registered_backends"] = registered
+		// WHY it is not ready, which the counts alone do not distinguish. A pool
+		// with no backends at all is a configuration fault — a selector matching
+		// nothing, most often a mistyped label — while a pool with backends that
+		// are not healthy is a fleet problem. Those need opposite responses, and
+		// a bare `{"ready": false}` sends an operator to the wrong one.
+		if n == 0 {
+			if registered == 0 {
+				body["reason"] = "no backends configured or discovered — check the route's " +
+					"endpoints, and for a pods: selector check it against the pods' own labels"
+			} else {
+				body["reason"] = "backends are registered but none is healthy — check the " +
+					"upstreams themselves and the router's health probes against them"
+			}
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if n == 0 {
