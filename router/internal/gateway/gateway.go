@@ -281,7 +281,7 @@ func (s *Server) handleMergedModels() http.Handler {
 			if len(cands) == 0 {
 				continue
 			}
-			body, err := s.fetchModels(r.Context(), cands[0].URL)
+			body, err := s.fetchModels(r.Context(), cands[0].URL, r, t)
 			if err != nil {
 				continue
 			}
@@ -313,26 +313,60 @@ type modelsResponse struct {
 	} `json:"data"`
 }
 
-func (s *Server) fetchModels(ctx context.Context, base string) (*modelsResponse, error) {
+// fetchModels asks one endpoint what it serves.
+//
+// Attempt-then-fallback on the path, because hosted providers do not agree:
+// OpenAI and Anthropic answer <base>/v1/models, while Google's
+// OpenAI-compatible surface is <base>/models with the /v1beta/openai prefix
+// already in the base. Trying both is cheaper than making an operator encode
+// which flavour each endpoint is.
+//
+// Credentials are forwarded from the CALLER's request rather than configured
+// here. A hosted provider returns 401 to an unauthenticated listing, so without
+// this a hosted pool silently contributes nothing to the merged result — which
+// looks identical to it having no models.
+func (s *Server) fetchModels(ctx context.Context, base string, from *http.Request, t Target) (*modelsResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/models", nil)
-	if err != nil {
-		return nil, err
+
+	var lastErr error
+	for _, path := range []string{"/v1/models", "/models"} {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+		if err != nil {
+			return nil, err
+		}
+		if !t.StripAuth && from != nil {
+			for _, h := range []string{"Authorization", "X-Api-Key", "Anthropic-Version"} {
+				if v := from.Header.Get(h); v != "" {
+					req.Header.Set(h, v)
+				}
+			}
+			// Anthropic rejects a request without it, and no other provider
+			// minds an extra header.
+			if req.Header.Get("Anthropic-Version") == "" && req.Header.Get("X-Api-Key") != "" {
+				req.Header.Set("Anthropic-Version", "2023-06-01")
+			}
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("models %s%s: status %d", base, path, resp.StatusCode)
+			continue
+		}
+		var out modelsResponse
+		err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return &out, nil
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models: status %d", resp.StatusCode)
-	}
-	var out modelsResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return nil, lastErr
 }
 
 func orString(v, def string) string {

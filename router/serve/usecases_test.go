@@ -74,7 +74,10 @@ func post(t *testing.T, ts *httptest.Server, path, body string) (int, map[string
 // intervals rather than instant.
 func eventually(t *testing.T, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	// Generous: a poll that queries real hosted providers takes ~1s, so a short
+	// deadline fits only a couple of attempts and fails on latency rather than
+	// on the condition. Costs nothing when the condition holds early.
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return

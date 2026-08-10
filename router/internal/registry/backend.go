@@ -249,5 +249,11 @@ func Canonical(raw string) (string, error) {
 			port = "80"
 		}
 	}
-	return scheme + "://" + net.JoinHostPort(host, port), nil
+	// The PATH is part of the identity, not decoration. An endpoint can live
+	// behind a base path — Google's OpenAI-compatible surface is
+	// /v1beta/openai, and a vLLM behind an ingress prefix is the same shape —
+	// and dropping it silently rewrites the backend to a different service on
+	// the same host. Two paths on one host are two backends.
+	path := strings.TrimRight(u.EscapedPath(), "/")
+	return scheme + "://" + net.JoinHostPort(host, port) + path, nil
 }
