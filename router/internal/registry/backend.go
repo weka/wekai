@@ -257,3 +257,43 @@ func Canonical(raw string) (string, error) {
 	path := strings.TrimRight(u.EscapedPath(), "/")
 	return scheme + "://" + net.JoinHostPort(host, port) + path, nil
 }
+
+// ResolveURL builds the URL for a request the ROUTER makes to a backend on its
+// own behalf — a health probe, a metrics scrape, a model listing — from the
+// backend's configured URL and the path being asked for.
+//
+// It exists because Canonical preserves a backend's base path, and every caller
+// that then wrote backendURL+path got it wrong in one of two directions. A base
+// path is real for providers not hosted at the root (Google's OpenAI-compatible
+// surface is /v1beta/openai), and a redundant one is common because people
+// paste an OpenAI base_url ending in /v1. Plain concatenation turns the first
+// into a correct URL only by accident and the second into /v1/v1/models.
+//
+// The rule is the same one the proxy applies to client requests: a base path
+// REPLACES the version segment rather than stacking on it, because that is what
+// base_url means everywhere it appears.
+func ResolveURL(backendURL, path string) string {
+	u, err := url.Parse(backendURL)
+	if err != nil || u.Path == "" || u.Path == "/" {
+		// Nothing to reconcile: the overwhelmingly common case, and the one
+		// where concatenation was already right.
+		return strings.TrimRight(backendURL, "/") + path
+	}
+	base := strings.TrimRight(u.Path, "/")
+	u.Path = JoinBasePath(base, path)
+	u.RawPath = ""
+	return u.String()
+}
+
+// JoinBasePath composes a backend's base path with a request path. Exported so
+// the proxy applies the identical rule to client traffic; see ResolveURL.
+func JoinBasePath(base, path string) string {
+	base = strings.TrimRight(base, "/")
+	if base == "" {
+		return path
+	}
+	if rest, ok := strings.CutPrefix(path, "/v1/"); ok {
+		return base + "/" + rest
+	}
+	return base + path
+}

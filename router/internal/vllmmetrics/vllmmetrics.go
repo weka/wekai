@@ -27,6 +27,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"github.com/weka/wekai/router/internal/registry"
 	"io"
 	"net/http"
 	"sort"
@@ -182,7 +183,7 @@ func (a *Aggregator) ScrapeAll(ctx context.Context, endpoints []string) {
 }
 
 func (a *Aggregator) scrapeOne(ctx context.Context, endpoint string) (map[string]float64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/metrics", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, registry.ResolveURL(endpoint, "/metrics"), nil)
 	if err != nil {
 		return nil, err
 	}

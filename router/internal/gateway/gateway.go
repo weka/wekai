@@ -330,7 +330,7 @@ func (s *Server) fetchModels(ctx context.Context, base string, from *http.Reques
 
 	var lastErr error
 	for _, path := range []string{"/v1/models", "/models"} {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, registry.ResolveURL(base, path), nil)
 		if err != nil {
 			return nil, err
 		}

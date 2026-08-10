@@ -1,4 +1,4 @@
-package proxy
+package registry
 
 import "testing"
 
@@ -26,8 +26,43 @@ func TestJoinBase(t *testing.T) {
 			"/", "/v1/chat/completions", "/v1/chat/completions"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := joinBase(tc.base, tc.path); got != tc.want {
-				t.Errorf("joinBase(%q, %q) = %q, want %q", tc.base, tc.path, got, tc.want)
+			if got := JoinBasePath(tc.base, tc.path); got != tc.want {
+				t.Errorf("JoinBasePath(%q, %q) = %q, want %q", tc.base, tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// ResolveURL is what every probe the router makes on its own behalf now goes
+// through. Before, each site concatenated, which was right only for a backend
+// hosted at the root — and silently wrong in both directions otherwise.
+func TestResolveURL(t *testing.T) {
+	for _, tc := range []struct {
+		name, backend, path, want string
+	}{
+		{"root-hosted backend is plain concatenation",
+			"http://vllm:8000", "/health", "http://vllm:8000/health"},
+		{"a trailing slash does not double up",
+			"http://vllm:8000/", "/health", "http://vllm:8000/health"},
+		{"root-hosted model listing is unchanged",
+			"http://vllm:8000", "/v1/models", "http://vllm:8000/v1/models"},
+		{"the redundant /v1 no longer doubles the version segment",
+			"http://vllm:8000/v1", "/v1/models", "http://vllm:8000/v1/models"},
+		{"google's compat surface lists at <base>/models",
+			"https://generativelanguage.googleapis.com/v1beta/openai", "/v1/models",
+			"https://generativelanguage.googleapis.com/v1beta/openai/models"},
+		{"a versionless path is prefixed by the base",
+			"https://generativelanguage.googleapis.com/v1beta/openai", "/metrics",
+			"https://generativelanguage.googleapis.com/v1beta/openai/metrics"},
+		// Documented, not fixed: /v1 + /health has no correct join, because the
+		// suffix is a mistake rather than a base. The router warns about it at
+		// startup instead of guessing.
+		{"a redundant /v1 still misplaces the health probe",
+			"http://vllm:8000/v1", "/health", "http://vllm:8000/v1/health"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ResolveURL(tc.backend, tc.path); got != tc.want {
+				t.Errorf("ResolveURL(%q, %q) = %q, want %q", tc.backend, tc.path, got, tc.want)
 			}
 		})
 	}

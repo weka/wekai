@@ -23,6 +23,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/weka/wekai/router/internal/clock"
@@ -120,9 +121,13 @@ type Options struct {
 	// --- The routing flow, shared by every pool.
 	NodeConcurrency int64
 	RebalanceRatio  float64
-	SplitGuard      float64
-	TailTTL         time.Duration
-	RefusalTTL      time.Duration
+	// AutoModel controls asking a pool what it serves when a route carries no
+	// explicit `as <model>`: "auto" (rewrite only when the pool serves exactly
+	// one model), "force", or "off". Empty means "auto".
+	AutoModel  string
+	SplitGuard float64
+	TailTTL    time.Duration
+	RefusalTTL time.Duration
 
 	// --- Kubernetes discovery, applied to any route carrying a selector.
 	DiscoveryNamespace  string
@@ -279,6 +284,14 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 	registerDialectOnce.Do(func() { dialect.Register(d) })
 
 	clk := clock.Real{}
+	// "auto" is the default: it only rewrites when a pool serves exactly one
+	// model, which is the case where rewriting cannot send a request somewhere
+	// the operator did not intend.
+	autoMode := opts.AutoModel
+	if autoMode == "" {
+		autoMode = autoModelAuto
+	}
+
 	var rules []routing.Rule
 	var pools []*pool.Pool
 	// Endpoints discovery identified as vLLM instances, and so worth scraping.
@@ -298,7 +311,7 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			// classified a hosted API, marked passive, and never actively
 			// health-checked — serving fine until it dies, and then still
 			// serving as far as the router knows.
-			if strings.HasSuffix(strings.TrimRight(ep, "/"), "/v1") {
+			if isRedundantV1(ep) {
 				log.Warn("backend URL ends in /v1; the router appends the API path itself, "+
 					"so health, metrics and model discovery will all 404 against it. "+
 					"Drop the suffix.", "endpoint", ep)
@@ -351,14 +364,22 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 				return nil, fmt.Errorf("pool %q credential file %s is empty", name, rt.CredentialFile)
 			}
 		}
-		rules = append(rules, routing.Rule{
+		rule := routing.Rule{
 			Patterns:                routing.NormalizePatterns(rt.Patterns),
 			Pool:                    p,
 			RewriteModel:            rt.RewriteModel,
 			StripAuth:               rt.StripAuth,
 			Credential:              cred,
 			ForwardClientCredential: rt.ForwardClientCredential,
-		})
+		}
+		// Discovery only has something to add when the operator was not
+		// explicit. It runs in the background against the POOL, and only once a
+		// backend is healthy — see automodel.go for why both of those matter.
+		if rt.RewriteModel == "" && autoMode != autoModelOff {
+			rule.AutoModel = &atomic.Pointer[string]{}
+			go resolveAutoModel(ctx, autoMode, p.Name, p.Registry, rule.AutoModel, log)
+		}
+		rules = append(rules, rule)
 	}
 
 	tbl, err := routing.NewTable(rules)
@@ -507,6 +528,21 @@ func vizData(pools []*pool.Pool) http.HandlerFunc {
 	}
 }
 
+// isRedundantV1 reports whether a backend URL's path is exactly "/v1" — the
+// redundant suffix people write out of OpenAI base_url habit.
+//
+// Deliberately not "ends in /v1": a base path that ends in a version segment
+// after something else, like "/inference/v1", is a real sub-mounted API base
+// and composes correctly. Only a bare "/v1" is certainly a mistake, because the
+// router already appends the API path itself.
+func isRedundantV1(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return strings.TrimRight(u.Path, "/") == "/v1"
+}
+
 // probeIsVLLM asks an endpoint, ONCE, whether it looks like a vLLM-style
 // OpenAI backend: it answers GET /v1/models.
 //
@@ -582,13 +618,13 @@ func probeIsVLLM(ctx context.Context, endpoint string, log *slog.Logger) bool {
 	// which request schema it accepts would therefore get exactly that
 	// deployment wrong — it would be classed a hosted API and its metrics left
 	// unread. What identifies the engine is the engine's own metric names.
-	if body, ok := probeGet(ctx, endpoint+"/metrics", log); ok && strings.Contains(body, "vllm:") {
+	if body, ok := probeGet(ctx, registry.ResolveURL(endpoint, "/metrics"), log); ok && strings.Contains(body, "vllm:") {
 		return true
 	}
 	// Otherwise fall back to the OpenAI model listing. This is a weaker signal —
 	// plenty of things serve it — but it is enough to decide the only thing
 	// riding on this: whether active health probing can work.
-	_, ok := probeGet(ctx, endpoint+"/v1/models", log)
+	_, ok := probeGet(ctx, registry.ResolveURL(endpoint, "/v1/models"), log)
 	if !ok {
 		log.Info("endpoint looks like neither a vLLM instance nor an OpenAI model server; "+
 			"treating as passive", "endpoint", endpoint)

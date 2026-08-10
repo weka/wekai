@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -612,33 +611,7 @@ func (s *scanBody) observeUsage() {
 }
 
 // joinBase composes the upstream path from the backend's configured base path
-// and the client's request path.
-//
-// Almost every backend is configured as a bare host — vLLM, OpenAI and
-// Anthropic all serve their APIs at the root — and then the client's own path
-// is already the right one and nothing happens here.
-//
-// A base path exists for the providers that do NOT sit at the root. Google's
-// OpenAI-compatible surface is at /v1beta/openai/chat/completions, so the
-// prefix can only come from configuration; without it the request lands on
-// Google's native API instead, which is a different protocol.
-//
-// The base REPLACES the client's version segment rather than stacking on top of
-// it, because that is what the base_url convention means everywhere it appears:
-// an OpenAI base_url is ".../v1" and the caller appends "chat/completions". So
-// ".../v1beta/openai" + "/v1/chat/completions" is
-// ".../v1beta/openai/chat/completions", not ".../v1beta/openai/v1/...".
-//
-// A useful consequence: the redundant "http://vllm:8000/v1" that people write
-// out of base_url habit composes back to exactly the right URL instead of
-// doubling the segment.
-func joinBase(base, path string) string {
-	base = strings.TrimRight(base, "/")
-	if base == "" {
-		return path
-	}
-	if rest, ok := strings.CutPrefix(path, "/v1/"); ok {
-		return base + "/" + rest
-	}
-	return base + path
-}
+// and the client's request path. The rule lives in registry, next to the
+// Canonical that decided a backend URL keeps its path at all, so that client
+// traffic and the router's own probes cannot drift apart.
+func joinBase(base, path string) string { return registry.JoinBasePath(base, path) }

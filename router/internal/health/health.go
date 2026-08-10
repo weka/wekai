@@ -180,7 +180,7 @@ type result struct {
 func (c *Checker) probe(ctx context.Context, b *registry.Backend) bool {
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.URL+c.cfg.Path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, registry.ResolveURL(b.URL, c.cfg.Path), nil)
 	if err != nil {
 		return false
 	}
