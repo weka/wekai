@@ -19,6 +19,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -446,7 +447,56 @@ func vizData(pools []*pool.Pool) http.HandlerFunc {
 // served, its health inferred from real traffic instead of probes. A false
 // positive would mean probing /health on something that lacks it, which is why
 // the probe asks for the thing vLLM definitely serves rather than sniffing.
+// knownHostedProviders are APIs that are never a vLLM instance and never
+// expose a liveness path. They are recognised by host so the router does not
+// conclude "unreachable" from the two things it cannot do to them: read
+// vllm: metrics, and probe /health.
+//
+// Without this they still end up passive — the probe fails and the fallback is
+// correct — but at the cost of two requests over the internet per endpoint at
+// startup, and a log line that reads like a problem. Naming them makes the
+// intent explicit and the startup silent.
+//
+// A miss is harmless: an unlisted provider takes the probe path and lands in
+// the same place. This is an optimisation and a clarity measure, not a
+// correctness dependency, which is why it is a short list rather than an
+// exhaustive one.
+var knownHostedProviders = []string{
+	"api.anthropic.com",
+	"api.openai.com",
+	"generativelanguage.googleapis.com",
+	"api.mistral.ai",
+	"api.cohere.ai",
+	"api.groq.com",
+	"openrouter.ai",
+	"api.deepseek.com",
+	"api.x.ai",
+	"bedrock-runtime",   // AWS Bedrock, region-prefixed
+	"openai.azure.com",  // Azure OpenAI, tenant-prefixed
+}
+
+// IsKnownHostedProvider reports whether the endpoint is a hosted API we already
+// know cannot be probed.
+func IsKnownHostedProvider(endpoint string) bool {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	for _, known := range knownHostedProviders {
+		if host == known || strings.Contains(host, known) {
+			return true
+		}
+	}
+	return false
+}
+
 func probeIsVLLM(ctx context.Context, endpoint string, log *slog.Logger) bool {
+	if IsKnownHostedProvider(endpoint) {
+		log.Info("known hosted provider: passive health, no probe",
+			"endpoint", endpoint)
+		return false
+	}
 	// /metrics FIRST, because it is the question that actually matters and the
 	// only one whose answer is unambiguous.
 	//

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,4 +178,121 @@ func summarise(data []struct {
 		out += fmt.Sprintf("%s(%s) ", m.ID, m.Pool)
 	}
 	return out
+}
+
+// TestHostedPoolStaysUsableWithoutModelsOrHealth is the guarantee that matters
+// for a mixed deployment: the two things the router cannot do to a hosted API —
+// read vllm: metrics, and probe a liveness path — must not be read as "this
+// endpoint is down".
+//
+// It uses a stub rather than a real provider so it runs everywhere, and asserts
+// the whole chain: the pool is routable, it is counted for readiness, and a
+// failed model listing removes neither it nor anyone else from the merged
+// result.
+func TestHostedPoolStaysUsableWithoutModelsOrHealth(t *testing.T) {
+	local, _ := mockFleet(t, 1, mockvllm.SurfaceVLLM)
+
+	var served int
+	// A hosted API as the router meets it unauthenticated: 401 on the listing,
+	// 404 on anything operational, but perfectly able to serve a request the
+	// client authenticates itself.
+	hosted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models", "/models":
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/health", "/metrics":
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			served++
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"id":"msg_1","type":"message","content":[{"type":"text","text":"ok"}]}`)
+		}
+	}))
+	defer hosted.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h, err := serve.Handler(ctx, serve.Options{
+		Routes: []serve.Route{
+			{Patterns: "local", Endpoints: local, Name: "local"},
+			{Patterns: "*", Endpoints: []string{hosted.URL}, Name: "hosted"},
+		},
+		HealthInterval:  200 * time.Millisecond,
+		HealthUnhealthy: 20 * time.Millisecond,
+		HealthTimeout:   100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	rt := httptest.NewServer(h)
+	defer rt.Close()
+
+	// Routable despite failing every probe the router knows how to make.
+	resp, err := rt.Client().Post(rt.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"claude-x","max_tokens":4,"messages":[]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("hosted pool returned %d; an endpoint with no /health and no "+
+			"readable models is not therefore down", resp.StatusCode)
+	}
+	if served == 0 {
+		t.Error("the hosted endpoint never received the request")
+	}
+
+	// Readiness counts it.
+	rd, err := rt.Client().Get(rt.URL + "/readiness")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd.Body.Close()
+	if rd.StatusCode != http.StatusOK {
+		t.Errorf("/readiness = %d with a usable hosted pool", rd.StatusCode)
+	}
+
+	// And a pool whose listing 401s must not take the others down with it:
+	// merge what can be merged.
+	eventually(t, func() bool {
+		r, err := rt.Client().Get(rt.URL + "/v1/models")
+		if err != nil {
+			return false
+		}
+		defer r.Body.Close()
+		if r.StatusCode != http.StatusOK {
+			return false
+		}
+		var got struct {
+			Data []struct{ Pool string } `json:"data"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		for _, m := range got.Data {
+			if m.Pool == "local" {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// TestKnownHostedProvidersAreNotProbed: the well-known APIs are recognised by
+// host, so the router does not spend two internet round trips per endpoint at
+// startup discovering what it already knows.
+func TestKnownHostedProvidersAreNotProbed(t *testing.T) {
+	for _, ep := range []string{
+		"https://api.anthropic.com",
+		"https://api.openai.com/v1",
+		"https://generativelanguage.googleapis.com/v1beta/openai",
+		"https://my-tenant.openai.azure.com",
+	} {
+		if !serve.IsKnownHostedProvider(ep) {
+			t.Errorf("%s not recognised as a hosted provider", ep)
+		}
+	}
+	for _, ep := range []string{"http://vllm-a:8000", "http://127.0.0.1:9001"} {
+		if serve.IsKnownHostedProvider(ep) {
+			t.Errorf("%s wrongly treated as hosted; a local fleet must still be probed", ep)
+		}
+	}
 }
