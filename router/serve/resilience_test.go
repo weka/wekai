@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,11 +20,15 @@ import (
 // killable wraps a mock vLLM so a test can take it down and bring it back,
 // which is what a pod restart looks like to the router.
 type killable struct {
-	ts   *httptest.Server
-	down bool
+	ts *httptest.Server
+	// Atomic because the test goroutine flips these while the mock's HTTP
+	// handler goroutine reads them on every request — plain fields here are a
+	// real data race, and -race reports it as a failure of whatever test
+	// happens to be running.
+	down atomic.Bool
 	// hits counts requests that actually reached the engine, so a test can tell
 	// "routed elsewhere" from "routed here and failed".
-	hits int
+	hits atomic.Int64
 }
 
 func newKillable(t *testing.T, surface mockvllm.Surface) *killable {
@@ -34,14 +40,14 @@ func newKillable(t *testing.T, surface mockvllm.Surface) *killable {
 	inner.Surface = surface
 	k := &killable{}
 	k.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if k.down {
+		if k.down.Load() {
 			// A dead vLLM: connection refused is the honest shape, but a 503
 			// from an in-between proxy is just as common and is what a fatal
 			// upstream failure looks like to the router.
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		k.hits++
+		k.hits.Add(1)
 		inner.Handler().ServeHTTP(w, r)
 	}))
 	t.Cleanup(k.ts.Close)
@@ -88,8 +94,8 @@ func TestBackendDiesAndRecovers(t *testing.T) {
 	// Kill one. Requests must keep succeeding on the survivor: a fatal upstream
 	// failure has to take the backend out of rotation, not surface to the
 	// client.
-	a.down = true
-	a.hits = 0
+	a.down.Store(true)
+	a.hits.Store(0)
 	deadline := time.Now().Add(3 * time.Second)
 	ok := 0
 	for time.Now().Before(deadline) && ok < 10 {
@@ -104,13 +110,13 @@ func TestBackendDiesAndRecovers(t *testing.T) {
 	}
 
 	// Bring it back. It has to re-enter rotation on its own.
-	a.down = false
-	before := a.hits
+	a.down.Store(false)
+	before := a.hits.Load()
 	recovered := false
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		chat(t, rt)
-		if a.hits > before {
+		if a.hits.Load() > before {
 			recovered = true
 			break
 		}
@@ -203,8 +209,11 @@ func TestModelsMergesEveryPool(t *testing.T) {
 // endpoint is then taken for a hosted API and never actively health-checked,
 // which is a silent loss rather than a visible failure. It has to be loud.
 func TestBackendURLEndingInV1IsFlagged(t *testing.T) {
-	var logged strings.Builder
-	h := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	// Guarded: Handler starts background goroutines that log, and a bare
+	// strings.Builder written from two goroutines is a data race that surfaces
+	// as an unrelated test failing under -race.
+	logged := &syncBuf{}
+	h := slog.New(slog.NewTextHandler(logged, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -223,4 +232,22 @@ func TestBackendURLEndingInV1IsFlagged(t *testing.T) {
 		t.Errorf("no warning for a /v1 backend URL; the degradation is silent otherwise:\n%s",
 			logged.String())
 	}
+}
+
+// syncBuf is a concurrency-safe io.Writer for capturing log output.
+type syncBuf struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
