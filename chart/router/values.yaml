@@ -10,9 +10,15 @@ imageTag: ""  # defaults to .Chart.AppVersion
 imagePullSecrets: []
 nameOverride: ""
 
-replicaCount: 2
+# One by default. The router keeps its cache-affinity state in memory — which
+# backend holds which prefix — so replicas do not share a view of the fleet.
+# Two routers each decide on half the evidence and send the same prefix to
+# different backends, duplicating it across the fleet and undoing the affinity
+# the router exists to provide. Scale up when a single router is genuinely the
+# throughput bottleneck, knowing that is the trade.
+replicaCount: 1
 
-# Router CLI flags (see `wekai-benchmark router serve --help`).
+# Router CLI flags (see `wekai router serve --help`).
 router:
   # Grace period after SIGTERM: readiness flips to 503 so k8s stops routing new
   # traffic, in-flight requests are allowed to finish, then force shutdown.

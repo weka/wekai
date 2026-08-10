@@ -1,8 +1,10 @@
 # wekai-router
 
 Helm chart that deploys `wekai router serve` — the model-aware HTTP reverse
-proxy for LLM traffic. Shares the `wekai-benchmark` container image and build
-pipeline: the benchmark binary embeds the `router` subcommand.
+proxy for LLM traffic. Uses the replay-less `wekai-router` image: the same
+binary as `wekai`, built without the embedded replay corpora, which keeps a
+router pull small. `chart_test.go` guards that — pointing this chart back at the
+benchmark image adds gigabytes to every pull.
 
 ## Quick install
 
@@ -55,7 +57,7 @@ helm upgrade --install wekai-router ./chart/router \
 ```
 
 Captures land in `/data/router/capture/<mode>/` on the PVC and survive pod
-restarts. Pair with `wekai-benchmark router analyze` for offline analytics.
+restarts. Pair with `wekai router analyze` for offline analytics.
 
 ## Values
 
@@ -63,8 +65,9 @@ Key values (see `values.yaml` for the full list):
 
 | Key | Default | Purpose |
 |---|---|---|
-| `imageRepository` | `quay.io/weka.io/wekai-benchmark` | Image holding the router-capable binary |
+| `imageRepository` | `quay.io/weka.io/wekai-router` | Replay-less router image |
 | `imageTag` | `""` (falls back to `.Chart.AppVersion`) | Pin to a specific build |
+| `replicaCount` | `1` | Cache-affinity state is per-pod and unshared; see `values.yaml` before scaling |
 | `service.targetPort` | `25201` | Container listen port (`--listen`) |
 | `router.routes` | `[]` | Repeated `--route` flags |
 | `router.default` | `""` | Catch-all `--default` flag |
