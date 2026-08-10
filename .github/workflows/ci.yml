@@ -56,7 +56,7 @@ jobs:
 
   # The router's JSON scanner parses untrusted request bodies, and its seed corpus
   # already found a remote DoS: a 15-byte body looped forever with unbounded
-  # allocation. The seeds under testdata/fuzz run as ordinary tests in `make
+  # allocation. The seeds under testdata/fuzz run as ordinary tests in `task
   # verify`; this job spends real cycles looking for the next one. Scheduled rather
   # than per-PR because it is time-boxed exploration, not a correctness gate.
   fuzz:
