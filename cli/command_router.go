@@ -65,26 +65,25 @@ type RouterServeCommand struct {
 	RefusalTTL     time.Duration `long:"cache-refusal-ttl" default:"2s" description:"How long a backend's own 429 keeps it out of its prefixes. Cleared early by any success from it, and by its in-flight dropping below the level it refused at."`
 
 	// --- Listener behaviour.
-	APIKeyFile         string        `long:"api-key-file" description:"Read the inbound API key from this file. PREFER this to --api-key: a key given as a flag is visible in a process listing and in the pod spec that launched it."`
-	APIKey             string        `long:"api-key" description:"Require this key on inference and admin requests. Empty leaves the listener unauthenticated, which is logged loudly at startup."`
-	CORSOrigins        []string      `long:"cors-origins" description:"Origins permitted to call the inference listener. '*' cannot be combined with --api-key."`
-	PathAllowlist      []string      `long:"path-allowlist" description:"Restrict which upstream paths may be proxied. Empty allows every path."`
-	MaxBodyBytes       int64         `long:"max-body-bytes" default:"67108864" description:"Maximum request body. Bodies are buffered whole so a retry can replay them, so this is the real per-request memory bound."`
-	MaxConcurrent      int           `long:"max-concurrent-requests" default:"256" description:"Router-wide in-flight cap protecting the router's own memory; sheds 503 router_at_capacity. Distinct from per-backend capacity, which sheds 429. 0 disables."`
-	MaxAttempts        int           `long:"max-attempts" default:"2" description:"Upstream attempts including the first, after a FAILURE. A 429 does not spend this budget: refusals draw on their own, bounded by the number of endpoints."`
-	RequestTimeout     time.Duration `long:"request-timeout" default:"600s" description:"Overall upstream request deadline."`
-	IdleTimeout        time.Duration `long:"idle-timeout" default:"300s" description:"Abort a stream that has produced nothing for this long."`
-	UpstreamCred       string        `long:"upstream-credential" description:"Credential presented to upstreams, replacing the client's."`
-	HealthInterval     time.Duration `long:"health-interval" default:"15s" description:"How often a HEALTHY backend is re-probed. Can be slow: a healthy backend that breaks is caught by real traffic failing, since an upstream 5xx trips its circuit and removes it from selection."`
-	DiscoverKubeconfig string        `long:"discover-kubeconfig" description:"Kubeconfig path for out-of-cluster discovery. In-cluster credentials are used when empty."`
-	HealthUnhealthy    time.Duration `long:"health-unhealthy-interval" default:"1s" description:"How often a backend that is NOT healthy is re-probed. Much shorter on purpose: a recovered backend stays out of rotation for this long, and every request that could have used its warm cache goes somewhere colder."`
-	HealthTimeout      time.Duration `long:"health-timeout" default:"5s" description:"Health probe timeout. Must be below the interval, or probes fall behind forever."`
-	HealthPath         string        `long:"health-path" default:"/health" description:"Path probed on each backend."`
-	VLLMMetrics        bool          `long:"vllm-metrics" description:"Aggregate upstream vLLM counters into router-level totals served on --metrics-listen. Only endpoints discovered to be vLLM are scraped. Totals accumulate DELTAS, so they never go backwards when a pod restarts or the fleet scales down — a decreasing counter silently breaks rate() and increase()."`
-	VLLMMetricsEvery   time.Duration `long:"vllm-metrics-interval" default:"30s" description:"How often each discovered vLLM endpoint is scraped."`
-	VLLMMetricsNames   []string      `long:"vllm-metrics-name" description:"Upstream counter to aggregate; repeatable. Default: vllm:prompt_tokens_by_source_total. Re-exporting every series would multiply cardinality by the fleet size."`
-	LogLevel           string        `long:"log-level" default:"info" description:"debug, info, warn or error."`
-	LogFormat          string        `long:"log-format" choice:"json" choice:"text" default:"json" description:"Log output format."`
+	APIKeyFile       string        `long:"api-key-file" description:"Read the inbound API key from this file. PREFER this to --api-key: a key given as a flag is visible in a process listing and in the pod spec that launched it."`
+	APIKey           string        `long:"api-key" description:"Require this key on inference and admin requests. Empty leaves the listener unauthenticated, which is logged loudly at startup."`
+	CORSOrigins      []string      `long:"cors-origins" description:"Origins permitted to call the inference listener. '*' cannot be combined with --api-key."`
+	PathAllowlist    []string      `long:"path-allowlist" description:"Restrict which upstream paths may be proxied. Empty allows every path."`
+	MaxBodyBytes     int64         `long:"max-body-bytes" default:"67108864" description:"Maximum request body. Bodies are buffered whole so a retry can replay them, so this is the real per-request memory bound."`
+	MaxConcurrent    int           `long:"max-concurrent-requests" default:"256" description:"Router-wide in-flight cap protecting the router's own memory; sheds 503 router_at_capacity. Distinct from per-backend capacity, which sheds 429. 0 disables."`
+	MaxAttempts      int           `long:"max-attempts" default:"2" description:"Upstream attempts including the first, after a FAILURE. A 429 does not spend this budget: refusals draw on their own, bounded by the number of endpoints."`
+	RequestTimeout   time.Duration `long:"request-timeout" default:"600s" description:"Overall upstream request deadline."`
+	IdleTimeout      time.Duration `long:"idle-timeout" default:"300s" description:"Abort a stream that has produced nothing for this long."`
+	UpstreamCred     string        `long:"upstream-credential" description:"Credential presented to upstreams, replacing the client's."`
+	HealthInterval   time.Duration `long:"health-interval" default:"15s" description:"How often a HEALTHY backend is re-probed. Can be slow: a healthy backend that breaks is caught by real traffic failing, since an upstream 5xx trips its circuit and removes it from selection."`
+	HealthUnhealthy  time.Duration `long:"health-unhealthy-interval" default:"1s" description:"How often a backend that is NOT healthy is re-probed. Much shorter on purpose: a recovered backend stays out of rotation for this long, and every request that could have used its warm cache goes somewhere colder."`
+	HealthTimeout    time.Duration `long:"health-timeout" default:"5s" description:"Health probe timeout. Must be below the interval, or probes fall behind forever."`
+	HealthPath       string        `long:"health-path" default:"/health" description:"Path probed on each backend."`
+	VLLMMetrics      bool          `long:"vllm-metrics" description:"Aggregate upstream vLLM counters into router-level totals served on --metrics-listen. Only endpoints discovered to be vLLM are scraped. Totals accumulate DELTAS, so they never go backwards when a pod restarts or the fleet scales down — a decreasing counter silently breaks rate() and increase()."`
+	VLLMMetricsEvery time.Duration `long:"vllm-metrics-interval" default:"30s" description:"How often each discovered vLLM endpoint is scraped."`
+	VLLMMetricsNames []string      `long:"vllm-metrics-name" description:"Upstream counter to aggregate; repeatable. Default: vllm:prompt_tokens_by_source_total. Re-exporting every series would multiply cardinality by the fleet size."`
+	LogLevel         string        `long:"log-level" default:"info" description:"debug, info, warn or error."`
+	LogFormat        string        `long:"log-format" choice:"json" choice:"text" default:"json" description:"Log output format."`
 }
 
 type routeRule struct {
@@ -230,7 +229,6 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		SplitGuard:            c.SplitGuard,
 		TailTTL:               c.TailTTL,
 		RefusalTTL:            c.RefusalTTL,
-		DiscoveryKubeconfig:   c.DiscoverKubeconfig,
 		HealthInterval:        c.HealthInterval,
 		HealthUnhealthy:       c.HealthUnhealthy,
 		HealthTimeout:         c.HealthTimeout,

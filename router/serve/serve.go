@@ -140,7 +140,6 @@ type Options struct {
 	RefusalTTL time.Duration
 
 	// --- Kubernetes discovery, applied to any route carrying a selector.
-	DiscoveryKubeconfig string
 
 	// --- Health probing.
 	// HealthInterval is how often a HEALTHY backend is re-probed;
@@ -668,7 +667,12 @@ func probeGet(ctx context.Context, url string, log *slog.Logger) (string, bool) 
 // decides eligibility (SD-4), so a discovered pod is not routed to until it
 // passes the same checks a statically configured one does.
 func startPodDiscovery(ctx context.Context, opts Options, rt Route, p *pool.Pool, log *slog.Logger) error {
-	client, err := k8sdisc.NewInClusterOrKubeconfig(opts.DiscoveryKubeconfig)
+	// In-cluster only. There was a --discover-kubeconfig for running the router
+	// outside a cluster, and once the namespace became "whatever namespace this
+	// pod is in" that flag could not work: out of a pod there is no service
+	// account file to read it from, so discovery failed before it started. A
+	// flag that cannot do what it says is worse than no flag.
+	client, err := k8sdisc.NewInClusterOrKubeconfig("")
 	if err != nil {
 		return err
 	}

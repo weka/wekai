@@ -39,37 +39,38 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-app.endpointToken renders one endpoint, from either accepted form.
+app.endpointToken renders ONE endpoint. There is exactly one endpoint grammar,
+used everywhere an endpoint can appear — `backends` and a route's `endpoints`
+are the same list of the same things.
 
-A string is passed through as written. A map is the Kubernetes-native form,
-which exists because --set splits values on commas: a label selector is
-comma-separated, so the string form arrives truncated at its first label —
-silently, rendering fine and failing at runtime.
+A URL is a string. A pod selector is a map, and it has to be a map because
+--set splits values on commas: a label selector is comma-separated, so the
+string form arrives truncated at its first label — silently, rendering fine and
+failing at runtime.
 
-  {pods: {app: vllm, tier: prod}, port: http}   ->  pods:app=vllm,tier=prod:http
-  {url: http://vllm-a:8000}                     ->  http://vllm-a:8000
+  http://vllm-a:8000                           ->  unchanged
+  {pods: {app: vllm, tier: prod}, port: http}  ->  pods:app=vllm,tier=prod:http
 
-Map keys render in sorted order, so the flag is stable across renders; selector
-order is insignificant to Kubernetes either way.
+Map keys render sorted, so the flag is stable across renders; selector order is
+insignificant to Kubernetes either way.
 */}}
 {{- define "app.endpointToken" -}}
 {{- if kindIs "string" . -}}
 {{ . }}
-{{- else if .url -}}
-{{ .url }}
 {{- else if .pods -}}
 {{- $sel := list -}}
 {{- range $k, $v := .pods }}{{ $sel = append $sel (printf "%s=%s" $k (toString $v)) }}{{ end -}}
 {{- $tok := printf "pods:%s" (join "," $sel) -}}
 {{- if .port }}{{ $tok = printf "%s:%v" $tok .port }}{{ end -}}
 {{ $tok }}
+{{- else -}}
+{{ fail "router: an endpoint is a URL string or a map with `pods:` — got neither" }}
 {{- end -}}
 {{- end -}}
 
 {{/*
-app.endpointList renders a pipe-separated endpoint list from a mixed sequence of
-strings and maps, which is what lets static and discovered endpoints share one
-pool — the shape of a migration.
+app.endpointList renders a pipe-separated endpoint list. Mixing a URL and a
+selector in one list is what a migration looks like.
 */}}
 {{- define "app.endpointList" -}}
 {{- $out := list -}}

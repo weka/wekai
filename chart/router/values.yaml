@@ -25,53 +25,47 @@ router:
   # `terminationGracePeriodSeconds` (below) must exceed this.
   drainTimeout: 5m
 
-  # Routing rules, first match wins. Two accepted forms.
+  # An ENDPOINT is a URL string or a pod selector map. One grammar, used
+  # everywhere an endpoint appears — in `backends` and in a route's
+  # `endpoints`, which are the same list of the same things:
   #
-  # As a string, exactly as the CLI takes it:
+  #   http://vllm-a:8000                    a URL
+  #   {pods: {app: vllm}, port: http}       every matching pod in THIS namespace,
+  #                                         each on its containerPort named http
+  #   {pods: {app: vllm}, port: 8000}       ... or 8000 for a pod declaring none
+  #
+  # The selector is a map because --set splits values on commas: a label
+  # selector is comma-separated, so the string "pods:app=vllm,tier=prod"
+  # arrives truncated at its first label — silently, rendering fine and failing
+  # at runtime. In a values file the string form is fine too.
+  #
+  # Discovery searches the router's own namespace only; see `discovery` below.
+  #
+  # Routing rules, first match wins. As a string, exactly as the CLI takes it:
   #   - "fast,small => http://a:8000|http://b:8000"
   #   - "sonnet => http://a:8000 as Qwen/Qwen3-32B"
   #
-  # Or structured, which is what to use with --set: helm's --set splits values
-  # on commas, so a multi-pattern route given as a string is truncated at its
-  # first pattern — silently, rendering fine and failing at runtime. As lists
-  # there is no comma inside any single value.
+  # Or structured, which is what --set needs, since a multi-pattern route
+  # written as one string is truncated at its first pattern the same way:
   #   - patterns: [fast, small]
   #     endpoints: [http://a:8000, http://b:8000]
   #     as: Qwen/Qwen3-32B            # optional model rewrite
-  #
-  # Endpoints discovered from pod labels, in the router's own namespace. Given
-  # as a MAP for the same reason: a label selector is comma-separated, and
-  # --set would split it and keep only the first label.
   #   - patterns: ["*"]
-  #     pods: {app: vllm, tier: prod}
-  #     port: http                    # containerPort name, or a number for a
-  #                                   # pod that declares none of its own
-  #
-  # Discovered and static endpoints mix in one route, which is what a migration
-  # looks like: give both `endpoints` and `pods`.
+  #     endpoints:
+  #       - pods: {app: vllm}
+  #         port: http
   routes: []
 
   # Endpoints for the implicit catch-all pool — shorthand for a single
-  # "* => a|b|c" route. Use this for the simplest deployment: one vLLM fleet,
-  # every model routed to it, no patterns and no rules. Ignored if `routes`
-  # covers everything you need.
-  #
-  # Each entry is a URL string, or a map — the same two forms `routes` accepts:
+  # "* => a|b|c" route. The simplest deployment: one fleet, every model routed
+  # to it, no patterns and no rules. Takes the endpoint grammar above.
   #
   #   backends:
-  #     - http://vllm-a:8000              # a URL
-  #     - url: http://vllm-b:8000         # the same, as a map
-  #     - pods: {app: vllm, tier: prod}   # every matching pod in this namespace
-  #       port: http                      # each pod's containerPort named "http"
+  #     - http://vllm-a:8000
+  #     - pods: {app: vllm}
+  #       port: http
   #
-  # Use the map form with --set: a label selector is comma-separated and --set
-  # splits on commas, so the string "pods:app=vllm,tier=prod" arrives truncated
-  # at its first label — silently, rendering fine and failing at runtime.
-  #
-  #   --set-string router.backends[0].pods.app=vllm
-  #   --set-string router.backends[0].port=http
-  #
-  # Mixing a URL and a selector in this list is what a migration looks like.
+  # Mixing a URL and a selector is what a migration looks like.
   backends: []
 
   # Address for /metrics and the live KV map at /router-viz. Must not be

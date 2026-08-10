@@ -312,14 +312,14 @@ func TestRouterChartDiscoveryTravelsInTheRoute(t *testing.T) {
 	// form silently arrives truncated at its first label.
 	out := renderRouter(t,
 		"--set-string", "router.routes[0].patterns[0]=fast",
-		"--set-string", "router.routes[0].pods.app=vllm",
-		"--set-string", "router.routes[0].pods.tier=prod",
-		"--set-string", "router.routes[0].port=http",
+		"--set-string", "router.routes[0].endpoints[0].pods.app=vllm",
+		"--set-string", "router.routes[0].endpoints[0].pods.tier=prod",
+		"--set-string", "router.routes[0].endpoints[0].port=http",
 		// A migration: static and discovered endpoints in one pool.
 		"--set-string", "router.routes[1].patterns[0]=slow",
 		"--set-string", "router.routes[1].endpoints[0]=http://legacy:8000",
-		"--set-string", "router.routes[1].pods.app=vllm-cpu",
-		"--set-string", "router.routes[1].port=9000")
+		"--set-string", "router.routes[1].endpoints[1].pods.app=vllm-cpu",
+		"--set-string", "router.routes[1].endpoints[1].port=9000")
 	for _, want := range []string{
 		`- "--route=fast => pods:app=vllm,tier=prod:http"`,
 		`- "--route=slow => http://legacy:8000|pods:app=vllm-cpu:9000"`,
@@ -450,7 +450,7 @@ func TestRouterChartBackendsAcceptBothEndpointForms(t *testing.T) {
 		}, `- "--backends=pods:app=vllm,tier=prod:http"`},
 
 		{"a URL and a selector in one pool, which is a migration", []string{
-			"--set-string", "router.backends[0].url=http://legacy:8000",
+			"--set-string", "router.backends[0]=http://legacy:8000",
 			"--set-string", "router.backends[1].pods.app=vllm",
 		}, `- "--backends=http://legacy:8000|pods:app=vllm"`},
 	} {
@@ -472,5 +472,34 @@ func TestRouterChartSelectorStringSurvivesAValuesFile(t *testing.T) {
 	// when it arrives whole.
 	if !strings.Contains(out, `--backends=pods:app=vllm`) {
 		t.Errorf("string endpoint form not passed through:\n%s", out)
+	}
+}
+
+// One endpoint grammar, used in both places it can appear. Two ways to say one
+// thing is bad; two ways that LOOK alike and are subtly different is worse — a
+// selector was a list item in `backends` but a sibling of `endpoints` in a
+// route, so the same concept lived at two nesting levels.
+func TestRouterChartHasOneEndpointGrammar(t *testing.T) {
+	backends := renderRouter(t,
+		"--set-string", "router.backends[0].pods.app=vllm",
+		"--set-string", "router.backends[0].port=http")
+	routes := renderRouter(t,
+		"--set-string", "router.routes[0].patterns[0]=*",
+		"--set-string", "router.routes[0].endpoints[0].pods.app=vllm",
+		"--set-string", "router.routes[0].endpoints[0].port=http")
+
+	const want = "pods:app=vllm:http"
+	if !strings.Contains(backends, want) || !strings.Contains(routes, want) {
+		t.Errorf("the same endpoint must render identically in both lists\nbackends:\n%s\nroutes:\n%s",
+			backends, routes)
+	}
+	// A route-level `pods:` was the second, differently-shaped way in. It must
+	// not quietly work, or both shapes survive and drift.
+	stray := renderRouter(t,
+		"--set-string", "router.routes[0].patterns[0]=*",
+		"--set-string", "router.routes[0].endpoints[0]=http://a:8000",
+		"--set-string", "router.routes[0].pods.app=vllm")
+	if strings.Contains(stray, "pods:app=vllm") {
+		t.Errorf("a route-level pods: still renders; endpoints belong in `endpoints`:\n%s", stray)
 	}
 }

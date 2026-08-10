@@ -1,6 +1,10 @@
 package cli
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
 
 // The pods: token carries everything about the pool it describes, so a router
 // fronting two fleets on different ports can say so. It used to need a global
@@ -82,5 +86,29 @@ func TestBackendsShorthandBuildsADiscoveryRoute(t *testing.T) {
 	}
 	if len(r.patterns) != 0 {
 		t.Errorf("--backends must produce the catch-all rule, got patterns %v", r.patterns)
+	}
+}
+
+// Discovery is configured entirely by the route, and this is the guard that it
+// stays that way. Every knob it used to take as a flag is gone: the port and
+// selector moved into the pods: token, the namespace became "this pod's"
+// unconditionally, and the kubeconfig went with it — out of a pod there is no
+// service account file to read a namespace from, so that flag could not do what
+// it said.
+func TestNoStandaloneDiscoveryFlags(t *testing.T) {
+	src, err := os.ReadFile("command_router.go")
+	if err != nil {
+		t.Fatalf("read command_router.go: %v", err)
+	}
+	for _, gone := range []string{
+		`long:"discover-namespace"`,
+		`long:"discover-port"`,
+		`long:"discover-port-name"`,
+		`long:"discover-kubeconfig"`,
+	} {
+		if strings.Contains(string(src), gone) {
+			t.Errorf("%s is back; discovery config belongs in the route token, or it "+
+				"cannot describe a router fronting two fleets on different ports", gone)
+		}
 	}
 }

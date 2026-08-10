@@ -37,8 +37,8 @@ served, health inferred from real traffic rather than from probes it would alway
 fail. The probe never repeats. Because it keys on metric names rather than wire
 format, **a vLLM fronted with an Anthropic API is still recognised as vLLM**.
 
-**An endpoint is a URL or a pod selector.** Anywhere a backend can be named,
-either form works, and they mix in one pool:
+**An endpoint is a URL or a pod selector.** One grammar, used everywhere an
+endpoint can appear, and the two forms mix in one pool:
 
 ```
 http://vllm-a:8000              a URL
@@ -136,8 +136,9 @@ helm upgrade --install my-router \
   --set router.signals.maxNodeConcurrency=32
 ```
 
-The same pool from pod labels — still no patterns, still just `backends`. Each
-entry is a URL string or a map, and the map is the Kubernetes-native form:
+The same pool from pod labels — still no patterns, still just `backends`. An
+endpoint is a URL string or a selector map, and that is the same grammar a
+route's `endpoints` takes:
 
 ```yaml
 router:
@@ -163,7 +164,7 @@ list, which is what a migration looks like:
 ```yaml
 router:
   backends:
-    - url: http://legacy-vllm:8000
+    - http://legacy-vllm:8000
     - pods: {app: vllm}
       port: http
 ```
@@ -313,11 +314,13 @@ model patterns and label selectors are comma-separated:
 router:
   routes:
     - patterns: [fast, small]
-      pods: {app: vllm, size: 7b}
-      port: http
+      endpoints:
+        - pods: {app: vllm, size: 7b}
+          port: http
     - patterns: [sonnet]
-      pods: {app: vllm, size: 70b}
-      port: http
+      endpoints:
+        - pods: {app: vllm, size: 70b}
+          port: http
       as: Qwen/Qwen3-32B
   default: "https://api.anthropic.com"
   stripAuthWhen: ["fast,small,sonnet"]

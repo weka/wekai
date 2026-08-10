@@ -59,9 +59,7 @@ spec:
                    written as one string is truncated at its first model
                    pattern — silently, rendering fine and failing at runtime.
                    As lists there is no comma inside any single --set value. */}}
-            {{- $eps := .endpoints | default list }}
-            {{- if .pods }}{{ $eps = append $eps (dict "pods" .pods "port" .port) }}{{ end }}
-            - "--route={{ join "," .patterns }} => {{ include "app.endpointList" $eps }}{{ if .as }} as {{ .as }}{{ end }}{{ if .using }} using {{ .using }}{{ end }}"
+            - "--route={{ join "," .patterns }} => {{ include "app.endpointList" .endpoints }}{{ if .as }} as {{ .as }}{{ end }}{{ if .using }} using {{ .using }}{{ end }}"
             {{- end }}
             {{- end }}
             {{- if .Values.router.default }}
