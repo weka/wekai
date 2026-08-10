@@ -64,6 +64,7 @@ type RouterServeCommand struct {
 	RefusalTTL     time.Duration `long:"cache-refusal-ttl" default:"2s" description:"How long a backend's own 429 keeps it out of its prefixes. Cleared early by any success from it, and by its in-flight dropping below the level it refused at."`
 
 	// --- Listener behaviour.
+	APIKeyFile         string        `long:"api-key-file" description:"Read the inbound API key from this file. PREFER this to --api-key: a key given as a flag is visible in a process listing and in the pod spec that launched it."`
 	APIKey             string        `long:"api-key" description:"Require this key on inference and admin requests. Empty leaves the listener unauthenticated, which is logged loudly at startup."`
 	CORSOrigins        []string      `long:"cors-origins" description:"Origins permitted to call the inference listener. '*' cannot be combined with --api-key."`
 	PathAllowlist      []string      `long:"path-allowlist" description:"Restrict which upstream paths may be proxied. Empty allows every path."`
@@ -99,7 +100,12 @@ type routeRule struct {
 	// written as an endpoint of the form pods:<selector>.
 	discoverSelector string
 	rewriteModel     string
-	stripAuth        bool
+	// credentialFile holds the router's own key for this pool, from
+	// "<upstream> using <file>".
+	credentialFile string
+	// forwardClient passes the caller's own credential upstream ("using client").
+	forwardClient bool
+	stripAuth     bool
 	// passive skips active health probing, for an upstream with no /health —
 	// a hosted API. Its health is inferred from proxied request outcomes.
 	passive bool
@@ -193,12 +199,14 @@ func (c *RouterServeCommand) Execute(args []string) error {
 			pat = strings.Join(r.patterns, ",")
 		}
 		routes = append(routes, serve.Route{
-			Patterns:          pat,
-			Endpoints:         r.endpoints,
-			DiscoverySelector: r.discoverSelector,
-			RewriteModel:      r.effectiveRewrite(),
-			StripAuth:         r.stripAuth,
-			Passive:           c.Passive,
+			Patterns:                pat,
+			Endpoints:               r.endpoints,
+			DiscoverySelector:       r.discoverSelector,
+			CredentialFile:          r.credentialFile,
+			ForwardClientCredential: r.forwardClient,
+			RewriteModel:            r.effectiveRewrite(),
+			StripAuth:               r.stripAuth,
+			Passive:                 c.Passive,
 		})
 	}
 
@@ -210,6 +218,7 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		MetricsListen:         c.MetricsListen,
 		Routes:                routes,
 		APIKey:                c.APIKey,
+		APIKeyFile:            c.APIKeyFile,
 		CORSOrigins:           c.CORSOrigins,
 		PathAllowlist:         c.PathAllowlist,
 		MaxBodyBytes:          c.MaxBodyBytes,
@@ -322,7 +331,13 @@ func parseRoute(spec string) (*routeRule, error) {
 		return nil, fmt.Errorf("empty pattern or upstream")
 	}
 
-	upstreams, rewrite := splitAsModel(rhs)
+	upstreams, credRef := splitUsing(rhs)
+	forwardClient := strings.EqualFold(credRef, "client")
+	credFile := credRef
+	if forwardClient {
+		credFile = ""
+	}
+	upstreams, rewrite := splitAsModel(upstreams)
 	var endpoints []string
 	var selector string
 	for _, raw := range strings.Split(upstreams, "|") {
@@ -356,7 +371,27 @@ func parseRoute(spec string) (*routeRule, error) {
 		patterns = normalizePatternList([]string{lhs})
 	}
 	return &routeRule{patterns: patterns, endpoints: endpoints,
-		discoverSelector: selector, rewriteModel: rewrite}, nil
+		discoverSelector: selector, rewriteModel: rewrite,
+		credentialFile: credFile, forwardClient: forwardClient}, nil
+}
+
+// splitUsing separates "<upstream> using <ref>", how this pool authenticates.
+//
+//	using /path/to/secret   the ROUTER's own key, read from a mounted file — a
+//	                        path rather than a value so the secret never appears
+//	                        in a process listing or a pod spec
+//	using client            forward the CALLER's credential, which a hosted API
+//	                        the user pays for requires
+//
+// Neither means send no credential at all, which is the safe default: a user's
+// key reaching an internal backend has to take saying so out loud.
+func splitUsing(s string) (rest, credFile string) {
+	lower := strings.ToLower(s)
+	idx := strings.LastIndex(lower, " using ")
+	if idx < 0 {
+		return strings.TrimSpace(s), ""
+	}
+	return strings.TrimSpace(s[:idx]), strings.TrimSpace(s[idx+7:])
 }
 
 // splitAsModel separates "<upstream> as <model>" (case-insensitive " as ").

@@ -62,6 +62,21 @@ type Route struct {
 	// or "default" for the catch-all.
 	Name string
 
+	// CredentialFile holds a secret this pool authenticates to its upstreams
+	// with, replacing whatever the caller sent.
+	//
+	// This is what lets one router front both a hosted API the CALLER pays for
+	// and an internal fleet the ROUTER holds the key to: the hosted route
+	// forwards the user's credential, the internal route substitutes its own.
+	// A file rather than a value so the secret never appears in a process
+	// listing or a pod spec.
+	CredentialFile string
+
+	// ForwardClientCredential passes the caller's own credential to this pool's
+	// upstreams. A hosted API the user pays for needs it; an internal fleet
+	// must never receive it, which is why it is opt-in.
+	ForwardClientCredential bool
+
 	// DiscoverySelector, when set, populates this pool from Kubernetes pods
 	// matching a label selector instead of (or alongside) a static endpoint
 	// list. Each pod contributes its OWN declared port, which is what a Service
@@ -91,7 +106,11 @@ type Options struct {
 	Routes []Route
 
 	// --- Listener behaviour.
-	APIKey                string
+	APIKey string
+	// APIKeyFile is read at startup and takes precedence over APIKey. Prefer it:
+	// a key passed as a flag is visible in a process listing and in the pod
+	// spec that launched it.
+	APIKeyFile            string
 	RequireAuthForProbes  bool
 	CORSOrigins           []string
 	PathAllowlist         []string
@@ -238,6 +257,16 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		return nil, errors.New("router: no routes configured; give --route or --backends")
 	}
 	opts = opts.withDefaults()
+	if opts.APIKeyFile != "" {
+		b, err := os.ReadFile(opts.APIKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("api key file: %w", err)
+		}
+		opts.APIKey = strings.TrimSpace(string(b))
+		if opts.APIKey == "" {
+			return nil, fmt.Errorf("api key file %s is empty", opts.APIKeyFile)
+		}
+	}
 
 	// One dialect, registered at the wiring layer rather than as a package side
 	// effect, so what is compiled in is explicit (API-3).
@@ -297,11 +326,26 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			}
 		}
 		pools = append(pools, p)
+		cred := ""
+		if rt.CredentialFile != "" {
+			b, err := os.ReadFile(rt.CredentialFile)
+			if err != nil {
+				return nil, fmt.Errorf("pool %q credential: %w", name, err)
+			}
+			// Trimmed: a secret written by kubectl or an editor usually ends in
+			// a newline, and sending that in a header is a confusing 401.
+			cred = strings.TrimSpace(string(b))
+			if cred == "" {
+				return nil, fmt.Errorf("pool %q credential file %s is empty", name, rt.CredentialFile)
+			}
+		}
 		rules = append(rules, routing.Rule{
-			Patterns:     routing.NormalizePatterns(rt.Patterns),
-			Pool:         p,
-			RewriteModel: rt.RewriteModel,
-			StripAuth:    rt.StripAuth,
+			Patterns:                routing.NormalizePatterns(rt.Patterns),
+			Pool:                    p,
+			RewriteModel:            rt.RewriteModel,
+			StripAuth:               rt.StripAuth,
+			Credential:              cred,
+			ForwardClientCredential: rt.ForwardClientCredential,
 		})
 	}
 

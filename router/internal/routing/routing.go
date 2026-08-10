@@ -31,6 +31,11 @@ type Rule struct {
 	// StripAuth drops inbound credentials, for an upstream that is
 	// unauthenticated and would otherwise receive someone else's key.
 	StripAuth bool
+	// Credential authenticates the router to this pool's upstreams, replacing
+	// whatever the caller sent.
+	Credential string
+	// ForwardClientCredential passes the caller's credential upstream.
+	ForwardClientCredential bool
 }
 
 func (r Rule) matches(model string) bool {
@@ -94,11 +99,13 @@ func NewTable(rules []Rule) (*Table, error) {
 
 func (r Rule) target() gateway.Target {
 	return gateway.Target{
-		Name:         r.Pool.Name,
-		Registry:     r.Pool.Registry,
-		Selector:     r.Pool.Flow,
-		RewriteModel: r.RewriteModel,
-		StripAuth:    r.StripAuth,
+		Name:                    r.Pool.Name,
+		Registry:                r.Pool.Registry,
+		Selector:                r.Pool.Flow,
+		RewriteModel:            r.RewriteModel,
+		StripAuth:               r.StripAuth,
+		Credential:              r.Credential,
+		ForwardClientCredential: r.ForwardClientCredential,
 	}
 }
 

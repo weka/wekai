@@ -162,9 +162,8 @@ func (s *Server) inferenceHandler(route dialect.Route, affine bool) http.Handler
 			body = rewriteModelField(body, target.RewriteModel)
 			rr.Model = target.RewriteModel
 		}
-		if target.StripAuth {
-			stripInboundCredentials(r)
-		}
+		auth := proxy.Auth{Credential: target.Credential,
+			Forward: target.ForwardClientCredential, Strip: target.StripAuth}
 		obs.SetTarget(ctx, target.Name, target.RewriteModel)
 
 		candidates := s.candidates(target)
@@ -196,7 +195,7 @@ func (s *Server) inferenceHandler(route dialect.Route, affine bool) http.Handler
 				}
 			}
 		}
-		res := s.px.Serve(w, r, candidates, target.Selector, s.dialect, rr, body, accepted, outcome)
+		res := s.px.Serve(w, r, candidates, target.Selector, s.dialect, rr, body, accepted, outcome, auth)
 		if res.Backend != nil {
 			obs.SetBackend(ctx, res.Backend.URL)
 		}
@@ -410,6 +409,27 @@ func (s *Server) poolByName(name string) (Target, bool) {
 func stripInboundCredentials(r *http.Request) {
 	for _, h := range []string{"Authorization", "X-Api-Key", "Anthropic-Beta"} {
 		r.Header.Del(h)
+	}
+}
+
+// applyRouterCredential replaces the caller's credentials with the router's own
+// for this pool.
+//
+// The caller's are REPLACED, not merged: forwarding both would send a user's
+// key to an internal service that has no business seeing it, which is the leak
+// this feature exists to prevent in the other direction.
+//
+// Both header styles are set because the two conventions coexist —
+// Authorization: Bearer for OpenAI-compatible servers, x-api-key for
+// Anthropic — and a pool is configured by URL, not by which flavour it speaks.
+// Sending the key twice to a server that reads one is harmless; guessing wrong
+// is a 401 an operator has to debug.
+func applyRouterCredential(r *http.Request, cred string) {
+	stripInboundCredentials(r)
+	r.Header.Set("Authorization", "Bearer "+cred)
+	r.Header.Set("X-Api-Key", cred)
+	if r.Header.Get("Anthropic-Version") == "" {
+		r.Header.Set("Anthropic-Version", "2023-06-01")
 	}
 }
 

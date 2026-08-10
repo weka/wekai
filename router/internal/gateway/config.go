@@ -78,6 +78,15 @@ type Target struct {
 	// StripAuth drops inbound credentials before forwarding, for upstreams that
 	// are unauthenticated and would reject or log them.
 	StripAuth bool
+	// Credential, when set, authenticates the ROUTER to this pool's upstreams
+	// instead of forwarding the caller's own. It is what lets one router front
+	// a hosted API the caller pays for alongside an internal fleet the router
+	// holds the key to.
+	Credential string
+	// ForwardClientCredential passes the caller's own credential upstream,
+	// which a hosted API the user pays for requires and an internal one must
+	// never receive.
+	ForwardClientCredential bool
 }
 
 // Router maps a request's model to the pool that serves it.

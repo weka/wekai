@@ -156,13 +156,32 @@ type OnAccepted func(*registry.Backend)
 // refusals OnAccepted deliberately ignores.
 type OnOutcome func(b *registry.Backend, status int)
 
+// Auth says how one route authenticates to its upstreams.
+//
+// The caller's credential is dropped unless a route explicitly asks to forward
+// it. That default is the security posture: a user's personal key reaching an
+// internal backend is a leak, and it must take saying so out loud rather than
+// forgetting to say otherwise.
+//
+// Credential wins over Forward: a route the router authenticates to itself
+// never also carries the caller's.
+type Auth struct {
+	Credential string
+	// Forward passes the caller's own credential upstream. Required for a
+	// hosted API the USER pays for, where the router has no key that could
+	// work — and opt-in because the same behaviour pointed at an internal
+	// service is a leak.
+	Forward bool
+	Strip   bool
+}
+
 // Serve routes one request, retrying on a different backend where allowed.
 func (p *Proxy) Serve(
 	w http.ResponseWriter, r *http.Request,
 	candidates []*registry.Backend,
 	sel Selector, d dialect.Dialect,
 	rr *policy.RoutingRequest, body []byte,
-	accepted OnAccepted, outcome OnOutcome,
+	accepted OnAccepted, outcome OnOutcome, auth Auth,
 ) Result {
 	res := Result{}
 	remaining := append([]*registry.Backend(nil), candidates...)
@@ -213,7 +232,7 @@ func (p *Proxy) Serve(
 
 		refusalsLeft := failovers < maxFailovers
 		canRetry := (attempt+1 < p.cfg.MaxAttempts || refusalsLeft) && len(remaining) > 1
-		out := p.attempt(w, r, b, d, body, &committed, canRetry, accepted, outcome)
+		out := p.attempt(w, r, b, d, body, &committed, canRetry, accepted, outcome, auth)
 		b.CB.Record(circuit.Classify(out.status, out.err), token)
 		if out.err != nil {
 			metrics.UpstreamErrors.WithLabelValues(b.URL, kindOf(out.err)).Inc()
@@ -268,7 +287,7 @@ type attemptOut struct {
 func (p *Proxy) attempt(
 	w http.ResponseWriter, r *http.Request,
 	b *registry.Backend, d dialect.Dialect,
-	body []byte, committed *bool, canRetry bool, accepted OnAccepted, outcome OnOutcome,
+	body []byte, committed *bool, canRetry bool, accepted OnAccepted, outcome OnOutcome, auth Auth,
 ) attemptOut {
 	// The lease is the only in-flight increment in the program (LB-1), and the
 	// deferred release fires after ServeHTTP returns — i.e. after the response
@@ -316,10 +335,45 @@ func (p *Proxy) attempt(
 			pr.Out.ContentLength = int64(len(body))
 		}
 		// Never forward the client's credential to a backend (AUTH-9, SEC-4).
-		pr.Out.Header.Del("Authorization")
-		pr.Out.Header.Del("X-Api-Key")
-		if p.cfg.UpstreamCredential != "" {
+		// Credential handling, in precedence order.
+		//
+		// The old behaviour here was to strip the caller's credential
+		// unconditionally and substitute one global upstream key. That is right
+		// for a fleet the router owns and wrong for everything else: it made a
+		// route to a hosted API impossible, because the user's key — the only
+		// one that can pay for that call — never left the router. A route now
+		// says which it wants.
+		switch {
+		case auth.Credential != "":
+			// The router authenticates to this pool itself. The caller's
+			// credential is REPLACED, never merged: an internal service has no
+			// business seeing a user's personal key.
+			pr.Out.Header.Del("Authorization")
+			pr.Out.Header.Del("X-Api-Key")
+			pr.Out.Header.Set("Authorization", "Bearer "+auth.Credential)
+			pr.Out.Header.Set("X-Api-Key", auth.Credential)
+			if pr.Out.Header.Get("Anthropic-Version") == "" {
+				pr.Out.Header.Set("Anthropic-Version", "2023-06-01")
+			}
+		case auth.Forward && !auth.Strip:
+			// Left as the client sent them: this route reaches an API the user
+			// authenticates to directly.
+		case auth.Strip:
+			// An unauthenticated upstream: forwarding a credential there leaks
+			// it into someone else's logs for no benefit.
+			pr.Out.Header.Del("Authorization")
+			pr.Out.Header.Del("X-Api-Key")
+		case p.cfg.UpstreamCredential != "":
+			pr.Out.Header.Del("Authorization")
+			pr.Out.Header.Del("X-Api-Key")
 			pr.Out.Header.Set("Authorization", "Bearer "+p.cfg.UpstreamCredential)
+		default:
+			// Nothing configured: the caller's credential does NOT go upstream.
+			// This is the case that must be safe when an operator says nothing,
+			// and leaving it to fall through is how a user's key reaches a
+			// backend nobody meant it to.
+			pr.Out.Header.Del("Authorization")
+			pr.Out.Header.Del("X-Api-Key")
 		}
 		for _, h := range hopByHop {
 			pr.Out.Header.Del(h)
