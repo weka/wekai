@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+
+# mock-vllm — DEVELOPMENT ONLY, never published.
+#
+# A GPU-less stand-in that speaks the vLLM wire format, so the router can be
+# exercised end to end without hardware. It exists as an image purely so the
+# k8s end-to-end test can run it in-cluster; it is not part of any release, and
+# nothing in the release workflow builds it.
+FROM golang:1.25.7-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ENV CGO_ENABLED=0 GOOS=linux
+RUN go build -trimpath -o /out/mock-vllm ./router/cmd/mock-vllm
+
+FROM alpine:latest
+LABEL org.opencontainers.image.title="mock-vllm" \
+      org.opencontainers.image.description="GPU-less vLLM stand-in for router development. Not for production."
+COPY --from=builder /out/mock-vllm /usr/local/bin/mock-vllm
+ENTRYPOINT ["/usr/local/bin/mock-vllm"]

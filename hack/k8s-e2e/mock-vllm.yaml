@@ -1,0 +1,46 @@
+# A mock vLLM fleet for the end-to-end test.
+#
+# Two replicas behind one Service, which is the shape the router is for: the
+# Service resolves to both pod IPs, and --backends names them individually so
+# the router load-balances rather than letting kube-proxy do it. Prefix affinity
+# only means something if the router picks the endpoint.
+# A StatefulSet, not a Deployment, for one reason: stable per-pod DNS.
+# mock-vllm-0.mock-vllm resolves only for a StatefulSet behind a headless
+# Service. The router needs to name each endpoint individually — routing to a
+# single Service name would hand endpoint selection to kube-proxy, and prefix
+# affinity means nothing if the router does not pick the backend.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mock-vllm
+  labels: { app: mock-vllm }
+spec:
+  serviceName: mock-vllm
+  replicas: 2
+  selector:
+    matchLabels: { app: mock-vllm }
+  template:
+    metadata:
+      labels: { app: mock-vllm }
+    spec:
+      containers:
+        - name: mock-vllm
+          image: mock-vllm:e2e
+          # Never: the image is side-loaded with `k3d image import`, so a pull
+          # would fail — there is no registry holding it, deliberately.
+          imagePullPolicy: Never
+          args: ["--port=8000", "--model-id=e2e-model", "--max-concurrency=32"]
+          ports: [{ containerPort: 8000, name: http }]
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 1
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-vllm
+spec:
+  clusterIP: None   # headless: DNS returns every pod IP
+  selector: { app: mock-vllm }
+  ports: [{ port: 8000, targetPort: http, name: http }]

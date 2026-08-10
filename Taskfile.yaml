@@ -112,6 +112,11 @@ tasks:
   # Chart TEMPLATE correctness needs none of them — `go test ./chart/` renders
   # and asserts with helm alone.
 
+  e2e:k8s:
+    desc: "End-to-end test in a throwaway k3d cluster: builds both images, side-loads them (no registry), helm installs chart/router against a mock vLLM fleet, and asserts the pod passes its own probes and routes a request. KEEP=1 to leave the cluster up."
+    cmds:
+      - ./hack/k8s-e2e/run.sh
+
   router:image:
     desc: "Build the router image with plain docker build (no Dagger). TAG=... to override."
     cmds:
