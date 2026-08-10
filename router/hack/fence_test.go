@@ -180,6 +180,7 @@ func exempted(lines []string, i int) bool {
 // this fence guards against.
 var argvReaders = map[string]bool{
 	"cmd/wllm-router/main.go": true, // main legitimately reads os.Args to parse them
+	"cmd/loadgen/main.go":     true, // dev-only load generator; parses its own flags
 	"cmd/mock-vllm/main.go":   true, // same pattern: main() -> run(os.Args[1:]) -> flag.FlagSet
 }
 

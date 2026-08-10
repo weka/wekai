@@ -1,0 +1,62 @@
+# Eight vLLM stand-ins configured for ZERO service time.
+#
+# Every latency term is off and concurrency is unbounded, so a backend returns
+# as fast as it can parse the request. What remains between a client and its
+# response is the router: the routing decision, the proxy hop, the accounting.
+# Any ceiling the harness finds is therefore the router's own, not the fleet's.
+#
+# A StatefulSet rather than a Deployment because each pod needs stable DNS —
+# the router is configured with the eight names directly, and a Deployment's
+# pods have no per-pod address to configure.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-vllm
+  labels: {app: mock-vllm}
+spec:
+  clusterIP: None
+  selector: {app: mock-vllm}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mock-vllm
+spec:
+  serviceName: mock-vllm
+  replicas: 8
+  selector:
+    matchLabels: {app: mock-vllm}
+  template:
+    metadata:
+      labels: {app: mock-vllm, wekai.io/pool: perf}
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: mock-vllm
+          image: mock-vllm:perf
+          imagePullPolicy: IfNotPresent
+          args:
+            - -port=8000
+            - -log-level=error
+            # Zero service time. Each of these is a latency term in the
+            # engine's model; together they make a response cost nothing but
+            # parsing.
+            - -base-latency=0s
+            - -cold-input-tps=1e12
+            - -cached-input-tps=1e12
+            - -output-tps=1e12
+            - -default-max-tokens=1
+            # Unbounded: a 429 from a backend would put the fleet back in the
+            # measurement, and this harness is about the router.
+            - -max-concurrency=0
+            # Large enough never to evict during a run, so cache behaviour does
+            # not drift mid-measurement.
+            - -block-capacity=0
+          ports:
+            - {name: http, containerPort: 8000}
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}

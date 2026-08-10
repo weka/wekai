@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1
+
+# loadgen — DEVELOPMENT ONLY, never published.
+#
+# Drives load at the router for the routing performance harness. It exists as
+# an image so it can run INSIDE the cluster: driving this through `kubectl
+# port-forward` measures the port-forward, a single userspace TCP relay that
+# saturates long before the router does. Not part of any release, and nothing
+# in the release workflow builds it.
+FROM golang:1.25.7-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ENV CGO_ENABLED=0 GOOS=linux
+RUN go build -trimpath -o /out/loadgen ./router/cmd/loadgen
+
+FROM alpine:latest
+LABEL org.opencontainers.image.title="loadgen" \
+      org.opencontainers.image.description="Router load generator for performance measurement. Not for production."
+COPY --from=builder /out/loadgen /usr/local/bin/loadgen
+ENTRYPOINT ["/usr/local/bin/loadgen"]

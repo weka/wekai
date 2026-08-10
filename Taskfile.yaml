@@ -77,6 +77,14 @@ tasks:
       # absent. Only /models is called, never a completion.
       - WEKAI_LIVE=1 go test ./router/serve/ -run 'RealHosted|Hosted' -count=1 -v
 
+  perf:k8s:
+    desc: "Measure the router's own throughput ceiling in k3d: 8 zero-latency backends, load stepped until it plateaus"
+    cmds:
+      # Everything downstream is neutralised, so the plateau is the ROUTER's.
+      # Override with STEPS, STEP_DURATION, SESSIONS, PREFIX_TOKENS, ROUTER_CPU;
+      # KEEP=1 leaves the cluster up for poking at.
+      - bash hack/k8s-perf/run.sh
+
   fuzz:
     desc: "Fuzz the router's JSON scanner, which parses untrusted request bodies (FUZZTIME=60s)"
     vars:
