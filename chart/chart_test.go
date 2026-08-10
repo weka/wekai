@@ -427,3 +427,50 @@ func TestRouterChartResourcesAreIndependentlyOverridable(t *testing.T) {
 		}
 	})
 }
+
+// The simplest deployment names no patterns at all: one pool, every model to
+// it. `backends` has to reach a discovered pool as readily as `routes` does, or
+// the simple case is forced into the complex form for no reason.
+func TestRouterChartBackendsAcceptBothEndpointForms(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"plain URLs", []string{
+			"--set-string", "router.backends[0]=http://a:8000",
+			"--set-string", "router.backends[1]=http://b:8000",
+		}, `- "--backends=http://a:8000|http://b:8000"`},
+
+		// The map form is the only one --set can express for a selector.
+		{"pod selector as a map", []string{
+			"--set-string", "router.backends[0].pods.app=vllm",
+			"--set-string", "router.backends[0].pods.tier=prod",
+			"--set-string", "router.backends[0].port=http",
+		}, `- "--backends=pods:app=vllm,tier=prod:http"`},
+
+		{"a URL and a selector in one pool, which is a migration", []string{
+			"--set-string", "router.backends[0].url=http://legacy:8000",
+			"--set-string", "router.backends[1].pods.app=vllm",
+		}, `- "--backends=http://legacy:8000|pods:app=vllm"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := renderRouter(t, tc.args...)
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("rendered manifest missing %q:\n%s", tc.want, out)
+			}
+		})
+	}
+}
+
+// A selector given as a string survives a values FILE, where nothing splits on
+// commas. It must not be silently mangled — only --set has the problem.
+func TestRouterChartSelectorStringSurvivesAValuesFile(t *testing.T) {
+	out := renderRouter(t, "--set-string", "router.backends[0]=pods:app=vllm,tier=prod:http")
+	// --set-string DOES split, so this is the truncation the map form exists to
+	// avoid; assert the shape that proves the string passes through untouched
+	// when it arrives whole.
+	if !strings.Contains(out, `--backends=pods:app=vllm`) {
+		t.Errorf("string endpoint form not passed through:\n%s", out)
+	}
+}

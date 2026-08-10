@@ -37,6 +37,39 @@ served, health inferred from real traffic rather than from probes it would alway
 fail. The probe never repeats. Because it keys on metric names rather than wire
 format, **a vLLM fronted with an Anthropic API is still recognised as vLLM**.
 
+**An endpoint is a URL or a pod selector.** Anywhere a backend can be named,
+either form works, and they mix in one pool:
+
+```
+http://vllm-a:8000              a URL
+pods:app=vllm                   every matching pod IN THE ROUTER'S NAMESPACE
+pods:app=vllm:http              ... using each pod's containerPort named "http"
+pods:app=vllm:8000              ... using 8000 for a pod declaring no port
+http://legacy:8000|pods:app=vllm    both, which is what a migration looks like
+```
+
+Each discovered pod contributes **its own declared port**. That is the reason to
+prefer a selector over a Service, and it is not a detail: a fleet run as several
+DaemonSets — one per GPU topology, or per model — commonly listens on a different
+port per set. A Service maps one port, so covering three sets needs three
+Services, and the single selector that made them one pool is gone.
+
+The port belongs to the route because it describes the *pool*. A router fronting
+two fleets on different ports could not say so while this was a router-wide flag.
+A colon is safe as the separator: Kubernetes label keys and values never contain
+one.
+
+Discovery searches the router's **own namespace** only. There is no syntax for
+another, deliberately — reading pods across namespaces needs a ClusterRole, and a
+standing cluster-wide pod read on every router is a poor trade for a case a
+second router covers. It is what keeps the chart's RBAC a plain Role, which it
+creates by default.
+
+Discovery only ever *proposes* backends: the registry decides admission and
+health decides eligibility, so a discovered pod is not routed to until it passes
+the same checks a statically named one does, and a pod going NotReady leaves the
+pool on its own.
+
 **Capacity is signalled, not assumed.** The backend's own `429` is the ultimate
 signal and is always on. `--max-node-concurrency` and `--rebalance-ratio` are
 opt-in early warnings that save a round trip.
@@ -56,7 +89,13 @@ wekai router serve \
   --backends 'http://vllm-a:8000|http://vllm-b:8000|http://vllm-c:8000'
 ```
 
-`--backends` is shorthand for `--route '* => a|b|c'`.
+`--backends` is shorthand for `--route '* => a|b|c'` — no model patterns, no
+rules, every request to one pool. It takes pod selectors too, which is the
+tidiest form there is:
+
+```bash
+wekai router serve --listen :8080 --backends pods:app=vllm:http
+```
 
 Set `--max-node-concurrency` to the backends' vLLM `--max-num-seqs` to predict
 saturation rather than discovering it one refusal at a time:
@@ -97,6 +136,37 @@ helm upgrade --install my-router \
   --set router.signals.maxNodeConcurrency=32
 ```
 
+The same pool from pod labels — still no patterns, still just `backends`. Each
+entry is a URL string or a map, and the map is the Kubernetes-native form:
+
+```yaml
+router:
+  backends:
+    - pods: {app: vllm}
+      port: http
+```
+
+```bash
+--set-string 'router.backends[0].pods.app=vllm' \
+--set-string 'router.backends[0].port=http'
+```
+
+Use the map with `--set`. A label selector is comma-separated and `--set` splits
+on commas, so the string `pods:app=vllm,tier=prod` arrives truncated at its first
+label — silently, rendering fine and failing at runtime. In a values *file* the
+string form is fine; the problem is `--set` specifically.
+
+All forms render to the one CLI grammar, so the pod ends up running
+`--backends pods:app=vllm:http` either way. A URL and a selector can share the
+list, which is what a migration looks like:
+
+```yaml
+router:
+  backends:
+    - url: http://legacy-vllm:8000
+    - pods: {app: vllm}
+      port: http
+```
 
 Covered by `TestUseCase1_SingleFleetAllTraffic`.
 
@@ -187,9 +257,43 @@ catch-all. `--strip-auth-when` drops the caller's credentials before forwarding
 to an unauthenticated local upstream, so a client's key is not leaked into your
 own logs.
 
-The hosted endpoint has no `/health` or `/metrics`; discovery works that out and
+The hosted endpoint has no `/health` or `/metrics`; the router works that out and
 treats it as passive, so it is usable immediately. Pass `--passive-health` to
 skip the probe entirely when you already know.
+
+### The full shape
+
+Everything at once: two local fleets discovered from pod labels on different
+ports, a model-name rewrite, and Anthropic as the fallback paid for with the
+caller's own key.
+
+```bash
+wekai router serve \
+  --listen :8080 --metrics-listen 0.0.0.0:29000 \
+  --route 'fast,small => pods:app=vllm,size=7b:http' \
+  --route 'sonnet     => pods:app=vllm,size=70b:http as Qwen/Qwen3-32B' \
+  --default 'https://api.anthropic.com' \
+  --strip-auth-when 'fast,small,sonnet' \
+  --max-node-concurrency 48
+```
+
+What each line does:
+
+- **`fast,small`** — either substring in the model name picks the 7b pool,
+  discovered from pod labels, each pod on its own port named `http`.
+- **`sonnet`** — a client asking for `sonnet` reaches the 70b fleet, with the
+  model rewritten to the checkpoint the backend actually serves. The client
+  never learns the local name.
+- **`--default`** — anything unmatched goes to Anthropic. The caller's key is
+  forwarded, so they pay for their own hosted calls.
+- **`--strip-auth-when`** — the caller's key is removed before it reaches a
+  local fleet, which is unauthenticated and would otherwise log someone's
+  credential.
+- **`--max-node-concurrency`** — the backends' vLLM `--max-num-seqs`, so
+  saturation is predicted rather than discovered one refusal at a time.
+
+Both APIs route through the same rules, so a client on `/v1/messages` and one on
+`/v1/chat/completions` are matched identically.
 
 ### Helm
 
@@ -200,6 +304,25 @@ router:
   default: "https://api.anthropic.com"
   stripAuthWhen:
     - "llama,mistral"
+```
+
+The full shape above, structured — which is what `--set` requires, since both
+model patterns and label selectors are comma-separated:
+
+```yaml
+router:
+  routes:
+    - patterns: [fast, small]
+      pods: {app: vllm, size: 7b}
+      port: http
+    - patterns: [sonnet]
+      pods: {app: vllm, size: 70b}
+      port: http
+      as: Qwen/Qwen3-32B
+  default: "https://api.anthropic.com"
+  stripAuthWhen: ["fast,small,sonnet"]
+  signals:
+    maxNodeConcurrency: 48
 ```
 
 Covered by `TestUseCase3_SelfHostedModelsWithHostedFallback`.
@@ -352,104 +475,6 @@ router:
     - name: inner-key
       secretName: router-inner-key
       mountPath: /etc/router
-```
-
-## Discovering endpoints from Kubernetes
-
-A route's endpoints can be discovered from pod labels instead of listed:
-
-```
---route '* => pods:app=vllm'
-```
-
-The tidiest form is `--backends`, which is shorthand for the same catch-all
-route and takes the same token:
-
-```
---backends pods:app=vllm:http
-```
-
-Each discovered pod contributes **its own declared `containerPort`**. That is
-the reason to prefer pod discovery over a Service, and it is not a detail: a
-fleet run as several DaemonSets — one per GPU topology, or per model — commonly
-listens on a different port per set. A Service maps ONE port, so covering three
-DaemonSets needs three Services, and the router loses the single label selector
-that made them one pool. Pod discovery keeps them one pool.
-
-The port travels in the token, after the selector:
-
-```
---route '* => pods:app=vllm:http'      # containerPort named "http"
---route '* => pods:app=vllm:8000'      # for a pod declaring no port of its own
-```
-
-It belongs to the route rather than to the router because it describes the POOL.
-A router fronting two fleets on different ports could not say so while this was
-one global flag — which is the very case pod discovery exists for. A colon is
-safe as the separator: Kubernetes label keys and values never contain one.
-
-Port precedence: the pod's named port when a name is given, then its sole
-declared port, then the number as a floor. The pod is the authority on what it
-listens on — configuration silently overriding it would send traffic to a port
-nothing is bound to. A pod declaring several unnamed ports with no name given
-falls back to the number rather than guessing.
-
-Discovery always searches the router's **own namespace**. There is no syntax for
-another one, deliberately: reading pods across namespaces needs a ClusterRole,
-and a standing cluster-wide pod read on every router is a poor trade for a case
-that a second router in the other namespace covers. It is what keeps the chart's
-RBAC a plain Role.
-
-Discovery only ever PROPOSES backends. The registry decides admission and health
-decides eligibility, so a discovered pod is not routed to until it passes the
-same checks a statically listed one does — and a pod that goes NotReady leaves
-the pool on its own.
-
-Static and discovered endpoints can be mixed in one route, which is what a
-migration looks like:
-
-```
---route '* => http://legacy-vllm:8000|pods:app=vllm'
-```
-
-### CLI
-
-```bash
-wekai router serve \
-  --listen :8080 --metrics-listen 0.0.0.0:29000 \
-  --backends pods:app=vllm:http
-```
-
-### Helm
-
-Discovery needs RBAC, which the chart creates only when asked — a
-namespace-scoped Role, never a ClusterRole:
-
-RBAC is created by default, because a `pods:` route fails without it and the
-runtime error names nothing about the chart. It is a namespace-scoped Role,
-never a ClusterRole. A router with only static endpoints can decline it with
-`discovery.enabled: false`.
-
-Give the selector as a **map**, not a string: a label selector is
-comma-separated and `--set` splits on commas, so a string arrives truncated at
-its first label — silently, rendering fine and failing at runtime.
-
-```yaml
-router:
-  routes:
-    - patterns: ["*"]
-      pods: {app: vllm, tier: prod}
-      port: http            # containerPort name, or a number as a floor
-```
-
-Several DaemonSets on different ports, as one pool:
-
-```yaml
-router:
-  routes:
-    - patterns: ["*"]           # matches every set
-      pods: {app: vllm}
-      port: http                # each set names its own port `http`
 ```
 
 ## Readiness

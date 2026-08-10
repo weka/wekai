@@ -60,18 +60,8 @@ spec:
                    pattern — silently, rendering fine and failing at runtime.
                    As lists there is no comma inside any single --set value. */}}
             {{- $eps := .endpoints | default list }}
-            {{- if .pods }}
-            {{- /* Pod discovery as a MAP, so --set never sees a comma: a label
-                   selector is comma-separated, and --set would split it into
-                   separate values and drop all but the first. Helm renders map
-                   keys in sorted order, so the flag is stable across renders. */}}
-            {{- $sel := list }}
-            {{- range $k, $v := .pods }}{{ $sel = append $sel (printf "%s=%s" $k (toString $v)) }}{{ end }}
-            {{- $tok := printf "pods:%s" (join "," $sel) }}
-            {{- if .port }}{{ $tok = printf "%s:%v" $tok .port }}{{ end }}
-            {{- $eps = append $eps $tok }}
-            {{- end }}
-            - "--route={{ join "," .patterns }} => {{ join "|" $eps }}{{ if .as }} as {{ .as }}{{ end }}{{ if .using }} using {{ .using }}{{ end }}"
+            {{- if .pods }}{{ $eps = append $eps (dict "pods" .pods "port" .port) }}{{ end }}
+            - "--route={{ join "," .patterns }} => {{ include "app.endpointList" $eps }}{{ if .as }} as {{ .as }}{{ end }}{{ if .using }} using {{ .using }}{{ end }}"
             {{- end }}
             {{- end }}
             {{- if .Values.router.default }}
@@ -95,7 +85,7 @@ spec:
             - "--user-prefix"
             {{- end }}
             {{- if .Values.router.backends }}
-            - "--backends={{ join "|" .Values.router.backends }}"
+            - "--backends={{ include "app.endpointList" .Values.router.backends }}"
             {{- end }}
             {{- if .Values.router.metricsListen }}
             - "--metrics-listen={{ .Values.router.metricsListen }}"

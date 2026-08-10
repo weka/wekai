@@ -53,10 +53,26 @@ router:
 
   # Endpoints for the implicit catch-all pool — shorthand for a single
   # "* => a|b|c" route. Use this for the simplest deployment: one vLLM fleet,
-  # every model routed to it. Ignored if `routes` covers everything you need.
+  # every model routed to it, no patterns and no rules. Ignored if `routes`
+  # covers everything you need.
+  #
+  # Each entry is a URL string, or a map — the same two forms `routes` accepts:
+  #
+  #   backends:
+  #     - http://vllm-a:8000              # a URL
+  #     - url: http://vllm-b:8000         # the same, as a map
+  #     - pods: {app: vllm, tier: prod}   # every matching pod in this namespace
+  #       port: http                      # each pod's containerPort named "http"
+  #
+  # Use the map form with --set: a label selector is comma-separated and --set
+  # splits on commas, so the string "pods:app=vllm,tier=prod" arrives truncated
+  # at its first label — silently, rendering fine and failing at runtime.
+  #
+  #   --set-string router.backends[0].pods.app=vllm
+  #   --set-string router.backends[0].port=http
+  #
+  # Mixing a URL and a selector in this list is what a migration looks like.
   backends: []
-  # - http://vllm-a:8000
-  # - http://vllm-b:8000
 
   # Address for /metrics and the live KV map at /router-viz. Must not be
   # loopback, or the PodMonitor below can never reach it.
