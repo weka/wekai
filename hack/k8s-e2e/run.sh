@@ -127,7 +127,59 @@ if [ "${found:-0}" -lt 2 ]; then
   kubectl logs deploy/router-disc --tail=30; exit 1
 fi
 
+# Two routers: an inner one owning the fleet behind an API key, and a public
+# outer one holding that key as a MOUNTED SECRET. A user calling the outer
+# router never learns the inner key. Only a cluster proves the mount, the
+# chaining and the auth actually line up.
+echo "==> two-router topology: inner authenticated, outer holds its key"
+INNER_KEY=inner-secret-$RANDOM
+kubectl create secret generic router-inner-key --from-literal=inner-key="$INNER_KEY" >/dev/null
+
+helm install inner "$ROOT/chart/router" \
+  --set imageRepository=wekai-router --set imageTag="$TAG" \
+  --set 'router.backends[0]=http://mock-vllm-0.mock-vllm:8000' \
+  --set 'router.backends[1]=http://mock-vllm-1.mock-vllm:8000' \
+  --set router.apiKey="$INNER_KEY" \
+  --set service.port=8080 --set service.targetPort=8080 --set replicaCount=1 >/dev/null
+
+helm install outer "$ROOT/chart/router" \
+  --set imageRepository=wekai-router --set imageTag="$TAG" \
+  --set-string 'router.routes[0].patterns[0]=*' \
+  --set-string 'router.routes[0].endpoints[0]=http://inner:8080' \
+  --set-string 'router.routes[0].using=/etc/router/inner-key' \
+  --set router.secretMounts[0].name=inner-key \
+  --set router.secretMounts[0].secretName=router-inner-key \
+  --set router.secretMounts[0].mountPath=/etc/router \
+  --set service.port=8080 --set service.targetPort=8080 --set replicaCount=1 >/dev/null
+
+for d in inner outer; do
+  if ! kubectl rollout status deploy/$d --timeout=120s 2>/dev/null; then
+    echo "!! $d router never became ready"; kubectl logs deploy/$d --tail=30; exit 1
+  fi
+done
+
+# Through the outer router with NO credential: it must substitute the mounted
+# key and the inner router must accept it.
+if ! kubectl exec deploy/outer -- wget -q -O- \
+      --header='Content-Type: application/json' --post-data="$BODY" \
+      http://127.0.0.1:8080/v1/chat/completions > /tmp/e2e-chain 2>/tmp/e2e-chain-err; then
+  echo "!! chained request failed"; cat /tmp/e2e-chain-err
+  kubectl logs deploy/outer --tail=30; kubectl logs deploy/inner --tail=30; exit 1
+fi
+grep -q 'chat.completion' /tmp/e2e-chain || {
+  echo "!! chained request did not return a completion:"; head -c 300 /tmp/e2e-chain; exit 1; }
+
+# And the inner router must still refuse an unauthenticated caller, or the key
+# is decoration.
+if kubectl exec deploy/outer -- wget -q -O- \
+      --header='Content-Type: application/json' --post-data="$BODY" \
+      http://inner:8080/v1/chat/completions >/dev/null 2>&1; then
+  echo "!! the inner router served an unauthenticated request; its API key is not enforced"
+  exit 1
+fi
+
 echo
 echo "PASS — chart deployed, probes passed, request routed, metrics served."
+echo "PASS — two routers: outer substituted its mounted key, inner refused an unauthenticated call."
 echo "PASS — pod-label discovery found $found backends and served through them."
 grep -E 'router_route_decisions_total\{' /tmp/e2e-metrics | head -3

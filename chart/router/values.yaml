@@ -84,6 +84,20 @@ router:
     # Which containerPort to use when a pod declares several, e.g. "http".
     portName: ""
 
+  # Secrets the router itself presents upstream, or its own inbound key.
+  # Mounted read-only; a route then references the file with "using <path>".
+  #
+  #   secretMounts:
+  #     - name: inner-key
+  #       secretName: router-inner-key   # key inside it becomes the filename
+  #       mountPath: /etc/router
+  secretMounts: []
+
+  # Read the inbound API key from a mounted file. PREFER this to apiKey below:
+  # a key set as a value ends up in the Deployment spec, readable by anyone who
+  # can describe the pod.
+  apiKeyFile: ""
+
   # Require this key on inference and admin requests. Empty leaves the listener
   # unauthenticated, which the router logs loudly at startup.
   apiKey: ""

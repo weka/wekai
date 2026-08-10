@@ -322,3 +322,37 @@ func TestRouterChartDiscoveryFlags(t *testing.T) {
 		t.Error("pod discovery is namespace-scoped; a ClusterRole grants more than it needs")
 	}
 }
+
+// TestRouterChartCredentials: the two-router deployment must be expressible —
+// a mounted secret the router presents upstream, and an inbound key read from
+// a file rather than set as a value.
+func TestRouterChartCredentials(t *testing.T) {
+	out := renderRouter(t,
+		"--set-string", "router.routes[0].patterns[0]=llama",
+		"--set-string", "router.routes[0].endpoints[0]=http://inner:8080",
+		"--set-string", "router.routes[0].using=/etc/router/inner-key",
+		"--set-string", "router.routes[1].patterns[0]=*",
+		"--set-string", "router.routes[1].endpoints[0]=https://api.anthropic.com",
+		"--set-string", "router.routes[1].using=client",
+		"--set", "router.secretMounts[0].name=inner-key",
+		"--set", "router.secretMounts[0].secretName=router-inner-key",
+		"--set", "router.secretMounts[0].mountPath=/etc/router",
+		"--set", "router.apiKeyFile=/etc/router/inbound")
+
+	for _, want := range []string{
+		`- "--route=llama => http://inner:8080 using /etc/router/inner-key"`,
+		`- "--route=* => https://api.anthropic.com using client"`,
+		`- "--api-key-file=/etc/router/inbound"`,
+		"secretName: router-inner-key",
+		"mountPath: /etc/router",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered manifest missing %q:\n%s", want, out)
+		}
+	}
+	// A secret set as a value lands in the Deployment spec, readable by anyone
+	// who can describe the pod; the file form must win when both are given.
+	if strings.Contains(out, `--api-key=`) {
+		t.Error("apiKeyFile given but --api-key also rendered, putting the secret in the pod spec")
+	}
+}

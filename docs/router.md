@@ -238,6 +238,79 @@ If Dagger cannot start — a locked-down Docker Desktop refusing to pull its eng
 image is the usual cause — `go test ./chart/` and `task router:image` still cover
 template and image correctness between them.
 
+## Credentials
+
+Two questions, kept separate: who may call the router, and how the router
+authenticates to each pool.
+
+### Protecting the router
+
+```bash
+--api-key-file /etc/router/inbound-key    # preferred
+--api-key <value>                         # visible in `ps` and in the pod spec
+```
+
+Every inference and admin request then needs the key. `/liveness` and
+`/readiness` stay open so a kubelet needs no credential; `--require-auth-for-probes`
+changes that.
+
+### How a pool authenticates
+
+A route says it in the same position as `as <model>`:
+
+```
+=> http://vllm:8000 using /etc/secrets/inner-key    the ROUTER's own key
+=> https://api.anthropic.com using client           forward the CALLER's key
+=> http://vllm:8000                                 send no credential
+```
+
+**Forwarding is opt-in and the default sends nothing.** A hosted API the user
+pays for is the case that needs `using client` — the router has no key that
+could work there. An internal backend must never receive a user's personal key,
+so defaulting to forward would leak one on any route somebody forgot to
+annotate. `--strip-auth-when` remains for dropping credentials by pattern.
+
+`using <file>` wins over `using client`: a pool the router authenticates to
+itself never also carries the caller's credential.
+
+### Two routers: internal fleet behind a user-facing edge
+
+The deployment this exists for. An inner router owns the fleet and requires a
+key; an outer router is public, holds that key as a mounted secret, and sends
+everything else to Anthropic with the user's own credential.
+
+```bash
+# inner — internal only, authenticated
+wekai router serve --listen :8080 \
+  --api-key-file /etc/router/inbound-key \
+  --backends 'http://vllm-a:8000|http://vllm-b:8000'
+
+# outer — public, no inbound key
+wekai router serve --listen :8080 \
+  --route 'llama,mistral => http://inner-router:8080 using /etc/router/inner-key' \
+  --default 'https://api.anthropic.com using client'
+```
+
+A user calling the outer router for `llama-3` never learns the inner key; a
+user calling it for `claude-*` pays with their own. Capture, if enabled, records
+both.
+
+```yaml
+# outer values.yaml
+router:
+  routes:
+    - patterns: [llama, mistral]
+      endpoints: [http://inner-router:8080]
+      using: /etc/router/inner-key
+    - patterns: ["*"]
+      endpoints: [https://api.anthropic.com]
+      using: client
+  secretMounts:
+    - name: inner-key
+      secretName: router-inner-key
+      mountPath: /etc/router
+```
+
 ## Discovering endpoints from Kubernetes
 
 A route's endpoints can be discovered from pod labels instead of listed:

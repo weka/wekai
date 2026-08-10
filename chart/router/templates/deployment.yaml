@@ -59,7 +59,7 @@ spec:
                    written as one string is truncated at its first model
                    pattern — silently, rendering fine and failing at runtime.
                    As lists there is no comma inside any single --set value. */}}
-            - "--route={{ join "," .patterns }} => {{ join "|" .endpoints }}{{ if .as }} as {{ .as }}{{ end }}"
+            - "--route={{ join "," .patterns }} => {{ join "|" .endpoints }}{{ if .as }} as {{ .as }}{{ end }}{{ if .using }} using {{ .using }}{{ end }}"
             {{- end }}
             {{- end }}
             {{- if .Values.router.default }}
@@ -117,7 +117,9 @@ spec:
             - "--discover-port-name={{ .portName }}"
             {{- end }}
             {{- end }}
-            {{- if .Values.router.apiKey }}
+            {{- if .Values.router.apiKeyFile }}
+            - "--api-key-file={{ .Values.router.apiKeyFile }}"
+            {{- else if .Values.router.apiKey }}
             - "--api-key={{ .Values.router.apiKey }}"
             {{- end }}
             {{- range .Values.extraArgs }}
@@ -164,13 +166,31 @@ spec:
             failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if or .Values.datastore.sharedPvc.enabled .Values.router.capture }}
+          {{- if or .Values.datastore.sharedPvc.enabled .Values.router.capture .Values.router.secretMounts }}
           volumeMounts:
+            {{- range .Values.router.secretMounts }}
+            - name: {{ .name }}
+              mountPath: {{ .mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if or .Values.datastore.sharedPvc.enabled .Values.router.capture }}
             - name: data
               mountPath: /data
+            {{- end }}
           {{- end }}
-      {{- if or .Values.datastore.sharedPvc.enabled .Values.router.capture }}
+      {{- if or .Values.datastore.sharedPvc.enabled .Values.router.capture .Values.router.secretMounts }}
       volumes:
+        {{- range .Values.router.secretMounts }}
+        - name: {{ .name }}
+          secret:
+            secretName: {{ .secretName }}
+            # 0444, not 0400: the image runs as a nonroot UID and 0400 makes
+            # the file readable only by its owner (root), so the router cannot
+            # read the key it was given. The pod is the boundary here — anything
+            # that can read this file is already inside it.
+            defaultMode: 0444
+        {{- end }}
+        {{- if or .Values.datastore.sharedPvc.enabled .Values.router.capture }}
         - name: data
           {{- if .Values.datastore.sharedPvc.enabled }}
           persistentVolumeClaim:
@@ -182,6 +202,7 @@ spec:
           # without a PVC should not silently look like it is retaining data.
           emptyDir: {}
           {{- end }}
+        {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
