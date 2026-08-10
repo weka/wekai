@@ -300,12 +300,11 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		authed := s.credentialValid(r)
-		if s.isPublicProbe(r) {
-			// Admitted without a credential, but the handler is told whether one was
-			// actually presented so it can disclose the minimum.
-			next.ServeHTTP(w, r.WithContext(withAuthed(r.Context(), authed)))
-			return
-		}
+		// No probe exemption. /liveness, /readiness and /health are served on the
+		// OPERATIONAL listener now, so on this one they are just paths — and an
+		// exemption here would have been a hole straight through to the
+		// backends, since the passthrough tier proxies any path the dialect does
+		// not claim.
 		if !authed {
 			// Never log the presented credential, not even a prefix (AUTH-10).
 			obs.Logger(r.Context()).Warn("authentication failed", "path", r.URL.Path)
@@ -344,25 +343,6 @@ func (s *Server) credentialValid(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(tok), s.apiKey) == 1
 }
 
-// isPublicProbe decides which endpoints a kubelet may reach without a credential.
-//
-// GET /liveness is always public: it reports only that the process is up (AUTH-5).
-// GET /readiness and GET /health are public unless require_auth_for_probes is set,
-// because a kubelet probe cannot authenticate and a 401 there means the pod never
-// becomes Ready (AUTH-6).
-func (s *Server) isPublicProbe(r *http.Request) bool {
-	if r.Method != http.MethodGet {
-		return false
-	}
-	switch r.URL.Path {
-	case "/liveness":
-		return true
-	case "/readiness", "/health":
-		return !s.cfg.RequireAuthForProbes
-	}
-	return false
-}
-
 // pathAllowed applies the allowlist with segment-boundary matching.
 //
 // An entry ending in "/" denotes a subtree; otherwise the match is exact or a
@@ -371,12 +351,11 @@ func (s *Server) isPublicProbe(r *http.Request) bool {
 //
 // An empty allowlist serves every path, with auth still applied to every path, so
 // this matches v1 rather than inverting it (see config.PathAllowlist re: AUTH-8).
+// A router that must serve ONLY a known set of endpoints sets the allowlist;
+// there is no path that escapes it.
 func (s *Server) pathAllowed(r *http.Request) bool {
 	if len(s.cfg.PathAllowlist) == 0 {
 		return true // no restriction configured; auth still applies
-	}
-	if s.isPublicProbe(r) {
-		return true
 	}
 	p := r.URL.Path
 	for _, entry := range s.cfg.PathAllowlist {

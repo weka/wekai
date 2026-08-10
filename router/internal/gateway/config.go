@@ -19,11 +19,6 @@ type Config struct {
 	// startup rather than assumed intentional.
 	APIKey string
 
-	// RequireAuthForProbes extends auth to /liveness and /readiness. Off by
-	// default so a kubelet probe needs no credential; v1 required one, which is
-	// why its probes were configured as exec.
-	RequireAuthForProbes bool
-
 	// MaxBodyBytes bounds a request body. The body is buffered whole so a retry
 	// can replay it (REL-4), so this is the real memory bound per in-flight
 	// request, not a formality.
@@ -53,7 +48,6 @@ type Config struct {
 func (c Config) Redacted() map[string]any {
 	return map[string]any{
 		"api_key_set":             c.APIKey != "",
-		"require_auth_for_probes": c.RequireAuthForProbes,
 		"max_body_bytes":          c.MaxBodyBytes,
 		"max_concurrent_requests": c.MaxConcurrentRequests,
 		"path_allowlist":          c.PathAllowlist,

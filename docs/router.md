@@ -427,6 +427,46 @@ the suffix; a genuine base path like `/v1beta/openai` is kept and used.
 Two questions, kept separate: who may call the router, and how the router
 authenticates to each pool.
 
+### Serving only what you intend
+
+`--path-allowlist` restricts which paths the router will serve at all. **Empty
+means every path**: anything the dialect does not claim is passed through to a
+backend, which is what lets one router front both an OpenAI-style fleet and a
+hosted API. A router exposed to users should set it:
+
+```bash
+wekai router serve \
+  --api-key-file /etc/wekai/key \
+  --path-allowlist /v1/chat/completions \
+  --path-allowlist /v1/messages \
+  --path-allowlist /v1/models \
+  --backends pods:app=vllm
+```
+
+```yaml
+router:
+  pathAllowlist:
+    - /v1/chat/completions
+    - /v1/messages
+    - /v1/models
+```
+
+Nothing outside the list is served — not the admin endpoints, and not a probe
+path. There is no exemption. Matching is on segment boundaries, so
+`/v1/mod` never admits `/v1/models`, and a trailing `/` denotes a subtree
+(`/v1/responses/` admits `/v1/responses/abc`). A path off the list answers 404
+rather than 401, so it does not confirm what the router has.
+
+### Probes are on the metrics listener
+
+`/liveness` and `/readiness` are served on `--metrics-listen`, not on the
+serving port. Their answer is operational detail — how many backends exist, how
+many are healthy, and why the router is not ready — and a user-facing router is
+routinely unauthenticated, so on the serving port that detail would be public.
+
+The chart probes the `metrics` port accordingly. A router started without
+`--metrics-listen` serves no probes at all and says so at startup.
+
 ### Protecting the router
 
 ```bash

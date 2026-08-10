@@ -82,16 +82,11 @@ func (s *Server) build() http.Handler {
 	mux.Handle("/", s.inferenceHandler(dialect.Route{Pattern: "/", Class: "passthrough"}, false))
 
 	// Operational endpoints.
-	mux.HandleFunc("GET /liveness", s.handleLiveness)
-	mux.HandleFunc("GET /readiness", s.handleReadiness)
-	mux.HandleFunc("GET /health", s.handleReadiness)
-	// Kubernetes-convention aliases. They exist because of the passthrough tier
-	// below: an unclaimed path is PROXIED, so a probe pointed at /healthz would
-	// be forwarded upstream and answered by a backend that knows nothing about
-	// it — a 404 that reads as "the router is unhealthy" and CrashLoopBackOffs
-	// the pod. A probe must never leave the router.
-	mux.HandleFunc("GET /healthz", s.handleReadiness)
-	mux.HandleFunc("GET /livez", s.handleLiveness)
+	// Probes are NOT registered here. They live on the operational listener —
+	// see ProbeHandler — because their answer is operational detail: how many
+	// backends exist, how many are healthy, and why the router is not ready.
+	// None of that is a caller's business on a listener that may be public and
+	// unauthenticated, which a user-facing router routinely is.
 	mux.HandleFunc("GET /get_server_info", s.handleServerInfo)
 
 	// Admin endpoints. Auth applies (AUTH-11).
@@ -479,26 +474,26 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 		n += len(s.candidates(t))
 		registered += len(t.Registry.Snapshot().Backends)
 	}
-	body := map[string]any{"ready": n > 0}
-	// The fleet size is operational detail, so it is disclosed only to an
-	// authenticated caller. An unauthenticated kubelet probe gets the boolean it
-	// needs and nothing more.
-	if Authed(r.Context()) {
-		body["healthy_backends"] = n
-		body["registered_backends"] = registered
-		// WHY it is not ready, which the counts alone do not distinguish. A pool
-		// with no backends at all is a configuration fault — a selector matching
-		// nothing, most often a mistyped label — while a pool with backends that
-		// are not healthy is a fleet problem. Those need opposite responses, and
-		// a bare `{"ready": false}` sends an operator to the wrong one.
-		if n == 0 {
-			if registered == 0 {
-				body["reason"] = "no backends configured or discovered — check the route's " +
-					"endpoints, and for a pods: selector check it against the pods' own labels"
-			} else {
-				body["reason"] = "backends are registered but none is healthy — check the " +
-					"upstreams themselves and the router's health probes against them"
-			}
+	// Counts and cause, unconditionally: this handler is mounted on the
+	// operational listener only, so there is no untrusted caller to withhold
+	// them from.
+	body := map[string]any{
+		"ready":               n > 0,
+		"healthy_backends":    n,
+		"registered_backends": registered,
+	}
+	// WHY it is not ready, which the counts alone do not distinguish. A pool
+	// with no backends at all is a configuration fault — a selector matching
+	// nothing, most often a mistyped label — while a pool with backends that are
+	// not healthy is a fleet problem. Those need opposite responses, and a bare
+	// {"ready": false} sends an operator to the wrong one.
+	if n == 0 {
+		if registered == 0 {
+			body["reason"] = "no backends configured or discovered — check the route's " +
+				"endpoints, and for a pods: selector check it against the pods' own labels"
+		} else {
+			body["reason"] = "backends are registered but none is healthy — check the " +
+				"upstreams themselves and the router's health probes against them"
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -656,4 +651,30 @@ func writeBusy(w http.ResponseWriter, d dialect.Dialect) {
 	w.Header().Set("Retry-After", "1")
 	d.WriteError(w, http.StatusTooManyRequests,
 		"rate_limit_error", "server is busy; retry shortly")
+}
+
+// ProbeHandler serves the kubelet's probes, for mounting on the OPERATIONAL
+// listener rather than the inference one.
+//
+// The answers are operational detail — the fleet size, how much of it is
+// healthy, and why the router is not ready — and a user-facing router is
+// routinely unauthenticated, so on the inference listener that detail would be
+// public. It is also simply the wrong surface: the inference listener is for
+// inference, and everything else the router exposes for operators already lives
+// beside the metrics.
+//
+// Detail is unconditional here. This listener is not published to callers, so
+// there is no one to withhold it from, and a probe endpoint that answers "not
+// ready" without saying why is what made a mistyped label selector take an
+// investigation across three components to find.
+func (s *Server) ProbeHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /liveness", s.handleLiveness)
+	mux.HandleFunc("GET /readiness", s.handleReadiness)
+	// Aliases, because a chart or an operator reaches for whichever name their
+	// last cluster used and a 404 from a probe path is a CrashLoopBackOff.
+	mux.HandleFunc("GET /health", s.handleReadiness)
+	mux.HandleFunc("GET /healthz", s.handleReadiness)
+	mux.HandleFunc("GET /livez", s.handleLiveness)
+	return mux
 }

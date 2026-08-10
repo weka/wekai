@@ -30,7 +30,10 @@ import (
 )
 
 type harness struct {
-	srv     *httptest.Server
+	srv *httptest.Server
+	// probes is the OPERATIONAL listener, mirroring how serve mounts
+	// ProbeHandler beside /metrics. Probes are deliberately absent from srv.
+	probes  *httptest.Server
 	gw      *gateway.Server
 	reg     *registry.Registry
 	workers []*mockvllm.Worker
@@ -43,7 +46,6 @@ type harness struct {
 // better with one knob bag.
 type harnessConfig struct {
 	APIKey                string
-	RequireAuthForProbes  bool
 	MaxBodyBytes          int64
 	MaxConcurrentRequests int
 	PathAllowlist         []string
@@ -68,7 +70,6 @@ func defaultHarnessConfig() harnessConfig {
 func (c harnessConfig) gateway() gateway.Config {
 	return gateway.Config{
 		APIKey:                c.APIKey,
-		RequireAuthForProbes:  c.RequireAuthForProbes,
 		MaxBodyBytes:          c.MaxBodyBytes,
 		MaxConcurrentRequests: c.MaxConcurrentRequests,
 		PathAllowlist:         c.PathAllowlist,
@@ -112,6 +113,8 @@ func newHarness(t *testing.T, nWorkers int, mutate func(*harnessConfig)) *harnes
 	})), px, d)
 	h.gw = gw
 	h.srv = httptest.NewServer(gw)
+	h.probes = httptest.NewServer(gw.ProbeHandler())
+	t.Cleanup(h.probes.Close)
 	t.Cleanup(h.srv.Close)
 	return h
 }
@@ -452,22 +455,9 @@ func TestAdminNotExemptibleByAllowlist(t *testing.T) {
 	}
 }
 
-// AUTH-5: GET /liveness is the one public endpoint, even with auth and an
-// allowlist configured, so a kubelet httpGet probe still works.
-func TestLivenessIsPublic(t *testing.T) {
-	h := newHarness(t, 1, func(c *harnessConfig) {
-		c.APIKey = "secret"
-		c.PathAllowlist = []string{"/v1/chat/completions"}
-	})
-	resp, err := h.srv.Client().Get(h.srv.URL + "/liveness")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /liveness = %d, want 200 with auth and an allowlist set", resp.StatusCode)
-	}
-}
+// Removed: /liveness is no longer served on the inference listener at all. Auth and the
+// allowlist now apply to those paths like any other; see
+// TestAllowlistedRouterServesNothingElse.
 
 func TestRequestIDIsEchoedAndForwarded(t *testing.T) {
 	h := newHarness(t, 1, nil)
@@ -831,92 +821,55 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// TestKubeletProbesWorkWithAuthEnabled is a regression test for a bug found by
-// running the container the way Kubernetes runs it.
-//
-// The kubelet's httpGet probe cannot present a credential — doing so would mean
-// embedding the secret in the pod spec in plaintext. With /readiness behind auth
-// the probe got a 401, so the pod never became Ready and the Deployment never
-// received traffic. That is exactly why v1's README instructed operators to
-// replace httpGet with an exec probe, an instruction that cannot be followed on a
-// distroless image with no shell.
-func TestKubeletProbesWorkWithAuthEnabled(t *testing.T) {
-	h := newHarness(t, 1, func(c *harnessConfig) { c.APIKey = "secret-key" })
+// Removed: the kubelet probes the operational listener now. Auth and the
+// allowlist now apply to those paths like any other; see
+// TestAllowlistedRouterServesNothingElse.
 
-	for _, path := range []string{"/liveness", "/readiness", "/health"} {
+// Probes are not on the inference listener at all.
+//
+// Their answer is operational detail — fleet size, health, and why the router is
+// not ready — and a user-facing router is routinely unauthenticated, so on the
+// serving port that detail would simply be public. They live on the operational
+// listener beside the metrics instead.
+//
+// On the serving port these paths are now unclaimed, so the passthrough tier
+// proxies them upstream like any other unknown path. What matters here is that
+// the ROUTER does not answer them with its own state.
+func TestProbesAreNotOnTheInferenceListener(t *testing.T) {
+	h := newHarness(t, 3, nil)
+
+	for _, path := range []string{"/readiness", "/liveness", "/healthz", "/livez"} {
 		resp, err := h.srv.Client().Get(h.srv.URL + path)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("%s: %v", path, err)
 		}
-		body, _ := io.ReadAll(resp.Body)
+		var body map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&body)
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("unauthenticated GET %s = %d, want 200: a kubelet probe cannot "+
-				"authenticate, so this makes the pod permanently NotReady\nbody: %s",
-				path, resp.StatusCode, body)
+		for _, leaked := range []string{"healthy_backends", "registered_backends", "reason"} {
+			if _, found := body[leaked]; found {
+				t.Errorf("%s on the inference listener disclosed %q: %v", path, leaked, body)
+			}
 		}
 	}
-}
 
-// The fleet size is operational detail: an unauthenticated probe gets only the
-// boolean it needs.
-func TestUnauthenticatedReadinessDisclosesOnlyReadiness(t *testing.T) {
-	h := newHarness(t, 3, func(c *harnessConfig) { c.APIKey = "secret-key" })
-
-	resp, err := h.srv.Client().Get(h.srv.URL + "/readiness")
+	// And they ARE served, with detail, on the operational listener.
+	resp, err := h.probes.Client().Get(h.probes.URL + "/readiness")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var anon map[string]any
-	json.NewDecoder(resp.Body).Decode(&anon)
+	var body map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&body)
 	resp.Body.Close()
-	if _, leaked := anon["healthy_backends"]; leaked {
-		t.Errorf("unauthenticated /readiness disclosed the backend count: %v", anon)
-	}
-	if anon["ready"] != true {
-		t.Errorf("unauthenticated /readiness should still report readiness: %v", anon)
-	}
-
-	req, _ := http.NewRequest(http.MethodGet, h.srv.URL+"/readiness", nil)
-	req.Header.Set("Authorization", "Bearer secret-key")
-	resp2, err := h.srv.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var authed map[string]any
-	json.NewDecoder(resp2.Body).Decode(&authed)
-	resp2.Body.Close()
-	if got, ok := authed["healthy_backends"]; !ok || got.(float64) != 3 {
-		t.Errorf("authenticated /readiness should report the count, got %v", authed)
+	if got, ok := body["healthy_backends"]; !ok || got.(float64) != 3 {
+		t.Errorf("the operational /readiness must report the fleet it can see, got %v", body)
 	}
 }
 
-// An operator who wants probes locked down can have that, at the cost of needing
-// probes that can authenticate.
-func TestRequireAuthForProbesIsHonoured(t *testing.T) {
-	h := newHarness(t, 1, func(c *harnessConfig) {
-		c.APIKey = "secret-key"
-		c.RequireAuthForProbes = true
-	})
-	resp, err := h.srv.Client().Get(h.srv.URL + "/readiness")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("with require_auth_for_probes, /readiness = %d, want 401", resp.StatusCode)
-	}
-
-	// /liveness stays public regardless: it discloses only that the process is up.
-	resp2, err := h.srv.Client().Get(h.srv.URL + "/liveness")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
-		t.Errorf("/liveness = %d, want 200 even with require_auth_for_probes", resp2.StatusCode)
-	}
-}
+// There is no probe-auth option any more, and no probe exemption. Probes are
+// served on the operational listener, so on the inference listener their paths
+// are ordinary ones: auth applies, the allowlist applies, and nothing is exempt.
+// Covered by TestAllowlistedRouterServesNothingElse.
 
 // A readiness probe reporting "not ready" is the mechanism working, so it must
 // not be logged at ERROR. Observed in the cluster: a 15-minute vLLM model load
@@ -1564,13 +1517,10 @@ func TestProbePathsNeverReachABackend(t *testing.T) {
 // most often a label selector matching nothing, while a pool whose backends are
 // all unhealthy is a fleet problem. They need opposite responses.
 func TestReadinessSaysWhyItIsNotReady(t *testing.T) {
-	read := func(t *testing.T, h *harness, key string) (int, map[string]any) {
+	read := func(t *testing.T, h *harness) (int, map[string]any) {
 		t.Helper()
-		req, _ := http.NewRequest(http.MethodGet, h.srv.URL+"/readiness", nil)
-		if key != "" {
-			req.Header.Set("Authorization", "Bearer "+key)
-		}
-		resp, err := h.srv.Client().Do(req)
+		req, _ := http.NewRequest(http.MethodGet, h.probes.URL+"/readiness", nil)
+		resp, err := h.probes.Client().Do(req)
 		if err != nil {
 			t.Fatalf("readiness: %v", err)
 		}
@@ -1584,7 +1534,7 @@ func TestReadinessSaysWhyItIsNotReady(t *testing.T) {
 
 	t.Run("no backends at all names the configuration", func(t *testing.T) {
 		h := newHarness(t, 0, func(c *harnessConfig) { c.APIKey = "k" })
-		code, body := read(t, h, "k")
+		code, body := read(t, h)
 		if code != http.StatusServiceUnavailable {
 			t.Fatalf("status = %d, want 503", code)
 		}
@@ -1603,7 +1553,7 @@ func TestReadinessSaysWhyItIsNotReady(t *testing.T) {
 		for _, b := range h.reg.Snapshot().Backends {
 			b.SetHealth(registry.Unhealthy)
 		}
-		code, body := read(t, h, "k")
+		code, body := read(t, h)
 		if code != http.StatusServiceUnavailable {
 			t.Fatalf("status = %d, want 503", code)
 		}
@@ -1617,20 +1567,69 @@ func TestReadinessSaysWhyItIsNotReady(t *testing.T) {
 		}
 	})
 
-	// On a router WITH a key, an uncredentialed probe — the kubelet's view —
-	// gets the boolean it needs and nothing else. (On a keyless router there is
-	// no such distinction to make: the whole listener is open, so `Authed` is
-	// true for everyone and the counts are disclosed. That is how
-	// healthy_backends has always behaved.)
-	t.Run("an unauthenticated probe still learns nothing", func(t *testing.T) {
-		h := newHarness(t, 0, func(c *harnessConfig) { c.APIKey = "k" })
-		_, body := read(t, h, "")
-		if _, leaked := body["reason"]; leaked {
-			t.Errorf("the reason is operational detail and must not reach an "+
-				"unauthenticated caller: %v", body)
-		}
-		if _, leaked := body["registered_backends"]; leaked {
-			t.Errorf("backend counts must not reach an unauthenticated caller: %v", body)
-		}
+	// There is no third case about withholding detail from an unauthenticated
+	// caller. This listener is not published to callers at all, which is the
+	// point of moving the probes onto it — see
+	// TestProbesAreNotOnTheInferenceListener.
+}
+
+// A router exposed to users must serve ONLY what it was told to serve.
+//
+// Two ways that was not true. The allowlist exempted probe paths, so
+// /readiness, /health and /liveness bypassed both auth and the allowlist — and
+// since the passthrough tier proxies any path the dialect does not claim, that
+// exemption was a hole straight through to the backends. And the Helm chart
+// never exposed the allowlist at all, so a deployment could not switch it on
+// even though the binary supported it.
+func TestAllowlistedRouterServesNothingElse(t *testing.T) {
+	const key = "secret-key"
+	h := newHarness(t, 1, func(c *harnessConfig) {
+		c.APIKey = key
+		c.PathAllowlist = []string{"/v1/chat/completions", "/v1/models"}
 	})
+
+	get := func(t *testing.T, path string, withKey bool) int {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, h.srv.URL+path, nil)
+		if withKey {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		resp, err := h.srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Probe paths are not exempt from anything. Each of these previously reached
+	// a backend with no credential at all. The allowlist is applied before auth,
+	// so a path off the list is 404 rather than 401 — it does not confirm what
+	// the router has.
+	for _, path := range []string{"/liveness", "/readiness", "/health", "/healthz", "/livez"} {
+		if code := get(t, path, false); code != http.StatusNotFound {
+			t.Errorf("GET %s without a credential returned %d, want 404: an exempt probe "+
+				"path on an allowlisted router is a hole through to the backends", path, code)
+		}
+		if code := get(t, path, true); code != http.StatusNotFound {
+			t.Errorf("GET %s with a credential returned %d, want 404: not on the allowlist",
+				path, code)
+		}
+	}
+
+	// Nor is anything else off the list, credential or not — including the admin
+	// endpoints, which the allowlist never exempts.
+	for _, path := range []string{"/get_server_info", "/workers", "/v1/embeddings", "/anything"} {
+		if code := get(t, path, true); code != http.StatusNotFound {
+			t.Errorf("GET %s returned %d, want 404: it is not on the allowlist", path, code)
+		}
+	}
+
+	// What IS on the list still works, with a credential.
+	if code := get(t, "/v1/models", true); code != http.StatusOK {
+		t.Errorf("GET /v1/models returned %d, want 200: an allowlisted path must be served", code)
+	}
+	if code := get(t, "/v1/models", false); code != http.StatusUnauthorized {
+		t.Errorf("GET /v1/models without a credential returned %d, want 401", code)
+	}
 }

@@ -65,6 +65,9 @@ spec:
             {{- if .Values.router.default }}
             - "--default={{ .Values.router.default }}"
             {{- end }}
+            {{- range .Values.router.pathAllowlist }}
+            - "--path-allowlist={{ . }}"
+            {{- end }}
             {{- range .Values.router.stripAuthWhen }}
             - "--strip-auth-when={{ . }}"
             {{- end }}
@@ -118,6 +121,11 @@ spec:
             - name: http
               containerPort: {{ .Values.service.targetPort }}
               protocol: TCP
+            {{- if .Values.router.metricsListen }}
+            - name: metrics
+              containerPort: {{ (splitList ":" .Values.router.metricsListen) | last | int }}
+              protocol: TCP
+            {{- end }}
           {{- if .Values.llmApiKeySecretName }}
           env:
             - name: GEMINI_API_KEY
@@ -139,17 +147,20 @@ spec:
                   key: ANTHROPIC_API_KEY
                   optional: true
           {{- end }}
+          # Probed on the METRICS port, which is where the router serves them:
+          # their answer carries fleet size and health, and the inference
+          # listener may be public and unauthenticated.
           readinessProbe:
             httpGet:
               path: /readiness
-              port: http
+              port: metrics
             initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
             failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
           livenessProbe:
             httpGet:
               path: /liveness
-              port: http
+              port: metrics
             initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
             failureThreshold: {{ .Values.probes.liveness.failureThreshold }}

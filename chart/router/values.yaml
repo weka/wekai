@@ -68,9 +68,29 @@ router:
   # Mixing a URL and a selector is what a migration looks like.
   backends: []
 
-  # Address for /metrics and the live KV map at /router-viz. Must not be
-  # loopback, or the PodMonitor below can never reach it.
+  # Address for /metrics, the live KV map at /router-viz, and the kubelet's
+  # /liveness and /readiness. Must not be loopback, or neither the PodMonitor
+  # nor the probes can reach it.
+  #
+  # The probes are here rather than on the serving port because their answer is
+  # operational detail — fleet size, health, and why the router is not ready —
+  # and a user-facing router is routinely unauthenticated.
   metricsListen: "0.0.0.0:29000"
+
+  # Restrict which paths may be proxied. EMPTY MEANS EVERY PATH: any path the
+  # dialect does not claim is passed through to a backend, which is what lets
+  # one router front both an OpenAI-style fleet and a hosted API.
+  #
+  # A router exposed to users should set this. With it, nothing outside the list
+  # is served at all — there is no exempt path, not even a probe. Matching is on
+  # segment boundaries, so "/v1/mod" never admits "/v1/models"; a trailing "/"
+  # denotes a subtree.
+  #
+  #   pathAllowlist:
+  #     - /v1/chat/completions
+  #     - /v1/messages
+  #     - /v1/models
+  pathAllowlist: []
 
   # Split signals. The backend's own 429 is always on and needs no
   # configuration; these are opt-in early warnings that save a round trip.

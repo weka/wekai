@@ -122,7 +122,6 @@ type Options struct {
 	// a key passed as a flag is visible in a process listing and in the pod
 	// spec that launched it.
 	APIKeyFile            string
-	RequireAuthForProbes  bool
 	CORSOrigins           []string
 	PathAllowlist         []string
 	MaxBodyBytes          int64
@@ -184,7 +183,6 @@ type Options struct {
 func (o Options) gatewayConfig() gateway.Config {
 	return gateway.Config{
 		APIKey:                o.APIKey,
-		RequireAuthForProbes:  o.RequireAuthForProbes,
 		MaxBodyBytes:          o.MaxBodyBytes,
 		MaxConcurrentRequests: o.MaxConcurrentRequests,
 		PathAllowlist:         o.PathAllowlist,
@@ -437,8 +435,13 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		go agg.Run(ctx, func() []string { return eps })
 	}
 
-	// Metrics and the live KV map on their own listener: diagnostic surface,
-	// never reachable on the inference path (GW-13).
+	// Metrics, the live KV map and the kubelet's probes on their own listener:
+	// diagnostic surface, never reachable on the inference path (GW-13).
+	if opts.MetricsListen == "" {
+		log.Warn("no metrics listener, so /readiness and /liveness are not served " +
+			"anywhere: they carry operational detail and are not exposed on the " +
+			"inference listener. Set --metrics-listen to probe this router.")
+	}
 	if opts.MetricsListen != "" {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -451,6 +454,14 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 				_ = agg.Render(w)
 			}
 		})
+		// The kubelet's probes live here, not on the inference listener: their
+		// answer is operational detail — fleet size, health, and why the router
+		// is not ready — and a user-facing router is routinely unauthenticated.
+		mux.Handle("/liveness", gw.ProbeHandler())
+		mux.Handle("/readiness", gw.ProbeHandler())
+		mux.Handle("/health", gw.ProbeHandler())
+		mux.Handle("/healthz", gw.ProbeHandler())
+		mux.Handle("/livez", gw.ProbeHandler())
 		mux.HandleFunc("/router-viz", viz.PageHandler())
 		// One KV map per pool; the page takes ?pool=, defaulting to the first.
 		mux.HandleFunc("/router-viz/data", vizData(pools))
