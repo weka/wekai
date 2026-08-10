@@ -162,13 +162,27 @@ jobs:
 
             Model-aware LLM router with prefix-cache affinity. Separate,
             replay-less image — same binary, without the multi-GB replay layer a
-            router never reads:
+            router never reads.
+
+            Point it at your fleet by pod label. Each discovered pod contributes
+            its own port, so several DaemonSets on different ports stay one pool:
 
             ```
             helm upgrade --install my-router oci://quay.io/weka.io/helm/wekai-router \
               --version ${{ steps.semver.outputs.new_tag }} \
-              --set router.routes[0]="* => http://vllm-a:8000|http://vllm-b:8000"
+              --set-string 'router.backends[0].pods.app=vllm' \
+              --set-string 'router.backends[0].port=http'
             ```
+
+            A static list works the same way, and the two can be mixed:
+
+            ```
+              --set-string 'router.backends[0]=http://vllm-a:8000' \
+              --set-string 'router.backends[1]=http://vllm-b:8000'
+            ```
+
+            Per-model routes, a hosted fallback and credentials are in
+            [docs/router.md](https://github.com/weka/wekai/blob/main/docs/router.md).
 
             ```
             docker pull quay.io/weka.io/wekai-router:${{ steps.semver.outputs.new_tag }}
