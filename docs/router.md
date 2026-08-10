@@ -76,12 +76,18 @@ that saves a round trip: set it to the backends' vLLM `--max-num-seqs` and
 saturation is predicted rather than discovered one refusal at a time.
 
 `--rebalance-ratio` defaults to `0.5`, so a backend carrying more than twice the
-fleet minimum stops taking new work. It trades locality for evenness — a fleet
-where affinity is working is *supposed* to look imbalanced — so set it to `0`
-when locality matters more. Note the arithmetic against an idle backend: the
-fleet minimum is then 0, `(inflight - 0)/inflight` is 1.0 for anything carrying
-work at all, and every busy backend is treated as saturated until the idle one
-picks up traffic.
+fleet minimum stops taking new work and the idle capacity beside it gets used.
+It trades locality for evenness — a fleet where affinity is working is *supposed*
+to look imbalanced — so set it to `0` when locality matters more.
+
+A backend under **8 in-flight** is never rebalanced away from, whatever the
+proportions say. The floor is fixed, and it is what keeps the ratio meaningful:
+the fleet minimum is 0 whenever any backend is momentarily idle, and then
+`(inflight − 0)/inflight` is 1.0 for every backend carrying anything at all. A
+fleet of `1,1,1,0` would read as imbalanced as `20,20,20,0` — they are
+ratio-identical, and only magnitude separates them. Above the floor the ratio
+decides; below it nothing is under pressure and moving a prefix costs more than
+the imbalance does.
 
 ---
 

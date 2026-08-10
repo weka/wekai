@@ -4,10 +4,16 @@
 
 Every commit MUST follow [Conventional Commits](https://www.conventionalcommits.org/):
 
-- `feat: ...` — new functionality → **minor** release
-- `fix: ...` — bug fix → **patch** release
+- `feat: ...` — **genuinely new functionality** → **minor** release
+- `fix: ...` — bug fix, **and any tuning of existing behaviour** → **patch**
 - `feat!: ...` / `fix!: ...` or a `BREAKING CHANGE:` footer → **major** release
 - `docs:`, `chore:`, `refactor:`, `test:`, `ci:`, `build:` — no release
+
+**`feat:` means a capability that did not exist before.** Changing a default,
+adjusting a threshold, or refining how something already works is a `fix:`,
+however much the reasoning behind it changed — those ship as patches. Reaching
+for `feat:` because a change felt significant inflates the minor version and
+tells a reader to look for something new that is not there.
 
 Releases are cut automatically: on every push to `main`,
 `.github/workflows/release.yml` derives the next semver from the commit

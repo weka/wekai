@@ -169,15 +169,40 @@ func (c concurrencySignal) saturated(b *registry.Backend, _ loadView) (bool, int
 // (balance_abs_threshold / balance_rel_threshold, from the retired
 // prefix-cache-aware policy) needed retuning per deployment.
 //
-// This is the signal that trades locality for evenness, so it is off by
-// default: a fleet where affinity is working is SUPPOSED to look imbalanced.
+// A ratio alone is not enough, because it degenerates exactly where it matters
+// least. The fleet minimum is 0 whenever any backend is momentarily idle, and
+// then (load - 0)/load is 1.0 for every backend carrying anything at all — so
+// no ratio below 1.0 can fail, and a fleet of 1,1,1,0 is called as imbalanced
+// as one of 20,20,20,0. Those two are ratio-IDENTICAL: same minimum, same
+// proportions. Only their magnitude differs, so only an absolute term can tell
+// them apart.
+//
+// Hence minRebalanceLoad: a backend carrying less than that is never treated as
+// overloaded, whatever the proportions say. Nothing is under pressure there, and
+// copying a prefix away from it costs more than the imbalance does. Above it the
+// ratio decides, as before.
+//
+// This is the signal that trades locality for evenness: a fleet where affinity
+// is working is SUPPOSED to look imbalanced. Setting the ratio to 0 turns it
+// off for a deployment that values locality more.
 type imbalanceSignal struct{ ratio float64 }
+
+// minRebalanceLoad is the in-flight floor, in requests, below which a backend is
+// never rebalanced away from. Deliberately a constant and not a knob: it does
+// not separate deployments, it separates "this backend is under pressure" from
+// "it is not", and that boundary is the same everywhere.
+const minRebalanceLoad = 8
 
 func (imbalanceSignal) name() string { return "imbalance" }
 
 func (i imbalanceSignal) saturated(b *registry.Backend, view loadView) (bool, int64) {
 	load := b.Inflight()
 	if load <= 0 || load <= view.minInflight {
+		return false, 0
+	}
+	// Both tests, and the absolute one first because it is the cheap one and
+	// the one that rejects the degenerate cases.
+	if load < minRebalanceLoad {
 		return false, 0
 	}
 	if float64(load-view.minInflight)/float64(load) > i.ratio {

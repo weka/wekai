@@ -81,14 +81,16 @@ router:
     # Rebalance once (inflight - fleetMin)/inflight exceeds this — at 0.5, once
     # a backend carries more than twice the fleet minimum.
     #
+    # A backend under 8 in-flight is never rebalanced away from, whatever the
+    # proportions say. That floor is not tunable and is what keeps the ratio
+    # honest: the fleet minimum is 0 whenever any backend is momentarily idle,
+    # and then the ratio is 1.0 for every backend carrying anything at all —
+    # so 1,1,1,0 would read as imbalanced as 20,20,20,0. They are
+    # ratio-identical; only magnitude tells them apart.
+    #
     # This trades locality for evenness, so it is a real trade: a fleet where
     # prefix affinity is working is SUPPOSED to look imbalanced. Set 0 to turn
     # it off and let affinity concentrate work as far as it will.
-    #
-    # Note the arithmetic when a backend is fully idle: the fleet minimum is
-    # then 0, so (inflight - 0)/inflight is 1.0 for every backend carrying
-    # anything at all, and all of them are treated as saturated until the idle
-    # one picks up work.
     rebalanceRatio: 0.5
     # A prefix is split onto a backend only while its in-flight is below
     # limit*(1-this). Lower and every backend ends up holding every prefix.

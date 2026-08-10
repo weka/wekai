@@ -131,10 +131,14 @@ func TestRefusalSplitsRatherThanReturningToTheFullBackend(t *testing.T) {
 	}
 }
 
-// TestImbalanceRatioArithmetic pins the one number the imbalance signal takes.
-// It is expressed against the HIGHER side — (load-min)/load > ratio — which is
-// what lets a single value work at any fleet size, unlike the absolute-plus-
-// relative pair it replaces from the retired prefix-cache-aware policy.
+// TestImbalanceRatioArithmetic pins the ratio half of the signal. It is
+// expressed against the HIGHER side — (load-min)/load > ratio — which is what
+// lets a single value work at any fleet size, unlike the absolute-plus-relative
+// pair it replaces from the retired prefix-cache-aware policy.
+//
+// The ratio never fires alone: a backend below minRebalanceLoad is not under
+// pressure whatever the proportions say. See TestImbalanceNeedsBothA... for
+// that half, and for why a ratio cannot judge it on its own.
 func TestImbalanceRatioArithmetic(t *testing.T) {
 	sig := imbalanceSignal{ratio: 0.5}
 	for _, tc := range []struct {
@@ -142,9 +146,11 @@ func TestImbalanceRatioArithmetic(t *testing.T) {
 		want      bool
 	}{
 		{load: 10, min: 4, want: true},   // gap 6 of 10 = 60% > 50%
+		{load: 8, min: 0, want: true},    // at the floor, and wholly lopsided
+		{load: 7, min: 0, want: false},   // one below it, and never rebalanced from
 		{load: 10, min: 5, want: false},  // gap 5 of 10 = exactly 50%, not over
 		{load: 10, min: 6, want: false},  // gap 4 of 10 = 40%
-		{load: 2, min: 0, want: true},    // gap 2 of 2 = 100%
+		{load: 2, min: 0, want: false},   // 100% of nothing: under the in-flight floor
 		{load: 0, min: 0, want: false},   // an idle backend is never "too loaded"
 		{load: 4, min: 10, want: false},  // below the minimum cannot happen, but must not panic
 		{load: 100, min: 49, want: true}, // scale-free: same shape at 10x
