@@ -369,3 +369,83 @@ func TestPodPortComesFromThePodNotTheFlag(t *testing.T) {
 	})
 	cancel()
 }
+
+// Port precedence, which the `pods:<selector>` form with no port suffix relies
+// on entirely: a pod declaring exactly one port is served on THAT port, not on
+// the configured floor.
+//
+// The rule was implemented and documented but never tested — the only pod-port
+// case in this file always names its port, so the sole-declared-port path had
+// no coverage at all. It is the path the tidiest configuration takes.
+func TestPodPortPrecedence(t *testing.T) {
+	mkPod := func(name, ip string, ports ...corev1.ContainerPort) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns,
+				Labels: map[string]string{"app": "vllm"}},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning, PodIP: ip,
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			},
+		}
+		if len(ports) > 0 {
+			p.Spec.Containers = []corev1.Container{{Ports: ports}}
+		}
+		return p
+	}
+
+	for _, tc := range []struct {
+		name     string
+		portName string
+		ports    []corev1.ContainerPort
+		want     string
+	}{
+		{
+			name:  "a sole declared port wins over the configured floor",
+			ports: []corev1.ContainerPort{{ContainerPort: 9001}},
+			want:  "http://10.2.0.1:9001",
+		},
+		{
+			name:  "a sole declared port needs no name",
+			ports: []corev1.ContainerPort{{Name: "grpc", ContainerPort: 9002}},
+			want:  "http://10.2.0.1:9002",
+		},
+		{
+			name:  "no declared port falls back to the floor",
+			ports: nil,
+			want:  "http://10.2.0.1:8000",
+		},
+		{
+			name: "several unnamed ports fall back rather than guess",
+			ports: []corev1.ContainerPort{
+				{ContainerPort: 9003}, {ContainerPort: 9004},
+			},
+			want: "http://10.2.0.1:8000",
+		},
+		{
+			name:     "a named port is picked out of several",
+			portName: "http",
+			ports: []corev1.ContainerPort{
+				{Name: "metrics", ContainerPort: 9090},
+				{Name: "http", ContainerPort: 9005},
+			},
+			want: "http://10.2.0.1:9005",
+		},
+		{
+			// Deliberate: picking a different port would send traffic where
+			// nothing is listening, so the floor is at least wrong the same way
+			// for every pod.
+			name:     "a named port that is absent falls back to the floor",
+			portName: "http",
+			ports:    []corev1.ContainerPort{{Name: "grpc", ContainerPort: 9006}},
+			want:     "http://10.2.0.1:8000",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, cancel := run(t, k8sdisc.Config{
+				Mode: k8sdisc.ModePod, Namespace: ns, Selector: "app=vllm",
+				Port: 8000, PortName: tc.portName, Scheme: "http",
+			}, []runtimeObject{mkPod("vllm-0", "10.2.0.1", tc.ports...)}, []string{tc.want})
+			defer cancel()
+		})
+	}
+}
