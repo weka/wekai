@@ -402,10 +402,14 @@ wekai router serve \
 Discovery needs RBAC, which the chart creates only when asked — a
 namespace-scoped Role, never a ClusterRole:
 
+Note the two blocks. Top-level `discovery` carries one field and it is a
+permission: it creates the ServiceAccount, Role and RoleBinding and mounts the
+API token. Everything about HOW to look pods up lives under `router.discovery`,
+because those become CLI flags.
+
 ```yaml
 discovery:
-  enabled: true
-  mode: pod
+  enabled: true      # the ONLY field here; grants API access
 
 router:
   routes:
