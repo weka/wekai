@@ -727,14 +727,29 @@ func TestMetricsCarryTheMatchedRouteClass(t *testing.T) {
 	unmatchedBefore := testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("unmatched", "", "2xx"))
 
 	resp := h.post(t, "/v1/chat/completions", `{"model":"m","messages":[]}`, nil)
+	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
+
+	// Check the response BEFORE the counter. This assertion is about a label
+	// reaching the middleware, and it is read from a delta on a process-global
+	// counter — so a request that simply failed shows up as "the label did not
+	// arrive", which sends the reader hunting through middleware for a routing
+	// bug that is not there. Ask the direct question first.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("request returned %d, want 200 — nothing can be concluded about the "+
+			"route label from a request that did not succeed. Body: %s",
+			resp.StatusCode, body)
+	}
 
 	after := testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("chat", "openai", "2xx"))
 	unmatchedAfter := testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("unmatched", "", "2xx"))
 
 	if after != before+1 {
-		t.Errorf("router_requests_total{route=chat,dialect=openai} went %v -> %v, want +1: "+
-			"the matched route class did not reach the access-log middleware", before, after)
+		t.Errorf("router_requests_total{route=chat,dialect=openai,status=2xx} went %v -> %v, "+
+			"want +1: the request succeeded, so the matched route class did not reach the "+
+			"access-log middleware. unmatched went %v -> %v",
+			before, after, unmatchedBefore,
+			testutil.ToFloat64(metrics.RequestsTotal.WithLabelValues("unmatched", "", "2xx")))
 	}
 	if unmatchedAfter != unmatchedBefore {
 		t.Errorf("a matched request was counted as route=unmatched (%v -> %v)",
