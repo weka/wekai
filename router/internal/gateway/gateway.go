@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/weka/wekai/router/internal/dialect"
@@ -36,10 +37,51 @@ type Server struct {
 
 // New builds the HTTP surface over a Router, which decides which pool serves a
 // given model.
+// dialectPaths is the set of paths a dialect claims, taken from its own route
+// table so the two can never disagree.
+func dialectPaths(d dialect.Dialect) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, rt := range d.Routes() {
+		p := rt.Pattern
+		if i := strings.LastIndexByte(p, ' '); i >= 0 {
+			p = p[i+1:] // "POST /v1/chat/completions" -> "/v1/chat/completions"
+		}
+		if p == "" || p == "/" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
 func New(cfg Config, rt Router, px *proxy.Proxy, d dialect.Dialect) *Server {
 	s := &Server{cfg: cfg, router: rt, px: px, dialect: d}
 	if cfg.APIKey != "" {
 		s.apiKey = []byte(cfg.APIKey)
+		// A protected router serves the inference surface and nothing else,
+		// unless told otherwise.
+		//
+		// The allowlist defaults to empty, and empty means EVERY path, because
+		// the passthrough tier is what lets one router front a hosted API on
+		// paths this dialect never claims. That default is right for an internal
+		// router and wrong for a protected one: setting a key says this listener
+		// faces users, and then proxying arbitrary paths to a backend is a
+		// surface nobody asked for. The two settings belong together, so one
+		// implies the other.
+		//
+		// The set is the DIALECT'S OWN ROUTES — what the router knows how to
+		// serve — rather than a list written out here that would drift from it.
+		// Everything else is refused, including the admin endpoints; an operator
+		// who wants those says so explicitly.
+		if len(cfg.PathAllowlist) == 0 {
+			s.cfg.PathAllowlist = dialectPaths(d)
+			slog.Info("an API key is set, so only this dialect's own endpoints are served, "+
+				"all of them requiring the key; pass --path-allowlist to choose a "+
+				"different set",
+				"paths", s.cfg.PathAllowlist)
+		}
 	}
 	if cfg.MaxConcurrentRequests > 0 {
 		s.sem = make(chan struct{}, cfg.MaxConcurrentRequests)

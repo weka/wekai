@@ -605,6 +605,9 @@ func TestServerInfoRedactsSecretsAndStatesResidencySource(t *testing.T) {
 	h := newHarness(t, 1, func(c *harnessConfig) {
 		c.APIKey = "super-secret-value"
 		c.UpstreamCredential = "upstream-secret-value"
+		// Asked for explicitly: an API key now confines the router to the
+		// dialect's own routes, and the admin endpoints are not among them.
+		c.PathAllowlist = []string{"/get_server_info"}
 	})
 	req, _ := http.NewRequest(http.MethodGet, h.srv.URL+"/get_server_info", nil)
 	req.Header.Set("Authorization", "Bearer super-secret-value")
@@ -1631,5 +1634,91 @@ func TestAllowlistedRouterServesNothingElse(t *testing.T) {
 	}
 	if code := get(t, "/v1/models", false); code != http.StatusUnauthorized {
 		t.Errorf("GET /v1/models without a credential returned %d, want 401", code)
+	}
+}
+
+// Setting an API key says this listener faces users. It should not then also
+// require remembering to close the passthrough tier by hand.
+//
+// From a production config that had to say both things separately:
+//
+//	FORWARD_PATH_ALLOWLIST=/v1/chat/completions,/v1/completions,/v1/embeddings,/v1/models
+//	INBOUND_API_KEY=...
+//
+// The second now implies the first.
+func TestAnAPIKeyImpliesTheInferenceAllowlist(t *testing.T) {
+	const key = "secret-key"
+	h := newHarness(t, 1, func(c *harnessConfig) { c.APIKey = key })
+
+	get := func(path string) int {
+		req, _ := http.NewRequest(http.MethodGet, h.srv.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, err := h.srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := get("/v1/models"); code != http.StatusOK {
+		t.Errorf("GET /v1/models = %d, want 200: the inference surface must still be served", code)
+	}
+	// The dialect's other routes are served too — they are what this router
+	// knows how to answer, and they are protected like the rest.
+	if code := get("/get_model_info"); code == http.StatusNotFound {
+		t.Error("GET /get_model_info = 404: a dialect route must still be served")
+	}
+	// What is gone is everything the dialect does NOT claim: the passthrough
+	// tier, and the admin endpoints an operator must now ask for.
+	for _, path := range []string{
+		"/get_server_info", "/workers", "/readiness", "/anything", "/v1/messages",
+	} {
+		if code := get(path); code != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404: a protected router serves this dialect's "+
+				"own endpoints and nothing else", path, code)
+		}
+	}
+}
+
+// An explicit allowlist always wins: the default is a default, not a policy.
+func TestAnExplicitAllowlistOverridesTheDefault(t *testing.T) {
+	const key = "secret-key"
+	h := newHarness(t, 1, func(c *harnessConfig) {
+		c.APIKey = key
+		c.PathAllowlist = []string{"/v1/models", "/v1/messages"}
+	})
+	get := func(path string) int {
+		req, _ := http.NewRequest(http.MethodGet, h.srv.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, err := h.srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := get("/v1/models"); code != http.StatusOK {
+		t.Errorf("GET /v1/models = %d, want 200", code)
+	}
+	// In the default set, but not in the one the operator asked for.
+	if code := get("/v1/embeddings"); code != http.StatusNotFound {
+		t.Errorf("GET /v1/embeddings = %d, want 404: an explicit allowlist replaces the "+
+			"default rather than adding to it", code)
+	}
+}
+
+// Without a key nothing changes: an internal router still passes through, which
+// is what lets one router front a hosted API on paths this dialect never claims.
+func TestNoKeyLeavesPassthroughOpen(t *testing.T) {
+	h := newHarness(t, 1, nil)
+	resp, err := h.srv.Client().Get(h.srv.URL + "/v1/anything")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		t.Error("an unprotected router stopped passing unclaimed paths through; that is " +
+			"how a hosted API is fronted")
 	}
 }

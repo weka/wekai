@@ -429,10 +429,21 @@ authenticates to each pool.
 
 ### Serving only what you intend
 
-`--path-allowlist` restricts which paths the router will serve at all. **Empty
-means every path**: anything the dialect does not claim is passed through to a
-backend, which is what lets one router front both an OpenAI-style fleet and a
-hosted API. A router exposed to users should set it:
+**Setting an API key already does this.** A protected router serves the
+dialect's own routes — `/v1/chat/completions`, `/v1/completions`,
+`/v1/embeddings`, `/v1/models`, and the rest of the table — all of them
+requiring the key, and nothing else. The passthrough tier is closed, and so are
+the admin endpoints; ask for those explicitly if you want them.
+
+Setting a key says this listener faces users, and proxying arbitrary paths
+through to a backend is not something a user-facing listener should do. The two
+belong together, so one implies the other rather than being a second thing to
+remember.
+
+`--path-allowlist` overrides that default when you want a different set. Without
+a key it is the only way to restrict anything: **empty means every path**, since
+the passthrough tier is what lets one router front both a local fleet and a
+hosted API on paths this dialect never claims.
 
 ```bash
 wekai router serve \

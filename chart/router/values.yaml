@@ -77,14 +77,20 @@ router:
   # and a user-facing router is routinely unauthenticated.
   metricsListen: "0.0.0.0:29000"
 
-  # Restrict which paths may be proxied. EMPTY MEANS EVERY PATH: any path the
-  # dialect does not claim is passed through to a backend, which is what lets
-  # one router front both an OpenAI-style fleet and a hosted API.
+  # Restrict which paths may be proxied.
   #
-  # A router exposed to users should set this. With it, nothing outside the list
-  # is served at all — there is no exempt path, not even a probe. Matching is on
-  # segment boundaries, so "/v1/mod" never admits "/v1/models"; a trailing "/"
-  # denotes a subtree.
+  # Setting apiKey/apiKeyFile already restricts the router to the dialect's own
+  # routes — chat/completions, completions, embeddings, models and the rest —
+  # all requiring the key, with the passthrough tier and the admin endpoints
+  # closed. This overrides that default with a set of your own.
+  #
+  # WITHOUT a key, EMPTY MEANS EVERY PATH: any path the dialect does not claim
+  # is passed through to a backend, which is what lets one router front both an
+  # OpenAI-style fleet and a hosted API.
+  #
+  # Nothing outside the list is served — there is no exempt path, not even a
+  # probe. Matching is on segment boundaries, so "/v1/mod" never admits
+  # "/v1/models"; a trailing "/" denotes a subtree.
   #
   #   pathAllowlist:
   #     - /v1/chat/completions
