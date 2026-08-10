@@ -238,26 +238,48 @@ If Dagger cannot start — a locked-down Docker Desktop refusing to pull its eng
 image is the usual cause — `go test ./chart/` and `task router:image` still cover
 template and image correctness between them.
 
-## Backend URLs: no `/v1` suffix
+## Backend URLs and base paths
 
-Write a backend as its base, without the API path:
+A backend is configured as a **base**; the client's request supplies the
+**path**. For anything hosted at the root — vLLM, OpenAI, Anthropic — write the
+bare host and nothing is added or stripped:
 
 ```
-http://vllm:8000          correct
-http://vllm:8000/v1       wrong, and it degrades quietly
+http://vllm:8000            +  POST /v1/chat/completions
+  -> http://vllm:8000/v1/chat/completions
 ```
 
-The router appends the dialect's own paths, so a `/v1` suffix still PROXIES
-correctly — `POST /v1/chat/completions` lands where you expect. What breaks is
-everything the router asks the backend on its own behalf: `/v1/health`,
-`/v1/metrics` and `/v1/v1/models` all 404. The endpoint is then taken for a
-hosted API, marked passive, and never actively health-checked — so it serves
-fine until it dies, and keeps looking healthy afterwards. It also contributes no
-models to `/v1/models` and no upstream metrics.
+A base path exists for providers that are *not* at the root. Google's
+OpenAI-compatible surface is one, and the prefix can only come from
+configuration — without it the request lands on Google's native API, which
+speaks a different protocol:
 
-The router logs a warning at startup for any backend URL ending in `/v1`. A base
-path that is genuinely part of the endpoint is fine and kept — Google's
-OpenAI-compatible surface is `https://generativelanguage.googleapis.com/v1beta/openai`.
+```
+https://generativelanguage.googleapis.com/v1beta/openai  +  POST /v1/chat/completions
+  -> https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
+```
+
+The base *replaces* the client's version segment rather than stacking on top of
+it, which is what `base_url` means everywhere else it appears: an OpenAI
+`base_url` ends in `/v1` and the caller appends `chat/completions`.
+
+### The `/v1` suffix
+
+Out of that same `base_url` habit, people often write:
+
+```
+http://vllm:8000/v1
+```
+
+Inference is unaffected — it composes back to exactly the same URL. But the
+requests the router makes *on its own behalf* concatenate onto the base, so
+`/v1/health`, `/v1/metrics` and `/v1/v1/models` all 404. The endpoint is then
+taken for a hosted API, marked passive, and never actively health-checked — so
+it serves fine until it dies and keeps looking healthy afterwards, while
+contributing no models to `/v1/models` and no upstream metrics.
+
+The router logs a warning at startup for any backend URL ending in `/v1`. Drop
+the suffix; a genuine base path like `/v1beta/openai` is kept and used.
 
 ## Credentials
 
