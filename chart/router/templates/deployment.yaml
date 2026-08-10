@@ -128,30 +128,38 @@ spec:
           {{- end }}
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readiness
               port: http
             initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
             failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
           livenessProbe:
             httpGet:
-              path: /livez
+              path: /liveness
               port: http
             initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
             failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if .Values.datastore.sharedPvc.enabled }}
+          {{- if or .Values.datastore.sharedPvc.enabled .Values.router.capture }}
           volumeMounts:
             - name: data
               mountPath: /data
           {{- end }}
-      {{- if .Values.datastore.sharedPvc.enabled }}
+      {{- if or .Values.datastore.sharedPvc.enabled .Values.router.capture }}
       volumes:
         - name: data
+          {{- if .Values.datastore.sharedPvc.enabled }}
           persistentVolumeClaim:
             claimName: {{ include "app.fullname" . }}-router-capture
+          {{- else }}
+          # Capture without a PVC: records land on the node and go with the pod.
+          # That is fine for a short-lived test and useless for collecting a
+          # corpus, which is why capture is off by default — turning it on
+          # without a PVC should not silently look like it is retaining data.
+          emptyDir: {}
+          {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

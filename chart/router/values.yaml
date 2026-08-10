@@ -89,7 +89,11 @@ router:
   # hashes, byte/token counts, tool-use ids, prompt/seed hashes) without
   # storing original prompt or response content. Operators that want full
   # raw bodies can override to "raw"; "" disables capture entirely.
-  capture: redacted
+  # OFF by default. Capture writes to /data, and enabling it without somewhere
+  # writable crashed the pod on startup. Turn it on together with
+  # datastore.sharedPvc.enabled=true to keep the records; without a PVC the
+  # chart mounts an emptyDir, so they are lost with the pod.
+  capture: ""
 
   # Optional override for capture directory. Defaults to
   # /data/router/capture/<mode> when datastore PVC is enabled; otherwise to

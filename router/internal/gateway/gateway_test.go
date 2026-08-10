@@ -1432,3 +1432,28 @@ func TestMaxNodeConcurrencyExcludesAtCapBackendFromFallback(t *testing.T) {
 		t.Errorf("load accounting errors = %d", n)
 	}
 }
+
+// TestProbePathsNeverReachABackend covers the failure that CrashLoopBackOffed a
+// deployed router: probes on the kubernetes-convention paths were proxied
+// upstream, because any path the dialect does not claim is passed through.
+//
+// A probe answered by a backend is not a probe of the router, and the backend's
+// 404 reads as the router being unhealthy.
+func TestProbePathsNeverReachABackend(t *testing.T) {
+	h := newHarness(t, 1, nil)
+	for _, path := range []string{"/readiness", "/liveness", "/healthz", "/livez", "/health"} {
+		resp, err := http.Get(h.srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			t.Errorf("GET %s = 404; a probe path must be answered by the router, "+
+				"not proxied to a backend that knows nothing about it", path)
+		}
+		if strings.Contains(string(body), "chat.completion") {
+			t.Errorf("GET %s was answered by a backend", path)
+		}
+	}
+}

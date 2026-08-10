@@ -238,6 +238,22 @@ If Dagger cannot start — a locked-down Docker Desktop refusing to pull its eng
 image is the usual cause — `go test ./chart/` and `task router:image` still cover
 template and image correctness between them.
 
+## Readiness
+
+A router pod is **not ready until at least one endpoint is alive**. `/readiness`
+returns 503 while no backend is healthy, so an orchestrator removes the pod from
+its Service rather than sending it traffic it cannot serve. Backends are probed
+immediately at startup and then on `--health-interval`, so readiness reflects the
+fleet rather than the router's own process being up — that is `/liveness`.
+
+Probe the router on `/readiness` and `/liveness` (`/healthz` and `/livez` are
+accepted aliases). **Do not probe an arbitrary path**: any path the dialect does
+not claim is proxied to a backend, so a probe on the wrong path is answered by
+something that knows nothing about it.
+
+A saturated router stays ready. It sheds with 429 rather than going NotReady,
+because it is working, not broken.
+
 ## Observability
 
 `/metrics` and the live KV map at `/router-viz` are on `--metrics-listen`, never
@@ -263,7 +279,7 @@ breaks `rate()` and `increase()`.
 
 ## Capture
 
-`--capture raw|redacted` records every proxied exchange to JSONL for later
+`--capture raw|redacted` (off by default) records every proxied exchange to JSONL for later
 analysis or replay. `redacted` keeps structured metadata — block hashes, token
 counts, tool-use ids — without bodies. This is how the replay corpora used for
 benchmarking are collected.

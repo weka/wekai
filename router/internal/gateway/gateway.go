@@ -72,6 +72,13 @@ func (s *Server) build() http.Handler {
 	mux.HandleFunc("GET /liveness", s.handleLiveness)
 	mux.HandleFunc("GET /readiness", s.handleReadiness)
 	mux.HandleFunc("GET /health", s.handleReadiness)
+	// Kubernetes-convention aliases. They exist because of the passthrough tier
+	// below: an unclaimed path is PROXIED, so a probe pointed at /healthz would
+	// be forwarded upstream and answered by a backend that knows nothing about
+	// it — a 404 that reads as "the router is unhealthy" and CrashLoopBackOffs
+	// the pod. A probe must never leave the router.
+	mux.HandleFunc("GET /healthz", s.handleReadiness)
+	mux.HandleFunc("GET /livez", s.handleLiveness)
 	mux.HandleFunc("GET /get_server_info", s.handleServerInfo)
 
 	// Admin endpoints. Auth applies (AUTH-11).

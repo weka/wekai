@@ -239,3 +239,63 @@ func TestRouterChartStructuredRoutesSurviveSet(t *testing.T) {
 		t.Errorf("string-form route stopped working:\n%s", str)
 	}
 }
+
+// TestRouterChartProbesPathsTheBinaryServes is the regression test for a
+// CrashLoopBackOff found only by deploying.
+//
+// The chart probed /healthz and /livez, which the router does not serve. That
+// alone would be a clean 404, but the router PROXIES any unclaimed path — so
+// the probe was forwarded to a backend, answered 404 by something that knows
+// nothing about it, and read as "the router is unhealthy". A probe must be
+// answered by the router itself.
+func TestRouterChartProbesPathsTheBinaryServes(t *testing.T) {
+	out := renderRouter(t, "--set", "router.backends[0]=http://a:8000")
+	for _, want := range []string{"path: /readiness", "path: /liveness"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("probe %q missing; a probe on a path the router does not serve is "+
+				"proxied to a backend and fails:\n%s", want, out)
+		}
+	}
+	for _, bad := range []string{"path: /healthz", "path: /livez"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("chart still probes %s", bad)
+		}
+	}
+}
+
+// TestRouterChartCaptureIsOffByDefault: capture writes to /data, and enabling
+// it with nowhere writable crashed the pod at startup. Off unless asked for.
+func TestRouterChartCaptureIsOffByDefault(t *testing.T) {
+	out := renderRouter(t, "--set", "router.backends[0]=http://a:8000")
+	if strings.Contains(out, "--capture=") {
+		t.Errorf("capture is enabled by default; it writes to /data and needs a volume:\n%s", out)
+	}
+	if strings.Contains(out, "mountPath: /data") {
+		t.Error("a /data volume is mounted with no capture and no PVC, for nothing to write")
+	}
+}
+
+// TestRouterChartCaptureGetsWritableStorage: with capture on and no PVC the
+// chart must mount an emptyDir, which its own comment always claimed it did.
+// Records are then lost with the pod — acceptable for a test, which is why
+// capture defaults off rather than silently looking like it retains data.
+func TestRouterChartCaptureGetsWritableStorage(t *testing.T) {
+	noPVC := renderRouter(t,
+		"--set", "router.backends[0]=http://a:8000",
+		"--set", "router.capture=redacted")
+	if !strings.Contains(noPVC, "emptyDir: {}") || !strings.Contains(noPVC, "mountPath: /data") {
+		t.Errorf("capture without a PVC has nowhere writable, so the pod crashes on "+
+			"startup:\n%s", noPVC)
+	}
+
+	withPVC := renderRouter(t,
+		"--set", "router.backends[0]=http://a:8000",
+		"--set", "router.capture=redacted",
+		"--set", "datastore.sharedPvc.enabled=true")
+	if !strings.Contains(withPVC, "persistentVolumeClaim:") {
+		t.Errorf("capture with a PVC enabled did not use it:\n%s", withPVC)
+	}
+	if strings.Contains(withPVC, "emptyDir: {}") {
+		t.Error("a PVC was requested but an emptyDir was mounted; capture would not survive the pod")
+	}
+}
