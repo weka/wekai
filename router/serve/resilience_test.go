@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -193,5 +194,33 @@ func TestModelsMergesEveryPool(t *testing.T) {
 	}
 	if ids["small-7b"] != "small" || ids["big-70b"] != "big" {
 		t.Errorf("each model must name the pool that serves it: %v", ids)
+	}
+}
+
+// TestBackendURLEndingInV1IsFlagged: the router appends the dialect's own paths,
+// so a backend written as http://host:8000/v1 still PROXIES correctly while
+// every probe against it 404s — health, metrics and model discovery alike. The
+// endpoint is then taken for a hosted API and never actively health-checked,
+// which is a silent loss rather than a visible failure. It has to be loud.
+func TestBackendURLEndingInV1IsFlagged(t *testing.T) {
+	var logged strings.Builder
+	h := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer up.Close()
+
+	if _, err := serve.Handler(ctx, serve.Options{
+		Routes: []serve.Route{{Patterns: "*", Endpoints: []string{up.URL + "/v1"}, Passive: true}},
+		Log:    h,
+	}); err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	if !strings.Contains(logged.String(), "ends in /v1") {
+		t.Errorf("no warning for a /v1 backend URL; the degradation is silent otherwise:\n%s",
+			logged.String())
 	}
 }

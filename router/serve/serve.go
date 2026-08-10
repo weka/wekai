@@ -291,6 +291,18 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		}
 		var backends []pool.Backend
 		for _, ep := range rt.Endpoints {
+			// A backend URL ending in /v1 is almost always a mistake, and it
+			// degrades SILENTLY: the router appends the dialect's own paths, so
+			// proxying still works, but every probe becomes /v1/health,
+			// /v1/metrics or /v1/v1/models and 404s. The endpoint is then
+			// classified a hosted API, marked passive, and never actively
+			// health-checked — serving fine until it dies, and then still
+			// serving as far as the router knows.
+			if strings.HasSuffix(strings.TrimRight(ep, "/"), "/v1") {
+				log.Warn("backend URL ends in /v1; the router appends the API path itself, "+
+					"so health, metrics and model discovery will all 404 against it. "+
+					"Drop the suffix.", "endpoint", ep)
+			}
 			passive := rt.Passive
 			if !passive {
 				isVLLM := probeIsVLLM(ctx, ep, log)
