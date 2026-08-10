@@ -2,6 +2,8 @@ package serve_test
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -68,5 +70,79 @@ func TestBackendBasePathComposesWithClientPath(t *testing.T) {
 					got, tc.want)
 			}
 		})
+	}
+}
+
+// Auto-model discovery used to probe the FIRST endpoint in a route's list at
+// startup, before the health checker had an opinion about any of them. That was
+// wrong twice: a pool whose first backend is dead never resolved even though
+// another backend could answer, and the answer it did get arrived too late to
+// matter, because the rewrite was snapshotted when the routing table was built.
+//
+// It now asks the POOL, once a backend is healthy enough to route to, and the
+// answer takes effect when it lands.
+func TestAutoModelAsksAHealthyBackendNotTheFirstOne(t *testing.T) {
+	// First endpoint: dead. Nothing here can answer anything.
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer dead.Close()
+
+	// Second endpoint: healthy, and serves exactly one model.
+	var mu sync.Mutex
+	var gotModel string
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			return
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"Qwen/Qwen3-32B"}]}`))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(body, &req)
+		mu.Lock()
+		gotModel = req.Model
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`))
+	}))
+	defer live.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h, err := serve.Handler(ctx, serve.Options{
+		Routes:          []serve.Route{{Patterns: "*", Endpoints: []string{dead.URL, live.URL}}},
+		HealthInterval:  200 * time.Millisecond,
+		HealthUnhealthy: 20 * time.Millisecond,
+		HealthTimeout:   200 * time.Millisecond,
+		MaxAttempts:     3,
+	})
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	rt := httptest.NewServer(h)
+	defer rt.Close()
+
+	// The client asks for a name the backend does not serve; discovery has to
+	// replace it with the one the pool actually loaded.
+	eventually(t, func() bool {
+		if chat(t, rt) != http.StatusOK {
+			return false
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return gotModel == "Qwen/Qwen3-32B"
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotModel != "Qwen/Qwen3-32B" {
+		t.Errorf("backend received model %q, want the discovered %q; discovery either "+
+			"never got past the dead first endpoint or landed too late to take effect",
+			gotModel, "Qwen/Qwen3-32B")
 	}
 }

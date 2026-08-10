@@ -91,14 +91,20 @@ wekai router serve \
   to it:
 
   ```
-  auto-model: http://127.0.0.1:25201 serves "zai-org/GLM-5.2-FP8" — rewriting every matching request's model to it
+  auto-model: rewriting every matching request's model to what the pool serves pool=default model=zai-org/GLM-5.2-FP8
     route: * => http://127.0.0.1:25201 as zai-org/GLM-5.2-FP8 (auto-discovered) (strip-auth)
   ```
 
   A multi-model upstream is left alone, so this can't silently collapse a
   real fan-out onto one model. Control it with `--auto-model`: `auto`
   (default), `force` (always take the first listed model), `off` (never
-  probe). An upstream that isn't up yet is retried in the background.
+  probe).
+
+  The question is asked of the *pool*, not of one endpoint, and only once a
+  backend has passed a health check — so a pool whose first endpoint is dead
+  still resolves from any sibling that answers, and a backend still loading
+  weights is simply waited for. The answer takes effect the moment it lands,
+  including for pools whose members arrive later from pod discovery.
 - Append `as <model>` to pin the rewrite explicitly and skip discovery:
   `--default 'http://127.0.0.1:25201 as my-local-model'`.
 - Use repeated `--route '<substr>,<substr> => <upstream>[ as <model>]'` rules

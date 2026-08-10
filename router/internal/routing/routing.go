@@ -13,6 +13,7 @@ package routing
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"github.com/weka/wekai/router/internal/gateway"
 	"github.com/weka/wekai/router/internal/pool"
@@ -28,6 +29,16 @@ type Rule struct {
 	// RewriteModel replaces the request's model before forwarding, so a
 	// client's name for a model can differ from the backend's.
 	RewriteModel string
+	// AutoModel is the model discovered from the pool's own upstreams, filled
+	// in asynchronously once a backend is healthy enough to answer.
+	//
+	// It is a live pointer rather than a value because discovery finishes after
+	// the table is built: a pool's backends are commonly still loading weights
+	// when the router starts. Reading it per request is what makes a late answer
+	// take effect at all — the previous arrangement snapshotted the value at
+	// construction, so a discovery that completed one second after startup
+	// updated a field nothing ever read again.
+	AutoModel *atomic.Pointer[string]
 	// StripAuth drops inbound credentials, for an upstream that is
 	// unauthenticated and would otherwise receive someone else's key.
 	StripAuth bool
@@ -61,6 +72,10 @@ func (r Rule) String() string {
 		len(r.Pool.Registry.Snapshot().Backends))
 	if r.RewriteModel != "" {
 		out += " as " + r.RewriteModel
+	} else if r.AutoModel != nil {
+		if m := r.AutoModel.Load(); m != nil {
+			out += " as " + *m + " (auto-discovered)"
+		}
 	}
 	if r.StripAuth {
 		out += " (strip-auth)"
@@ -98,11 +113,19 @@ func NewTable(rules []Rule) (*Table, error) {
 }
 
 func (r Rule) target() gateway.Target {
+	// An explicit `as <model>` always wins: the operator said it, and discovery
+	// does not second-guess it.
+	rewrite := r.RewriteModel
+	if rewrite == "" && r.AutoModel != nil {
+		if m := r.AutoModel.Load(); m != nil {
+			rewrite = *m
+		}
+	}
 	return gateway.Target{
 		Name:                    r.Pool.Name,
 		Registry:                r.Pool.Registry,
 		Selector:                r.Pool.Flow,
-		RewriteModel:            r.RewriteModel,
+		RewriteModel:            rewrite,
 		StripAuth:               r.StripAuth,
 		Credential:              r.Credential,
 		ForwardClientCredential: r.ForwardClientCredential,

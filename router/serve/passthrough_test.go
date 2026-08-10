@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -14,9 +15,15 @@ import (
 // collected. The dialect claims /v1/chat/completions; Anthropic's /v1/messages
 // it does not, and before the passthrough tier that request 404'd at the mux.
 func TestPassthroughReachesUnclaimedPaths(t *testing.T) {
+	// Guarded: the router makes its own requests to a backend on background
+	// goroutines (health, model discovery), so this handler is not called only
+	// from the test's goroutine.
+	var mu sync.Mutex
 	var gotPaths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		gotPaths = append(gotPaths, r.URL.Path)
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"ok":true}`)
 	}))
@@ -37,13 +44,25 @@ func TestPassthroughReachesUnclaimedPaths(t *testing.T) {
 		}
 	}
 
-	if len(gotPaths) != 2 {
-		t.Fatalf("upstream saw %v, want both paths forwarded", gotPaths)
+	// Only the paths this test drove. The router also asks the backend things on
+	// its own behalf — a model listing, a health probe — and those are not what
+	// is being asserted here.
+	mu.Lock()
+	var clientPaths []string
+	for _, p := range gotPaths {
+		if p == "/v1/messages" || p == "/v1/chat/completions" {
+			clientPaths = append(clientPaths, p)
+		}
+	}
+	mu.Unlock()
+
+	if len(clientPaths) != 2 {
+		t.Fatalf("upstream saw %v, want both client paths forwarded", clientPaths)
 	}
 	for i, want := range []string{"/v1/messages", "/v1/chat/completions"} {
-		if gotPaths[i] != want {
+		if clientPaths[i] != want {
 			t.Errorf("upstream saw %q, want %q — the path must be preserved, "+
-				"not rewritten to a dialect route", gotPaths[i], want)
+				"not rewritten to a dialect route", clientPaths[i], want)
 		}
 	}
 }

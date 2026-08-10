@@ -177,10 +177,6 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		}
 	}
 
-	// Probe before the listener opens, so the routes logged at startup already
-	// name whatever was discovered.
-	resolveAutoModels(rules, c.AutoModel)
-
 	var hook serve.CaptureHook
 	if c.Capture != "" {
 		dir := resolveCaptureDir(c.CaptureDir, c.Capture)
@@ -204,7 +200,7 @@ func (c *RouterServeCommand) Execute(args []string) error {
 			DiscoverySelector:       r.discoverSelector,
 			CredentialFile:          r.credentialFile,
 			ForwardClientCredential: r.forwardClient,
-			RewriteModel:            r.effectiveRewrite(),
+			RewriteModel:            r.rewriteModel,
 			StripAuth:               r.stripAuth,
 			Passive:                 c.Passive,
 		})
@@ -225,6 +221,7 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		MaxConcurrentRequests: c.MaxConcurrent,
 		NodeConcurrency:       c.MaxNodeConc,
 		RebalanceRatio:        c.RebalanceRatio,
+		AutoModel:             c.AutoModel,
 		SplitGuard:            c.SplitGuard,
 		TailTTL:               c.TailTTL,
 		RefusalTTL:            c.RefusalTTL,
