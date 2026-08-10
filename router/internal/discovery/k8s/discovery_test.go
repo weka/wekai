@@ -330,3 +330,42 @@ func BenchmarkReconcile256(b *testing.B) {
 		}
 	}
 }
+
+// TestPodPortComesFromThePodNotTheFlag covers what a Service cannot express and
+// why pod discovery exists: a fleet run as several DaemonSets, one per GPU
+// topology or model, each listening on a different port. A Service maps ONE
+// port, so covering them needs one Service per set — and the router loses the
+// single label selector that made them one pool.
+func TestPodPortComesFromThePodNotTheFlag(t *testing.T) {
+	mk := func(name, ip string, port int32) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns,
+				Labels: map[string]string{"app": "vllm"}},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning, PodIP: ip,
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			},
+		}
+		if port > 0 {
+			p.Spec.Containers = []corev1.Container{{Ports: []corev1.ContainerPort{
+				{Name: "http", ContainerPort: port}}}}
+		}
+		return p
+	}
+
+	// Three DaemonSets, three ports, ONE label selector. The configured Port is
+	// only the floor for a pod that declares nothing.
+	_, cancel := run(t, k8sdisc.Config{
+		Mode: k8sdisc.ModePod, Namespace: ns, Selector: "app=vllm",
+		Port: 8000, Scheme: "http",
+	}, []runtimeObject{
+		mk("set-a-0", "10.1.0.1", 8001),
+		mk("set-b-0", "10.1.0.2", 8002),
+		mk("set-c-0", "10.1.0.3", 0), // declares none: falls back to the flag
+	}, []string{
+		"http://10.1.0.1:8001",
+		"http://10.1.0.2:8002",
+		"http://10.1.0.3:8000",
+	})
+	cancel()
+}

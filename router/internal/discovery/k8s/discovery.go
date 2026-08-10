@@ -377,12 +377,48 @@ func (d *Discoverer) specFromPod(pod *corev1.Pod) (registry.Spec, bool) {
 		return registry.Spec{}, false
 	}
 	return registry.Spec{
-		URL:       d.cfg.Scheme + "://" + net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(d.cfg.Port)),
+		URL:       d.cfg.Scheme + "://" + net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(d.portFromPod(pod))),
 		Kind:      kindFrom(pod.Labels),
 		DialectID: dialectFrom(pod.Labels, d.cfg.DefaultDialect),
 		Model:     pod.Labels[LabelModel],
 		Capacity:  capacityFrom(pod.Annotations, d.cfg.DefaultCapacity),
 	}, true
+}
+
+// portFromPod takes each pod's own declared port rather than one number for
+// the whole selector.
+//
+// This is what a Service cannot express and why pod discovery exists at all: a
+// fleet run as several DaemonSets, one per GPU topology or model, commonly
+// listens on a different port per set. A Service maps ONE port, so covering
+// them needs one Service each and the router loses the single label selector
+// that made them one pool. Reading containerPort per pod keeps them one pool.
+//
+// Precedence: a named port if PortName is configured, then the pod's sole
+// declared port, then the configured Port as a floor. Preferring the pod's own
+// declaration over the flag is deliberate — the pod is the authority on what it
+// listens on, and a flag that silently overrode it would send traffic to a port
+// nothing is bound to.
+func (d *Discoverer) portFromPod(pod *corev1.Pod) int {
+	var declared []int
+	for _, c := range pod.Spec.Containers {
+		for _, p := range c.Ports {
+			if p.ContainerPort <= 0 {
+				continue
+			}
+			if d.cfg.PortName != "" && p.Name == d.cfg.PortName {
+				return int(p.ContainerPort)
+			}
+			declared = append(declared, int(p.ContainerPort))
+		}
+	}
+	// A named port was asked for and not found: fall through rather than guess
+	// at another one, since picking the wrong port is worse than the configured
+	// default being wrong in the same way for everyone.
+	if d.cfg.PortName == "" && len(declared) == 1 {
+		return declared[0]
+	}
+	return d.cfg.Port
 }
 
 func kindFrom(l map[string]string) registry.Kind {
