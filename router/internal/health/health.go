@@ -65,7 +65,7 @@ type Checker struct {
 	client *http.Client
 
 	mu      sync.Mutex
-	streaks map[string]int   // >0 consecutive successes, <0 consecutive failures
+	streaks map[string]int       // >0 consecutive successes, <0 consecutive failures
 	last    map[string]time.Time // when each backend was last probed
 }
 

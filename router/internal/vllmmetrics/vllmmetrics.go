@@ -242,9 +242,12 @@ func (a *Aggregator) tracked(name string) bool {
 	return false
 }
 
-// WriteTo renders the accumulated totals in Prometheus text exposition, so the
+// Render writes the accumulated totals in Prometheus text exposition, so the
 // router's /metrics can carry them alongside its own.
-func (a *Aggregator) WriteTo(w io.Writer) error {
+// Deliberately not named WriteTo: that name belongs to io.WriterTo, whose
+// signature returns the byte count, and a method that looks like an interface
+// it does not satisfy misleads every reader and every type switch.
+func (a *Aggregator) Render(w io.Writer) error {
 	a.mu.Lock()
 	keys := make([]string, 0, len(a.totals))
 	for k := range a.totals {

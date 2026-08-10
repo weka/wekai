@@ -345,7 +345,7 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			// registered as collectors because their names and labels come from
 			// the upstreams, not from anything declared here.
 			if agg != nil {
-				_ = agg.WriteTo(w)
+				_ = agg.Render(w)
 			}
 		})
 		mux.HandleFunc("/router-viz", viz.PageHandler())
@@ -471,8 +471,8 @@ var knownHostedProviders = []string{
 	"openrouter.ai",
 	"api.deepseek.com",
 	"api.x.ai",
-	"bedrock-runtime",   // AWS Bedrock, region-prefixed
-	"openai.azure.com",  // Azure OpenAI, tenant-prefixed
+	"bedrock-runtime",  // AWS Bedrock, region-prefixed
+	"openai.azure.com", // Azure OpenAI, tenant-prefixed
 }
 
 // IsKnownHostedProvider reports whether the endpoint is a hosted API we already

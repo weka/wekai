@@ -121,7 +121,7 @@ func TestTotalsSumAcrossEndpoints(t *testing.T) {
 	}
 
 	var sb strings.Builder
-	if err := agg.WriteTo(&sb); err != nil {
+	if err := agg.Render(&sb); err != nil {
 		t.Fatalf("WriteTo: %v", err)
 	}
 	out := sb.String()

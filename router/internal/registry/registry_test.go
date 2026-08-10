@@ -31,7 +31,7 @@ func TestCanonicalizationTable(t *testing.T) {
 		// behaviour change for anyone who wrote /v1 into a backend URL.
 		{"http://a:8000/v1/", "http://a:8000/v1"},
 		{"http://a:8000/", "http://a:8000"}, // a bare trailing slash still normalises
-		{"http://a", "http://a:80"},            // port made explicit
+		{"http://a", "http://a:80"},         // port made explicit
 		{"https://a", "https://a:443"},
 		{"  http://a:8000  ", "http://a:8000"},
 		{"http://[::1]:8000", "http://[::1]:8000"}, // IPv6 stays bracketed (SD-9)

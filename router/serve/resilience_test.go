@@ -70,11 +70,11 @@ func TestBackendDiesAndRecovers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h, err := serve.Handler(ctx, serve.Options{
-		Routes:            []serve.Route{{Patterns: "*", Endpoints: []string{a.ts.URL, b.ts.URL}}},
-		HealthInterval:    200 * time.Millisecond,
-		HealthUnhealthy:   20 * time.Millisecond,
-		HealthTimeout:     50 * time.Millisecond,
-		MaxAttempts:       3,
+		Routes:          []serve.Route{{Patterns: "*", Endpoints: []string{a.ts.URL, b.ts.URL}}},
+		HealthInterval:  200 * time.Millisecond,
+		HealthUnhealthy: 20 * time.Millisecond,
+		HealthTimeout:   50 * time.Millisecond,
+		MaxAttempts:     3,
 	})
 	if err != nil {
 		t.Fatalf("Handler: %v", err)
