@@ -16,7 +16,18 @@ spec:
         {{- include "app.selectorLabels" . | nindent 8 }}
         role: router
     spec:
-      automountServiceAccountToken: false
+      {{- if .Values.discovery.enabled }}
+      # Discovery reads the Kubernetes API, so the pod must run as the
+      # ServiceAccount the Role is bound to. Creating the RBAC without naming it
+      # here leaves the pod on `default` and the router fails at startup with no
+      # token — RBAC that exists and is not used is the same as none.
+      serviceAccountName: {{ include "app.fullname" . }}
+      {{- end }}
+      # No API token unless discovery needs one. A router serving traffic has no
+      # business holding a credential for the Kubernetes API, and mounting one
+      # by default is a standing privilege for nothing — but discovery reads
+      # pods, so the token must be there when it is on.
+      automountServiceAccountToken: {{ .Values.discovery.enabled }}
       {{- if .Values.terminationGracePeriodSeconds }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- end }}
@@ -93,6 +104,17 @@ spec:
             - "--vllm-metrics-interval={{ .Values.router.vllmMetrics.interval }}"
             {{- range .Values.router.vllmMetrics.names }}
             - "--vllm-metrics-name={{ . }}"
+            {{- end }}
+            {{- end }}
+            {{- with .Values.router.discovery }}
+            {{- if .namespace }}
+            - "--discover-namespace={{ .namespace }}"
+            {{- end }}
+            {{- if .port }}
+            - "--discover-port={{ .port }}"
+            {{- end }}
+            {{- if .portName }}
+            - "--discover-port-name={{ .portName }}"
             {{- end }}
             {{- end }}
             {{- if .Values.router.apiKey }}

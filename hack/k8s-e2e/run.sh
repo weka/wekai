@@ -89,6 +89,45 @@ kubectl exec deploy/router -- wget -q -O- http://127.0.0.1:29000/metrics > /tmp/
 grep -q 'router_route_decisions_total' /tmp/e2e-metrics || {
   echo "!! router_route_decisions_total absent"; head -20 /tmp/e2e-metrics; exit 1; }
 
+# Second install: the same fleet, found by LABEL rather than listed. This is the
+# case a Service cannot express — each pod contributes its own containerPort —
+# and it exercises the discovery RBAC, which only a real cluster can check.
+echo "==> helm install a second router using pod discovery"
+helm install router-disc "$ROOT/chart/router" \
+  --set imageRepository=wekai-router \
+  --set imageTag="$TAG" \
+  --set-string 'router.routes[0]=* => pods:app=mock-vllm' \
+  --set router.discovery.portName=http \
+  --set discovery.enabled=true \
+  --set service.port=8080 --set service.targetPort=8080 \
+  --set replicaCount=1 >/dev/null
+
+if ! kubectl rollout status deploy/router-disc --timeout=120s 2>/dev/null; then
+  echo "!! discovery router never became ready"
+  kubectl logs deploy/router-disc --tail=40 || true
+  exit 1
+fi
+
+echo "==> routing through the discovered pool"
+if ! kubectl exec deploy/router-disc -- wget -q -O- \
+      --header='Content-Type: application/json' \
+      --post-data="$BODY" \
+      http://127.0.0.1:8080/v1/chat/completions > /tmp/e2e-disc 2>/tmp/e2e-disc-err; then
+  echo "!! discovered-pool request failed"; cat /tmp/e2e-disc-err
+  kubectl logs deploy/router-disc --tail=40; exit 1
+fi
+grep -q 'chat.completion' /tmp/e2e-disc || {
+  echo "!! discovered pool did not serve a completion:"; head -c 300 /tmp/e2e-disc; exit 1; }
+
+# Both pods must be found, on the port they declare rather than a default.
+kubectl exec deploy/router-disc -- wget -q -O- http://127.0.0.1:29000/metrics > /tmp/e2e-disc-metrics 2>/dev/null || true
+found=$(grep -c '^router_backend_inflight{' /tmp/e2e-disc-metrics || true)
+if [ "${found:-0}" -lt 2 ]; then
+  echo "!! discovery found $found backends, want 2 (one per mock pod)"
+  kubectl logs deploy/router-disc --tail=30; exit 1
+fi
+
 echo
 echo "PASS — chart deployed, probes passed, request routed, metrics served."
+echo "PASS — pod-label discovery found $found backends and served through them."
 grep -E 'router_route_decisions_total\{' /tmp/e2e-metrics | head -3

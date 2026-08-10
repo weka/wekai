@@ -181,14 +181,13 @@ func TestRouterChartRBACIsOptedInto(t *testing.T) {
 	if strings.Contains(on, "kind: ClusterRole") {
 		t.Error("discovery is namespace-scoped; a ClusterRole grants more than it needs")
 	}
-	if strings.Contains(on, `resources: ["pods"]`) {
-		t.Error("pod read granted in endpointslice mode, which does not use it")
+	// Pods, and only pods: discovery is by label selector so each pod
+	// contributes its own port, and there is no other mode to grant for.
+	if !strings.Contains(on, `resources: ["pods"]`) {
+		t.Error("discovery enabled but pod read not granted, so it cannot list anything")
 	}
-
-	podMode := renderRouter(t, "--set", "router.routes[0]=* => http://vllm:8000",
-		"--set", "discovery.enabled=true", "--set", "discovery.mode=pod")
-	if !strings.Contains(podMode, `resources: ["pods"]`) {
-		t.Error("pod-mode discovery did not grant pod read, so it cannot work")
+	if strings.Contains(on, "endpointslices") {
+		t.Error("endpointslice read granted for a mode the router does not have")
 	}
 }
 
@@ -297,5 +296,29 @@ func TestRouterChartCaptureGetsWritableStorage(t *testing.T) {
 	}
 	if strings.Contains(withPVC, "emptyDir: {}") {
 		t.Error("a PVC was requested but an emptyDir was mounted; capture would not survive the pod")
+	}
+}
+
+// TestRouterChartDiscoveryFlags: pod discovery is configured through the chart,
+// and it is the case a Service cannot cover — several DaemonSets on different
+// ports behind one label selector.
+func TestRouterChartDiscoveryFlags(t *testing.T) {
+	out := renderRouter(t,
+		"--set-string", "router.routes[0]=* => pods:app=vllm",
+		"--set", "router.discovery.namespace=inference",
+		"--set", "router.discovery.portName=http",
+		"--set", "discovery.enabled=true")
+	for _, want := range []string{
+		`- "--route=* => pods:app=vllm"`,
+		`- "--discover-namespace=inference"`,
+		`- "--discover-port-name=http"`,
+		"kind: Role",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered manifest missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "kind: ClusterRole") {
+		t.Error("pod discovery is namespace-scoped; a ClusterRole grants more than it needs")
 	}
 }

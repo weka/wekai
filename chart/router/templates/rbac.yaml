@@ -5,9 +5,7 @@
 # needs cluster-wide read. v1 defaulted to all-namespaces when none was
 # configured, which quietly required cluster-wide pod read.
 #
-# endpointslices alone covers the recommended mode; the pods rule is needed only
-# for pod-mode discovery and is gated separately so a deployment that does not
-# use it does not grant it.
+# Pods only — see the rule below for why there is nothing else to grant.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -22,14 +20,13 @@ metadata:
   labels:
     {{- include "app.labels" . | nindent 4 }}
 rules:
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
-  {{- if eq .Values.discovery.mode "pod" }}
+  # Pods only. The router discovers by LABEL SELECTOR — a route written as
+  # "pods:<selector>" — because each pod then contributes its own declared
+  # port, which a Service cannot express. There is no EndpointSlice mode to
+  # grant for, and granting one anyway would be a permission nothing uses.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
-  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

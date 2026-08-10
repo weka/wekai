@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"github.com/weka/wekai/router/internal/clock"
 	"github.com/weka/wekai/router/internal/dialect"
 	"github.com/weka/wekai/router/internal/dialect/openai"
+	k8sdisc "github.com/weka/wekai/router/internal/discovery/k8s"
 	"github.com/weka/wekai/router/internal/gateway"
 	"github.com/weka/wekai/router/internal/health"
 	"github.com/weka/wekai/router/internal/metrics"
@@ -59,6 +61,13 @@ type Route struct {
 	// Name labels the pool in logs and on metrics. Defaults to the patterns,
 	// or "default" for the catch-all.
 	Name string
+
+	// DiscoverySelector, when set, populates this pool from Kubernetes pods
+	// matching a label selector instead of (or alongside) a static endpoint
+	// list. Each pod contributes its OWN declared port, which is what a Service
+	// cannot express: a fleet run as several DaemonSets, one per GPU topology,
+	// commonly listens on a different port per set.
+	DiscoverySelector string
 
 	// Passive forces this route's endpoints to skip active health probing.
 	//
@@ -95,6 +104,12 @@ type Options struct {
 	SplitGuard      float64
 	TailTTL         time.Duration
 	RefusalTTL      time.Duration
+
+	// --- Kubernetes discovery, applied to any route carrying a selector.
+	DiscoveryNamespace  string
+	DiscoveryPort       int
+	DiscoveryPortName   string
+	DiscoveryKubeconfig string
 
 	// --- Health probing.
 	// HealthInterval is how often a HEALTHY backend is re-probed;
@@ -275,6 +290,11 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		}, clk, log)
 		if err != nil {
 			return nil, err
+		}
+		if rt.DiscoverySelector != "" {
+			if err := startPodDiscovery(ctx, opts, rt, p, log); err != nil {
+				return nil, fmt.Errorf("pool %q discovery: %w", name, err)
+			}
 		}
 		pools = append(pools, p)
 		rules = append(rules, routing.Rule{
@@ -541,6 +561,51 @@ func probeGet(ctx context.Context, url string, log *slog.Logger) (string, bool) 
 		return "", false
 	}
 	return string(b), true
+}
+
+// startPodDiscovery populates a pool from pods matching a label selector.
+//
+// It only ever PROPOSES backends; the registry decides admission and health
+// decides eligibility (SD-4), so a discovered pod is not routed to until it
+// passes the same checks a statically configured one does.
+func startPodDiscovery(ctx context.Context, opts Options, rt Route, p *pool.Pool, log *slog.Logger) error {
+	client, err := k8sdisc.NewInClusterOrKubeconfig(opts.DiscoveryKubeconfig)
+	if err != nil {
+		return err
+	}
+	ns := opts.DiscoveryNamespace
+	if ns == "" {
+		// "Empty means my own namespace" is what an operator expects, and it is
+		// the only value that is right by default: a router discovers the fleet
+		// it is deployed beside. Kubernetes publishes it to every pod through
+		// the service account, which is the same place the token comes from.
+		b, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+		if err != nil {
+			return fmt.Errorf("no --discover-namespace given and this is not a pod: %w", err)
+		}
+		ns = strings.TrimSpace(string(b))
+	}
+	d, err := k8sdisc.New(k8sdisc.Config{
+		Mode:            k8sdisc.ModePod,
+		Namespace:       ns,
+		Selector:        rt.DiscoverySelector,
+		Port:            opts.DiscoveryPort,
+		PortName:        opts.DiscoveryPortName,
+		Scheme:          "http",
+		DefaultCapacity: 1,
+		DefaultDialect:  "openai",
+	}, client, p.Registry, log.With("pool", p.Name))
+	if err != nil {
+		return err
+	}
+	go func() {
+		if err := d.Run(ctx); err != nil && ctx.Err() == nil {
+			log.Error("discovery stopped", "pool", p.Name, "err", err)
+		}
+	}()
+	log.Info("discovering pods by label", "pool", p.Name, "selector", rt.DiscoverySelector,
+		"namespace", ns)
+	return nil
 }
 
 func publishFleetLoad(pools []*pool.Pool) {

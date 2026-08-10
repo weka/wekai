@@ -238,6 +238,78 @@ If Dagger cannot start — a locked-down Docker Desktop refusing to pull its eng
 image is the usual cause — `go test ./chart/` and `task router:image` still cover
 template and image correctness between them.
 
+## Discovering endpoints from Kubernetes
+
+A route's endpoints can be discovered from pod labels instead of listed:
+
+```
+--route '* => pods:app=vllm'
+```
+
+Each discovered pod contributes **its own declared `containerPort`**. That is
+the reason to prefer pod discovery over a Service, and it is not a detail: a
+fleet run as several DaemonSets — one per GPU topology, or per model — commonly
+listens on a different port per set. A Service maps ONE port, so covering three
+DaemonSets needs three Services, and the router loses the single label selector
+that made them one pool. Pod discovery keeps them one pool.
+
+Port precedence: the pod's named port when `--discover-port-name` is set, then
+its sole declared port, then `--discover-port` as a floor. The pod is the
+authority on what it listens on — a flag silently overriding it would send
+traffic to a port nothing is bound to. A pod declaring several unnamed ports
+with no `--discover-port-name` falls back to the flag rather than guessing.
+
+Discovery only ever PROPOSES backends. The registry decides admission and health
+decides eligibility, so a discovered pod is not routed to until it passes the
+same checks a statically listed one does — and a pod that goes NotReady leaves
+the pool on its own.
+
+Static and discovered endpoints can be mixed in one route, which is what a
+migration looks like:
+
+```
+--route '* => http://legacy-vllm:8000|pods:app=vllm'
+```
+
+### CLI
+
+```bash
+wekai router serve \
+  --listen :8080 --metrics-listen 0.0.0.0:29000 \
+  --route '* => pods:app=vllm' \
+  --discover-namespace inference \
+  --discover-port-name http
+```
+
+### Helm
+
+Discovery needs RBAC, which the chart creates only when asked — a
+namespace-scoped Role, never a ClusterRole:
+
+```yaml
+discovery:
+  enabled: true
+  mode: pod
+
+router:
+  routes:
+    - "* => pods:app=vllm"
+  discovery:
+    namespace: ""      # empty: the router's own namespace
+    portName: http     # which containerPort serves inference
+    port: 8000         # only for a pod declaring none of its own
+```
+
+Several DaemonSets on different ports, as one pool:
+
+```yaml
+router:
+  routes:
+    - "* => pods:app=vllm"      # matches every set
+  discovery:
+    portName: http              # each set names its own port `http`
+```
+
 ## Readiness
 
 A router pod is **not ready until at least one endpoint is alive**. `/readiness`

@@ -68,6 +68,22 @@ router:
     names: []
     # - vllm:prompt_tokens_by_source_total
 
+  # Kubernetes pod discovery, used by any route written as
+  # "<patterns> => pods:<label-selector>". Enable RBAC below as well.
+  #
+  # Each discovered pod contributes its OWN declared containerPort, which is
+  # what a Service cannot express: a fleet run as several DaemonSets, one per
+  # GPU topology or model, commonly listens on a different port per set, and
+  # covering that with Services needs one per set — losing the single label
+  # selector that made them one pool.
+  discovery:
+    # Namespace searched. Empty means the router's own.
+    namespace: ""
+    # Port for a pod that declares none of its own; a declared port always wins.
+    port: 8000
+    # Which containerPort to use when a pod declares several, e.g. "http".
+    portName: ""
+
   # Require this key on inference and admin requests. Empty leaves the listener
   # unauthenticated, which the router logs loudly at startup.
   apiKey: ""
@@ -208,8 +224,9 @@ podMonitor:
 # common case and needs no RBAC at all. Enabling this creates a ServiceAccount,
 # a namespace-scoped Role and a RoleBinding — never a ClusterRole, because
 # discovery is namespace-scoped and cluster-wide read is not needed.
+# Grants the router read access to pods in its own namespace, which any route
+# written as "<patterns> => pods:<selector>" needs. Off by default: a static
+# endpoint list needs no API access at all, and a serving router should not hold
+# a Kubernetes credential it does not use.
 discovery:
   enabled: false
-  # "endpointslice" (recommended) or "pod". Pod mode additionally grants pod
-  # read, so it is gated rather than granted unconditionally.
-  mode: endpointslice

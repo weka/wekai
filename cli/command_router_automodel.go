@@ -145,6 +145,13 @@ func probeAndApply(r *routeRule, mode string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), modelsProbeTimeout)
 	defer cancel()
 
+	if len(r.endpoints) == 0 {
+		// A discovery-only route has no endpoint to probe at startup: its pods
+		// arrive from the watcher, later and possibly never. Reporting success
+		// stops the retry loop rather than spinning on a rule that will never
+		// have a static endpoint.
+		return true
+	}
 	ep, err := url.Parse(r.endpoints[0])
 	if err != nil {
 		return false
