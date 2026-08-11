@@ -298,8 +298,11 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 
 	var rules []routing.Rule
 	var pools []*pool.Pool
-	// Endpoints discovery identified as vLLM instances, and so worth scraping.
-	var vllmEndpoints []string
+	// Endpoints the startup probe identified as NOT vLLM — a hosted API, most
+	// often. The aggregator is told about these so it never asks them for
+	// counters they do not have; everything else it works out by scraping,
+	// which is what lets a pod added by discovery contribute at all.
+	var notVLLM []string
 
 	for i, rt := range opts.Routes {
 		name := rt.Name
@@ -324,8 +327,8 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			if !passive {
 				isVLLM := probeIsVLLM(ctx, ep, log)
 				passive = !isVLLM
-				if isVLLM {
-					vllmEndpoints = append(vllmEndpoints, ep)
+				if !isVLLM {
+					notVLLM = append(notVLLM, ep)
 				}
 			}
 			backends = append(backends, pool.Backend{URL: ep, Passive: passive})
@@ -424,15 +427,45 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 	}()
 
 	var agg *vllmmetrics.Aggregator
-	if opts.VLLMMetrics && len(vllmEndpoints) > 0 {
+	if opts.VLLMMetrics {
 		agg = vllmmetrics.New(vllmmetrics.Config{
 			Interval: opts.VLLMMetricsInterval,
 			Names:    opts.VLLMMetricsNames,
 		})
-		eps := vllmEndpoints
-		log.Info("aggregating upstream vLLM metrics",
-			"endpoints", len(eps), "interval", agg.Interval())
-		go agg.Run(ctx, func() []string { return eps })
+		// Endpoints known at startup NOT to be vLLM are retired immediately, so a
+		// hosted API in the same router is never asked for counters it does not
+		// have. Everything else is discovered by scraping and latched off after
+		// two barren cycles.
+		for _, ep := range notVLLM {
+			agg.Retire(ep)
+		}
+		// THE LIVE REGISTRY, not a list frozen at startup.
+		//
+		// This used to close over the endpoints that answered the vLLM probe
+		// during construction, which meant a pool populated by pod discovery
+		// contributed nothing at all — the probe runs over statically configured
+		// endpoints, and a `pods:` selector has none. The router then either
+		// exported no upstream counters or, with one static endpoint configured,
+		// exported that single pod's numbers as though they were the fleet's.
+		// Neither is distinguishable from working if you do not already know the
+		// fleet's true totals.
+		eps := func() []string {
+			seen := map[string]bool{}
+			var out []string
+			for _, p := range pools {
+				for _, b := range p.Registry.Snapshot().Backends {
+					if seen[b.URL] {
+						continue
+					}
+					seen[b.URL] = true
+					out = append(out, b.URL)
+				}
+			}
+			return out
+		}
+		log.Info("aggregating upstream vLLM metrics from the live backend set",
+			"backends", len(eps()), "interval", agg.Interval())
+		go agg.Run(ctx, eps)
 	}
 
 	// Metrics, the live KV map and the kubelet's probes on their own listener:

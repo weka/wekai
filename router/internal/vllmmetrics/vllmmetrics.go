@@ -16,25 +16,47 @@
 //     router started still contributes its history
 //
 // Totals are summed across endpoints under the upstream metric name and labels
-// and never decrease, including when an endpoint leaves for good. That makes
-// the router's /metrics a drop-in for scraping vLLM directly.
+// and never decrease FOR THE LIFETIME OF THE PROCESS, including when an
+// endpoint leaves for good.
+//
+// Two things that qualifies, both of which have produced a decreasing counter
+// in production and neither of which this scheme can fix from the inside:
+//
+//   - The totals are in memory. A router restart takes them with it, and the
+//     next scrape reports whatever the fleet's first sighting adds — which,
+//     right after a restart, is one scrape's worth of the fleet rather than its
+//     history. The exported series drops. Scraping several router REPLICAS
+//     through one Service address has the same effect continuously, since each
+//     replica accumulates independently and a round-robin scrape alternates
+//     between them.
+//   - One endpoint must be one process. The delta is computed against what THIS
+//     ADDRESS reported last time, so pointing the router at a Service or a load
+//     balancer that fronts N pods means consecutive scrapes read different
+//     processes: every lower reading looks like a restart and contributes a
+//     whole counter, every higher one contributes a fictitious delta, and the
+//     total is arbitrary. This is detected and warned about (see loadBalanced)
+//     rather than silently produced, because the resulting number looks
+//     entirely plausible — it is the right order of magnitude and it moves in
+//     the right direction most of the time.
 //
 // Ported from the Rust vllm-router's vllm_metrics.rs, whose delta scheme this
-// is; the reasoning above is its, and it is right.
+// is; the reasoning above is its, and it is right as far as it goes.
 package vllmmetrics
 
 import (
 	"bufio"
 	"context"
 	"fmt"
-	"github.com/weka/wekai/router/internal/registry"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/weka/wekai/router/internal/registry"
 )
 
 // Defaults, matching the reference implementation.
@@ -47,6 +69,22 @@ const (
 	// dropping it eventually bounds memory under pod churn. Accumulated totals
 	// are never affected either way.
 	maxMissingCycles = 120
+	// deadAfter is how many consecutive barren cycles — scrape failed, or
+	// succeeded and carried none of the tracked series — retire an endpoint from
+	// scraping for good.
+	//
+	// It exists because the endpoint set is now the LIVE registry rather than a
+	// list probed once at startup, which is what makes discovered pods work.
+	// Without a latch, an endpoint that is not a vLLM at all would be asked for
+	// /metrics every interval forever — precisely the retry-forever shape
+	// serve.probeIsVLLM's doc criticises. Two cycles, so a single restart window
+	// or one dropped connection does not retire a real backend.
+	deadAfter = 2
+	// resetsBeforeWarning is how many apparent counter restarts from ONE address
+	// are tolerated before saying out loud that the address is probably not one
+	// process. Real pods do restart, so a couple mean nothing; a steady stream
+	// from the same address means every scrape is reading a different pod.
+	resetsBeforeWarning = 5
 )
 
 // DefaultNames are the upstream counters aggregated unless told otherwise.
@@ -76,6 +114,16 @@ type Aggregator struct {
 	prev map[string]map[string]float64
 	// missing counts consecutive cycles an endpoint went unregistered.
 	missing map[string]int
+	// barren counts consecutive cycles an endpoint gave nothing; dead retires it
+	// once that passes deadAfter. An endpoint the registry holds is not
+	// necessarily a vLLM, and asking one forever is what this avoids.
+	barren map[string]int
+	dead   map[string]bool
+	// resets counts apparent counter restarts per endpoint, and warned records
+	// that we have already said something about it. A steady stream from one
+	// address means the address is not one process.
+	resets map[string]int
+	warned map[string]bool
 }
 
 func New(cfg Config) *Aggregator {
@@ -94,7 +142,32 @@ func New(cfg Config) *Aggregator {
 		totals:  map[string]float64{},
 		prev:    map[string]map[string]float64{},
 		missing: map[string]int{},
+		barren:  map[string]int{},
+		dead:    map[string]bool{},
+		resets:  map[string]int{},
+		warned:  map[string]bool{},
 	}
+}
+
+// Retire marks an endpoint as never worth scraping — the caller already knows it
+// is not a vLLM, so it should not cost two cycles to rediscover that.
+func (a *Aggregator) Retire(endpoint string) {
+	a.mu.Lock()
+	a.dead[endpoint] = true
+	a.mu.Unlock()
+}
+
+// live filters the caller's endpoint set to those still worth asking.
+func (a *Aggregator) live(endpoints []string) []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]string, 0, len(endpoints))
+	for _, ep := range endpoints {
+		if !a.dead[ep] {
+			out = append(out, ep)
+		}
+	}
+	return out
 }
 
 // Interval is how often Run scrapes.
@@ -126,6 +199,7 @@ func (a *Aggregator) ScrapeAll(ctx context.Context, endpoints []string) {
 		endpoint string
 		series   map[string]float64
 	}
+	endpoints = a.live(endpoints)
 	results := make(chan result, len(endpoints))
 	var wg sync.WaitGroup
 	for _, ep := range endpoints {
@@ -134,7 +208,8 @@ func (a *Aggregator) ScrapeAll(ctx context.Context, endpoints []string) {
 			defer wg.Done()
 			s, err := a.scrapeOne(ctx, ep)
 			if err != nil {
-				return // best effort; absence is not a reset
+				results <- result{ep, nil} // barren, and absence is not a reset
+				return
 			}
 			results <- result{ep, s}
 		}(ep)
@@ -148,23 +223,49 @@ func (a *Aggregator) ScrapeAll(ctx context.Context, endpoints []string) {
 	for r := range results {
 		seen[r.endpoint] = true
 		a.missing[r.endpoint] = 0
+
+		// An endpoint that gave nothing — unreachable, or reachable and serving
+		// none of the tracked series, which is what a hosted API or a sidecar
+		// does — is retired after deadAfter cycles rather than asked forever.
+		if len(r.series) == 0 {
+			a.barren[r.endpoint]++
+			if a.barren[r.endpoint] >= deadAfter {
+				a.dead[r.endpoint] = true
+				slog.Info("no longer scraping this endpoint for vLLM counters: it has served "+
+					"none of them on consecutive attempts, so it is either not a vLLM or not "+
+					"reachable from here",
+					"endpoint", r.endpoint, "counters", a.cfg.Names)
+			}
+			continue
+		}
+		a.barren[r.endpoint] = 0
+
 		prev := a.prev[r.endpoint]
 		if prev == nil {
 			prev = map[string]float64{}
 			a.prev[r.endpoint] = prev
 		}
+		reset := false
 		for key, cur := range r.series {
 			last, had := prev[key]
 			switch {
-			case !had || cur < last:
-				// First sighting, or the upstream restarted: the delta is the
-				// whole current value. Treating a restart as a decrease is the
-				// bug this scheme exists to avoid.
+			case !had:
+				// First sighting: the delta is the whole current value, so a pod
+				// already serving before the router started still contributes its
+				// history.
 				a.totals[key] += cur
+			case cur < last:
+				// The upstream restarted. Treating that as a decrease is the bug
+				// this scheme exists to avoid.
+				a.totals[key] += cur
+				reset = true
 			default:
 				a.totals[key] += cur - last
 			}
 			prev[key] = cur
+		}
+		if reset {
+			a.noteReset(r.endpoint)
 		}
 	}
 
@@ -180,6 +281,34 @@ func (a *Aggregator) ScrapeAll(ctx context.Context, endpoints []string) {
 			delete(a.missing, ep)
 		}
 	}
+}
+
+// noteReset records an apparent counter restart and, once they stop looking
+// like coincidence, says what they almost certainly mean. Caller holds the lock.
+//
+// A pod restarting resets its counters, which is normal and is exactly what the
+// delta scheme handles. The same address resetting over and over is a different
+// thing: it means each scrape is reading a DIFFERENT process, which happens when
+// the configured endpoint is a Service or a load balancer rather than a pod. No
+// delta scheme can work through that — there is no such thing as "what this
+// address reported last time" when the address is several processes — and the
+// resulting totals are arbitrary while looking entirely reasonable.
+//
+// Worth saying loudly for a second reason: an endpoint like that also defeats
+// prefix affinity, since the router believes it is routing to one backend whose
+// KV cache it is modelling, and the traffic lands wherever the load balancer
+// feels like. The counters are the visible symptom of a deeper misconfiguration.
+func (a *Aggregator) noteReset(endpoint string) {
+	a.resets[endpoint]++
+	if a.resets[endpoint] < resetsBeforeWarning || a.warned[endpoint] {
+		return
+	}
+	a.warned[endpoint] = true
+	slog.Warn("this endpoint's vLLM counters keep restarting, which usually means the address "+
+		"is a Service or load balancer in front of several pods rather than one pod. Aggregated "+
+		"upstream totals through such an address are not meaningful, and prefix affinity is not "+
+		"either: point the router at the pods (a pods: selector, or their individual addresses).",
+		"endpoint", endpoint, "resets", a.resets[endpoint])
 }
 
 func (a *Aggregator) scrapeOne(ctx context.Context, endpoint string) (map[string]float64, error) {
