@@ -91,6 +91,86 @@ func EstimateTokens(byteLen int) int32 {
 	return 1
 }
 
+// Coverage is one request's split between what a cache already holds and what
+// somebody has to compute, in both units the repo cares about.
+//
+// It exists because five components ask that same question — the router's
+// affinity flow when it decides where a request goes and whether it needs a
+// dedicated prefill, the mock vLLM as ground truth, the benchmark's replay
+// simulator, the offline replay analyzer, and the dashboards over all of them —
+// and until this type they each wrote the division inline, in whichever unit was
+// nearest to hand. That is not a hypothetical hazard: router_cache_predicted_
+// fraction was emitting matched BLOCKS over total blocks while
+// router_cache_observed_fraction emitted cached TOKENS over prompt tokens, and
+// the two were plotted on one Grafana panel. Blocks are variable-sized here — a
+// 180-byte conversational turn and a 1024-byte system chunk are both one block —
+// so on agentic traffic those differ severalfold, and the only closed loop the
+// repo has on whether prefix prediction works was comparing two different
+// quantities.
+//
+// MissingTokens is the one written definition of "how cold is this request",
+// which the router's prefill/decode segregation and the offline estimator that
+// scores the same rule over a replay both read. They cannot disagree about it
+// while they both call this.
+//
+// Matched counts are a PREFIX RUN, not a set: a cache hit requires every block
+// before it, which is what makes summing units[:matched] the right arithmetic.
+type Coverage struct {
+	MatchedBlocks, TotalBlocks int
+	MatchedTokens, TotalTokens int
+}
+
+// Cover scores a walk: units is the whole request, matchedBlocks how many
+// leading blocks of it some cache holds.
+//
+// One pass of int adds over a slice the caller already has hot, no allocation
+// and no lock, so it is safe on a request path with a 250us p99 budget — the
+// ExtractUnits call that produced units in the first place SHA-256s the entire
+// prompt and costs orders of magnitude more.
+func Cover(units []Unit, matchedBlocks int) Coverage {
+	c := Coverage{TotalBlocks: len(units)}
+	if matchedBlocks < 0 {
+		matchedBlocks = 0
+	}
+	if matchedBlocks > len(units) {
+		matchedBlocks = len(units)
+	}
+	c.MatchedBlocks = matchedBlocks
+	for i, u := range units {
+		c.TotalTokens += int(u.Tokens)
+		if i < matchedBlocks {
+			c.MatchedTokens += int(u.Tokens)
+		}
+	}
+	return c
+}
+
+// MissingBlocks is the cold depth in blocks.
+func (c Coverage) MissingBlocks() int { return c.TotalBlocks - c.MatchedBlocks }
+
+// MissingTokens is the cold depth in estimated tokens — the work a prefill has
+// to do, and the quantity a prefill/decode split is decided on.
+func (c Coverage) MissingTokens() int { return c.TotalTokens - c.MatchedTokens }
+
+// TokenFraction is the share of the request already resident, weighted by size.
+// This is the one to compare against a backend's reported cached_tokens; see the
+// type comment for what happened when it was not.
+func (c Coverage) TokenFraction() float64 {
+	if c.TotalTokens <= 0 {
+		return 0
+	}
+	return float64(c.MatchedTokens) / float64(c.TotalTokens)
+}
+
+// BlockFraction is the unweighted share, which is what a structural view of the
+// tree shows and is NOT comparable with an upstream's token accounting.
+func (c Coverage) BlockFraction() float64 {
+	if c.TotalBlocks <= 0 {
+		return 0
+	}
+	return float64(c.MatchedBlocks) / float64(c.TotalBlocks)
+}
+
 // HashContent is sha256(tag || 0x00 || content) truncated to 64 bits.
 //
 // SHA-256 rather than a fast non-cryptographic hash on purpose: prompt content
