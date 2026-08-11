@@ -120,8 +120,16 @@ func TestReplayEndpointResolution(t *testing.T) {
 		if n != 1 {
 			t.Errorf("server saw %d requests, want 1 (500 must not trigger the /v1 fallback)", n)
 		}
-		if got := p.endpointAttempts(); len(got) != 2 {
-			t.Errorf("endpoint latched on a failed request: %v", got)
+		// The 500 DOES latch, and that is the point of the rule: a 404 means the
+		// path is wrong, anything else means the path is right and something
+		// else went wrong. This assertion used to require the opposite — no
+		// latch on any failure — and was left behind when the latch rule
+		// changed, so the suite has been red since. What this subtest is
+		// actually for is the `hits != 1` check above: a 500 must not send the
+		// client probing the /v1 form.
+		if got := p.endpointAttempts(); len(got) != 1 {
+			t.Errorf("endpoint attempts = %v, want the primary latched: a non-404 answer means "+
+				"the path was right, so the form is resolved and must not be probed again", got)
 		}
 	})
 
