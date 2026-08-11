@@ -68,7 +68,7 @@ func startSSE(w http.ResponseWriter) http.Flusher {
 	return flusher
 }
 
-func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatCompletionRequest, modelID string, units []kvcache.Unit, cached, total, maxTok int, work time.Duration) {
+func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatCompletionRequest, modelID string, units []kvcache.Unit, res Residency, maxTok int, work time.Duration) {
 	ctx := r.Context()
 	flusher := startSSE(w)
 	id := s.newID("chatcmpl")
@@ -106,7 +106,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatComp
 		Choices: []chatChoice{{Index: 0, Delta: &chatMsgOut{}, FinishReason: &finish}},
 	}
 	if req.wantsUsage() {
-		u := buildUsage(total, cached, generated)
+		u := buildUsage(res.Total, res.Cached(), generated)
 		final.Usage = &u
 	}
 	writeSSE(w, flusher, final)
@@ -118,10 +118,11 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req chatComp
 	// decode-KV is written for whatever was actually generated, not the
 	// originally requested budget.
 	s.engine.AppendOutputBlocks(units, generated, strings.Join(tokens[:generated], " "))
-	s.coll.observe("success", cached, total, generated)
+	s.engine.PublishToTier(units)
+	s.coll.observe("success", res, generated)
 }
 
-func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, req completionRequest, modelID string, units []kvcache.Unit, cached, total, maxTok int, work time.Duration) {
+func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, req completionRequest, modelID string, units []kvcache.Unit, res Residency, maxTok int, work time.Duration) {
 	ctx := r.Context()
 	flusher := startSSE(w)
 	id := s.newID("cmpl")
@@ -152,7 +153,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, req co
 		Choices: []completionChoice{{Index: 0, Text: "", FinishReason: &finish}},
 	}
 	if req.wantsUsage() {
-		u := buildUsage(total, cached, generated)
+		u := buildUsage(res.Total, res.Cached(), generated)
 		final.Usage = &u
 	}
 	writeSSE(w, flusher, final)
@@ -160,5 +161,6 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, req co
 
 	s.engine.RecordOutput(generated)
 	s.engine.AppendOutputBlocks(units, generated, strings.Join(tokens[:generated], " "))
-	s.coll.observe("success", cached, total, generated)
+	s.engine.PublishToTier(units)
+	s.coll.observe("success", res, generated)
 }

@@ -114,6 +114,27 @@ type Config struct {
 	CachedInputTPS float64 // tokens/sec, CACHED prompt tokens (cache read) — INSTANCE aggregate, shared via processor sharing
 	OutputTPS      float64 // tokens/sec, decode — PER-REQUEST, not contended; also paces SSE chunk spacing
 
+	// ExternalInputTPS is the rate for prompt tokens read from the FLEET-SHARED
+	// tier — blocks another instance computed and wrote out, which this one
+	// loads instead of recomputing. It belongs between CachedInputTPS and
+	// ColdInputTPS: a network or storage read is far dearer than local HBM and
+	// far cheaper than prefill. Like the others it is an instance-aggregate rate
+	// and contends through the same processor-sharing scheduler, which is right
+	// — a node loading a large prefix off WEKA is not free to prefill something
+	// else at full speed meanwhile.
+	//
+	// Only meaningful with Tier set. Left at 0 with a Tier present, an external
+	// hit costs nothing at all, which is a legitimate (if optimistic) thing to
+	// want to measure.
+	ExternalInputTPS float64
+
+	// Tier, when set, is the fleet-shared KV cache every instance in the fleet
+	// reads from and writes to. Nil (the default) is a fleet of plain,
+	// independent vLLMs, where prefilling on one node does nothing for another.
+	// See tier.go for why the distinction decides whether prefill/decode
+	// segregation can work at all.
+	Tier *Tier
+
 	// DefaultMaxTokens is the completion length used when a request omits
 	// max_tokens (or sends <= 0).
 	DefaultMaxTokens int
@@ -198,12 +219,13 @@ type Engine struct {
 	trie    *kvcache.Trie
 	prefill *prefillScheduler // this instance's shared prefill processor-sharing resource
 
-	inflight   atomic.Int64
-	admitted   atomic.Int64
-	rejected   atomic.Int64
-	promptToks atomic.Int64
-	cachedToks atomic.Int64
-	genToks    atomic.Int64
+	inflight     atomic.Int64
+	admitted     atomic.Int64
+	rejected     atomic.Int64
+	promptToks   atomic.Int64
+	cachedToks   atomic.Int64
+	externalToks atomic.Int64
+	genToks      atomic.Int64
 }
 
 // NewEngine builds an Engine. A zero BlockCapacity means an unbounded cache
@@ -268,13 +290,13 @@ func (e *Engine) Query(units []kvcache.Unit) (cached, total int) {
 // Unpin) precisely so this engine and a future TTL-evicting router share the
 // exact same block-splitting/chain-hashing/prefix-hit-counting core; only the
 // eviction discipline differs (LRU-among-unpinned here, tail-TTL there).
-func (e *Engine) Admit(units []kvcache.Unit) (release func(), cached, total int, ok bool) {
+func (e *Engine) Admit(units []kvcache.Unit) (release func(), res Residency, ok bool) {
 	if e.cfg.MaxConcurrency > 0 {
 		n := e.inflight.Add(1)
 		if n > int64(e.cfg.MaxConcurrency) {
 			e.inflight.Add(-1)
 			e.rejected.Add(1)
-			return nil, 0, 0, false
+			return nil, Residency{}, false
 		}
 	} else {
 		e.inflight.Add(1)
@@ -283,28 +305,58 @@ func (e *Engine) Admit(units []kvcache.Unit) (release func(), cached, total int,
 
 	cached, total, pin := e.trie.RecordAndPin(units)
 	e.trie.Observe(cached, total)
+	res = Residency{Local: cached, Total: total}
+
+	// What the local cache missed may still be in the fleet-shared tier. The
+	// tier is asked about the WHOLE unit list rather than the missing suffix,
+	// because its answer is a prefix run from the start of the request just as
+	// the local one is; only the part beyond the local hit is new information.
+	if e.cfg.Tier != nil {
+		if shared := e.cfg.Tier.Query(units); shared > cached {
+			res.External = shared - cached
+			e.externalToks.Add(int64(res.External))
+		}
+	}
+
 	e.promptToks.Add(int64(total))
-	e.cachedToks.Add(int64(cached))
+	e.cachedToks.Add(int64(res.Cached()))
 
 	return func() {
 		e.trie.Unpin(pin)
 		e.inflight.Add(-1)
-	}, cached, total, true
+	}, res, true
+}
+
+// PublishToTier writes this request's blocks out to the fleet-shared tier, so
+// another instance can load rather than recompute them. A no-op without a Tier.
+//
+// Called once a request has been served, alongside AppendOutputBlocks, for the
+// reason given on Tier.Publish: a refused or abandoned request computed nothing
+// and must advertise nothing.
+func (e *Engine) PublishToTier(units []kvcache.Unit) {
+	e.cfg.Tier.Publish(units)
 }
 
 // PrefillWork computes this request's prefill job SIZE — the amount of
 // solo-rate GPU time it would take if it were the ONLY thing prefilling on
-// this instance: uncachedTokens/ColdInputTPS + cachedTokens/CachedInputTPS
-// (a cache hit still costs a KV read at CachedInputTPS, it just isn't full
-// recompute at ColdInputTPS). Pure: no side effects, no waiting. Feed the
-// result to AwaitTTFT, which is where contention with every other
-// concurrently-prefilling request on this instance is actually applied.
-func (e *Engine) PrefillWork(cachedTokens, totalTokens int) time.Duration {
-	uncached := totalTokens - cachedTokens
-	if uncached < 0 {
-		uncached = 0
-	}
-	return tokensAtRate(uncached, e.cfg.ColdInputTPS) + tokensAtRate(cachedTokens, e.cfg.CachedInputTPS)
+// this instance — as one term per place the tokens were found:
+//
+//	cold/ColdInputTPS + external/ExternalInputTPS + local/CachedInputTPS
+//
+// A cache hit is never free; only recompute is skipped. The external term is
+// what a fleet-shared KV tier buys and what it costs: a request whose prefix
+// another instance already computed pays a storage read rather than a prefill,
+// which is the entire mechanism the router's prefill/decode segregation is
+// betting on. Without a Tier configured that term is always zero because
+// Residency.External is.
+//
+// Pure: no side effects, no waiting. Feed the result to AwaitTTFT, which is
+// where contention with every other concurrently-prefilling request on this
+// instance is actually applied.
+func (e *Engine) PrefillWork(res Residency) time.Duration {
+	return tokensAtRate(res.Cold(), e.cfg.ColdInputTPS) +
+		tokensAtRate(res.External, e.cfg.ExternalInputTPS) +
+		tokensAtRate(res.Local, e.cfg.CachedInputTPS)
 }
 
 // AwaitTTFT blocks for BaseLatency, then submits work (see PrefillWork) to
@@ -449,8 +501,12 @@ type Stats struct {
 	PinnedNodes                  int64 // blocks currently held by an in-flight request's Pin
 	Inflight, Admitted, Rejected int64
 	PromptTokens, CachedTokens   int64
-	GeneratedTokens              int64
-	Capacity                     int64 // BlockCapacity, 0 = unbounded
+	// ExternalTokens is the share of CachedTokens that came from the
+	// fleet-shared tier rather than this instance's own cache. Always 0 without
+	// a Tier configured.
+	ExternalTokens  int64
+	GeneratedTokens int64
+	Capacity        int64 // BlockCapacity, 0 = unbounded
 }
 
 func (e *Engine) Stats() Stats {
@@ -465,6 +521,7 @@ func (e *Engine) Stats() Stats {
 		Rejected:        e.rejected.Load(),
 		PromptTokens:    e.promptToks.Load(),
 		CachedTokens:    e.cachedToks.Load(),
+		ExternalTokens:  e.externalToks.Load(),
 		GeneratedTokens: e.genToks.Load(),
 		Capacity:        e.cfg.BlockCapacity,
 	}

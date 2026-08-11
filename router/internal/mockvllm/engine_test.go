@@ -24,7 +24,8 @@ func repeatWord(word string, n int) string {
 // This is the direct successor to the old Engine.Serve, which this test file
 // used before Admit absorbed pinning into admission.
 func serveOnce(e *Engine, prompt string) (cached, total int) {
-	release, cached, total, ok := e.Admit(e.Tokenize(prompt))
+	release, res, ok := e.Admit(e.Tokenize(prompt))
+	cached, total = res.Cached(), res.Total
 	if !ok {
 		return 0, 0
 	}
@@ -137,13 +138,13 @@ func TestEngine_AdmitRejectsPastMaxConcurrency(t *testing.T) {
 	e := NewEngine(Config{MaxConcurrency: 2})
 	units := e.Tokenize("occupy a slot")
 
-	rel1, _, _, ok1 := e.Admit(units)
-	rel2, _, _, ok2 := e.Admit(units)
+	rel1, _, ok1 := e.Admit(units)
+	rel2, _, ok2 := e.Admit(units)
 	if !ok1 || !ok2 {
 		t.Fatalf("expected the first two admissions to succeed: ok1=%v ok2=%v", ok1, ok2)
 	}
 
-	_, _, _, ok3 := e.Admit(units)
+	_, _, ok3 := e.Admit(units)
 	if ok3 {
 		t.Fatalf("third admission at MaxConcurrency=2 should have been rejected")
 	}
@@ -152,7 +153,7 @@ func TestEngine_AdmitRejectsPastMaxConcurrency(t *testing.T) {
 	}
 
 	rel1()
-	rel4, _, _, ok4 := e.Admit(units)
+	rel4, _, ok4 := e.Admit(units)
 	if !ok4 {
 		t.Fatalf("admission should succeed again after a slot is released")
 	}
@@ -166,7 +167,7 @@ func TestEngine_AdmitUnboundedNeverRejects(t *testing.T) {
 	units := e.Tokenize("unbounded concurrency")
 	var releases []func()
 	for i := 0; i < 500; i++ {
-		rel, _, _, ok := e.Admit(units)
+		rel, _, ok := e.Admit(units)
 		if !ok {
 			t.Fatalf("MaxConcurrency=0 must never reject (request %d)", i)
 		}
@@ -188,11 +189,12 @@ func TestEngine_RejectedAdmissionTouchesNothing(t *testing.T) {
 	e := NewEngine(Config{MaxConcurrency: 1})
 	units := e.Tokenize(repeatWord("neverserved", 200))
 
-	rel1, _, total1, ok1 := e.Admit(units)
+	rel1, res1, ok1 := e.Admit(units)
+	total1 := res1.Total
 	if !ok1 {
 		t.Fatalf("first admission should succeed")
 	}
-	_, _, _, ok2 := e.Admit(units)
+	_, _, ok2 := e.Admit(units)
 	if ok2 {
 		t.Fatalf("second admission at MaxConcurrency=1 should have been rejected")
 	}
@@ -222,7 +224,8 @@ func TestEngine_PinnedChainSurvivesEvictionPressureUntilRelease(t *testing.T) {
 	pinnedPrompt := strings.Repeat("A", 140) // 3 blocks at 64 bytes/block: 64+64+12
 	units := e.Tokenize(pinnedPrompt)
 
-	release, cached, total, ok := e.Admit(units)
+	release, res, ok := e.Admit(units)
+	cached, total := res.Cached(), res.Total
 	if !ok {
 		t.Fatalf("admit unexpectedly rejected")
 	}
@@ -286,7 +289,7 @@ func TestEngine_PrefillWorkChargesColdAndCachedSeparately(t *testing.T) {
 		OutputTPS:      500,  // 2ms/token
 	})
 	defer e.Close()
-	work := e.PrefillWork(40, 100) // 40 cached, 60 uncached
+	work := e.PrefillWork(Residency{Local: 40, Total: 100}) // 40 cached, 60 uncached
 
 	wantWork := time.Duration(60.0/1000*float64(time.Second)) + time.Duration(40.0/2000*float64(time.Second))
 	if work != wantWork {
@@ -306,7 +309,7 @@ func TestEngine_PrefillWorkChargesColdAndCachedSeparately(t *testing.T) {
 func TestEngine_CachedTokensAreNotFree(t *testing.T) {
 	e := NewEngine(Config{CachedInputTPS: 1000})
 	defer e.Close()
-	work := e.PrefillWork(100, 100) // fully cached, zero uncached
+	work := e.PrefillWork(Residency{Local: 100, Total: 100}) // fully cached, zero uncached
 	if work <= 0 {
 		t.Fatalf("a fully cached request should still cost time at CachedInputTPS, got work=%v", work)
 	}
@@ -318,7 +321,7 @@ func TestEngine_CachedTokensAreNotFree(t *testing.T) {
 func TestEngine_ZeroRateIsInstant(t *testing.T) {
 	e := NewEngine(Config{})
 	defer e.Close()
-	work := e.PrefillWork(0, 100)
+	work := e.PrefillWork(Residency{Total: 100})
 	decode := e.DecodeDuration(50)
 	if work != 0 || decode != 0 {
 		t.Fatalf("zero-rate Config should be instant, got work=%v decode=%v", work, decode)
@@ -413,7 +416,7 @@ func TestEngine_OutputBlocksOccupyCapacityAndAreEvictable(t *testing.T) {
 	e := NewEngine(Config{BlockSizeTokens: 16, BlockCapacity: 10, OutputKVMultiplier: 1.0})
 	promptUnits := e.Tokenize("short prompt for the output-kv capacity test")
 
-	release, _, _, ok := e.Admit(promptUnits)
+	release, _, ok := e.Admit(promptUnits)
 	if !ok {
 		t.Fatalf("admit failed")
 	}

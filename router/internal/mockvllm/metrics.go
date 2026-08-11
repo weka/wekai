@@ -25,6 +25,13 @@ type collectors struct {
 	genTokensTotal    prometheus.Counter
 	cacheQueriesTotal prometheus.Counter
 	cacheHitsTotal    prometheus.Counter
+	// tokensBySource mirrors vllm:prompt_tokens_by_source_total, whose labels
+	// are the only place real vLLM distinguishes a local prefix-cache hit from
+	// a block pulled over a shared KV tier. benchmark/vllm_metrics.go already
+	// parses exactly this metric and exactly these label values, so a mock fleet
+	// with --external-kv-tps set reports its tiering through the same channel a
+	// real one does rather than inventing a private one.
+	tokensBySource *prometheus.CounterVec
 	// numRequestsRunning and cacheUsagePerc are GaugeFuncs, not Gauges: they
 	// must reflect the engine's state AT SCRAPE TIME, not a value frozen from
 	// whichever request last called observe(). A plain Gauge.Set() here would
@@ -64,6 +71,10 @@ func newCollectors(e *Engine) *collectors {
 			Name: "vllm:prefix_cache_hits_total",
 			Help: "Estimated prompt tokens served from the prefix cache.",
 		}),
+		tokensBySource: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vllm:prompt_tokens_by_source_total",
+			Help: "Prompt tokens by where they came from: recompute, local_cache_hit, or external_kv_transfer.",
+		}, []string{"source"}),
 	}
 }
 
@@ -71,19 +82,26 @@ func (c *collectors) register(reg *prometheus.Registry) {
 	reg.MustRegister(
 		c.requestsTotal, c.numRequestsRunning, c.cacheUsagePerc,
 		c.promptTokensTotal, c.genTokensTotal,
-		c.cacheQueriesTotal, c.cacheHitsTotal,
+		c.cacheQueriesTotal, c.cacheHitsTotal, c.tokensBySource,
 	)
 }
 
 // observe folds one completed request's outcome into the counters. status is
 // "success" or "rejected" (429). The two live gauges are NOT touched here —
 // see the GaugeFunc comment above.
-func (c *collectors) observe(status string, cached, total, generated int) {
+func (c *collectors) observe(status string, res Residency, generated int) {
 	c.requestsTotal.WithLabelValues(status).Inc()
-	if status == "success" {
-		c.promptTokensTotal.Add(float64(total))
-		c.genTokensTotal.Add(float64(generated))
-		c.cacheQueriesTotal.Add(float64(total))
-		c.cacheHitsTotal.Add(float64(cached))
+	if status != "success" {
+		return
 	}
+	c.promptTokensTotal.Add(float64(res.Total))
+	c.genTokensTotal.Add(float64(generated))
+	c.cacheQueriesTotal.Add(float64(res.Total))
+	// Local AND external, because that is what vLLM's own prefix-cache counters
+	// report: the split between the two lives in tokensBySource below and
+	// nowhere else.
+	c.cacheHitsTotal.Add(float64(res.Cached()))
+	c.tokensBySource.WithLabelValues("recompute").Add(float64(res.Cold()))
+	c.tokensBySource.WithLabelValues("local_cache_hit").Add(float64(res.Local))
+	c.tokensBySource.WithLabelValues("external_kv_transfer").Add(float64(res.External))
 }

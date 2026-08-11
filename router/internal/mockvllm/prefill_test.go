@@ -139,7 +139,7 @@ func TestEngine_AwaitTTFTReportsBasePlusPrefillCompletion(t *testing.T) {
 	e := NewEngine(Config{BaseLatency: base, ColdInputTPS: 1000}) // 1ms/token
 	defer e.Close()
 
-	work := e.PrefillWork(0, 50) // 50 uncached tokens @ 1000 tok/s = 50ms
+	work := e.PrefillWork(Residency{Total: 50}) // 50 uncached tokens @ 1000 tok/s = 50ms
 	start := time.Now()
 	if !e.AwaitTTFT(context.Background(), work) {
 		t.Fatal("AwaitTTFT returned false unexpectedly")

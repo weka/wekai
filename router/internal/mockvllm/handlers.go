@@ -28,14 +28,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // touched in the cache model for a rejected request, matching a real 429
 // where the backend did no prefill and cached nothing. Callers must invoke
 // the returned release exactly once when ok.
-func (s *Server) admitOrReject(w http.ResponseWriter, units []kvcache.Unit) (release func(), cached, total int, ok bool) {
-	release, cached, total, ok = s.engine.Admit(units)
+func (s *Server) admitOrReject(w http.ResponseWriter, units []kvcache.Unit) (release func(), res Residency, ok bool) {
+	release, res, ok = s.engine.Admit(units)
 	if !ok {
 		writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
 			"server is at max concurrency; retry")
-		s.coll.observe("rejected", 0, 0, 0)
+		s.coll.observe("rejected", Residency{}, 0)
 	}
-	return release, cached, total, ok
+	return release, res, ok
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -46,18 +46,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	units := s.engine.Tokenize(string(req.promptBytes()))
-	release, cached, total, ok := s.admitOrReject(w, units)
+	release, res, ok := s.admitOrReject(w, units)
 	if !ok {
 		return
 	}
 	defer release()
 
 	maxTok := s.engine.MaxTokensOrDefault(req.MaxTokens)
-	work := s.engine.PrefillWork(cached, total)
+	work := s.engine.PrefillWork(res)
 	modelID := s.engine.Config().ModelID
 
 	if req.Stream {
-		s.streamChat(w, r, req, modelID, units, cached, total, maxTok, work)
+		s.streamChat(w, r, req, modelID, units, res, maxTok, work)
 		return
 	}
 
@@ -71,8 +71,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	content := strings.Join(syntheticTokens(maxTok), " ")
 	s.engine.AppendOutputBlocks(units, maxTok, content)
+	s.engine.PublishToTier(units)
 	finish := "stop"
-	u := buildUsage(total, cached, maxTok)
+	u := buildUsage(res.Total, res.Cached(), maxTok)
 	writeJSON(w, http.StatusOK, chatCompletionResponse{
 		ID:     s.newID("chatcmpl"),
 		Object: "chat.completion",
@@ -87,7 +88,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Usage: &u,
 	})
 
-	s.coll.observe("success", cached, total, maxTok)
+	s.coll.observe("success", res, maxTok)
 }
 
 func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
@@ -98,18 +99,18 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	units := s.engine.Tokenize(req.promptText())
-	release, cached, total, ok := s.admitOrReject(w, units)
+	release, res, ok := s.admitOrReject(w, units)
 	if !ok {
 		return
 	}
 	defer release()
 
 	maxTok := s.engine.MaxTokensOrDefault(req.MaxTokens)
-	work := s.engine.PrefillWork(cached, total)
+	work := s.engine.PrefillWork(res)
 	modelID := s.engine.Config().ModelID
 
 	if req.Stream {
-		s.streamCompletion(w, r, req, modelID, units, cached, total, maxTok, work)
+		s.streamCompletion(w, r, req, modelID, units, res, maxTok, work)
 		return
 	}
 
@@ -123,8 +124,9 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 
 	text := strings.Join(syntheticTokens(maxTok), " ")
 	s.engine.AppendOutputBlocks(units, maxTok, text)
+	s.engine.PublishToTier(units)
 	finish := "stop"
-	u := buildUsage(total, cached, maxTok)
+	u := buildUsage(res.Total, res.Cached(), maxTok)
 	writeJSON(w, http.StatusOK, completionResponse{
 		ID:     s.newID("cmpl"),
 		Object: "text_completion",
@@ -135,7 +137,7 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 		Usage:   &u,
 	})
 
-	s.coll.observe("success", cached, total, maxTok)
+	s.coll.observe("success", res, maxTok)
 }
 
 func (s *Server) newID(prefix string) string {
@@ -194,14 +196,14 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	units := s.engine.Tokenize(sb.String())
-	release, cached, total, ok := s.admitOrReject(w, units)
+	release, res, ok := s.admitOrReject(w, units)
 	if !ok {
 		return
 	}
 	defer release()
 
 	maxTok := s.engine.MaxTokensOrDefault(req.MaxTokens)
-	if !s.engine.AwaitTTFT(r.Context(), s.engine.PrefillWork(cached, total)) {
+	if !s.engine.AwaitTTFT(r.Context(), s.engine.PrefillWork(res)) {
 		return
 	}
 	if !sleepCtx(r.Context(), s.engine.DecodeDuration(maxTok)) {
@@ -210,6 +212,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.engine.RecordOutput(maxTok)
 	content := strings.Join(syntheticTokens(maxTok), " ")
 	s.engine.AppendOutputBlocks(units, maxTok, content)
+	s.engine.PublishToTier(units)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":      s.newID("msg"),
@@ -218,8 +221,8 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		"model":   req.Model,
 		"content": []map[string]any{{"type": "text", "text": content}},
 		"usage": map[string]any{
-			"input_tokens":            total - cached,
-			"cache_read_input_tokens": cached,
+			"input_tokens":            res.Total - res.Cached(),
+			"cache_read_input_tokens": res.Cached(),
 			"output_tokens":           maxTok,
 		},
 	})

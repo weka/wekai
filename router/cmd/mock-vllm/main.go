@@ -83,6 +83,7 @@ func run(args []string) error {
 	cachedInputTPS := fs.Float64("cached-input-tps", 1_000_000, "tokens/sec for CACHED prompt tokens (cache read) — NOT free: only recompute is skipped, a cache hit still costs a KV read")
 	outputTPS := fs.Float64("output-tps", 500, "tokens/sec decode, per request — also paces SSE chunk spacing")
 	outputKVMultiplier := fs.Float64("output-kv-multiplier", 1.0, "models real vLLM writing decode KV into the same pool as prompt KV: on completion, ceil(output_tokens*multiplier/block-size-tokens) blocks are appended to the request's own chain, occupying capacity and evictable like prompt blocks. 0 disables this (outputs stay invisible to the cache, the historical behavior)")
+	externalKVTPS := fs.Float64("external-kv-tps", 0, "tokens/sec for prompt tokens read from a FLEET-SHARED KV tier (LMCache over WEKA), and the switch that creates one: 0 (the default) gives independent per-instance caches, where prefilling on one instance does nothing for another. Set it and every instance in this process reads and writes one shared trie, so a block computed anywhere is loadable everywhere at this rate — between --cached-input-tps (local HBM) and --cold-input-tps (recompute). This is what the router's --prefill-split depends on, and turning it off is how you measure that dependency")
 	logLevel := fs.String("log-level", "info", "debug, info, warn, or error")
 	surface := fs.String("surface", "vllm", "which HTTP surface to expose: 'vllm' (OpenAI routes + /health + /metrics), "+
 		"'anthropic' (a vLLM fronted with /v1/messages, still serving vllm: metrics — the case that must not be "+
@@ -102,8 +103,20 @@ func run(args []string) error {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
 
+	// One Tier for the whole process, or none at all. Shared across instances is
+	// the entire point — a per-instance "shared" tier would be an ordinary local
+	// cache wearing a different name — which also means this flag only models a
+	// shared tier for the instances THIS process runs. A fleet split across
+	// several mock-vllm processes gets one tier per process.
+	var tier *mockvllm.Tier
+	if *externalKVTPS > 0 {
+		tier = mockvllm.NewTier()
+	}
+
 	cfg := mockvllm.Config{
 		ModelID:            *modelID,
+		Tier:               tier,
+		ExternalInputTPS:   *externalKVTPS,
 		BlockSizeTokens:    *blockSizeTokens,
 		CharsPerToken:      *charsPerToken,
 		BlockCapacity:      *blockCapacity,
@@ -158,7 +171,8 @@ func run(args []string) error {
 				"block_size_tokens", cfg.BlockSizeTokens, "chars_per_token", cfg.CharsPerToken,
 				"block_capacity", cfg.BlockCapacity, "max_concurrency", cfg.MaxConcurrency,
 				"cold_input_tps", cfg.ColdInputTPS, "cached_input_tps", cfg.CachedInputTPS,
-				"output_tps", cfg.OutputTPS, "output_kv_multiplier", cfg.OutputKVMultiplier)
+				"output_tps", cfg.OutputTPS, "output_kv_multiplier", cfg.OutputKVMultiplier,
+				"shared_kv_tier", cfg.Tier != nil, "external_kv_tps", cfg.ExternalInputTPS)
 			errCh <- hs.ListenAndServe()
 		}()
 	}
