@@ -36,6 +36,16 @@ Scope is optional but encouraged: `feat(llm): ...`, `fix(chart): ...`,
   → template `imageTag | default .Chart.AppVersion`. Never hardcode a
   version in `values.yaml`.
 
+## Comments and Docs
+
+Describe the current design, never how it got there. A comment earns its place
+by explaining what the code does and why it is that way — the trade-off taken,
+the constraint respected, the failure a rule prevents. It does not earn its
+place by narrating what the code used to do or which bug was fixed.
+
+That belongs in the commit message, where `git log` and `git blame` put it in
+front of whoever needs it.
+
 ## Build & Test
 
 - Binary is named `wekai` (main package at the repo root, so plain `go install github.com/weka/wekai@<vX>` works); module stays

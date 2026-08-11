@@ -131,6 +131,21 @@ func (s *Server) build() http.Handler {
 	// unauthenticated, which a user-facing router routinely is.
 	mux.HandleFunc("GET /get_server_info", s.handleServerInfo)
 
+	// /metrics is REFUSED here rather than falling through to the passthrough
+	// tier below, which would proxy it to a backend like any other unclaimed
+	// path — chosen by least-outstanding, so a different backend per scrape.
+	// A scraper aimed at the serving port would then receive ONE vLLM's vllm:*
+	// counters, which is indistinguishable from a fleet total except that it is
+	// wrong by a factor of the fleet size and moves BACKWARDS whenever
+	// consecutive scrapes land on different backends, silently breaking rate()
+	// and increase().
+	//
+	// The aggregated counters live on --metrics-listen. They are not served here
+	// instead, because they are diagnostic surface and this listener may be
+	// public (GW-13); the refusal names the flag so one request establishes what
+	// otherwise takes paired snapshots and a delta calculation.
+	mux.HandleFunc("GET /metrics", s.handleMetricsElsewhere)
+
 	// Admin endpoints. Auth applies (AUTH-11).
 	mux.HandleFunc("GET /workers", s.handleListWorkers)
 	mux.HandleFunc("GET /list_workers", s.handleListWorkers)
@@ -497,6 +512,28 @@ func rewriteModelField(body []byte, model string) []byte {
 		return body
 	}
 	return out
+}
+
+// handleMetricsElsewhere answers a scrape aimed at the serving port.
+//
+// 404 rather than a redirect: the metrics listener is a different address on a
+// different port, routinely bound where the scraper cannot follow, and a
+// redirect to something unreachable is a worse error than a plain refusal. The
+// body names the flag, because the whole point is that the operator learns this
+// from one request.
+//
+// Logged at WARN on every scrape on purpose. A misconfigured scraper is
+// persistent, and the log is where somebody will be looking when a dashboard's
+// pool totals turn out not to be pool totals.
+func (s *Server) handleMetricsElsewhere(w http.ResponseWriter, r *http.Request) {
+	slog.Warn("a /metrics scrape reached the INFERENCE listener, which does not serve metrics. "+
+		"The router's own metrics and the aggregated upstream vLLM counters are on "+
+		"--metrics-listen; whatever is scraping this address is not collecting them.",
+		"request_id", obs.RequestID(r.Context()), "remote", r.RemoteAddr)
+	s.dialect.WriteError(w, http.StatusNotFound, "metrics_not_here",
+		"this is the inference listener; metrics are served on the address given to "+
+			"--metrics-listen (default 127.0.0.1:29000), including upstream vLLM counters "+
+			"aggregated across the whole pool")
 }
 
 func (s *Server) handleLiveness(w http.ResponseWriter, r *http.Request) {
