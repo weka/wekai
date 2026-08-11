@@ -36,6 +36,16 @@ Scope is optional but encouraged: `feat(llm): ...`, `fix(chart): ...`,
   → template `imageTag | default .Chart.AppVersion`. Never hardcode a
   version in `values.yaml`.
 
+## Replay Content and KV
+
+**A wekai run generates unique content. KV is never reused between runs.**
+
+So a fleet is cold for a new run's prefixes whatever it served before, and two
+runs are comparable at equal elapsed time without resetting the backends. Cache
+hit rate within a run comes from that run's own sessions extending their
+prefixes, nothing else. Never explain a result — good or bad — by the fleet
+being warm from earlier traffic.
+
 ## Comments and Docs
 
 Describe the current design, never how it got there. A comment earns its place
