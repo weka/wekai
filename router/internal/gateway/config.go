@@ -1,6 +1,9 @@
 package gateway
 
 import (
+	"time"
+
+	"github.com/weka/wekai/router/internal/clock"
 	"github.com/weka/wekai/router/internal/proxy"
 	"github.com/weka/wekai/router/internal/registry"
 )
@@ -52,6 +55,26 @@ type Config struct {
 	// DefaultCapacity is applied to a backend added at runtime through the
 	// admin endpoints, which carry no capacity of their own.
 	DefaultCapacity int64
+
+	// RetryTimeLimit is how long the router will keep re-deciding a request
+	// that no backend can currently take, before answering 429. Zero (the
+	// default) answers immediately, as it always has.
+	//
+	// It applies to CAPACITY refusals only — every backend saturated, or the
+	// split guard declining to spend idle capacity on a duplicate. Both are
+	// transient by nature: they describe the fleet's state this instant, and an
+	// in-flight request completing anywhere changes the answer. A client that
+	// receives the 429 will retry anyway, so the choice is only whether the
+	// waiting happens here, where the fleet's state is already known, or across
+	// a round trip.
+	//
+	// It is NOT a retry budget for failures. A broken backend is retried by the
+	// proxy under its own much tighter rules; waiting out a 502 would just delay
+	// an error the caller has to handle.
+	RetryTimeLimit time.Duration
+
+	// Clock is the time source for that backoff. Nil means clock.Real.
+	Clock clock.Clock
 }
 
 // Redacted returns the config with nothing secret in it, for

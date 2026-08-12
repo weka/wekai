@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/weka/wekai/router/internal/clock"
 	"github.com/weka/wekai/router/internal/dialect"
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/obs"
@@ -57,6 +58,9 @@ func dialectPaths(d dialect.Dialect) []string {
 }
 
 func New(cfg Config, rt Router, px *proxy.Proxy, d dialect.Dialect) *Server {
+	if cfg.Clock == nil {
+		cfg.Clock = clock.Real{}
+	}
 	s := &Server{cfg: cfg, router: rt, px: px, dialect: d}
 	if cfg.APIKey != "" {
 		s.apiKey = []byte(cfg.APIKey)
@@ -248,7 +252,7 @@ func (s *Server) inferenceHandler(route dialect.Route, affine bool) http.Handler
 				}
 			}
 		}
-		res := s.px.Serve(w, r, candidates, target.Selector, s.dialect, rr, body, accepted, outcome, auth)
+		res := s.serveWithCapacityRetry(w, r, target, rr, body, accepted, outcome, auth)
 		if res.Backend != nil {
 			obs.SetBackend(ctx, res.Backend.URL)
 		}

@@ -101,6 +101,12 @@ spec:
             {{- if .splitGuard }}
             - "--cache-split-guard={{ .splitGuard }}"
             {{- end }}
+            {{- if .transientFallbackThreshold }}
+            - "--transient-fallback-threshold={{ .transientFallbackThreshold }}"
+            {{- end }}
+            {{- if .retryTimeLimit }}
+            - "--retry-time-limit={{ .retryTimeLimit }}"
+            {{- end }}
             {{- end }}
             {{- if .Values.router.vllmMetrics.enabled }}
             - "--vllm-metrics"

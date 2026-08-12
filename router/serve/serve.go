@@ -135,8 +135,14 @@ type Options struct {
 	// one model), "force", or "off". Empty means "auto".
 	AutoModel  string
 	SplitGuard float64
-	TailTTL    time.Duration
-	RefusalTTL time.Duration
+	// TransientFallback lets a request the split guard refused be SERVED on a
+	// backend without recording it as a holder. 0 is off.
+	TransientFallback float64
+	// RetryTimeLimit is how long to keep re-deciding a request no backend can
+	// take before answering 429. 0 answers immediately.
+	RetryTimeLimit time.Duration
+	TailTTL        time.Duration
+	RefusalTTL     time.Duration
 
 	// --- Kubernetes discovery, applied to any route carrying a selector.
 
@@ -188,16 +194,18 @@ func (o Options) gatewayConfig() gateway.Config {
 		PathAllowlist:         o.PathAllowlist,
 		CORSOrigins:           o.CORSOrigins,
 		DefaultCapacity:       1,
+		RetryTimeLimit:        o.RetryTimeLimit,
 	}
 }
 
 func (o Options) flowConfig() affinity.Config {
 	return affinity.Config{
-		NodeConcurrency: o.NodeConcurrency,
-		RebalanceRatio:  o.RebalanceRatio,
-		SplitGuard:      o.SplitGuard,
-		TailTTL:         o.TailTTL,
-		RefusalTTL:      o.RefusalTTL,
+		NodeConcurrency:   o.NodeConcurrency,
+		RebalanceRatio:    o.RebalanceRatio,
+		SplitGuard:        o.SplitGuard,
+		TransientFallback: o.TransientFallback,
+		TailTTL:           o.TailTTL,
+		RefusalTTL:        o.RefusalTTL,
 	}
 }
 

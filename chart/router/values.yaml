@@ -121,6 +121,20 @@ router:
     # A prefix is split onto a backend only while its in-flight is below
     # limit*(1-this). Lower and every backend ends up holding every prefix.
     splitGuard: 0.20
+    # Serve a request the split guard refused WITHOUT recording the backend as
+    # a holder, while it is below ref*(1-this). Must be BELOW splitGuard to do
+    # anything — it is the looser bar. At 0.05 against a guard of 0.20: under
+    # 80% of the holders' load a backend takes the prefix and keeps it, between
+    # 80% and 95% it serves the request and is forgotten, above that the
+    # request is refused. 0 = off, the guard's rejection is final.
+    transientFallbackThreshold: 0
+    # Keep re-deciding a request no backend can currently take for up to this
+    # long before answering 429, backing off 10ms/20ms/50ms/... to 3s with
+    # jitter. Capacity refusals only: they describe one instant and stop being
+    # true the moment any in-flight request completes. A client would retry
+    # anyway; this waits where the fleet's state is already known.
+    # 0 = off, answer immediately.
+    retryTimeLimit: 0s
 
   # Aggregate upstream vLLM counters into router-level totals on the metrics
   # listener. Only endpoints discovered to be vLLM are scraped, and totals

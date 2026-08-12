@@ -57,6 +57,19 @@ type Config struct {
 	// ref is supplied by whichever signal made the holders unusable.
 	SplitGuard float64
 
+	// TransientFallback enables serving a request on a backend the split guard
+	// refused, WITHOUT recording it as a holder. A candidate qualifies while its
+	// in-flight is below ref*(1-TransientFallback), against the same reference
+	// the guard uses — so a value BELOW SplitGuard is a looser bar, which is the
+	// only setting that does anything. Zero (the default) leaves the guard's
+	// rejection final.
+	//
+	// The guard protects the tree, not capacity: a split adds a holder
+	// permanently, and a fleet that splits freely converges on everyone holding
+	// everything. A request served without a mark costs nothing permanent, so it
+	// can be allowed much closer to the holders' own load.
+	TransientFallback float64
+
 	// TailTTL is how long a leaf run may go untouched before eviction.
 	TailTTL time.Duration
 
@@ -117,6 +130,14 @@ func (c Config) withDefaults() Config {
 	}
 	if c.PoolName == "" {
 		c.PoolName = DefaultPoolName
+	}
+	// A transient threshold at or above the guard is a STRICTER bar than the
+	// guard it exists to relax, so it could never admit a request the guard had
+	// already refused. Quietly doing nothing is the wrong failure here: the
+	// operator asked for a fallback and would get rejections instead, with no
+	// way to tell the difference from the outside.
+	if c.TransientFallback < 0 || c.TransientFallback >= c.SplitGuard {
+		c.TransientFallback = 0
 	}
 	return c
 }
@@ -423,6 +444,41 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 			p.m.Splits.Inc()
 			p.m.AnchorBlocks.Observe(float64(a.matched))
 			return p.fallback.Select(ctx, split, rr)
+		}
+
+		// Tier 2b: TRANSIENT FALLBACK. Nothing was far enough below the holders
+		// to be worth a permanent copy — but a backend that is merely close to
+		// them can still serve this one request, provided we do not pretend
+		// afterwards that it holds the prefix.
+		//
+		// The distinction is the whole point. What the split guard is protecting
+		// is not capacity, it is the TREE: every split adds a holder for good,
+		// and a fleet that splits freely converges on everyone holding
+		// everything. Serving without marking costs nothing permanent, so it can
+		// be allowed on a much looser threshold — the same arithmetic against
+		// the same reference, just a smaller margin.
+		//
+		// At the shipped pair (guard 0.20, transient 0.05) a backend under 80%
+		// of the holders' load takes the prefix and keeps it; one between 80%
+		// and 95% serves the request and is forgotten; above 95% it is genuinely
+		// as loaded as what it would relieve, and the request is refused.
+		if p.cfg.TransientFallback > 0 && guardRef > 0 {
+			limit := float64(guardRef) * (1 - p.cfg.TransientFallback)
+			transient := make([]*registry.Backend, 0, len(usable))
+			for i, c := range usable {
+				if a.held.Has(slots[i]) {
+					continue // a holder, and unavailable — that is why we are here
+				}
+				if float64(c.Inflight()) < limit {
+					transient = append(transient, c)
+				}
+			}
+			if len(transient) > 0 {
+				rr.PolicyState = noMarkDecision
+				p.m.Decision("overflow")
+				p.m.Overflows.Inc()
+				return p.fallback.Select(ctx, transient, rr)
+			}
 		}
 
 		// Tier 3. Nothing cleared the guard. Idle capacity may exist — a

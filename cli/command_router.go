@@ -55,14 +55,16 @@ type RouterServeCommand struct {
 
 	// --- Fleet routing. A --route with several pipe-separated endpoints, or
 	// --backends, turns on prefix-cache affinity across them.
-	Backends       []string      `long:"backends" description:"Endpoints for the implicit catch-all pool, comma- or pipe-separated. Shorthand for --route '* => a|b|c' — the simplest router: route every model to this set."`
-	Passive        bool          `long:"passive-health" description:"Skip active health probing. Required for upstreams with no /health endpoint (a hosted API); their health is inferred from proxied request outcomes."`
-	MetricsListen  string        `long:"metrics-listen" default:"127.0.0.1:29000" description:"Address for /metrics and the live KV map at /router-viz. Separate from the inference listener: diagnostic surface is never reachable on the serving path. Empty disables it."`
-	MaxNodeConc    int64         `long:"max-node-concurrency" description:"Enables the concurrency split signal: treat a backend at or above this many in-flight requests as saturated without waiting for it to say so. Set it to the backends' vLLM --max-num-seqs. 0 = off; the backend's own 429 remains the ultimate signal either way."`
-	RebalanceRatio float64       `long:"rebalance-ratio" default:"0.5" description:"The imbalance split signal: a backend is saturated while (inflight - fleetMin)/inflight exceeds this. At the 0.5 default a backend carrying more than twice the fleet minimum stops taking new work. 0 = off, which is what a fleet that values locality above evenness wants — affinity working is SUPPOSED to look imbalanced."`
-	SplitGuard     float64       `long:"cache-split-guard" default:"0.20" description:"A prefix is split onto a backend only while its in-flight is below limit*(1-this). Higher keeps the holder set tighter at the cost of splitting less readily; too low and every backend ends up holding every prefix."`
-	TailTTL        time.Duration `long:"cache-tail-ttl" default:"5m" description:"How long a leaf of the shared prefix tree may go untouched before eviction. Memory pressure only: eviction never removes a run that still has children."`
-	RefusalTTL     time.Duration `long:"cache-refusal-ttl" default:"2s" description:"How long a backend's own 429 keeps it out of its prefixes. Cleared early by any success from it, and by its in-flight dropping below the level it refused at."`
+	Backends          []string      `long:"backends" description:"Endpoints for the implicit catch-all pool, comma- or pipe-separated. Shorthand for --route '* => a|b|c' — the simplest router: route every model to this set."`
+	Passive           bool          `long:"passive-health" description:"Skip active health probing. Required for upstreams with no /health endpoint (a hosted API); their health is inferred from proxied request outcomes."`
+	MetricsListen     string        `long:"metrics-listen" default:"127.0.0.1:29000" description:"Address for /metrics and the live KV map at /router-viz. Separate from the inference listener: diagnostic surface is never reachable on the serving path. Empty disables it."`
+	MaxNodeConc       int64         `long:"max-node-concurrency" description:"Enables the concurrency split signal: treat a backend at or above this many in-flight requests as saturated without waiting for it to say so. Set it to the backends' vLLM --max-num-seqs. 0 = off; the backend's own 429 remains the ultimate signal either way."`
+	RebalanceRatio    float64       `long:"rebalance-ratio" default:"0.5" description:"The imbalance split signal: a backend is saturated while (inflight - fleetMin)/inflight exceeds this. At the 0.5 default a backend carrying more than twice the fleet minimum stops taking new work. 0 = off, which is what a fleet that values locality above evenness wants — affinity working is SUPPOSED to look imbalanced."`
+	SplitGuard        float64       `long:"cache-split-guard" default:"0.20" description:"A prefix is split onto a backend only while its in-flight is below limit*(1-this). Higher keeps the holder set tighter at the cost of splitting less readily; too low and every backend ends up holding every prefix."`
+	TailTTL           time.Duration `long:"cache-tail-ttl" default:"5m" description:"How long a leaf of the shared prefix tree may go untouched before eviction. Memory pressure only: eviction never removes a run that still has children."`
+	TransientFallback float64       `long:"transient-fallback-threshold" description:"Serve a request the split guard refused on a backend WITHOUT recording it as a holder, while that backend is below ref*(1-this) — the same reference the guard measures against. Must be BELOW --cache-split-guard to do anything, since it is the looser bar: at 0.05 against a guard of 0.20, a backend under 80% of the holders' load takes the prefix and keeps it, one between 80% and 95% serves the request and is forgotten. 0 = off, and the guard's rejection is final."`
+	RetryTimeLimit    time.Duration `long:"retry-time-limit" description:"Keep re-deciding a request that no backend can currently take for up to this long before answering 429, backing off 10ms/20ms/50ms/... to 3s with jitter. Applies to CAPACITY refusals only — every backend saturated, or the split guard declining a duplicate — both of which stop being true the moment any in-flight request completes. A client would retry anyway; this does the waiting where the fleet's state is already known. 0 = off, answer immediately."`
+	RefusalTTL        time.Duration `long:"cache-refusal-ttl" default:"2s" description:"How long a backend's own 429 keeps it out of its prefixes. Cleared early by any success from it, and by its in-flight dropping below the level it refused at."`
 
 	// --- Listener behaviour.
 	APIKeyFile       string        `long:"api-key-file" description:"Read the inbound API key from this file. PREFER this to --api-key: a key given as a flag is visible in a process listing and in the pod spec that launched it."`
@@ -227,6 +229,8 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		RebalanceRatio:        c.RebalanceRatio,
 		AutoModel:             c.AutoModel,
 		SplitGuard:            c.SplitGuard,
+		TransientFallback:     c.TransientFallback,
+		RetryTimeLimit:        c.RetryTimeLimit,
 		TailTTL:               c.TailTTL,
 		RefusalTTL:            c.RefusalTTL,
 		HealthInterval:        c.HealthInterval,
