@@ -392,7 +392,14 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 			p.m.Decision("cache")
 			p.m.AnchorBlocks.Observe(float64(a.anchorBlocks))
 			p.m.PoolSize.Observe(float64(len(pool)))
-			p.m.PredictedFraction.Observe(fraction(a.anchorBlocks, pth.len()))
+			// A TOKEN fraction, weighted by each block's size, because the
+			// number it is read against — CacheObservedFraction, from the
+			// backend's own usage.prompt_tokens_details.cached_tokens — is one
+			// too. Blocks here are variable-sized: a 180-byte conversational
+			// turn and a 1024-byte system chunk are both one block, so on
+			// agentic traffic an unweighted count and a token share differ
+			// severalfold and the pair says nothing.
+			p.m.PredictedFraction.Observe(kvcache.Cover(rr.Units, a.anchorBlocks).TokenFraction())
 			return p.fallback.Select(ctx, pool, rr)
 		}
 	}
@@ -443,13 +450,6 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	p.m.Decision("load")
 	metrics.PolicyFallbacks.WithLabelValues(p.Name(), "no_holders").Inc()
 	return p.fallback.Select(ctx, usable, rr)
-}
-
-func fraction(part, whole int) float64 {
-	if whole <= 0 {
-		return 0
-	}
-	return float64(part) / float64(whole)
 }
 
 // Commit records that b served the request, marking it on EVERY run along the

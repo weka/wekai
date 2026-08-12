@@ -1662,7 +1662,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "router_cache_predicted_fraction{pool=~\"$pool\"}",
+          "expr": "sum(rate(router_cache_predicted_fraction_sum{pool=~\"$pool\"}[$__rate_interval])) / clamp_min(sum(rate(router_cache_predicted_fraction_count{pool=~\"$pool\"}[$__rate_interval])), 1)",
           "legendFormat": "predicted {{pool}}",
           "refId": "A"
         },
@@ -1671,7 +1671,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "avg(router_cache_observed_fraction)",
+          "expr": "sum(rate(router_cache_observed_fraction_sum[$__rate_interval])) / clamp_min(sum(rate(router_cache_observed_fraction_count[$__rate_interval])), 1)",
           "legendFormat": "observed (fleet avg)",
           "refId": "B"
         }

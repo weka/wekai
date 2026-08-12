@@ -170,7 +170,7 @@ var (
 	// rather than observed (RES-3).
 	CachePredictedFraction = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "router_cache_predicted_fraction",
-		Help:    "Predicted fraction of a request's prefix already resident on the chosen backend.",
+		Help:    "Predicted fraction of a request's prompt TOKENS already resident on the chosen backend. Token-weighted so it is comparable with router_cache_observed_fraction.",
 		Buckets: fractionBuckets,
 	}, []string{"pool"})
 
