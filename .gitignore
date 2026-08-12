@@ -17,3 +17,7 @@ results/
 # whatever tree was checked in rather than from go.mod — a stale vendor/ would
 # change what ships without any dependency change to show for it.
 vendor/
+
+# Editor swap files.
+.*.sw[a-p]
+*~
