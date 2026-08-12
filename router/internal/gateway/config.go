@@ -24,9 +24,21 @@ type Config struct {
 	// request, not a formality.
 	MaxBodyBytes int64
 
-	// MaxConcurrentRequests bounds in-flight requests router-wide, protecting
-	// the router's own memory. Distinct from any per-backend capacity signal:
-	// this sheds 503 router_at_capacity, those shed 429. 0 disables.
+	// MaxConcurrentRequests bounds in-flight requests router-wide. ZERO — no
+	// limit — is the default, and the router then never refuses work on its own
+	// account.
+	//
+	// Capacity is the fleet's answer to give, end to end: a vLLM returns 429
+	// when it is full, the flow walks this prefix's other holders, and a 429
+	// reaches the client only once nothing can take the request. A router-side
+	// ceiling short-circuits all of that with a number that knows nothing about
+	// the fleet — it refuses work the backends could still have done, and it
+	// does so identically whether they are idle or saturated.
+	//
+	// Set it when the ROUTER's own memory is the constraint rather than the
+	// fleet's: each in-flight request may hold up to MaxBodyBytes buffered for
+	// retry, so a small container fronting large bodies has a real ceiling worth
+	// naming. That is a deployment fact, not a default.
 	MaxConcurrentRequests int
 
 	// PathAllowlist restricts which upstream paths may be proxied. Empty allows

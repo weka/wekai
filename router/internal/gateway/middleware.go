@@ -201,13 +201,19 @@ func isExpectedProbe503(r *http.Request, status int) bool {
 	return r.URL.Path == "/readiness" || r.URL.Path == "/health"
 }
 
-// concurrencyMiddleware caps requests in flight through the gateway.
+// concurrencyMiddleware caps requests in flight through the gateway, and is
+// OFF unless an operator asks for it.
 //
-// It sits INSIDE auth so an unauthenticated flood cannot consume slots, and
-// inside the body limit so the cap is on requests actually being processed. Each
-// in-flight request can hold up to max_body_bytes buffered for retry, so without
-// this the memory ceiling is unbounded in practice: at the shipped 64 MiB limit
-// roughly eight concurrent uploads reach a 1 GiB container limit.
+// When enabled it sits INSIDE auth so an unauthenticated flood cannot consume
+// slots, and inside the body limit so the cap is on requests actually being
+// processed. What it protects is the ROUTER's own memory: each in-flight
+// request may hold up to max_body_bytes buffered for retry, so a small
+// container fronting large bodies has a genuine ceiling.
+//
+// It protects nothing about the FLEET, which is why it is not on by default. A
+// backend's own 429 is the only ground truth about whether it can take a
+// request; a router-side number refuses work the fleet could still do and
+// cannot tell a saturated backend from an idle one.
 //
 // Shedding with 503 + Retry-After is deliberate: queueing here would just move
 // the memory problem behind a queue.
