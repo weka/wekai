@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.26@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 #
 # wekai replay image: the wekai binary (benchmark/router/eval
 # command trees) plus one embedded router-replay JSONL artifact, so a
