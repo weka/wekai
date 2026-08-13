@@ -604,7 +604,7 @@ on the serving path.
 | `router_cache_stretch_inflight` | in-flight on the chosen holder at selection time, stretch path only. Says whether the soft→hard band is entered lightly or is where the fleet lives |
 | `router_retries_total{reason="capacity_saturated"}` | waits caused by every backend being full. The transient fallback cannot apply here — there was no candidate — so waiting is the only move |
 | `router_retries_total{reason="capacity_guard_blocked"}` | waits caused by the split guard. The fallback is tried BEFORE this error is returned, so a count here with `overflows_total` at zero means the threshold is too tight or off — not that the router waited instead of falling back |
-| `router_retry_wait_seconds` | latency `--retry-time-limit` added, **per request** — `_count{outcome="satisfied"}` is how many requests the waiting rescued, `{outcome="expired"}` how many spent the budget and got a 429 anyway, and the quantiles what it cost. `retries_total` counts *attempts*, so it answers neither |
+| `router_retry_wait_seconds` | latency `--retry-time-limit` added, **per request** — `_count{outcome="satisfied"}` is how many requests the waiting rescued, `{outcome="expired"}` how many spent the budget and got a 429 anyway, and the quantiles what it cost. Spans the first refusal to the *start* of the attempt that ended the wait, so it excludes that attempt's service time and stays bounded by the budget in every outcome — quantiles are comparable across them. End-to-end cost is `router_request_duration_seconds`. `retries_total` counts *attempts*, so it answers neither |
 | `router_cache_tree_runs` / `_tail_set` | tree size, for memory |
 
 Every series above with a closed set of label values exists **at 0 from

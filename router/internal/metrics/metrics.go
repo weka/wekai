@@ -144,8 +144,8 @@ var (
 	}, []string{"reason", "outcome"})
 
 	// RetryWaitSeconds is the latency --retry-time-limit added, observed once
-	// per request that waited at all, spanning the first capacity refusal to
-	// the moment the request left the retry path.
+	// per request that waited at all: the span from the first capacity refusal
+	// to the start of the attempt that ended the loop.
 	//
 	// A histogram rather than a counter because its _count answers the question
 	// RetriesTotal cannot: how many REQUESTS entered the retry path and how
@@ -154,12 +154,19 @@ var (
 	// count of anything. With this, "the budget saved N requests at a p50 cost
 	// of X ms" is two queries against one series.
 	//
-	// It measures the whole path, not the sum of the sleeps: the re-decisions
-	// between waits are latency the caller pays too, and a closed-loop
-	// benchmark reads any added latency as lost throughput.
+	// The span stops before the final attempt on purpose, and that is what keeps
+	// it comparable across outcomes. Including it would put a refusal costing
+	// microseconds inside the `expired` observations and a whole completion
+	// inside the `satisfied` ones — the same series reporting a bounded 10s for
+	// one outcome and an unbounded 30s for the other against the same 10s
+	// budget, with any average across them describing nothing.
+	//
+	// So this is bounded by the budget in every outcome and answers what the
+	// flag is tuned against. End-to-end cost is RequestDuration, measured around
+	// the whole handler and therefore already inclusive of both.
 	RetryWaitSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "router_retry_wait_seconds",
-		Help:    "Added latency per request that waited out a capacity refusal, by the refusal it last waited on and how the wait ended.",
+		Help:    "Latency the retry budget added, per request that waited: first capacity refusal to the start of the attempt that ended the wait. Excludes that attempt's own service time, so it is bounded by --retry-time-limit whatever the outcome. End-to-end cost is router_request_duration_seconds.",
 		Buckets: prometheus.ExponentialBuckets(0.005, 2, 12), // 5ms .. ~10s, the shipped budget's range
 	}, []string{"reason", "outcome"})
 

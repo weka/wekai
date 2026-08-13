@@ -112,16 +112,36 @@ func (s *Server) serveWithCapacityRetry(
 	// never waits observes nothing and the histogram counts REQUESTS THAT
 	// WAITED rather than requests.
 	var firstRefusal time.Time
+	// waited is the time spent in the retry path BEFORE the attempt currently
+	// running — snapshotted at the top of each iteration rather than read at the
+	// end.
+	//
+	// The distinction is the difference between a number that means one thing
+	// and one that means two. Measured at settle time, the attempt that ENDS the
+	// loop is inside the span: for `expired` that is a refusal costing
+	// microseconds, but for `satisfied` it is a whole completion, so the same
+	// series would report a bounded ~10s for one outcome and an unbounded 30s
+	// for the other against the same 10s budget. Averaging across outcomes then
+	// produces a figure describing nothing, which is exactly what a dashboard
+	// does by default.
+	//
+	// Bounded by the budget in every outcome, this answers the question the flag
+	// is tuned against: how much latency did the waiting add. End-to-end cost is
+	// already router_request_duration_seconds, measured around the whole handler
+	// and therefore inclusive of both.
+	var waited time.Duration
 	lastReason := ""
 	settle := func(how string) {
 		if lastReason == "" {
 			return
 		}
-		metrics.RetryWaitSeconds.WithLabelValues(lastReason, how).
-			Observe(s.cfg.Clock.Now().Sub(firstRefusal).Seconds())
+		metrics.RetryWaitSeconds.WithLabelValues(lastReason, how).Observe(waited.Seconds())
 	}
 
 	for attempt := 0; ; attempt++ {
+		if lastReason != "" {
+			waited = s.cfg.Clock.Now().Sub(firstRefusal)
+		}
 		cands := s.candidates(target)
 		if len(cands) == 0 {
 			// Every backend went unhealthy while we waited. The caller is owed
@@ -171,6 +191,10 @@ func (s *Server) serveWithCapacityRetry(
 			// The caller gave up while we were waiting. Returning the refusal
 			// unchanged is right: the response writer is already dead, and the
 			// handler above renders nothing on a cancelled request.
+			//
+			// This leaves without looping, so the sleep just taken has to be
+			// added here or it goes unrecorded.
+			waited = s.cfg.Clock.Now().Sub(firstRefusal)
 			settle("abandoned")
 			return res
 		}

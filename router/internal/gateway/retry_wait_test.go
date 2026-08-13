@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
+	"github.com/weka/wekai/router/internal/clock"
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/policy"
 )
@@ -143,6 +144,58 @@ func TestRetryWaitIgnoresRequestsThatNeverWaited(t *testing.T) {
 	}
 	if after != before {
 		t.Errorf("a request that was served on its first attempt added %d observations", after-before)
+	}
+}
+
+// TestRetryWaitExcludesTheServiceTimeOfTheAttemptThatSucceeded.
+//
+// Measured to the end of the loop, the attempt that resolves it is inside the
+// span — and that attempt is a microsecond refusal when the outcome is
+// `expired` but a whole completion when it is `satisfied`. One series then
+// reports a bounded ~10s for one outcome and an unbounded ~30s for the other
+// against the same 10s budget, and any average across them describes nothing.
+//
+// The upstream here burns four minutes of clock, twenty-four times the budget.
+// If that leg is inside the span it cannot be missed.
+func TestRetryWaitExcludesTheServiceTimeOfTheAttemptThatSucceeded(t *testing.T) {
+	const (
+		reason  = metrics.ReasonGuardBlocked
+		budget  = 10 * time.Second
+		service = 4 * time.Minute
+	)
+	_, sumBefore := waitStats(t, reason, "satisfied")
+	countBefore, _ := waitStats(t, reason, "satisfied")
+
+	sel := &refusingSelector{err: policy.ErrSplitGuardBlocked}
+	sel.remaining.Store(2)
+
+	var clk *clock.Fake
+	srv, c := retryHarness(t, sel, budget, func(w http.ResponseWriter, r *http.Request) {
+		clk.Advance(service) // a slow completion, on the attempt that succeeds
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c","object":"chat.completion","choices":[]}`))
+	})
+	clk = c
+
+	done := make(chan struct{})
+	go drive(clk, done)
+	resp, err := post(srv)
+	close(done)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	countAfter, sumAfter := waitStats(t, reason, "satisfied")
+	if countAfter-countBefore != 1 {
+		t.Fatalf("observations moved by %d, want 1", countAfter-countBefore)
+	}
+	// The driver advances the clock freely while the handler runs, so the exact
+	// value is not pinned — only that the four-minute service leg is not in it.
+	if got := sumAfter - sumBefore; got >= service.Seconds() {
+		t.Errorf("observed %.1fs on a request whose successful attempt alone took %v: the "+
+			"attempt that ends the wait is inside the span, which makes this series mean one "+
+			"thing for satisfied and another for expired", got, service)
 	}
 }
 
