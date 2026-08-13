@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -198,5 +199,35 @@ func TestFailuresAreNotWaitedOut(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("an upstream failure hung against an hour-long CAPACITY budget: the budget is " +
 			"covering transport errors, which it must not")
+	}
+}
+
+// TestRetryReasonNamesWhichRefusal. "Retries happened and no transient did" is
+// the observation an operator will actually make, and it has two opposite
+// explanations: every backend was saturated, so the fallback could not apply at
+// all, or the guard refused and the fallback found nobody inside its margin —
+// a threshold set too tight. Sharing one label makes those indistinguishable
+// and invites the wrong conclusion, that the router waited when it should have
+// fallen back.
+func TestRetryReasonNamesWhichRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"saturated", policy.ErrAllBackendsSaturated, "capacity_saturated"},
+		{"guard", policy.ErrSplitGuardBlocked, "capacity_guard_blocked"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := capacityReason(tc.err); got != tc.want {
+				t.Errorf("capacityReason = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if got := capacityReason(errors.New("connection refused")); got != "" {
+		t.Errorf("a transport error was named %q; only capacity refusals are waited out", got)
+	}
+	if isCapacityRefusal(nil) {
+		t.Error("a nil error must not read as a capacity refusal")
 	}
 }

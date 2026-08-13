@@ -69,8 +69,34 @@ func backoffAt(n int, remaining time.Duration) time.Duration {
 // isCapacityRefusal reports whether an error means "the fleet cannot take this
 // right now" as opposed to "something went wrong".
 func isCapacityRefusal(err error) bool {
-	return errors.Is(err, policy.ErrAllBackendsSaturated) ||
-		errors.Is(err, policy.ErrSplitGuardBlocked)
+	return capacityReason(err) != ""
+}
+
+// capacityReason names WHICH refusal is being waited out, and the distinction
+// is the whole diagnostic value of these counters.
+//
+// The two mean opposite things about the configuration. `saturated` is every
+// backend called full by some signal: there was no candidate at all, so
+// --transient-fallback-threshold could not have applied however it was set, and
+// waiting is the only move left. `guard_blocked` is the guard refusing a
+// duplicate while capacity existed — and since the transient fallback is tried
+// inside the same decision, before this error is ever returned, a retry with
+// this reason means the fallback looked and found nobody inside its margin.
+//
+// So a fleet retrying constantly on `guard_blocked` with
+// router_cache_overflows_total at zero is not evidence that the ordering is
+// wrong; it is evidence that the threshold is too tight, or off. Without the
+// label the two are indistinguishable, and the natural reading of "retries
+// happened and no transient did" is that the router waited when it should have
+// fallen back — which is the one thing it cannot do.
+func capacityReason(err error) string {
+	switch {
+	case errors.Is(err, policy.ErrAllBackendsSaturated):
+		return "capacity_saturated"
+	case errors.Is(err, policy.ErrSplitGuardBlocked):
+		return "capacity_guard_blocked"
+	}
+	return ""
 }
 
 // serveWithCapacityRetry runs the request, and on a capacity refusal waits and
@@ -107,11 +133,11 @@ func (s *Server) serveWithCapacityRetry(
 
 		remaining := deadline.Sub(s.cfg.Clock.Now())
 		if remaining <= 0 {
-			metrics.RetriesTotal.WithLabelValues("capacity", "exhausted").Inc()
+			metrics.RetriesTotal.WithLabelValues(capacityReason(res.Err), "exhausted").Inc()
 			return res
 		}
 
-		metrics.RetriesTotal.WithLabelValues("capacity", "retried").Inc()
+		metrics.RetriesTotal.WithLabelValues(capacityReason(res.Err), "retried").Inc()
 		select {
 		case <-s.cfg.Clock.After(backoffAt(attempt, remaining)):
 		case <-r.Context().Done():
