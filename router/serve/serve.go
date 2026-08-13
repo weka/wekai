@@ -129,7 +129,12 @@ type Options struct {
 
 	// --- The routing flow, shared by every pool.
 	NodeConcurrency int64
-	RebalanceRatio  float64
+	// SoftNodeConcurrency makes NodeConcurrency the top of a band: past the soft
+	// limit the router prefers to split, and if the guard refuses it queues on a
+	// holder rather than spilling onto a backend with none of the prefix. 0 is
+	// off.
+	SoftNodeConcurrency int64
+	RebalanceRatio      float64
 	// AutoModel controls asking a pool what it serves when a route carries no
 	// explicit `as <model>`: "auto" (rewrite only when the pool serves exactly
 	// one model), "force", or "off". Empty means "auto".
@@ -200,12 +205,13 @@ func (o Options) gatewayConfig() gateway.Config {
 
 func (o Options) flowConfig() affinity.Config {
 	return affinity.Config{
-		NodeConcurrency:   o.NodeConcurrency,
-		RebalanceRatio:    o.RebalanceRatio,
-		SplitGuard:        o.SplitGuard,
-		TransientFallback: o.TransientFallback,
-		TailTTL:           o.TailTTL,
-		RefusalTTL:        o.RefusalTTL,
+		NodeConcurrency:     o.NodeConcurrency,
+		SoftNodeConcurrency: o.SoftNodeConcurrency,
+		RebalanceRatio:      o.RebalanceRatio,
+		SplitGuard:          o.SplitGuard,
+		TransientFallback:   o.TransientFallback,
+		TailTTL:             o.TailTTL,
+		RefusalTTL:          o.RefusalTTL,
 	}
 }
 
@@ -814,7 +820,14 @@ func poolName(patterns string, i int) string {
 func signalSummary(c affinity.Config) string {
 	out := "refused"
 	if c.NodeConcurrency > 0 {
-		out += fmt.Sprintf(",concurrency=%d", c.NodeConcurrency)
+		// The soft limit is normalised away when it cannot bind, so printing it
+		// only when it survived tells the operator whether the value they passed
+		// was accepted rather than merely received.
+		if c.SoftNodeConcurrency > 0 {
+			out += fmt.Sprintf(",concurrency=%d..%d", c.SoftNodeConcurrency, c.NodeConcurrency)
+		} else {
+			out += fmt.Sprintf(",concurrency=%d", c.NodeConcurrency)
+		}
 	}
 	if c.RebalanceRatio > 0 {
 		out += fmt.Sprintf(",imbalance=%.3g", c.RebalanceRatio)

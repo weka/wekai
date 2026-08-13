@@ -247,6 +247,47 @@ var (
 		Help: "Requests the split guard refused and --transient-fallback-threshold served anyway, without recording the backend as a prefix holder. The resolved half of the pair whose other half is router_cache_guard_rejects_total.",
 	}, []string{"pool"})
 
+	// CacheSoftBlocked counts decisions where every available holder of the
+	// prefix was at or above --soft-node-concurrency: the moment the soft limit
+	// exists to create, where the router would rather spread than pile on.
+	//
+	// The TRIGGER, not the outcome. What happens next is a split if one clears
+	// the guard, a stretch if none does, and occasionally a transient serve, so
+	// this reconciles as soft_blocked >= stretches and the gap is how often
+	// spreading actually worked. Flat at zero means the soft limit is set too
+	// high to bind; equal to the decision count means it is set too low and the
+	// fleet lives above it.
+	CacheSoftBlocked = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_cache_soft_blocked_total",
+		Help: "Decisions where every available holder of the prefix was at or above the soft concurrency limit. The trigger for a split or a stretch, not an outcome.",
+	}, []string{"pool"})
+
+	// CacheStretches counts requests loaded onto a holder ALREADY past the soft
+	// limit because no backend cleared the split guard.
+	//
+	// The opposite trade from CacheOverflows, at the same moment. A transient
+	// serve keeps the holder's queue short and pays a full prefill on a backend
+	// with none of the KV; a stretch keeps the cache hit and pays queueing. Both
+	// resolve a guard block, so overflows + stretches + guard_rejects accounts
+	// for every one of them.
+	CacheStretches = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_cache_stretches_total",
+		Help: "Requests kept on an existing prefix holder that was already past the soft concurrency limit, because no backend cleared the split guard.",
+	}, []string{"pool"})
+
+	// CacheStretchInflight is the chosen holder's in-flight at selection time,
+	// on the stretch path only.
+	//
+	// It answers the question the counter cannot: whether the soft-to-hard band
+	// is being entered lightly or is where the fleet actually lives. Piled
+	// against the hard limit means soft is set too low — the router is paying
+	// the queueing cost continuously rather than as relief.
+	CacheStretchInflight = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "router_cache_stretch_inflight",
+		Help:    "In-flight on the holder chosen by a stretch, at selection time. Shows how far into the soft-to-hard band the fleet is running.",
+		Buckets: prometheus.LinearBuckets(0, 8, 16), // 0..120 requests, the observed per-backend range
+	}, []string{"pool"})
+
 	// SignalFired counts, per signal, how often it called a backend saturated.
 	//
 	// The router has one routing flow; what varies between deployments is which
@@ -406,7 +447,8 @@ func All() []prometheus.Collector {
 		UpstreamErrors, RetriesTotal, RetryWaitSeconds, StreamAborted, PanicsTotal, ClientDisconnects,
 		LoadAccountingErrors, DiscoveryConflicts,
 		CachePredictedFraction, CacheObservedFraction, CacheEntries, CacheTokens,
-		CacheSplits, CacheOverflows, CacheAvgCopies, CacheAnchorBlocks,
+		CacheSplits, CacheOverflows, CacheSoftBlocked, CacheStretches, CacheStretchInflight,
+		CacheAvgCopies, CacheAnchorBlocks,
 		CacheShallowAnchors, CacheShallowAnchorBlocks, CacheGuardRejects, SignalFired,
 		CachePoolSize, CacheTreeRuns, CacheTailSet, CacheBlocksExpired,
 		RequestsShed, SaturationRejects, BackendCapExceeded, observedShadow,
@@ -504,6 +546,8 @@ func StatusClass(code int) string {
 type PoolMetrics struct {
 	Splits              prometheus.Counter
 	Overflows           prometheus.Counter
+	SoftBlocked         prometheus.Counter
+	Stretches           prometheus.Counter
 	GuardRejects        prometheus.Counter
 	ShallowAnchors      prometheus.Counter
 	ShallowAnchorBlocks prometheus.Counter
@@ -516,6 +560,7 @@ type PoolMetrics struct {
 	AnchorBlocks      prometheus.Observer
 	PoolSize          prometheus.Observer
 	PredictedFraction prometheus.Observer
+	StretchInflight   prometheus.Observer
 
 	// decisions and signals stay vectors: their second label varies per event.
 	decisions *prometheus.CounterVec
@@ -526,7 +571,7 @@ type PoolMetrics struct {
 // the signals that judge a backend full. Exported so a dashboard or a scrape
 // check can enumerate what it should find.
 var (
-	DecisionTiers = []string{"cache", "split", "overflow", "load"}
+	DecisionTiers = []string{"cache", "split", "overflow", "stretch", "load"}
 	SplitSignals  = []string{"refused", "concurrency", "imbalance"}
 )
 
@@ -548,6 +593,8 @@ func ForPool(name string) *PoolMetrics {
 	return &PoolMetrics{
 		Splits:              CacheSplits.With(lbl),
 		Overflows:           CacheOverflows.With(lbl),
+		SoftBlocked:         CacheSoftBlocked.With(lbl),
+		Stretches:           CacheStretches.With(lbl),
 		GuardRejects:        CacheGuardRejects.With(lbl),
 		ShallowAnchors:      CacheShallowAnchors.With(lbl),
 		ShallowAnchorBlocks: CacheShallowAnchorBlocks.With(lbl),
@@ -558,6 +605,7 @@ func ForPool(name string) *PoolMetrics {
 		AnchorBlocks:        CacheAnchorBlocks.With(lbl),
 		PoolSize:            CachePoolSize.With(lbl),
 		PredictedFraction:   CachePredictedFraction.With(lbl),
+		StretchInflight:     CacheStretchInflight.With(lbl),
 		decisions:           RouteDecisions.MustCurryWith(lbl),
 		signals:             SignalFired.MustCurryWith(lbl),
 	}

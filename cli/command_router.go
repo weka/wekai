@@ -59,6 +59,7 @@ type RouterServeCommand struct {
 	Passive           bool          `long:"passive-health" description:"Skip active health probing. Required for upstreams with no /health endpoint (a hosted API); their health is inferred from proxied request outcomes."`
 	MetricsListen     string        `long:"metrics-listen" default:"127.0.0.1:29000" description:"Address for /metrics and the live KV map at /router-viz. Separate from the inference listener: diagnostic surface is never reachable on the serving path. Empty disables it."`
 	MaxNodeConc       int64         `long:"max-node-concurrency" description:"Enables the concurrency split signal: treat a backend at or above this many in-flight requests as saturated without waiting for it to say so. Set it to the backends' vLLM --max-num-seqs. 0 = off; the backend's own 429 remains the ultimate signal either way."`
+	SoftNodeConc      int64         `long:"soft-node-concurrency" description:"Turns --max-node-concurrency into a band rather than a cliff. Below this a holder is a plain cache hit; at or above it the router prefers to split the request elsewhere; and if nothing clears --cache-split-guard the request goes BACK to the least-loaded holder and queues there until the hard limit. That last step is the point: it keeps the request on a backend that already has the KV rather than paying a full prefill on one that does not. Must be below --max-node-concurrency, which must be set. 0 = off, and the hard limit stays a single cliff."`
 	RebalanceRatio    float64       `long:"rebalance-ratio" default:"0.5" description:"The imbalance split signal: a backend is saturated while (inflight - fleetMin)/inflight exceeds this. At the 0.5 default a backend carrying more than twice the fleet minimum stops taking new work. 0 = off, which is what a fleet that values locality above evenness wants — affinity working is SUPPOSED to look imbalanced."`
 	SplitGuard        float64       `long:"cache-split-guard" default:"0.20" description:"A prefix is split onto a backend only while its in-flight is below limit*(1-this). Higher keeps the holder set tighter at the cost of splitting less readily; too low and every backend ends up holding every prefix."`
 	TailTTL           time.Duration `long:"cache-tail-ttl" default:"5m" description:"How long a leaf of the shared prefix tree may go untouched before eviction. Memory pressure only: eviction never removes a run that still has children."`
@@ -226,6 +227,7 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		MaxBodyBytes:          c.MaxBodyBytes,
 		MaxConcurrentRequests: c.MaxConcurrent,
 		NodeConcurrency:       c.MaxNodeConc,
+		SoftNodeConcurrency:   c.SoftNodeConc,
 		RebalanceRatio:        c.RebalanceRatio,
 		AutoModel:             c.AutoModel,
 		SplitGuard:            c.SplitGuard,

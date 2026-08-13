@@ -43,6 +43,25 @@ type Config struct {
 	// own 429 is the ultimate signal; this one is an early warning.
 	NodeConcurrency int64
 
+	// SoftNodeConcurrency splits NodeConcurrency into a BAND. Below it a holder
+	// is a plain cache hit; between it and the hard limit the router would
+	// rather spread the request than pile on, so tier 1 is skipped and the
+	// guarded split gets first refusal; at the hard limit the backend is
+	// saturated and leaves the usable set entirely, exactly as before.
+	//
+	// What makes it more than an earlier cliff is where it lands when spreading
+	// is refused. A request the guard blocks does NOT go to a backend holding
+	// none of its prefix — it goes back to the least-loaded holder and queues
+	// there. Both choices relieve the same moment and pay opposite prices:
+	// TransientFallback keeps the holder's queue short and pays a full prefill
+	// on a cold backend, this keeps the cache hit and pays the queue. On a fleet
+	// where prefix placement is already worth a 27% spread in prompt-token
+	// throughput between the best and worst backend, that is the trade worth
+	// having a knob for.
+	//
+	// Zero (the default) leaves NodeConcurrency a single hard limit.
+	SoftNodeConcurrency int64
+
 	// RebalanceRatio enables the imbalance signal: a backend is unusable while
 	// (inflight - fleetMin) / inflight exceeds this. 0.5 means "rebalance once
 	// the gap is more than half the busier side". Zero leaves it off, which is
@@ -139,6 +158,13 @@ func (c Config) withDefaults() Config {
 	if c.TransientFallback < 0 || c.TransientFallback >= c.SplitGuard {
 		c.TransientFallback = 0
 	}
+	// A soft limit only means something as the lower edge of a band. At or above
+	// the hard limit it names a state the backend can never be in, and with no
+	// hard limit at all there is no band for it to be the floor of — the
+	// concurrency signal is off, so nothing bounds the stretch.
+	if c.SoftNodeConcurrency < 0 || c.NodeConcurrency <= 0 || c.SoftNodeConcurrency >= c.NodeConcurrency {
+		c.SoftNodeConcurrency = 0
+	}
 	return c
 }
 
@@ -161,11 +187,25 @@ func (c Config) withDefaults() Config {
 //     ancestor a candidate happens to hold; anchoring on an ancestor
 //     is how a backend ends up marked as holding a session tail it
 //     never had, which is the whole of the duplication problem.
-//  2. split  — holders exist but none is usable. Route to the least-loaded
-//     backend outside the holder set whose in-flight is under
-//     ref*(1-guard), where ref comes from the signal that made the
-//     holders unusable, and record it as a new holder. The holder set
-//     GROWS under pressure instead of affinity being thrown away.
+//
+//  2. split  — holders exist but none is usable, or --soft-node-concurrency is
+//     set and every available holder is past it. Route to the
+//     least-loaded backend outside the holder set whose in-flight is
+//     under ref*(1-guard), where ref comes from the signal that made
+//     the holders unusable (or from the soft limit, when that is what
+//     pushed the request out of tier 1), and record it as a new
+//     holder. The holder set GROWS under pressure instead of affinity
+//     being thrown away.
+//
+//     2b. stretch — only with --soft-node-concurrency. Nothing cleared the
+//     guard, but the holders are merely past soft rather than
+//     saturated, so the request goes back to the least loaded of
+//     them and queues. Keeps the cache hit, pays the queue.
+//
+//     2c. overflow — only with --transient-fallback-threshold. Serves a
+//     non-holder inside a looser margin WITHOUT marking it. Keeps
+//     the queue short, pays a full prefill.
+//
 //  3. reject — holders exist and nothing clears the guard:
 //     ErrSplitGuardBlocked, answered 429. Idle capacity may exist and
 //     is deliberately left unused, because spending it would mean a
@@ -173,6 +213,7 @@ func (c Config) withDefaults() Config {
 //     not worth it. Anton's call, taken with the numbers in front of
 //     him: mean holders per block near 1.05 is worth 429s and worth
 //     nodes not always reaching full concurrency.
+//
 //  4. load   — nothing is marked anywhere: a genuinely new prompt, so there is
 //     no holder set to split from and nothing to duplicate. Route by
 //     least-outstanding over the usable set and record the result.
@@ -358,6 +399,57 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	pth := path{units: rr.Units, modelKey: modelKey(rr.Model)}
 	a := p.tree.walk(pth, candMask)
 
+	// shallow means the anchor is NOT the deepest marked run: this request's own
+	// holders are unavailable and only a shared ancestor is left. Serving it
+	// there and marking the whole path is what put a session's private tail on
+	// every backend in the fleet, so under LadderStrict it is not a cache hit —
+	// it falls through to the split, which is guarded.
+	shallow := !a.pool.Empty() && !a.availDeepest
+	if shallow {
+		p.m.ShallowAnchors.Inc()
+		p.m.ShallowAnchorBlocks.Add(float64(a.heldBlocks - a.anchorBlocks))
+	}
+
+	// The available holders of the anchor, resolved once. Tier 1 routes to them,
+	// and the soft limit decides between tier 1 and a split before the guard has
+	// even chosen its reference.
+	var pool []*registry.Backend
+	if !a.pool.Empty() && !(shallow && p.cfg.Ladder == LadderStrict) {
+		pool = make([]*registry.Backend, 0, len(usable))
+		for i, c := range usable {
+			if a.pool.Has(slots[i]) {
+				pool = append(pool, c)
+			}
+		}
+	}
+
+	// stretch is non-empty only when the SOFT limit is what pushed this request
+	// out of tier 1: every available holder is at or above it, yet all are below
+	// the hard limit and could still take the request. Tier 2b brings it back to
+	// them if nothing clears the guard.
+	//
+	// Deliberately not a signal. A signal answers "can this backend take more
+	// work", and the answer here is yes — what the soft limit expresses is that
+	// the router would rather it did not have to. Routing them through the same
+	// mechanism would remove these backends from the usable set, and then a
+	// split could land on a backend the soft limit had also passed, which is the
+	// opposite of the point.
+	var stretch []*registry.Backend
+	if p.cfg.SoftNodeConcurrency > 0 && len(pool) > 0 {
+		under := make([]*registry.Backend, 0, len(pool))
+		for _, c := range pool {
+			if c.Inflight() < p.cfg.SoftNodeConcurrency {
+				under = append(under, c)
+			}
+		}
+		if len(under) == 0 {
+			p.m.SoftBlocked.Inc()
+			stretch, pool = pool, nil
+		} else {
+			pool = under
+		}
+	}
+
 	// The guard measures a candidate against THE THING BEING RELIEVED — the
 	// saturated holders of this prefix — and nothing else. Among them the
 	// busiest defines "as loaded as it": that is the load a copy is being made
@@ -368,7 +460,20 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 			guardRef = ref
 		}
 	}
-	if guardRef <= 0 {
+	if len(stretch) > 0 {
+		// A soft-triggered split is escaping the SOFT limit, not the hard one:
+		// the holders it would relieve are sitting just above soft and are not
+		// saturated at all. Measuring against the hard limit would let the copy
+		// land on a backend BUSIER than the holder it was made to escape, which
+		// is a permanent duplicate bought for nothing.
+		//
+		// Deliberately the limit rather than the busiest holder's actual load,
+		// matching how the concurrency signal names its own ceiling. It is the
+		// conservative choice — it makes splits harder the further the holders
+		// run past soft — and conservative is the intent here: this whole
+		// mechanism exists to keep requests on backends that already have the KV.
+		guardRef = p.cfg.SoftNodeConcurrency
+	} else if guardRef <= 0 {
 		// No saturated holder named a level. Either the configured limit is the
 		// only capacity model available, or there is none.
 		guardRef = p.cfg.NodeConcurrency
@@ -389,40 +494,21 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 		threshold = float64(guardRef) * (1 - p.cfg.SplitGuard)
 	}
 
-	// shallow means the anchor is NOT the deepest marked run: this request's own
-	// holders are unavailable and only a shared ancestor is left. Serving it
-	// there and marking the whole path is what put a session's private tail on
-	// every backend in the fleet, so under LadderStrict it is not a cache hit —
-	// it falls through to the split, which is guarded.
-	shallow := !a.pool.Empty() && !a.availDeepest
-	if shallow {
-		p.m.ShallowAnchors.Inc()
-		p.m.ShallowAnchorBlocks.Add(float64(a.heldBlocks - a.anchorBlocks))
-	}
-
-	// Tier 1: a usable backend holds the deepest marked run.
-	if !a.pool.Empty() && !(shallow && p.cfg.Ladder == LadderStrict) {
-		pool := make([]*registry.Backend, 0, len(usable))
-		for i, c := range usable {
-			if a.pool.Has(slots[i]) {
-				pool = append(pool, c)
-			}
-		}
-		if len(pool) > 0 {
-			rr.PolicyState = markDecision
-			p.m.Decision("cache")
-			p.m.AnchorBlocks.Observe(float64(a.anchorBlocks))
-			p.m.PoolSize.Observe(float64(len(pool)))
-			// A TOKEN fraction, weighted by each block's size, because the
-			// number it is read against — CacheObservedFraction, from the
-			// backend's own usage.prompt_tokens_details.cached_tokens — is one
-			// too. Blocks here are variable-sized: a 180-byte conversational
-			// turn and a 1024-byte system chunk are both one block, so on
-			// agentic traffic an unweighted count and a token share differ
-			// severalfold and the pair says nothing.
-			p.m.PredictedFraction.Observe(kvcache.Cover(rr.Units, a.anchorBlocks).TokenFraction())
-			return p.fallback.Select(ctx, pool, rr)
-		}
+	// Tier 1: a usable backend holds the deepest marked run, and is below the
+	// soft limit if one is set.
+	if len(pool) > 0 {
+		rr.PolicyState = markDecision
+		p.m.Decision("cache")
+		p.m.AnchorBlocks.Observe(float64(a.anchorBlocks))
+		p.m.PoolSize.Observe(float64(len(pool)))
+		// A TOKEN fraction, weighted by each block's size, because the number it
+		// is read against — CacheObservedFraction, from the backend's own
+		// usage.prompt_tokens_details.cached_tokens — is one too. Blocks here
+		// are variable-sized: a 180-byte conversational turn and a 1024-byte
+		// system chunk are both one block, so on agentic traffic an unweighted
+		// count and a token share differ severalfold and the pair says nothing.
+		p.m.PredictedFraction.Observe(kvcache.Cover(rr.Units, a.anchorBlocks).TokenFraction())
+		return p.fallback.Select(ctx, pool, rr)
 	}
 
 	// Tiers 2 and 3 both mean: this prefix has holders, and not one of them is
@@ -446,7 +532,40 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 			return p.fallback.Select(ctx, split, rr)
 		}
 
-		// Tier 2b: TRANSIENT FALLBACK. Nothing was far enough below the holders
+		// Tier 2b: STRETCH. The soft limit said "rather not" and the guard said
+		// "not worth a copy", and both are true at once — so the request goes
+		// back to the holders it was being steered away from, onto the least
+		// loaded of them, and queues there until the hard limit.
+		//
+		// It runs BEFORE the transient fallback deliberately. Both resolve the
+		// same guard block and pay opposite prices: a stretch pays queueing and
+		// keeps the cache hit, a transient serve keeps the queue short and pays
+		// a full prefill on a backend holding none of this prefix. Anton's
+		// intent for this mechanism is the cache side of that trade, so when
+		// both are configured the one that preserves the KV wins. The two also
+		// confound each other in measurement, which is why the evaluation runs
+		// with transient off.
+		//
+		// The mark is the ordinary one: this backend already holds the prefix,
+		// so recording the request extends a run that exists rather than
+		// creating a copy. Nothing is duplicated, which is also why the guard
+		// does not apply among holders — there is nothing here for it to
+		// protect against.
+		if len(stretch) > 0 {
+			rr.PolicyState = markDecision
+			p.m.Decision("stretch")
+			p.m.Stretches.Inc()
+			p.m.AnchorBlocks.Observe(float64(a.anchorBlocks))
+			b, err := p.fallback.Select(ctx, stretch, rr)
+			if err == nil && b != nil {
+				// Read before the lease is taken, so this is the queue the
+				// request is about to join rather than the one it created.
+				p.m.StretchInflight.Observe(float64(b.Inflight()))
+			}
+			return b, err
+		}
+
+		// Tier 2c: TRANSIENT FALLBACK. Nothing was far enough below the holders
 		// to be worth a permanent copy — but a backend that is merely close to
 		// them can still serve this one request, provided we do not pretend
 		// afterwards that it holds the prefix.

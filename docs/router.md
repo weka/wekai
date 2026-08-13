@@ -75,6 +75,31 @@ signal and is always on. `--max-node-concurrency` is an opt-in early warning
 that saves a round trip: set it to the backends' vLLM `--max-num-seqs` and
 saturation is predicted rather than discovered one refusal at a time.
 
+`--soft-node-concurrency` makes that limit the **top of a band** rather than a
+single cliff. Below the soft value a holder is an ordinary cache hit; at or
+above it the router prefers to split the request elsewhere; and if nothing
+clears `--cache-split-guard`, the request goes **back to the least-loaded
+holder** and queues there until the hard limit.
+
+That last step is the point, and it is the opposite trade from
+`--transient-fallback-threshold`. Both relieve the same moment — the guard
+refusing a duplicate — and they pay opposite prices:
+
+| | keeps | pays |
+|---|---|---|
+| `--soft-node-concurrency` (stretch) | the cache hit; the KV is already there | queueing on a busier backend |
+| `--transient-fallback-threshold` (overflow) | a short queue | a full prefill on a backend holding none of the prefix |
+
+When both are set the stretch wins, because keeping the KV is the reason to
+have the soft limit at all. They also confound each other in measurement, so
+evaluate one at a time.
+
+Pick the pair from where the fleet actually sits: a soft limit below the load
+backends idle at fires continuously and a hard limit above their ceiling never
+binds. `router_cache_stretch_inflight` is the check — piled against the hard
+limit means soft is set too low, and the router is paying the queueing cost
+continuously rather than as relief.
+
 `--rebalance-ratio` defaults to `0.5`, so a backend carrying more than twice the
 fleet minimum stops taking new work and the idle capacity beside it gets used.
 It trades locality for evenness — a fleet where affinity is working is *supposed*
@@ -574,6 +599,9 @@ on the serving path.
 | `router_cache_guard_rejects_total` | 429s the split guard caused. **Read with `avg_copies`** — a misconfiguration lands in one or the other depending on where the guard sits, and either alone misses half the failure space |
 | `router_signal_fired_total` | which capacity signal is actually driving decisions |
 | `router_cache_overflows_total` | requests `--transient-fallback-threshold` served without marking a holder. **Read with `guard_rejects`** — same situation, opposite outcomes; the ratio is what the threshold buys |
+| `router_cache_soft_blocked_total` | decisions where every available holder was past `--soft-node-concurrency`. The **trigger**, not an outcome: flat at zero means the soft limit is too high to bind, equal to the decision count means it is too low and the fleet lives above it |
+| `router_cache_stretches_total` | requests kept on a holder already past the soft limit because nothing cleared the guard. `soft_blocked − stretches` is how often spreading actually worked |
+| `router_cache_stretch_inflight` | in-flight on the chosen holder at selection time, stretch path only. Says whether the soft→hard band is entered lightly or is where the fleet lives |
 | `router_retries_total{reason="capacity_saturated"}` | waits caused by every backend being full. The transient fallback cannot apply here — there was no candidate — so waiting is the only move |
 | `router_retries_total{reason="capacity_guard_blocked"}` | waits caused by the split guard. The fallback is tried BEFORE this error is returned, so a count here with `overflows_total` at zero means the threshold is too tight or off — not that the router waited instead of falling back |
 | `router_retry_wait_seconds` | latency `--retry-time-limit` added, **per request** — `_count{outcome="satisfied"}` is how many requests the waiting rescued, `{outcome="expired"}` how many spent the budget and got a 429 anyway, and the quantiles what it cost. `retries_total` counts *attempts*, so it answers neither |

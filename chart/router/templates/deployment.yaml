@@ -95,6 +95,9 @@ spec:
             {{- if .maxNodeConcurrency }}
             - "--max-node-concurrency={{ .maxNodeConcurrency }}"
             {{- end }}
+            {{- if .softNodeConcurrency }}
+            - "--soft-node-concurrency={{ .softNodeConcurrency }}"
+            {{- end }}
             {{- if .rebalanceRatio }}
             - "--rebalance-ratio={{ .rebalanceRatio }}"
             {{- end }}

@@ -104,6 +104,16 @@ router:
     # The backends' vLLM --max-num-seqs. Predicts saturation instead of
     # discovering it one refusal at a time. 0 = off.
     maxNodeConcurrency: 0
+    # Makes maxNodeConcurrency the top of a band instead of a single cliff.
+    # Below this a holder is a plain cache hit; at or above it the router
+    # prefers to split elsewhere; and if nothing clears splitGuard the request
+    # goes BACK to the least-loaded holder and queues there up to the hard
+    # limit. That last step is the point — it keeps the request on a backend
+    # that already has the KV rather than paying a full prefill on one that
+    # does not, the opposite trade from transientFallbackThreshold.
+    #
+    # Must be below maxNodeConcurrency, which must be set. 0 = off.
+    softNodeConcurrency: 0
     # Rebalance once (inflight - fleetMin)/inflight exceeds this — at 0.5, once
     # a backend carries more than twice the fleet minimum.
     #
