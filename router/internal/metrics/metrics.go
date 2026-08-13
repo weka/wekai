@@ -140,7 +140,27 @@ var (
 
 	RetriesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_retries_total",
-		Help: "Retry attempts by reason and outcome.",
+		Help: "Retry ATTEMPTS by reason and outcome. Per attempt, not per request — a request that waits four times adds four. Use router_retry_wait_seconds_count for a per-request figure.",
+	}, []string{"reason", "outcome"})
+
+	// RetryWaitSeconds is the latency --retry-time-limit added, observed once
+	// per request that waited at all, spanning the first capacity refusal to
+	// the moment the request left the retry path.
+	//
+	// A histogram rather than a counter because its _count answers the question
+	// RetriesTotal cannot: how many REQUESTS entered the retry path and how
+	// many the budget rescued. Attempts and requests differ by however many
+	// times each request went round, so "retried minus exhausted" is not a
+	// count of anything. With this, "the budget saved N requests at a p50 cost
+	// of X ms" is two queries against one series.
+	//
+	// It measures the whole path, not the sum of the sleeps: the re-decisions
+	// between waits are latency the caller pays too, and a closed-loop
+	// benchmark reads any added latency as lost throughput.
+	RetryWaitSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "router_retry_wait_seconds",
+		Help:    "Added latency per request that waited out a capacity refusal, by the refusal it last waited on and how the wait ended.",
+		Buckets: prometheus.ExponentialBuckets(0.005, 2, 12), // 5ms .. ~10s, the shipped budget's range
 	}, []string{"reason", "outcome"})
 
 	StreamAborted = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -383,7 +403,7 @@ func All() []prometheus.Collector {
 		CircuitState, CircuitTransitions,
 		RoutingDecisionDuration, PolicySelections, PolicyFallbacks, RouteDecisions,
 		WorkerLoadAvg, WorkerLoadMax, WorkerLoadMin,
-		UpstreamErrors, RetriesTotal, StreamAborted, PanicsTotal, ClientDisconnects,
+		UpstreamErrors, RetriesTotal, RetryWaitSeconds, StreamAborted, PanicsTotal, ClientDisconnects,
 		LoadAccountingErrors, DiscoveryConflicts,
 		CachePredictedFraction, CacheObservedFraction, CacheEntries, CacheTokens,
 		CacheSplits, CacheOverflows, CacheAvgCopies, CacheAnchorBlocks,
@@ -399,7 +419,51 @@ func Registry() *prometheus.Registry {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors()...)
 	reg.MustRegister(All()...)
+	warm()
 	return reg
+}
+
+// The refusals --retry-time-limit waits out, named here rather than at the
+// increment so the set that is warmed and the set that is emitted cannot drift.
+const (
+	// ReasonSaturated: every backend was called full by some signal. There was
+	// no candidate, so --transient-fallback-threshold could not have applied
+	// however it was set, and waiting is the only move left.
+	ReasonSaturated = "capacity_saturated"
+	// ReasonGuardBlocked: capacity existed and the split guard refused a
+	// duplicate. The transient fallback runs inside that same decision, before
+	// the error is returned, so this reason means the fallback already looked
+	// and found nobody inside its margin — the threshold is too tight, or off.
+	ReasonGuardBlocked = "capacity_guard_blocked"
+)
+
+// CapacityRetryReasons is that set as an enum, for warming and for tests that
+// check the two stay in step.
+var CapacityRetryReasons = []string{ReasonSaturated, ReasonGuardBlocked}
+
+// warm creates every label combination a *Vec can produce from a closed enum,
+// so the series exists at 0 from startup.
+//
+// A lazily-created series is absent until its first event, and absent is not
+// zero — it is "this router does not report that". An operator reading a scrape
+// with no router_retries_total cannot distinguish a retry budget that was never
+// needed from one that was never wired up, and both readings are consistent
+// with every other number on the page. That ambiguity has already cost a fleet
+// experiment: three arms concluded "--retry-time-limit eliminated the guard
+// storm" from a series that was missing rather than flat.
+//
+// Only closed enums are warmed. Open label sets — backend URLs, error kinds —
+// stay lazy: there is no complete list to enumerate, and inventing one would
+// fill the scrape with series for backends that do not exist.
+func warm() {
+	for _, r := range CapacityRetryReasons {
+		for _, o := range []string{"retried", "exhausted"} {
+			RetriesTotal.WithLabelValues(r, o)
+		}
+		for _, o := range []string{"satisfied", "expired", "abandoned"} {
+			RetryWaitSeconds.WithLabelValues(r, o)
+		}
+	}
 }
 
 // Handler serves the metrics endpoint. It is mounted on its own listener, never
@@ -458,9 +522,29 @@ type PoolMetrics struct {
 	signals   *prometheus.CounterVec
 }
 
+// DecisionTiers is the closed enum of routing decisions, and SplitSignals of
+// the signals that judge a backend full. Exported so a dashboard or a scrape
+// check can enumerate what it should find.
+var (
+	DecisionTiers = []string{"cache", "split", "overflow", "load"}
+	SplitSignals  = []string{"refused", "concurrency", "imbalance"}
+)
+
 // ForPool resolves every per-pool collector for name.
+//
+// Every per-pool series is created here, at 0, including the two that carry a
+// second label — see warm() for why absent and zero must not be confused. A
+// signal that is configured off still reports 0 rather than vanishing: "it
+// never fired" is the true statement either way, and a reader chasing a missing
+// series learns nothing from its absence.
 func ForPool(name string) *PoolMetrics {
 	lbl := prometheus.Labels{"pool": name}
+	for _, t := range DecisionTiers {
+		RouteDecisions.With(prometheus.Labels{"pool": name, "decision": t})
+	}
+	for _, s := range SplitSignals {
+		SignalFired.With(prometheus.Labels{"pool": name, "signal": s})
+	}
 	return &PoolMetrics{
 		Splits:              CacheSplits.With(lbl),
 		Overflows:           CacheOverflows.With(lbl),

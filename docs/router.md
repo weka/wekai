@@ -569,14 +569,25 @@ on the serving path.
 
 | metric | what it tells you |
 |---|---|
-| `router_route_decisions_total` | which tier decided: `cache`, `split`, `load`. Aggregate by label. |
+| `router_route_decisions_total` | which tier decided: `cache`, `split`, `overflow`, `load`. Aggregate by label. |
 | `router_cache_avg_copies` | mean backends holding each block; ~1.0 means no duplication |
 | `router_cache_guard_rejects_total` | 429s the split guard caused. **Read with `avg_copies`** — a misconfiguration lands in one or the other depending on where the guard sits, and either alone misses half the failure space |
 | `router_signal_fired_total` | which capacity signal is actually driving decisions |
 | `router_cache_overflows_total` | requests `--transient-fallback-threshold` served without marking a holder. **Read with `guard_rejects`** — same situation, opposite outcomes; the ratio is what the threshold buys |
 | `router_retries_total{reason="capacity_saturated"}` | waits caused by every backend being full. The transient fallback cannot apply here — there was no candidate — so waiting is the only move |
 | `router_retries_total{reason="capacity_guard_blocked"}` | waits caused by the split guard. The fallback is tried BEFORE this error is returned, so a count here with `overflows_total` at zero means the threshold is too tight or off — not that the router waited instead of falling back |
+| `router_retry_wait_seconds` | latency `--retry-time-limit` added, **per request** — `_count{outcome="satisfied"}` is how many requests the waiting rescued, `{outcome="expired"}` how many spent the budget and got a 429 anyway, and the quantiles what it cost. `retries_total` counts *attempts*, so it answers neither |
 | `router_cache_tree_runs` / `_tail_set` | tree size, for memory |
+
+Every series above with a closed set of label values exists **at 0 from
+startup** — the retry reasons and outcomes, every `route_decisions` tier, every
+`signal_fired` signal, and each pool's cache counters. Absent and zero are
+different claims: a scrape missing `router_retries_total` is equally consistent
+with a budget that was never needed and one that was never wired up, so a
+missing series must never be the way a router says "this did not happen".
+
+Label sets with no complete list — backend URLs, upstream error kinds — stay
+lazy, since enumerating them would mean inventing backends that do not exist.
 
 Every cache and signal metric carries a **`pool`** label. A router may front
 several pools whose caches are unrelated, so summing across them describes

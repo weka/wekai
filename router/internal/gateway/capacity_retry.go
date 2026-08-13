@@ -73,17 +73,10 @@ func isCapacityRefusal(err error) bool {
 }
 
 // capacityReason names WHICH refusal is being waited out, and the distinction
-// is the whole diagnostic value of these counters.
+// is the whole diagnostic value of these counters — the two mean opposite
+// things about the configuration, spelled out where the names are declared.
 //
-// The two mean opposite things about the configuration. `saturated` is every
-// backend called full by some signal: there was no candidate at all, so
-// --transient-fallback-threshold could not have applied however it was set, and
-// waiting is the only move left. `guard_blocked` is the guard refusing a
-// duplicate while capacity existed — and since the transient fallback is tried
-// inside the same decision, before this error is ever returned, a retry with
-// this reason means the fallback looked and found nobody inside its margin.
-//
-// So a fleet retrying constantly on `guard_blocked` with
+// A fleet retrying constantly on guard_blocked with
 // router_cache_overflows_total at zero is not evidence that the ordering is
 // wrong; it is evidence that the threshold is too tight, or off. Without the
 // label the two are indistinguishable, and the natural reading of "retries
@@ -92,9 +85,9 @@ func isCapacityRefusal(err error) bool {
 func capacityReason(err error) string {
 	switch {
 	case errors.Is(err, policy.ErrAllBackendsSaturated):
-		return "capacity_saturated"
+		return metrics.ReasonSaturated
 	case errors.Is(err, policy.ErrSplitGuardBlocked):
-		return "capacity_guard_blocked"
+		return metrics.ReasonGuardBlocked
 	}
 	return ""
 }
@@ -115,6 +108,19 @@ func (s *Server) serveWithCapacityRetry(
 	deadline := s.cfg.Clock.Now().Add(s.cfg.RetryTimeLimit)
 	var res proxy.Result
 
+	// Set on the first refusal that is actually waited on, so a request that
+	// never waits observes nothing and the histogram counts REQUESTS THAT
+	// WAITED rather than requests.
+	var firstRefusal time.Time
+	lastReason := ""
+	settle := func(how string) {
+		if lastReason == "" {
+			return
+		}
+		metrics.RetryWaitSeconds.WithLabelValues(lastReason, how).
+			Observe(s.cfg.Clock.Now().Sub(firstRefusal).Seconds())
+	}
+
 	for attempt := 0; ; attempt++ {
 		cands := s.candidates(target)
 		if len(cands) == 0 {
@@ -123,27 +129,49 @@ func (s *Server) serveWithCapacityRetry(
 			// empty set: the request was refused for capacity, and the fleet
 			// disappearing afterwards does not change what happened to it. The
 			// handler's own up-front check covers an empty set on entry.
+			settle("abandoned")
 			return res
 		}
 
 		res = s.px.Serve(w, r, cands, target.Selector, s.dialect, rr, body, accepted, outcome, auth)
 		if s.cfg.RetryTimeLimit <= 0 || !isCapacityRefusal(res.Err) || res.Committed {
+			// satisfied means the waiting worked: a later attempt was served.
+			// Anything else — a backend broke, the fleet emptied — ended the
+			// wait without answering the question it was asked, and counting
+			// that as a rescue would inflate the one number the budget is
+			// judged on.
+			if res.Err == nil {
+				settle("satisfied")
+			} else {
+				settle("abandoned")
+			}
 			return res
 		}
+
+		// Stamped before the budget is checked, so a request refused with the
+		// budget already spent still lands in the histogram — at ~0s, which is
+		// the true added latency — rather than incrementing `exhausted` in
+		// RetriesTotal while appearing in no per-request series at all.
+		if lastReason == "" {
+			firstRefusal = s.cfg.Clock.Now()
+		}
+		lastReason = capacityReason(res.Err)
 
 		remaining := deadline.Sub(s.cfg.Clock.Now())
 		if remaining <= 0 {
-			metrics.RetriesTotal.WithLabelValues(capacityReason(res.Err), "exhausted").Inc()
+			metrics.RetriesTotal.WithLabelValues(lastReason, "exhausted").Inc()
+			settle("expired")
 			return res
 		}
 
-		metrics.RetriesTotal.WithLabelValues(capacityReason(res.Err), "retried").Inc()
+		metrics.RetriesTotal.WithLabelValues(lastReason, "retried").Inc()
 		select {
 		case <-s.cfg.Clock.After(backoffAt(attempt, remaining)):
 		case <-r.Context().Done():
 			// The caller gave up while we were waiting. Returning the refusal
 			// unchanged is right: the response writer is already dead, and the
 			// handler above renders nothing on a cancelled request.
+			settle("abandoned")
 			return res
 		}
 	}
