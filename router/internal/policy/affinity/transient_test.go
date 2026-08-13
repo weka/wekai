@@ -64,6 +64,9 @@ func TestTransientFallbackServesWithoutMarking(t *testing.T) {
 	p := newTransientPolicy(t, 0.05)
 	f, u := guardBlockedFleet(t, p, true)
 
+	overflowsBefore := counter(t, testPoolMetrics().Overflows)
+	decisionsBefore := decisions(t, "overflow")
+
 	rr := req(u)
 	got, err := p.Select(context.Background(), f, rr)
 	if err != nil {
@@ -90,6 +93,17 @@ func TestTransientFallbackServesWithoutMarking(t *testing.T) {
 			"point is that it leaves no trace in the tree", before.AvgCopies, after.AvgCopies)
 	}
 
+	// It has to be VISIBLE. A fallback that silently rescues requests is
+	// indistinguishable from a guard that never fired, and the whole reason to
+	// set the threshold is to find out how often it is needed.
+	if got := counter(t, testPoolMetrics().Overflows) - overflowsBefore; got != 1 {
+		t.Errorf("router_cache_overflows_total moved by %v, want 1: a transient serve must be "+
+			"countable, or nobody can tell the threshold is doing anything", got)
+	}
+	if got := decisions(t, "overflow") - decisionsBefore; got != 1 {
+		t.Errorf("router_route_decisions_total{decision=\"overflow\"} moved by %v, want 1", got)
+	}
+
 	// And the next request for the same prefix must still see only the original
 	// holder, not the backend that transiently served it.
 	a := p.tree.walk(path{units: u, modelKey: modelKey("m")}, allSlots(p, f))
@@ -102,6 +116,16 @@ func TestTransientFallbackServesWithoutMarking(t *testing.T) {
 func TestTransientFallbackStillRefusesWhenTrulyLoaded(t *testing.T) {
 	p := newTransientPolicy(t, 0.05)
 	f, u := guardBlockedFleet(t, p, false) // peers at 31, above the 30.4 limit
+
+	rejectsBefore := counter(t, testPoolMetrics().GuardRejects)
+	defer func() {
+		// The unresolved half of the pair. Overflows and GuardRejects are the
+		// same situation with opposite outcomes, which is what makes their
+		// ratio the measure of what the threshold buys.
+		if got := counter(t, testPoolMetrics().GuardRejects) - rejectsBefore; got != 1 {
+			t.Errorf("router_cache_guard_rejects_total moved by %v, want 1", got)
+		}
+	}()
 
 	if got, err := p.Select(context.Background(), f, req(u)); err == nil {
 		t.Errorf("routed to %s at 31 of a 32 reference: past the transient limit of 30.4 a "+

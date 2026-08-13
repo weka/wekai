@@ -91,7 +91,12 @@ var (
 	//   split    — every backend holding the prefix was saturated, so affinity
 	//              was EXTENDED onto a backend outside the holder set, which
 	//              then becomes a holder too (prefix-cache-split only).
-	//   overflow — retired with the serve-anyway ladder; reads 0.
+	//   overflow — the split guard refused, and --transient-fallback-threshold
+	//              served the request anyway on a backend it did NOT record as a
+	//              holder. Reads 0 unless that flag is set. Watch it against
+	//              router_cache_guard_rejects_total: the two are the same
+	//              situation resolved and unresolved, and their ratio is what
+	//              the threshold actually buys.
 	//   load     — no prefix was marked anywhere, so the selector decided: a
 	//              genuinely new prompt, or a route with no routable prefix.
 	//   other    — unused; kept so the enum stays closed.
@@ -210,13 +215,16 @@ var (
 	}, []string{"pool"})
 
 	// CacheOverflows counts idle capacity being used WITHOUT recording a
-	// holder, because nothing cleared the split guard. This is the capacity the
-	// reference simulator would instead have rejected with a 429 while nodes
-	// sat idle; the difference between this counter and zero is the reason
-	// premature rejections do not happen here.
+	// holder, because nothing cleared the split guard.
+	//
+	// Zero unless --transient-fallback-threshold is set. When it is, this and
+	// CacheGuardRejects are the same situation with opposite outcomes — the
+	// guard refused, and the fallback either found a backend inside its looser
+	// margin or did not — so the pair reads as one number: how often the
+	// threshold rescued a request that would otherwise have been a 429.
 	CacheOverflows = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_cache_overflows_total",
-		Help: "Requests routed to idle capacity without marking the backend as a prefix holder.",
+		Help: "Requests the split guard refused and --transient-fallback-threshold served anyway, without recording the backend as a prefix holder. The resolved half of the pair whose other half is router_cache_guard_rejects_total.",
 	}, []string{"pool"})
 
 	// SignalFired counts, per signal, how often it called a backend saturated.

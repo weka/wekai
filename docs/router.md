@@ -573,6 +573,8 @@ on the serving path.
 | `router_cache_avg_copies` | mean backends holding each block; ~1.0 means no duplication |
 | `router_cache_guard_rejects_total` | 429s the split guard caused. **Read with `avg_copies`** — a misconfiguration lands in one or the other depending on where the guard sits, and either alone misses half the failure space |
 | `router_signal_fired_total` | which capacity signal is actually driving decisions |
+| `router_cache_overflows_total` | requests `--transient-fallback-threshold` served without marking a holder. **Read with `guard_rejects`** — same situation, opposite outcomes; the ratio is what the threshold buys |
+| `router_retries_total{reason="capacity"}` | `outcome="retried"` counts waits under `--retry-time-limit`; `outcome="exhausted"` counts requests that spent the whole budget and got a 429 anyway |
 | `router_cache_tree_runs` / `_tail_set` | tree size, for memory |
 
 Every cache and signal metric carries a **`pool`** label. A router may front
