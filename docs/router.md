@@ -100,12 +100,15 @@ binds. `router_cache_stretch_inflight` is the check — piled against the hard
 limit means soft is set too low, and the router is paying the queueing cost
 continuously rather than as relief.
 
-`--rebalance-ratio` defaults to `0.5`, so a backend carrying more than twice the
-fleet minimum stops taking new work and the idle capacity beside it gets used.
-It trades locality for evenness — a fleet where affinity is working is *supposed*
-to look imbalanced — so set it to `0` when locality matters more.
+`--rebalance-ratio` is **off by default**. Set to `0.5` it makes a backend
+carrying more than twice the fleet minimum stop taking new work, so the idle
+capacity beside it gets used — but that trades locality for evenness, and a
+fleet where affinity is working is *supposed* to look imbalanced. Concentration
+is the mechanism, not a fault in it. Repeated measurement found spreading it
+away buys no throughput while costing cache hits, so it stays off unless a
+deployment values evenness for its own sake.
 
-A backend under **8 in-flight** is never rebalanced away from, whatever the
+If you do turn it on: a backend under **8 in-flight** is never rebalanced away from, whatever the
 proportions say. The floor is fixed, and it is what keeps the ratio meaningful:
 the fleet minimum is 0 whenever any backend is momentarily idle, and then
 `(inflight − 0)/inflight` is 1.0 for every backend carrying anything at all. A

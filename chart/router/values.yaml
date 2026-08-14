@@ -117,17 +117,18 @@ router:
     # Rebalance once (inflight - fleetMin)/inflight exceeds this — at 0.5, once
     # a backend carries more than twice the fleet minimum.
     #
-    # A backend under 8 in-flight is never rebalanced away from, whatever the
-    # proportions say. That floor is not tunable and is what keeps the ratio
-    # honest: the fleet minimum is 0 whenever any backend is momentarily idle,
-    # and then the ratio is 1.0 for every backend carrying anything at all —
-    # so 1,1,1,0 would read as imbalanced as 20,20,20,0. They are
-    # ratio-identical; only magnitude tells them apart.
+    # OFF by default. This trades locality for evenness, and a fleet where
+    # prefix affinity is working is SUPPOSED to look imbalanced: concentration
+    # is the mechanism, not a fault in it. Repeated measurement found spreading
+    # it away buys no throughput while costing cache hits.
     #
-    # This trades locality for evenness, so it is a real trade: a fleet where
-    # prefix affinity is working is SUPPOSED to look imbalanced. Set 0 to turn
-    # it off and let affinity concentrate work as far as it will.
-    rebalanceRatio: 0.5
+    # If you do turn it on: a backend under 8 in-flight is never rebalanced away
+    # from, whatever the proportions say. That floor is not tunable and is what
+    # keeps the ratio honest — the fleet minimum is 0 whenever any backend is
+    # momentarily idle, and then the ratio is 1.0 for every backend carrying
+    # anything at all, so 1,1,1,0 would read as imbalanced as 20,20,20,0. They
+    # are ratio-identical; only magnitude tells them apart.
+    rebalanceRatio: 0
     # A prefix is split onto a backend only while its in-flight is below
     # limit*(1-this). Lower and every backend ends up holding every prefix.
     splitGuard: 0.20
