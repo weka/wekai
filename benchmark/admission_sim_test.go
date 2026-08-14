@@ -204,3 +204,64 @@ func TestSeriesPoolOf512DistortsTheComparison(t *testing.T) {
 			"limit before the fleet does", fastCap.Bound)
 	}
 }
+
+// TestRampRateDecidesTheAnswerOnAFastFleet.
+//
+// One session per second is not a neutral ramp. It is a bound on how fast load
+// can grow, and on a fleet that answers quickly it is the SMALLER bound — the
+// run then reports how long it ran rather than what the fleet could carry.
+//
+// The size of the error is what makes this worth a knob. At a 0.90 hit rate,
+// admitting once a second finds 52.8 req/s at 36% prefill utilisation, with the
+// gate never closing; admitting five times a second finds 140.7 req/s at 97%.
+// The second is the fleet's actual ceiling and the first is the clock's. Run
+// both arms of a cache comparison at one-per-second and the fast arm is
+// understated by 2.7x, turning a 5x result into a 1.9x one.
+//
+// The slow arm barely moves across the same range, which is the trap: a ramp
+// rate validated on a saturating fleet looks harmless and then silently caps
+// the arm it was never tested against.
+func TestRampRateDecidesTheAnswerOnAFastFleet(t *testing.T) {
+	wl := loadSimWorkload(t)
+	run := func(hit, every float64) SimResult {
+		return RunAdmissionSim(SimConfig{
+			Servers:      fleet(fmt.Sprintf("hit %.2f admit 1/%.2fs", hit, every), 200_000, 50, 512, hit),
+			AdmitEvery:   every,
+			TTFTLimitSec: 5,
+			HorizonSec:   14400,
+			TTFTWindow:   32,
+		}, wl)
+	}
+
+	slowSlow, slowFast := run(0.50, 1), run(0.50, 0.2)
+	fastSlow, fastFast := run(0.90, 1), run(0.90, 0.2)
+	for _, r := range []SimResult{slowSlow, slowFast, fastSlow, fastFast} {
+		report(t, r)
+	}
+
+	slowSens := fastRatio(slowFast.ThroughputReqPerSec, slowSlow.ThroughputReqPerSec)
+	fastSens := fastRatio(fastFast.ThroughputReqPerSec, fastSlow.ThroughputReqPerSec)
+	t.Logf("throughput found by a 5x faster ramp: slow arm %.2fx, fast arm %.2fx", slowSens, fastSens)
+
+	if fastSens < 1.5 {
+		t.Errorf("the fast arm gained only %.2fx from a faster ramp; if one-per-second now reaches "+
+			"its ceiling, the reason for making the ramp configurable has gone", fastSens)
+	}
+	if fastSlow.Bound == "prefill bandwidth" {
+		t.Errorf("the fast arm saturated at one session per second (%s); this test's premise is "+
+			"that it does not", fastSlow.Bound)
+	}
+	// Converged: a further 4x on the ramp must not move the answer much, or the
+	// ceiling reported is still the ramp's rather than the fleet's.
+	if conv := fastRatio(run(0.90, 0.05).ThroughputReqPerSec, fastFast.ThroughputReqPerSec); conv > 1.15 {
+		t.Errorf("ramping 4x faster again moved throughput %.2fx: 1/0.2s has not converged, so the "+
+			"run must ramp faster still or report a floor rather than a ceiling", conv)
+	}
+}
+
+func fastRatio(a, b float64) float64 {
+	if b == 0 {
+		return 0
+	}
+	return a / b
+}
