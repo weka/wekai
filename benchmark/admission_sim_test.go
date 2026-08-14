@@ -59,7 +59,7 @@ func report(t *testing.T, r SimResult) {
 // is measuring the workload, not the fleet.
 func TestAdmissionGateFindsDifferentCeilingsForDifferentFleets(t *testing.T) {
 	wl := loadSimWorkload(t)
-	base := SimConfig{AdmitEvery: 1, TTFTLimitSec: 5, HorizonSec: 14400, TTFTWindow: 32}
+	base := SimConfig{AdmitEvery: 1, TTFTLimitSec: 5, HorizonSec: 14400, TTFTWindowSec: 30}
 
 	slow := base
 	slow.Servers = fleet("hbm-only (hit 0.50)", 200_000, 50, 512, 0.50)
@@ -87,12 +87,12 @@ func TestSeriesPoolOf512(t *testing.T) {
 	wl := loadSimWorkload(t)
 	for _, hit := range []float64{0.50, 0.90, 0.96, 0.99} {
 		cfg := SimConfig{
-			Servers:      fleet(fmt.Sprintf("hit %.2f", hit), 200_000, 50, 512, hit),
-			AdmitEvery:   1,
-			TTFTLimitSec: 5,
-			HorizonSec:   14400,
-			TTFTWindow:   32,
-			MaxSeries:    512,
+			Servers:       fleet(fmt.Sprintf("hit %.2f", hit), 200_000, 50, 512, hit),
+			AdmitEvery:    1,
+			TTFTLimitSec:  5,
+			HorizonSec:    14400,
+			TTFTWindowSec: 30,
+			MaxSeries:     512,
 		}
 		r := RunAdmissionSim(cfg, wl)
 		report(t, r)
@@ -105,11 +105,11 @@ func TestUncappedConcurrency(t *testing.T) {
 	wl := loadSimWorkload(t)
 	for _, hit := range []float64{0.50, 0.90, 0.96, 0.99} {
 		cfg := SimConfig{
-			Servers:      fleet(fmt.Sprintf("hit %.2f uncapped", hit), 200_000, 50, 512, hit),
-			AdmitEvery:   1,
-			TTFTLimitSec: 5,
-			HorizonSec:   14400,
-			TTFTWindow:   32,
+			Servers:       fleet(fmt.Sprintf("hit %.2f uncapped", hit), 200_000, 50, 512, hit),
+			AdmitEvery:    1,
+			TTFTLimitSec:  5,
+			HorizonSec:    14400,
+			TTFTWindowSec: 30,
 		}
 		report(t, RunAdmissionSim(cfg, wl))
 	}
@@ -124,11 +124,11 @@ func TestUncappedConcurrency(t *testing.T) {
 func TestPrefillBindsBeforeSequenceSlots(t *testing.T) {
 	wl := loadSimWorkload(t)
 	cfg := SimConfig{
-		Servers:      fleet("bound check", 200_000, 50, 512, 0.90),
-		AdmitEvery:   1,
-		TTFTLimitSec: 5,
-		HorizonSec:   14400,
-		TTFTWindow:   32,
+		Servers:       fleet("bound check", 200_000, 50, 512, 0.90),
+		AdmitEvery:    1,
+		TTFTLimitSec:  5,
+		HorizonSec:    14400,
+		TTFTWindowSec: 30,
 	}
 	r := RunAdmissionSim(cfg, wl)
 	report(t, r)
@@ -147,11 +147,11 @@ func TestGateTracksRawServerSpeed(t *testing.T) {
 	var prev SimResult
 	for _, prefill := range []float64{100_000, 200_000, 400_000} {
 		cfg := SimConfig{
-			Servers:      fleet(fmt.Sprintf("prefill %.0fk/s", prefill/1000), prefill, 50, 512, 0.50),
-			AdmitEvery:   1,
-			TTFTLimitSec: 5,
-			HorizonSec:   14400,
-			TTFTWindow:   32,
+			Servers:       fleet(fmt.Sprintf("prefill %.0fk/s", prefill/1000), prefill, 50, 512, 0.50),
+			AdmitEvery:    1,
+			TTFTLimitSec:  5,
+			HorizonSec:    14400,
+			TTFTWindowSec: 30,
 		}
 		r := RunAdmissionSim(cfg, wl)
 		report(t, r)
@@ -176,12 +176,12 @@ func TestSeriesPoolOf512DistortsTheComparison(t *testing.T) {
 	wl := loadSimWorkload(t)
 	mk := func(hit float64, cap int) SimResult {
 		return RunAdmissionSim(SimConfig{
-			Servers:      fleet(fmt.Sprintf("hit %.2f cap %d", hit, cap), 200_000, 50, 512, hit),
-			AdmitEvery:   1,
-			TTFTLimitSec: 5,
-			HorizonSec:   14400,
-			TTFTWindow:   32,
-			MaxSeries:    cap,
+			Servers:       fleet(fmt.Sprintf("hit %.2f cap %d", hit, cap), 200_000, 50, 512, hit),
+			AdmitEvery:    1,
+			TTFTLimitSec:  5,
+			HorizonSec:    14400,
+			TTFTWindowSec: 30,
+			MaxSeries:     cap,
 		}, wl)
 	}
 	slowFree, slowCap := mk(0.50, 0), mk(0.50, 512)
@@ -225,11 +225,11 @@ func TestRampRateDecidesTheAnswerOnAFastFleet(t *testing.T) {
 	wl := loadSimWorkload(t)
 	run := func(hit, every float64) SimResult {
 		return RunAdmissionSim(SimConfig{
-			Servers:      fleet(fmt.Sprintf("hit %.2f admit 1/%.2fs", hit, every), 200_000, 50, 512, hit),
-			AdmitEvery:   every,
-			TTFTLimitSec: 5,
-			HorizonSec:   14400,
-			TTFTWindow:   32,
+			Servers:       fleet(fmt.Sprintf("hit %.2f admit 1/%.2fs", hit, every), 200_000, 50, 512, hit),
+			AdmitEvery:    every,
+			TTFTLimitSec:  5,
+			HorizonSec:    14400,
+			TTFTWindowSec: 30,
 		}, wl)
 	}
 

@@ -88,8 +88,17 @@ type AutoBenchmarkConfig struct {
 	// count, so the serving tokenizer's counts land near the original
 	// capture's. 0 = byte-faithful sizing (default).
 	ReplayCharsPerToken float64
-	ReplayNoStamp       bool // when true, skip the per-run <ignore>RUN_GUID</ignore> prefix injection (default is to stamp so each run starts with a pristine server prefix cache while still permitting within-run cross-series cache hits)
-	AbortOnCollapse     bool // when true, abort if windowed cache hit rate < 50% for 2 minutes (legacy collapse detector, off by default — fires spuriously on legitimate low-reuse workloads)
+	// Real-time replay: sessions keep the think time they were captured with,
+	// and load grows by admitting sessions under a TTFT governor rather than by
+	// setting a concurrency number.
+	ReplayRealtime bool
+	AdmitEvery     time.Duration // 0 = off, no session admission governor
+	TTFTLimit      time.Duration // gate closes at or above this windowed mean
+	TTFTWindow     time.Duration // how far back the gate looks; default 30s
+	ReplaySkipIdle bool          // compress dead time when the whole run is idle
+
+	ReplayNoStamp   bool // when true, skip the per-run <ignore>RUN_GUID</ignore> prefix injection (default is to stamp so each run starts with a pristine server prefix cache while still permitting within-run cross-series cache hits)
+	AbortOnCollapse bool // when true, abort if windowed cache hit rate < 50% for 2 minutes (legacy collapse detector, off by default — fires spuriously on legitimate low-reuse workloads)
 	// ReplayStopAtLowConcurrency terminates the run when the queue is drained
 	// AND active worker count < desired concurrency — a long-tail cutoff so
 	// throughput numbers reflect steady-state behavior rather than the slow
@@ -888,6 +897,11 @@ type autoState struct {
 	seriesDone   bool
 	cacheWarning bool // server doesn't appear to support caching
 
+	// Real-time replay governor. ttft is what the admission gate reads; skipClk
+	// is the shared clock the pacers wait against.
+	ttft    *ttftWindow
+	skipClk *skipClock
+
 	allTimePeakRPS    float64 // highest req/s ever seen (never reset)
 	allTimePeakConc   int     // concurrency at which allTimePeakRPS was achieved
 	allTimePeakSeries int     // series count at which allTimePeakRPS was achieved
@@ -1576,6 +1590,8 @@ func runSingleModelBenchmark(
 		stream:            newCompletionStream(initMaxKeep),
 		gate:              newConcurrencyGate(initConc, !cfg.FIFOGateOrder),
 		datasetTracker:    newActiveDatasetTracker(),
+		ttft:              newTTFTWindow(cfg.TTFTWindow),
+		skipClk:           newSkipClock(cfg.ReplayRealtime && cfg.ReplaySkipIdle),
 	}
 	if sampler := startVLLMMetricsSampler(benchCtx, cfg.Model, st.datasetTracker, rdw); sampler != nil {
 		// stop() is deferred after rdw's close, so it runs first (LIFO) and
@@ -1991,6 +2007,54 @@ func runSingleModelBenchmark(
 		spawnSeries(uuid.New().String(), i+1)
 	}
 
+	// Session-admission governor. Replaces the cache-target series scaler: load
+	// grows one session at a time while windowed TTFT stays under the limit, so
+	// the fleet's own latency decides where the run settles rather than a
+	// concurrency number chosen up front.
+	//
+	// The gate pauses admission but never sheds — a session already admitted
+	// runs to the end of its capture. That is safe only because the ramp is slow
+	// relative to how fast the fleet answers; overshoot is bounded, not
+	// runaway, and simulation puts it around 0.9s past a 5s limit at the most
+	// aggressive rate worth using.
+	if cfg.AdmitEvery > 0 {
+		go func() {
+			t := time.NewTicker(cfg.AdmitEvery)
+			defer t.Stop()
+			next := cfg.StartSeries
+			for {
+				select {
+				case <-benchCtx.Done():
+					return
+				case <-t.C:
+				}
+				if cfg.MaxSeries > 0 && next >= cfg.MaxSeries {
+					// The safety cap, not the fleet. Say so: a run that stops
+					// here has measured the cap and nothing else.
+					st.mu.Lock()
+					if !st.seriesDone {
+						st.seriesDone = true
+						fmt.Fprintf(os.Stderr, "[admit] stopped at --max-series=%d; this is the cap, "+
+							"not the fleet's ceiling — raise it or the result is the cap's\n", cfg.MaxSeries)
+					}
+					st.mu.Unlock()
+					return
+				}
+				if !st.ttft.Open(time.Now(), cfg.TTFTLimit) {
+					continue // over the limit: hold, and re-check next tick
+				}
+				next++
+				st.mu.Lock()
+				st.series = next
+				if next > st.allTimePeakSeries {
+					st.allTimePeakSeries = next
+				}
+				st.mu.Unlock()
+				spawnSeries(uuid.New().String(), next)
+			}
+		}()
+	}
+
 	// Replay-mode drain watcher: when every worker has exited (queue drained
 	// or context cancelled) signal termChan so the main select unblocks with a
 	// clean termReasonReplayDone. Runs independently of the evaluator.
@@ -2180,7 +2244,11 @@ func runSingleModelBenchmark(
 				formatDur(frozenBaseline), formatDur(missP50), formatDur(missP95))
 		}
 
-		if !seriesDone {
+		// --admit-every owns series scaling when it is set. Both this scaler and
+		// the admission governor call spawnSeries, so leaving both live would
+		// ramp on two unrelated triggers at once — cache hit rate and TTFT —
+		// and the run's session count would be neither one's answer.
+		if !seriesDone && cfg.AdmitEvery <= 0 {
 			// When --global-cache-hit-rate-target is set it replaces the windowed TTFT hit rate
 			// as the series-scaling trigger (purely local, works correctly with --step mode).
 			// Otherwise fall back to the windowed TTFT-based rate.

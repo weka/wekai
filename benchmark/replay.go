@@ -316,6 +316,13 @@ func recordReplayRequest(
 	isCold bool,
 	coldStartTTFT *time.Duration,
 ) {
+	// Feed the admission governor. Only real first-token latencies count: a
+	// request that produced none reports 0, and averaging that in would pull the
+	// mean down and admit hardest exactly when the fleet had stopped answering.
+	if st.ttft != nil {
+		st.ttft.Observe(time.Now(), metrics.TimeToFirstToken)
+	}
+
 	if cfg.PrintResponses {
 		st.printMu.Lock()
 		ttftStr := formatDur(metrics.TimeToFirstToken)

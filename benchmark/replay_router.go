@@ -570,6 +570,11 @@ func runRouterReplaySession(
 ) {
 	includeRole := buildRoleFilter(cfg.RouterReplayRoles)
 
+	// The skip clock only advances with every ACTIVE session parked, so a
+	// session has to register while it runs or the idle test can never be true.
+	st.skipClk.AddSession(1)
+	defer st.skipClk.AddSession(-1)
+
 	// Build done-channels for every included request id. Helpers and
 	// ephemerals carry an implicit parent_spawn_request_id baked in at
 	// prepare time (see router replay-prepare), so the tree is complete:
@@ -614,7 +619,7 @@ func runRouterReplaySession(
 				return
 			}
 			runRouterReplayInstance(benchCtx, cfg, st, rdw,
-				sess.SessionID, seriesNum, inst, picker, reqTimeout, docs, requestDone, gate)
+				sess.SessionID, sess.StartTs, seriesNum, inst, picker, reqTimeout, docs, requestDone, gate)
 		}()
 	}
 	wg.Wait()
@@ -656,6 +661,7 @@ func runRouterReplayInstance(
 	st *autoState,
 	rdw *requestDataWriter,
 	sessionID string,
+	sessionStartTs string,
 	seriesNum int,
 	inst RouterReplayInstance,
 	picker endpointPicker,
@@ -724,11 +730,23 @@ func runRouterReplayInstance(
 	isFirstRequest := true
 	var coldStartTTFT time.Duration
 
+	// Real-time pacing is anchored on the SESSION's start, not the instance's,
+	// so every instance of a fan-out shares one timeline and the sub-agents keep
+	// their offsets relative to the turn that spawned them.
+	pacer := newSessionPacer(sessionStartTs, st.skipClk.Now(), cfg.ReplayRealtime, st.skipClk)
+
 	for ti, req := range inst.Requests {
 		if ctx.Err() != nil {
 			return
 		}
 		if cfg.Total > 0 && st.totalEmitted.Load() >= int64(cfg.Total) {
+			return
+		}
+		// Hold until this turn is due. Already-late turns return at once, which
+		// is the normal case on a fleet slower than the capture: the session
+		// falls behind rather than firing a backlog.
+		pacer.Wait(ctx, req.Ts)
+		if ctx.Err() != nil {
 			return
 		}
 		st.totalEmitted.Add(1)
@@ -766,11 +784,13 @@ func runRouterReplayInstance(
 		if reqPoster == nil {
 			reqPoster = poster
 		}
+		st.skipClk.AddInflight(1)
 		if reqPoster.dryRun {
 			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
 		} else {
 			metrics = reqPoster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
 		}
+		st.skipClk.AddInflight(-1)
 		picker.release(epIdx)
 		reqCancel()
 		gate.Release()

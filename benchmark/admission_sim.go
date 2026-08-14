@@ -71,10 +71,14 @@ type SimConfig struct {
 	// HorizonSec ends the run.
 	HorizonSec float64
 
-	// TTFTWindow is how many recent completions the gate averages over. A gate
-	// reading a single sample chases noise and oscillates; one reading too long
-	// a window admits well past the limit before it notices.
-	TTFTWindow int
+	// TTFTWindowSec is how far back the gate looks, in seconds of wall time.
+	//
+	// Deliberately a duration and not a request count. A count window is a
+	// different amount of history at every load level — at 140 req/s the last
+	// 32 requests are a fifth of a second, which is noise, while at 5 req/s
+	// they are six seconds — so a gate built on one would tighten as the fleet
+	// filled, exactly where its behaviour has to stay comparable.
+	TTFTWindowSec float64
 }
 
 // SimWorkload is the replayed traffic: sessions of requests at their original
@@ -212,8 +216,8 @@ func RunAdmissionSim(cfg SimConfig, wl SimWorkload) SimResult {
 	if cfg.TTFTLimitSec <= 0 {
 		cfg.TTFTLimitSec = 5
 	}
-	if cfg.TTFTWindow <= 0 {
-		cfg.TTFTWindow = 32
+	if cfg.TTFTWindowSec <= 0 {
+		cfg.TTFTWindowSec = 30
 	}
 	if cfg.HorizonSec <= 0 {
 		cfg.HorizonSec = 3600
@@ -245,7 +249,8 @@ func RunAdmissionSim(cfg SimConfig, wl SimWorkload) SimResult {
 		concSecs     float64
 		completed    int
 		ttfts        []float64
-		recent       []float64
+		recent       []float64 // TTFTs inside the window
+		recentAt     []float64 // when each was observed
 		recentSum    float64
 		seriesStall  float64
 		blockedSince float64
@@ -268,9 +273,28 @@ func RunAdmissionSim(cfg SimConfig, wl SimWorkload) SimResult {
 		}
 	}
 
+	// expire drops observations that have fallen out of the window.
+	expire := func() {
+		cut := now - cfg.TTFTWindowSec
+		i := 0
+		for i < len(recentAt) && recentAt[i] < cut {
+			recentSum -= recent[i]
+			i++
+		}
+		if i > 0 {
+			recent = recent[i:]
+			recentAt = recentAt[i:]
+		}
+	}
+
 	gateOpen := func() bool {
-		if len(recent) < cfg.TTFTWindow {
-			return true // not enough evidence to close it yet
+		expire()
+		if len(recent) == 0 {
+			// Nothing completed in the window. On a fleet this idle the gate has
+			// no reason to hold, and on a stalled one the sessions already
+			// admitted are the evidence — refusing to admit here would let a
+			// single slow request freeze the ramp for the rest of the run.
+			return true
 		}
 		return recentSum/float64(len(recent)) < cfg.TTFTLimitSec
 	}
@@ -278,11 +302,9 @@ func RunAdmissionSim(cfg SimConfig, wl SimWorkload) SimResult {
 	observe := func(ttft float64) {
 		ttfts = append(ttfts, ttft)
 		recent = append(recent, ttft)
+		recentAt = append(recentAt, now)
 		recentSum += ttft
-		if len(recent) > cfg.TTFTWindow {
-			recentSum -= recent[0]
-			recent = recent[1:]
-		}
+		expire()
 	}
 
 	// pick chooses a backend by least outstanding, the fleet's own rule.
