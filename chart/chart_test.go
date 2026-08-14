@@ -504,20 +504,21 @@ func TestRouterChartHasOneEndpointGrammar(t *testing.T) {
 	}
 }
 
-// The session-admission governor is exclusive with the fixed series pool, and
-// the chart has to enforce that rather than document it. --series pins
-// max-series as well, so passing both would halt the run at the pool size and
-// report the safety cap as the fleet's ceiling — a wrong answer that looks like
-// a measurement.
-func TestAdmitEveryReplacesTheFixedSeriesPool(t *testing.T) {
-	on := render(t, "--set", "replay.admitEvery=1s")
+// Real-time replay is exclusive with the fixed series pool, and the chart has
+// to enforce that rather than document it. --series pins max-series as well, so
+// rendering both would halt the run at the pool size and report the safety cap
+// as the fleet's ceiling — a wrong answer indistinguishable from a measurement.
+func TestRealtimeReplacesTheFixedSeriesPool(t *testing.T) {
+	on := render(t, "--set", "replay.realtime=true")
 	if strings.Contains(on, "--series=") {
-		t.Error("--series is still passed with the governor on; it pins max-series, so the run " +
-			"would stop at the pool size and report that as the fleet's ceiling")
+		t.Error("--series is still passed with realtime on; it pins max-series, so the run would " +
+			"stop at the pool size and report that as the fleet's ceiling")
 	}
-	for _, want := range []string{"--start-series=1", "--admit-every=1s", "--ttft-limit=5s", "--ttft-window=30s"} {
+	for _, want := range []string{
+		"--replay-realtime", "--start-series=1", "--admit-every=1s", "--ttft-limit=5s", "--ttft-window=30s",
+	} {
 		if !strings.Contains(on, want) {
-			t.Errorf("governor render is missing %s", want)
+			t.Errorf("realtime render is missing %s", want)
 		}
 	}
 	// The cap must sit far above any ceiling this workload reaches — simulation
@@ -527,35 +528,44 @@ func TestAdmitEveryReplacesTheFixedSeriesPool(t *testing.T) {
 	}
 }
 
-// TestGovernorOffChangesNothing: a chart that does not ask for the governor
-// must render exactly the run it rendered before the governor existed.
-func TestGovernorOffChangesNothing(t *testing.T) {
+// TestDefaultRenderIsUnchanged: a chart that does not ask for realtime must
+// render exactly the run it rendered before any of this existed.
+func TestDefaultRenderIsUnchanged(t *testing.T) {
 	off := render(t)
-	if !strings.Contains(off, "--series=") {
-		t.Error("the fixed series pool disappeared with the governor off")
+	if !strings.Contains(off, "--series=256") {
+		t.Error("the fixed series pool changed on the default path")
 	}
 	for _, unwanted := range []string{
-		"--admit-every", "--ttft-limit", "--ttft-window", "--replay-realtime", "--replay-skip-idle",
+		"--admit-every", "--ttft-limit", "--ttft-window", "--replay-realtime",
+		"--replay-skip-idle", "--start-series", "--max-series",
 	} {
 		if strings.Contains(off, unwanted) {
-			t.Errorf("%s is rendered with the governor off; TTFT settings on a run that is not "+
-				"governed read as though it were", unwanted)
+			t.Errorf("%s is rendered by default; the default run must be byte-identical to the "+
+				"one that shipped before real-time replay existed", unwanted)
 		}
 	}
 }
 
-// TestRealtimeAndSkipIdleAreIndependentOfTheGovernor. Pacing a replay by its
-// captured timestamps is useful on a fixed pool too — it is what makes the
-// arrival process real — so it must not be silently tied to admission.
-func TestRealtimeAndSkipIdleAreIndependentOfTheGovernor(t *testing.T) {
-	out := render(t, "--set", "replay.realtime=true", "--set", "replay.skipIdle=true")
-	if !strings.Contains(out, "--replay-realtime") || !strings.Contains(out, "--replay-skip-idle") {
-		t.Error("real-time pacing did not render without --admit-every")
+// TestSkipIdleRequiresRealtime. Skipping dead time is meaningful only when
+// something is pacing against that time; on a back-to-back pool there is no
+// dead time to skip, and rendering the flag would suggest otherwise.
+func TestSkipIdleRequiresRealtime(t *testing.T) {
+	if out := render(t, "--set", "replay.skipIdle=true"); strings.Contains(out, "--replay-skip-idle") {
+		t.Error("--replay-skip-idle rendered without --replay-realtime; there is no dead time to " +
+			"skip on a pool that fires back to back")
 	}
-	if strings.Contains(out, "--admit-every") {
-		t.Error("pacing pulled in the admission governor; they are separate decisions")
+	if out := render(t, "--set", "replay.realtime=true", "--set", "replay.skipIdle=true"); !strings.Contains(out, "--replay-skip-idle") {
+		t.Error("--replay-skip-idle did not render alongside realtime")
 	}
-	if !strings.Contains(out, "--series=") {
-		t.Error("the fixed pool was dropped by pacing alone")
+}
+
+// TestAdmitEveryIsTunableUnderRealtime. The ramp rate is not a neutral knob —
+// on a fleet that answers fast it, not the fleet, becomes the limit — so it has
+// to be reachable without editing the template.
+func TestAdmitEveryIsTunableUnderRealtime(t *testing.T) {
+	out := render(t, "--set", "replay.realtime=true", "--set", "replay.admitEvery=200ms")
+	if !strings.Contains(out, "--admit-every=200ms") {
+		t.Error("admitEvery did not reach the rendered command; the second run at a faster ramp " +
+			"is how a result is shown to have converged")
 	}
 }

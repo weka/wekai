@@ -43,11 +43,16 @@ replay:
   # Turning them on asks "what is the most load this fleet can carry", and the
   # answer is no longer a number set here.
   #
-  # realtime paces each session by the timestamps it was captured with, so a
-  # conversation keeps its own think time instead of firing back-to-back. The
-  # recorded gap includes the ORIGINAL response time, which this fleet will not
-  # reproduce, so it is a floor rather than a schedule: a slower fleet makes the
-  # session fall behind, not issue a backlog.
+  # realtime is the switch. It paces each session by the timestamps it was
+  # captured with, so a conversation keeps its own think time instead of firing
+  # back-to-back — the recorded gap includes the ORIGINAL response time, which
+  # this fleet will not reproduce, so it is a floor rather than a schedule and a
+  # slower fleet makes the session fall behind rather than issue a backlog.
+  #
+  # It also takes over the session count: `series` is NOT passed, because the
+  # count climbs on its own under the TTFT governor below. Passing a fixed pool
+  # alongside would pin max-series and halt the run there, reporting the pool
+  # size as the fleet's ceiling.
   realtime: false
   # skipIdle jumps the clock when NOTHING is in flight and every active session
   # is waiting on its next turn — captured median gap ~8s against a ~4min mean,
@@ -55,18 +60,16 @@ replay:
   # idle precondition means no in-flight request can have its latency distorted.
   # Rarely fires once the run is loaded, which is the intent.
   skipIdle: false
-  # admitEvery starts one session and adds one more this often while the fleet
-  # keeps up, so concurrency is whatever the fleet's latency implies. Setting it
-  # REPLACES the fixed pool: `series` is not passed at all, because --series
-  # pins max-series too and the run would halt at that number and report the cap
-  # as the fleet's ceiling.
+  # admitEvery is how fast the count climbs under realtime: one session, then
+  # one more this often while the fleet keeps up. Concurrency is then whatever
+  # the fleet's latency implies rather than a number set here. Ignored unless
+  # realtime is on.
   #
   # NOT a neutral knob. On a fleet that answers fast this rate, not the fleet,
   # becomes the limit: simulated at a 0.90 cache hit rate, one-per-second finds
   # 52.8 req/s at 36% prefill utilisation while five-per-second finds 140.7 at
   # 97%. Run two rates and check the answer stopped moving before believing it.
-  # "" = off, use the fixed series pool.
-  admitEvery: ""
+  admitEvery: "1s"
   # ttftLimit pauses admission while the windowed mean TTFT is at or above it,
   # and resumes below. This is the definition of "sustained" for the run — max
   # sessions at 5s and at 1s are different capacity numbers for one fleet — so

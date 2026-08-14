@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -296,6 +297,9 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 	}
 	if c.DryRun && c.RouterReplayFile == "" {
 		return fmt.Errorf("--dry-run requires --router-replay-file")
+	}
+	if err := c.validateRealtime(os.Stderr); err != nil {
+		return err
 	}
 	if c.RouterReplayFile != "" && c.MaxOutputTokens != 0 {
 		fmt.Fprintln(os.Stderr,
@@ -668,5 +672,31 @@ func (c *BenchmarkThroughputCommand) Execute(args []string) error {
 		fmt.Println(result.FormatText())
 	}
 
+	return nil
+}
+
+// validateRealtime checks the real-time replay flags against each other.
+//
+// A pinned pool defeats real-time replay silently: --series sets max-series as
+// well as start-series, so the session count stops climbing at the pool size
+// and the run reports that number as the fleet's ceiling. That is an error and
+// not a warning because the wrong answer is indistinguishable from a
+// measurement — nothing downstream looks different.
+//
+// The other two are warnings: they describe a run that does less than the
+// operator asked for, not one that reports something false.
+func (c *BenchmarkAutoCommand) validateRealtime(w io.Writer) error {
+	if c.ReplayRealtime && c.Series > 0 {
+		return fmt.Errorf("--series pins the session count, which --replay-realtime grows on its own; "+
+			"drop --series (use --max-series for a safety cap, currently %d)", c.MaxSeries)
+	}
+	if c.AdmitEvery > 0 && !c.ReplayRealtime {
+		fmt.Fprintln(w, "warning: --admit-every governs how fast sessions are ADDED, but without "+
+			"--replay-realtime each session still fires back-to-back rather than at its captured pace")
+	}
+	if c.ReplaySkipIdle && !c.ReplayRealtime {
+		fmt.Fprintln(w, "warning: --replay-skip-idle has nothing to skip without --replay-realtime; "+
+			"a pool that fires back-to-back has no dead time")
+	}
 	return nil
 }
