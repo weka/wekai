@@ -36,6 +36,53 @@ replay:
   replayRoles: ""          # comma-separated instance roles to replay (empty = all)
   replaySeries: 0          # cap on sessions replayed — subset selection (0 = all in the file)
   series: 256              # parallel series workers replaying sessions (--series; 0 = binary default ramp)
+
+  # ── Real-time replay and session admission ────────────────────────────────
+  # Together these change what the run measures. The default (both off) holds
+  # a FIXED series pool and asks "how does the fleet behave at concurrency N".
+  # Turning them on asks "what is the most load this fleet can carry", and the
+  # answer is no longer a number set here.
+  #
+  # realtime paces each session by the timestamps it was captured with, so a
+  # conversation keeps its own think time instead of firing back-to-back. The
+  # recorded gap includes the ORIGINAL response time, which this fleet will not
+  # reproduce, so it is a floor rather than a schedule: a slower fleet makes the
+  # session fall behind, not issue a backlog.
+  realtime: false
+  # skipIdle jumps the clock when NOTHING is in flight and every active session
+  # is waiting on its next turn — captured median gap ~8s against a ~4min mean,
+  # so a faithful replay is mostly a replay of nobody typing. Safe because the
+  # idle precondition means no in-flight request can have its latency distorted.
+  # Rarely fires once the run is loaded, which is the intent.
+  skipIdle: false
+  # admitEvery starts one session and adds one more this often while the fleet
+  # keeps up, so concurrency is whatever the fleet's latency implies. Setting it
+  # REPLACES the fixed pool: `series` is not passed at all, because --series
+  # pins max-series too and the run would halt at that number and report the cap
+  # as the fleet's ceiling.
+  #
+  # NOT a neutral knob. On a fleet that answers fast this rate, not the fleet,
+  # becomes the limit: simulated at a 0.90 cache hit rate, one-per-second finds
+  # 52.8 req/s at 36% prefill utilisation while five-per-second finds 140.7 at
+  # 97%. Run two rates and check the answer stopped moving before believing it.
+  # "" = off, use the fixed series pool.
+  admitEvery: ""
+  # ttftLimit pauses admission while the windowed mean TTFT is at or above it,
+  # and resumes below. This is the definition of "sustained" for the run — max
+  # sessions at 5s and at 1s are different capacity numbers for one fleet — so
+  # it belongs in the record whether or not you change it.
+  ttftLimit: "5s"
+  # ttftWindow is how far back the gate averages. A duration and not a request
+  # count on purpose: a count is a different amount of history at every load
+  # level, so a count-based gate tightens as the fleet fills.
+  ttftWindow: "30s"
+  # maxSessions is the safety cap on the governor, nothing more. Simulation of
+  # this workload reaches ~2,500 sessions on a cache-starved fleet and >12,000
+  # on a well-cached one, so a cap near either is a cap you will hit. If the run
+  # stops here it logs that it measured the cap rather than the fleet — but the
+  # cheaper habit is to set it far above any plausible ceiling.
+  maxSessions: 100000
+
   replayNoStamp: false     # disable per-run cache-busting stamp (bitwise-faithful replay)
   maxOutputTokens: 0       # override max output tokens per request (0 = use replay-file's own budgets)
   concurrency: 28          # fixed concurrency (0 = auto hill-climber)

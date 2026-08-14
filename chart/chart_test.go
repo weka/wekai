@@ -503,3 +503,59 @@ func TestRouterChartHasOneEndpointGrammar(t *testing.T) {
 		t.Errorf("a route-level pods: still renders; endpoints belong in `endpoints`:\n%s", stray)
 	}
 }
+
+// The session-admission governor is exclusive with the fixed series pool, and
+// the chart has to enforce that rather than document it. --series pins
+// max-series as well, so passing both would halt the run at the pool size and
+// report the safety cap as the fleet's ceiling — a wrong answer that looks like
+// a measurement.
+func TestAdmitEveryReplacesTheFixedSeriesPool(t *testing.T) {
+	on := render(t, "--set", "replay.admitEvery=1s")
+	if strings.Contains(on, "--series=") {
+		t.Error("--series is still passed with the governor on; it pins max-series, so the run " +
+			"would stop at the pool size and report that as the fleet's ceiling")
+	}
+	for _, want := range []string{"--start-series=1", "--admit-every=1s", "--ttft-limit=5s", "--ttft-window=30s"} {
+		if !strings.Contains(on, want) {
+			t.Errorf("governor render is missing %s", want)
+		}
+	}
+	// The cap must sit far above any ceiling this workload reaches — simulation
+	// puts a well-cached fleet past 12,000 sessions.
+	if !strings.Contains(on, "--max-series=100000") {
+		t.Error("default maxSessions is not rendered high enough to stay out of the way")
+	}
+}
+
+// TestGovernorOffChangesNothing: a chart that does not ask for the governor
+// must render exactly the run it rendered before the governor existed.
+func TestGovernorOffChangesNothing(t *testing.T) {
+	off := render(t)
+	if !strings.Contains(off, "--series=") {
+		t.Error("the fixed series pool disappeared with the governor off")
+	}
+	for _, unwanted := range []string{
+		"--admit-every", "--ttft-limit", "--ttft-window", "--replay-realtime", "--replay-skip-idle",
+	} {
+		if strings.Contains(off, unwanted) {
+			t.Errorf("%s is rendered with the governor off; TTFT settings on a run that is not "+
+				"governed read as though it were", unwanted)
+		}
+	}
+}
+
+// TestRealtimeAndSkipIdleAreIndependentOfTheGovernor. Pacing a replay by its
+// captured timestamps is useful on a fixed pool too — it is what makes the
+// arrival process real — so it must not be silently tied to admission.
+func TestRealtimeAndSkipIdleAreIndependentOfTheGovernor(t *testing.T) {
+	out := render(t, "--set", "replay.realtime=true", "--set", "replay.skipIdle=true")
+	if !strings.Contains(out, "--replay-realtime") || !strings.Contains(out, "--replay-skip-idle") {
+		t.Error("real-time pacing did not render without --admit-every")
+	}
+	if strings.Contains(out, "--admit-every") {
+		t.Error("pacing pulled in the admission governor; they are separate decisions")
+	}
+	if !strings.Contains(out, "--series=") {
+		t.Error("the fixed pool was dropped by pacing alone")
+	}
+}

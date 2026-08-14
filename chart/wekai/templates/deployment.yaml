@@ -47,8 +47,23 @@ spec:
                 {{- if .Values.replay.replaySeries }}
                 --replay-series={{ .Values.replay.replaySeries | int64 }} \
                 {{- end }}
-                {{- if .Values.replay.series }}
+                {{- if .Values.replay.admitEvery }}
+                {{/* The governor owns the session count, so --series must NOT be
+                     passed: it pins max-series too, and the run would stop at
+                     that number and report the cap as the fleet's ceiling. */}}
+                --start-series=1 \
+                --max-series={{ .Values.replay.maxSessions | int64 }} \
+                --admit-every={{ .Values.replay.admitEvery }} \
+                --ttft-limit={{ .Values.replay.ttftLimit }} \
+                --ttft-window={{ .Values.replay.ttftWindow }} \
+                {{- else if .Values.replay.series }}
                 --series={{ .Values.replay.series | int64 }} \
+                {{- end }}
+                {{- if .Values.replay.realtime }}
+                --replay-realtime \
+                {{- end }}
+                {{- if .Values.replay.skipIdle }}
+                --replay-skip-idle \
                 {{- end }}
                 {{- if .Values.replay.replayNoStamp }}
                 --replay-no-stamp \
