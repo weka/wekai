@@ -295,18 +295,30 @@ var (
 		Buckets: prometheus.LinearBuckets(0, 8, 16), // 0..120 requests, the observed per-backend range
 	}, []string{"pool"})
 
-	// VLLMMetricsEndpoints is how many upstreams the aggregator is currently
-	// summing, and how many it asked.
+	// VLLMMetricsEndpoints is how many upstreams the aggregator asked on the
+	// last cycle and how many answered.
 	//
-	// Upstream aggregation is on by default and degrades quietly when a backend
-	// cannot be reached — the totals simply stop growing from it — which is the
-	// right behaviour and also an indistinguishable one: a fleet that has gone
-	// entirely unreachable produces the same flat counters as an idle fleet.
-	// This is what tells them apart, and it is a GAUGE rather than a startup log
-	// because the interesting moment is usually not startup.
+	// It catches ONE failure: a backend that is still in the pool and cannot be
+	// scraped — a hung vLLM, a partition, a pod present but not serving. Then
+	// `asked` holds and `contributing` falls, and the flat totals are explained.
+	//
+	// It does NOT catch a backend LEAVING. `asked` tracks the live discovered
+	// set, so a deleted pod is gone from it before a scrape against it can fail:
+	// both labels drop together and the ratio still reads 1.0 while the fleet is
+	// down a node. That is an accurate statement about scrape coverage and a
+	// misleading one about the fleet, so alerting on `contributing < asked`
+	// alone misses the most common way a node departs. router_backends_total,
+	// which counts by health state, is what catches that.
+	//
+	// And a fleet that vanishes entirely reads 0/0, which is a ratio of 1 by any
+	// arithmetic. `asked == 0` with aggregation on is its own alert.
+	//
+	// A gauge rather than a startup log because the interesting moment is rarely
+	// startup: totals that stop growing look identical whether the fleet is idle
+	// or unreachable, and that ambiguity arrives at hour three.
 	VLLMMetricsEndpoints = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "router_vllm_metrics_endpoints",
-		Help: "Upstream endpoints the vLLM aggregator asked (state=\"asked\") and how many answered on the last cycle (state=\"contributing\"). Contributing at 0 while asked is not means the flat totals are unobserved, not idle.",
+		Help: "Upstream endpoints the vLLM aggregator asked (state=\"asked\") and how many answered (state=\"contributing\") on the last cycle. Catches a backend that is in the pool and unscrapeable. Does NOT catch one leaving: asked tracks the live set, so both fall together — use router_backends_total for fleet size, and alert on asked==0 separately.",
 	}, []string{"state"})
 
 	// SignalFired counts, per signal, how often it called a backend saturated.
