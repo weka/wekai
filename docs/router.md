@@ -592,8 +592,27 @@ because it is working, not broken.
 
 ## Observability
 
-`/metrics` and the live KV map at `/router-viz` are on `--metrics-listen`, never
-on the serving path.
+`/router-viz` and the probes are on `--metrics-listen`, never on the serving
+path. `/metrics` is there too — and, **when no API key is set**, also on the
+serving port.
+
+That second mount exists so a client can derive its scrape target from the
+serving endpoint (strip `/v1`, append `/metrics`) instead of being told a second
+address, because being told a second address is a step that gets skipped and the
+run then records nothing while looking healthy. An API key is the production
+shape; a keyless router is a dev or benchmark deployment, where the serving
+listener is already unauthenticated.
+
+It is not a passthrough. An earlier version proxied the scrape to one backend
+and returned that backend's `vllm:*` counters as though they were the fleet's —
+wrong by a factor of the fleet size, and moving backwards whenever consecutive
+scrapes landed on different backends. Both mounts now serve the same aggregate,
+from the same handler value.
+
+Add `--vllm-metrics` to include upstream counters; without it the scrape returns
+the router's own metrics only, and a client reading cache-source totals from it
+records zeros indistinguishable from an idle fleet. The router warns at startup
+when it is in that half-configured state.
 
 | metric | what it tells you |
 |---|---|

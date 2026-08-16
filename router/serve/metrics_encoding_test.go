@@ -9,7 +9,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/weka/wekai/router/internal/dialect/openai"
+	"github.com/weka/wekai/router/internal/gateway"
 	"github.com/weka/wekai/router/internal/metrics"
+	"github.com/weka/wekai/router/internal/proxy"
+	"github.com/weka/wekai/router/internal/vllmmetrics"
 )
 
 // The metrics endpoint carries TWO expositions — the router's own collectors and
@@ -176,3 +180,67 @@ func TestAcceptsGzipMatchesTheToken(t *testing.T) {
 		}
 	}
 }
+
+// A keyless router also serves /metrics on the INFERENCE listener, so a client
+// can derive its scrape target from the serving endpoint instead of being told a
+// second address. Being told a second address is a step that gets skipped, and
+// the run then records nothing while looking healthy.
+//
+// It must be the SAME handler value the metrics listener serves. Two handlers
+// would each re-derive their own content encoding, and one of them getting that
+// wrong is how a compressed exposition ended up with plain text appended.
+
+func TestKeylessRouterServesMetricsOnBothListeners(t *testing.T) {
+	h := metricsExposition(func() *vllmmetrics.Aggregator { return nil })
+
+	cfg := gateway.Config{MaxBodyBytes: 1 << 20, DefaultCapacity: 1, MetricsHandler: h}
+	gw := gateway.New(cfg, emptyRouter{}, proxy.New(proxy.Config{MaxAttempts: 1}), openai.New())
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/metrics") // transport adds Accept-Encoding
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200 on a keyless router", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read: %v — the serving-port mount must use the same one-encoding handler, not "+
+			"a second construction site", err)
+	}
+	if !strings.Contains(string(body), "router_") {
+		t.Error("no router collectors in the serving-port exposition")
+	}
+}
+
+// TestKeyedRouterStillRefusesMetricsOnTheServingPort. With a key set the serving
+// listener is the user-facing one, and fleet size, backend identity and
+// per-backend load are not a caller's business.
+func TestKeyedRouterStillRefusesMetricsOnTheServingPort(t *testing.T) {
+	// serve.go supplies MetricsHandler only when the key is empty; nil is what
+	// the gateway therefore sees for a keyed router.
+	cfg := gateway.Config{MaxBodyBytes: 1 << 20, DefaultCapacity: 1, APIKey: "secret"}
+	gw := gateway.New(cfg, emptyRouter{}, proxy.New(proxy.Config{MaxAttempts: 1}), openai.New())
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/metrics", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status %d, want 404: a keyed router is the production shape and must not expose "+
+			"backend identity and load on the listener callers reach", resp.StatusCode)
+	}
+}
+
+type emptyRouter struct{}
+
+func (emptyRouter) Route(string) (gateway.Target, bool) { return gateway.Target{}, false }
+func (emptyRouter) Targets() []gateway.Target           { return nil }

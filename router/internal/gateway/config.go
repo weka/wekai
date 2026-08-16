@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"net/http"
 	"time"
 
 	"github.com/weka/wekai/router/internal/clock"
@@ -17,6 +18,22 @@ import (
 // layer, so a package's real dependencies were invisible and the file+env+flag
 // loader behind it had to exist before anything could be constructed at all.
 type Config struct {
+	// MetricsHandler, when set, serves GET /metrics on the INFERENCE listener
+	// too. Set only for a keyless router, where an operator's client can then
+	// derive its scrape target from the serving endpoint instead of being told a
+	// second address — a step that gets skipped, after which the run records
+	// nothing while looking healthy.
+	//
+	// Nil keeps the refusal, which is what a router with an API key gets: fleet
+	// size, backend identity and per-backend load are not a caller's business on
+	// a listener that may be public (GW-13).
+	//
+	// It is the SAME handler value the metrics listener serves, deliberately.
+	// Two handlers would each re-derive their own content encoding, and one of
+	// them getting that wrong is how a compressed exposition ended up with plain
+	// text appended after it.
+	MetricsHandler http.Handler
+
 	// APIKey, when set, is required on every inference and admin request.
 	// Empty means the listener is unauthenticated, which is logged loudly at
 	// startup rather than assumed intentional.

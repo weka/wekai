@@ -148,7 +148,13 @@ func (s *Server) build() http.Handler {
 	// instead, because they are diagnostic surface and this listener may be
 	// public (GW-13); the refusal names the flag so one request establishes what
 	// otherwise takes paired snapshots and a delta calculation.
-	mux.HandleFunc("GET /metrics", s.handleMetricsElsewhere)
+	// Served here only for a keyless router — see Config.MetricsHandler. With a
+	// key set the refusal stands, and it names where the counters actually are.
+	if s.cfg.MetricsHandler != nil {
+		mux.Handle("GET /metrics", s.cfg.MetricsHandler)
+	} else {
+		mux.HandleFunc("GET /metrics", s.handleMetricsElsewhere)
+	}
 
 	// Admin endpoints. Auth applies (AUTH-11).
 	mux.HandleFunc("GET /workers", s.handleListWorkers)

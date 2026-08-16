@@ -419,7 +419,53 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		IdleTimeout:        opts.IdleTimeout,
 	})
 
-	gw := gateway.New(opts.gatewayConfig(), tbl, px, d)
+	// Declared here, assigned below once the endpoint set is known: the metrics
+	// handler closes over it and is read only at request time, long after.
+	var agg *vllmmetrics.Aggregator
+
+	// ONE handler value, mounted wherever /metrics is served.
+	//
+	// Two construction sites would each re-derive their own encoding, which is
+	// precisely how a compressed exposition ended up with plain text appended
+	// after it. Building it once makes that impossible by construction rather
+	// than by both sites remembering.
+	metricsHandler := metricsExposition(func() *vllmmetrics.Aggregator { return agg })
+
+	gwCfg := opts.gatewayConfig()
+	// A keyless router is a dev or benchmark deployment — an API key is the
+	// production shape — and there /metrics is also mounted on the SERVING port.
+	//
+	// Not a revert of the refusal that used to live there. That removed a
+	// passthrough which proxied the scrape to ONE backend and returned its
+	// counters as though they were the fleet's; this serves the same correct
+	// aggregate the metrics listener serves. What it buys is that a client
+	// deriving its scrape target from the serving endpoint — which is what every
+	// benchmark does, by stripping /v1 and appending /metrics — resolves without
+	// being told a second address. Being told a second address is a step that
+	// gets skipped, and the run then records nothing while looking healthy.
+	//
+	// With a key set the refusal stands: the serving listener is then the
+	// user-facing one, and fleet size, backend identity and per-backend load are
+	// not a caller's business (GW-13).
+	if opts.APIKey == "" {
+		gwCfg.MetricsHandler = metricsHandler
+		if !opts.VLLMMetrics {
+			// Half-configured is the dangerous state, not unconfigured. The
+			// scrape now resolves and returns a well-formed exposition carrying
+			// the router's own counters and NONE of the upstream ones, so a
+			// benchmark records rows that look like an idle fleet. Said loudly
+			// because the alternative — inferring that a keyless router wants
+			// upstream aggregation — would start scraping every discovered vLLM
+			// on its behalf, and that is a decision to make explicitly.
+			slog.Warn("/metrics is served on the inference listener because no API key is set, "+
+				"but upstream vLLM counters are NOT aggregated: a scrape here returns the "+
+				"router's own metrics only. A client reading cache-source totals from it will "+
+				"record zeros that are indistinguishable from an idle fleet. Pass --vllm-metrics "+
+				"to aggregate them.",
+				"listen", opts.Listen)
+		}
+	}
+	gw := gateway.New(gwCfg, tbl, px, d)
 
 	handler := captureMiddleware(opts.Capture, gw)
 
@@ -443,7 +489,6 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		}
 	}()
 
-	var agg *vllmmetrics.Aggregator
 	if opts.VLLMMetrics {
 		agg = vllmmetrics.New(vllmmetrics.Config{
 			Interval: opts.VLLMMetricsInterval,
@@ -494,43 +539,7 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 	}
 	if opts.MetricsListen != "" {
 		mux := http.NewServeMux()
-		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-			// Both expositions are rendered into one buffer and encoded once.
-			//
-			// Upstream totals are appended to the router's own exposition so a
-			// single scrape target covers both. They are rendered rather than
-			// registered as collectors because their names and labels come from
-			// the upstreams, not from anything declared here — but that means a
-			// second writer touches the response after promhttp has finished,
-			// and promhttp negotiates compression. Letting it compress and then
-			// appending plain text yields [gzip member][plain text], which a Go
-			// client reads as a malformed second member. So promhttp renders
-			// uncompressed and the encoding is chosen here, once, with the whole
-			// body in hand.
-			var body bytes.Buffer
-			rec := &metricsBuffer{hdr: http.Header{}, buf: &body, status: http.StatusOK}
-			metrics.Handler(metrics.Registry()).ServeHTTP(rec, r)
-			if agg != nil {
-				_ = agg.Render(&body)
-			}
-
-			h := w.Header()
-			for k, v := range rec.hdr {
-				h[k] = v
-			}
-			h.Del("Content-Length") // the buffer's length is the real one
-			if acceptsGzip(r) {
-				h.Set("Content-Encoding", "gzip")
-				w.WriteHeader(rec.status)
-				zw := gzip.NewWriter(w)
-				_, _ = zw.Write(body.Bytes())
-				_ = zw.Close()
-				return
-			}
-			h.Set("Content-Length", strconv.Itoa(body.Len()))
-			w.WriteHeader(rec.status)
-			_, _ = w.Write(body.Bytes())
-		})
+		mux.Handle("/metrics", metricsHandler)
 		// The kubelet's probes live here, not on the inference listener: their
 		// answer is operational detail — fleet size, health, and why the router
 		// is not ready — and a user-facing router is routinely unauthenticated.
@@ -887,4 +896,48 @@ func acceptsGzip(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// metricsExposition renders the router's own collectors and, when upstream
+// aggregation is on, the vLLM totals, into ONE body encoded ONCE.
+//
+// The aggregator arrives through a func because it is built after the gateway
+// that mounts this: read at request time, by which point setup is long done.
+//
+// Upstream totals are appended to the router's own exposition so a single
+// scrape target covers both. They are rendered rather than registered as
+// collectors because their names and labels come from the upstreams, not from
+// anything declared here — but that means a second writer touches the response
+// after the Prometheus handler has finished, and that handler negotiates
+// compression. Letting it compress and then appending plain text yields [gzip
+// member][plain text]: a Go client reads the appended bytes as a malformed
+// second member and fails with "gzip: invalid header", while a client that
+// sends no Accept-Encoding succeeds. So the Prometheus handler renders
+// uncompressed and the encoding is chosen here, with the whole body in hand.
+func metricsExposition(agg func() *vllmmetrics.Aggregator) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body bytes.Buffer
+		rec := &metricsBuffer{hdr: http.Header{}, buf: &body, status: http.StatusOK}
+		metrics.Handler(metrics.Registry()).ServeHTTP(rec, r)
+		if a := agg(); a != nil {
+			_ = a.Render(&body)
+		}
+
+		h := w.Header()
+		for k, v := range rec.hdr {
+			h[k] = v
+		}
+		h.Del("Content-Length") // the buffer's length is the real one
+		if acceptsGzip(r) {
+			h.Set("Content-Encoding", "gzip")
+			w.WriteHeader(rec.status)
+			zw := gzip.NewWriter(w)
+			_, _ = zw.Write(body.Bytes())
+			_ = zw.Close()
+			return
+		}
+		h.Set("Content-Length", strconv.Itoa(body.Len()))
+		w.WriteHeader(rec.status)
+		_, _ = w.Write(body.Bytes())
+	})
 }
