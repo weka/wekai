@@ -163,11 +163,22 @@ type Options struct {
 	HealthTimeout   time.Duration
 	HealthPath      string
 
-	// VLLMMetrics turns on upstream vLLM counter aggregation. Only endpoints
-	// DISCOVERED to be vLLM are scraped, so a hosted API in the same router is
-	// never asked for metrics it does not have — the probe already answered
-	// that, once, and the answer is reused rather than rediscovered per cycle.
-	VLLMMetrics         bool
+	// DisableVLLMMetrics turns OFF upstream vLLM counter aggregation, which is
+	// otherwise on.
+	//
+	// Inverted deliberately, so the zero value is the default rather than its
+	// opposite: a caller building Options without naming this field gets the
+	// behaviour the flag documents, and a field that had to be set to get the
+	// documented default is a trap.
+	//
+	// Aggregation is on everywhere and is NOT conditional on the API key. The
+	// key governs only where /metrics is exposed. Only endpoints DISCOVERED to
+	// be vLLM are scraped, so a hosted API in the same router is never asked for
+	// metrics it does not have — the probe already answered that, once, and the
+	// answer is reused rather than rediscovered per cycle. An endpoint that
+	// cannot be reached simply stops contributing; see the aggregator's delta
+	// scheme, which is what makes that safe rather than a reason to opt in.
+	DisableVLLMMetrics  bool
 	VLLMMetricsInterval time.Duration
 	VLLMMetricsNames    []string
 
@@ -449,19 +460,17 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 	// not a caller's business (GW-13).
 	if opts.APIKey == "" {
 		gwCfg.MetricsHandler = metricsHandler
-		if !opts.VLLMMetrics {
-			// Half-configured is the dangerous state, not unconfigured. The
-			// scrape now resolves and returns a well-formed exposition carrying
-			// the router's own counters and NONE of the upstream ones, so a
-			// benchmark records rows that look like an idle fleet. Said loudly
-			// because the alternative — inferring that a keyless router wants
-			// upstream aggregation — would start scraping every discovered vLLM
-			// on its behalf, and that is a decision to make explicitly.
+		if opts.DisableVLLMMetrics {
+			// Aggregation is on by default, so this warns about the state an
+			// operator chose rather than one they forgot. The scrape resolves
+			// and returns a well-formed exposition carrying the router's own
+			// counters and none of the upstream ones, and a client reading
+			// cache-source totals from it records zeros that look exactly like
+			// an idle fleet.
 			slog.Warn("/metrics is served on the inference listener because no API key is set, "+
-				"but upstream vLLM counters are NOT aggregated: a scrape here returns the "+
-				"router's own metrics only. A client reading cache-source totals from it will "+
-				"record zeros that are indistinguishable from an idle fleet. Pass --vllm-metrics "+
-				"to aggregate them.",
+				"but --no-vllm-metrics turned upstream aggregation off: a scrape here returns "+
+				"the router's own metrics only, and a client reading cache-source totals from "+
+				"it will record zeros indistinguishable from an idle fleet.",
 				"listen", opts.Listen)
 		}
 	}
@@ -489,7 +498,7 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		}
 	}()
 
-	if opts.VLLMMetrics {
+	if !opts.DisableVLLMMetrics {
 		agg = vllmmetrics.New(vllmmetrics.Config{
 			Interval: opts.VLLMMetricsInterval,
 			Names:    opts.VLLMMetricsNames,
@@ -540,6 +549,24 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 				"backends", 0, "interval", agg.Interval())
 		}
 		go agg.Run(ctx, eps)
+		// Coverage is published continuously, not just announced at startup. A
+		// fleet that goes entirely unreachable mid-run produces exactly the flat
+		// totals an idle one does, and the gauge is the only thing that
+		// separates them.
+		go func() {
+			t := time.NewTicker(agg.Interval())
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+				}
+				contributing, asked := agg.Coverage()
+				metrics.VLLMMetricsEndpoints.WithLabelValues("contributing").Set(float64(contributing))
+				metrics.VLLMMetricsEndpoints.WithLabelValues("asked").Set(float64(asked))
+			}
+		}()
 	}
 
 	// Metrics, the live KV map and the kubelet's probes on their own listener:

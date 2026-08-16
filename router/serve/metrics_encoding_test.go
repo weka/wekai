@@ -3,6 +3,7 @@ package serve
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -244,3 +245,57 @@ type emptyRouter struct{}
 
 func (emptyRouter) Route(string) (gateway.Target, bool) { return gateway.Target{}, false }
 func (emptyRouter) Targets() []gateway.Target           { return nil }
+
+// Upstream aggregation is ON by default and is NOT coupled to the API key. The
+// key governs only WHERE /metrics is exposed; a production router with a key set
+// still aggregates, it just does not serve the result on the serving port.
+//
+// Asserted on the zero value because that is the trap this shape avoids: a
+// caller building Options without naming the field must get the documented
+// default, not its opposite.
+func TestAggregationIsOnByDefaultAndIndependentOfTheAPIKey(t *testing.T) {
+	var o Options
+	if o.DisableVLLMMetrics {
+		t.Error("the zero value disables aggregation; the field is inverted precisely so that " +
+			"an unset Options carries the default the flag documents")
+	}
+	keyed := Options{APIKey: "secret"}
+	if keyed.DisableVLLMMetrics {
+		t.Error("setting an API key disabled aggregation; the key governs where /metrics is " +
+			"exposed, not whether the counters exist")
+	}
+}
+
+// TestCoverageSeparatesIdleFromUnreachable. Flat totals mean one of two opposite
+// things and nothing else in the exposition tells them apart, which is the
+// failure the whole absent-versus-zero thread has been about.
+func TestCoverageSeparatesIdleFromUnreachable(t *testing.T) {
+	a := vllmmetrics.New(vllmmetrics.Config{})
+
+	contributing, asked := a.Coverage()
+	if contributing != 0 || asked != 0 {
+		t.Errorf("a fresh aggregator reports %d/%d, want 0/0", contributing, asked)
+	}
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "vllm:prompt_tokens_by_source_total{source=\"local_compute\"} 5\n")
+	}))
+	defer up.Close()
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	dead.Close() // refused, not merely erroring
+
+	a.ScrapeAll(context.Background(), []string{up.URL, dead.URL})
+	contributing, asked = a.Coverage()
+	if contributing != 1 {
+		t.Errorf("contributing = %d, want 1: one endpoint answered", contributing)
+	}
+	if asked < 1 {
+		t.Errorf("asked = %d, want at least 1", asked)
+	}
+	if contributing == asked {
+		t.Error("an unreachable endpoint is counted as contributing, so a fleet that has gone " +
+			"dark reads the same as one that is idle — which is the distinction this exists for")
+	}
+}

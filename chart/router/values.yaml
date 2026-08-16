@@ -147,11 +147,23 @@ router:
     # 0 = off, answer immediately.
     retryTimeLimit: 0s
 
-  # Aggregate upstream vLLM counters into router-level totals on the metrics
-  # listener. Only endpoints discovered to be vLLM are scraped, and totals
-  # accumulate deltas so they never rewind when a pod restarts.
+  # Aggregate upstream vLLM counters into router-level totals. ON by default,
+  # and NOT conditional on the API key — the key governs only where /metrics is
+  # exposed, not whether the counters exist.
+  #
+  # Only endpoints discovered to be vLLM are scraped, so a hosted API in the
+  # same router is never asked. Totals accumulate deltas, so they never rewind
+  # when a pod restarts or the fleet scales down, and a backend that cannot be
+  # reached simply stops contributing rather than failing the cycle. That
+  # graceful degradation is why this needs no opt-in.
+  #
+  # It is also why `disabled: true` is rarely the right answer: the failure mode
+  # it avoids is one the aggregator already handles. Watch
+  # router_vllm_metrics_endpoints{state="contributing"} against state="asked" to
+  # tell an idle fleet from an unreachable one — flat totals look identical
+  # either way.
   vllmMetrics:
-    enabled: false
+    disabled: false
     interval: 30s
     names: []
     # - vllm:prompt_tokens_by_source_total

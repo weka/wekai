@@ -119,6 +119,12 @@ type Aggregator struct {
 	// necessarily a vLLM, and asking one forever is what this avoids.
 	barren map[string]int
 	dead   map[string]bool
+	// lastOK and lastAsked are the previous cycle's outcome, RECORDED rather
+	// than derived. Deriving it from prev/barren/missing looked possible and was
+	// wrong: an endpoint that fails never enters prev at all, so a count taken
+	// over prev reports full coverage at the moment coverage is lost — which is
+	// precisely the reading this exists to prevent.
+	lastOK, lastAsked int
 	// resets counts apparent counter restarts per endpoint, and warned records
 	// that we have already said something about it. A steady stream from one
 	// address means the address is not one process.
@@ -168,6 +174,16 @@ func (a *Aggregator) live(endpoints []string) []string {
 		}
 	}
 	return out
+}
+
+// Coverage is how many endpoints answered on the last cycle and how many were
+// asked. It is what separates "aggregating, and the fleet is idle" from
+// "aggregating, and nothing is reachable" — two states whose totals are
+// identical and whose meanings are opposite.
+func (a *Aggregator) Coverage() (contributing, asked int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastOK, a.lastAsked
 }
 
 // Interval is how often Run scrapes.
@@ -220,9 +236,13 @@ func (a *Aggregator) ScrapeAll(ctx context.Context, endpoints []string) {
 	seen := map[string]bool{}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.lastAsked, a.lastOK = len(endpoints), 0
 	for r := range results {
 		seen[r.endpoint] = true
 		a.missing[r.endpoint] = 0
+		if len(r.series) > 0 {
+			a.lastOK++
+		}
 
 		// An endpoint that gave nothing — unreachable, or reachable and serving
 		// none of the tracked series, which is what a hosted API or a sidecar

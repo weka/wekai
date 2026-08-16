@@ -59,6 +59,11 @@ func TestVLLMIsDiscoveredAndOthersFallBackToPassive(t *testing.T) {
 		},
 		HealthInterval: 50 * time.Millisecond,
 		HealthTimeout:  20 * time.Millisecond,
+		// Upstream aggregation is on by default and scrapes the same /metrics
+		// path this counts, so leaving it on would make `probes` the sum of two
+		// unrelated activities. What is under test is that DISCOVERY asks once;
+		// that the aggregator asks repeatedly is correct and covered elsewhere.
+		DisableVLLMMetrics: true,
 	})
 	if err != nil {
 		t.Fatalf("Handler: %v", err)
@@ -88,6 +93,6 @@ func TestVLLMIsDiscoveredAndOthersFallBackToPassive(t *testing.T) {
 			"a failed probe must be latched, not retried", hostedProbes-before)
 	}
 	if probes != 1 {
-		t.Errorf("vLLM /metrics was probed %d times, want exactly 1", probes)
+		t.Errorf("vLLM /metrics was probed %d times by DISCOVERY, want exactly 1", probes)
 	}
 }

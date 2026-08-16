@@ -609,10 +609,20 @@ wrong by a factor of the fleet size, and moving backwards whenever consecutive
 scrapes landed on different backends. Both mounts now serve the same aggregate,
 from the same handler value.
 
-Add `--vllm-metrics` to include upstream counters; without it the scrape returns
-the router's own metrics only, and a client reading cache-source totals from it
-records zeros indistinguishable from an idle fleet. The router warns at startup
-when it is in that half-configured state.
+Upstream vLLM counters are aggregated **by default**, independently of the API
+key — the key decides where `/metrics` is exposed, not whether the counters
+exist. `--no-vllm-metrics` turns it off. Only endpoints discovered to be vLLM
+are scraped, so a hosted API in the same router is never asked.
+
+Totals accumulate **deltas**, so they never rewind when a pod restarts or the
+fleet scales down, and a backend that cannot be reached simply stops
+contributing rather than failing the cycle. That is why it needs no opt-in:
+there is no failure the operator has to protect against by staying silent.
+
+The cost is that flat totals mean two opposite things — an idle fleet and an
+unreachable one produce the same numbers. `router_vllm_metrics_endpoints`
+separates them: `state="contributing"` at 0 while `state="asked"` is not means
+the totals are unobserved, not idle.
 
 | metric | what it tells you |
 |---|---|
@@ -627,6 +637,7 @@ when it is in that half-configured state.
 | `router_retries_total{reason="capacity_saturated"}` | waits caused by every backend being full. The transient fallback cannot apply here — there was no candidate — so waiting is the only move |
 | `router_retries_total{reason="capacity_guard_blocked"}` | waits caused by the split guard. The fallback is tried BEFORE this error is returned, so a count here with `overflows_total` at zero means the threshold is too tight or off — not that the router waited instead of falling back |
 | `router_retry_wait_seconds` | latency `--retry-time-limit` added, **per request** — `_count{outcome="satisfied"}` is how many requests the waiting rescued, `{outcome="expired"}` how many spent the budget and got a 429 anyway, and the quantiles what it cost. Spans the first refusal to the *start* of the attempt that ended the wait, so it excludes that attempt's service time and stays bounded by the budget in every outcome — quantiles are comparable across them. End-to-end cost is `router_request_duration_seconds`. `retries_total` counts *attempts*, so it answers neither |
+| `router_vllm_metrics_endpoints` | upstream endpoints `asked` vs `contributing` on the last aggregation cycle. **The only thing that separates an idle fleet from an unreachable one** — both produce flat `vllm:` totals |
 | `router_cache_tree_runs` / `_tail_set` | tree size, for memory |
 
 Every series above with a closed set of label values exists **at 0 from

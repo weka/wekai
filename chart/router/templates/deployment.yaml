@@ -111,8 +111,9 @@ spec:
             - "--retry-time-limit={{ .retryTimeLimit }}"
             {{- end }}
             {{- end }}
-            {{- if .Values.router.vllmMetrics.enabled }}
-            - "--vllm-metrics"
+            {{- if .Values.router.vllmMetrics.disabled }}
+            - "--no-vllm-metrics"
+            {{- else }}
             - "--vllm-metrics-interval={{ .Values.router.vllmMetrics.interval }}"
             {{- range .Values.router.vllmMetrics.names }}
             - "--vllm-metrics-name={{ . }}"

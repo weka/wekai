@@ -82,7 +82,8 @@ type RouterServeCommand struct {
 	HealthUnhealthy  time.Duration `long:"health-unhealthy-interval" default:"1s" description:"How often a backend that is NOT healthy is re-probed. Much shorter on purpose: a recovered backend stays out of rotation for this long, and every request that could have used its warm cache goes somewhere colder."`
 	HealthTimeout    time.Duration `long:"health-timeout" default:"5s" description:"Health probe timeout. Must be below the interval, or probes fall behind forever."`
 	HealthPath       string        `long:"health-path" default:"/health" description:"Path probed on each backend."`
-	VLLMMetrics      bool          `long:"vllm-metrics" description:"Aggregate upstream vLLM counters into router-level totals served on --metrics-listen. Only endpoints discovered to be vLLM are scraped. Totals accumulate DELTAS, so they never go backwards when a pod restarts or the fleet scales down — a decreasing counter silently breaks rate() and increase()."`
+	VLLMMetrics      bool          `long:"vllm-metrics" description:"No-op, kept so existing deployments keep starting: aggregation is now on by default. Use --no-vllm-metrics to turn it off."`
+	NoVLLMMetrics    bool          `long:"no-vllm-metrics" description:"Turn OFF aggregation of upstream vLLM counters into router-level totals. Aggregation is on by default and is not conditional on the API key — the key governs only WHERE /metrics is exposed. Only endpoints discovered to be vLLM are scraped, so a hosted API in the same router is never asked. Totals accumulate DELTAS, so they never go backwards when a pod restarts or the fleet scales down, and an unreachable backend simply stops contributing rather than failing the cycle — which is why this needs no opt-in. Watch router_vllm_metrics_endpoints to tell an idle fleet from an unreachable one."`
 	VLLMMetricsEvery time.Duration `long:"vllm-metrics-interval" default:"30s" description:"How often each discovered vLLM endpoint is scraped."`
 	VLLMMetricsNames []string      `long:"vllm-metrics-name" description:"Upstream counter to aggregate; repeatable. Default: vllm:prompt_tokens_by_source_total. Re-exporting every series would multiply cardinality by the fleet size."`
 	LogLevel         string        `long:"log-level" default:"info" description:"debug, info, warn or error."`
@@ -239,7 +240,7 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		HealthUnhealthy:       c.HealthUnhealthy,
 		HealthTimeout:         c.HealthTimeout,
 		HealthPath:            c.HealthPath,
-		VLLMMetrics:           c.VLLMMetrics,
+		DisableVLLMMetrics:    c.NoVLLMMetrics,
 		VLLMMetricsInterval:   c.VLLMMetricsEvery,
 		VLLMMetricsNames:      c.VLLMMetricsNames,
 		MaxAttempts:           c.MaxAttempts,

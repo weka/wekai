@@ -295,6 +295,20 @@ var (
 		Buckets: prometheus.LinearBuckets(0, 8, 16), // 0..120 requests, the observed per-backend range
 	}, []string{"pool"})
 
+	// VLLMMetricsEndpoints is how many upstreams the aggregator is currently
+	// summing, and how many it asked.
+	//
+	// Upstream aggregation is on by default and degrades quietly when a backend
+	// cannot be reached — the totals simply stop growing from it — which is the
+	// right behaviour and also an indistinguishable one: a fleet that has gone
+	// entirely unreachable produces the same flat counters as an idle fleet.
+	// This is what tells them apart, and it is a GAUGE rather than a startup log
+	// because the interesting moment is usually not startup.
+	VLLMMetricsEndpoints = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "router_vllm_metrics_endpoints",
+		Help: "Upstream endpoints the vLLM aggregator asked (state=\"asked\") and how many answered on the last cycle (state=\"contributing\"). Contributing at 0 while asked is not means the flat totals are unobserved, not idle.",
+	}, []string{"state"})
+
 	// SignalFired counts, per signal, how often it called a backend saturated.
 	//
 	// The router has one routing flow; what varies between deployments is which
@@ -457,7 +471,7 @@ func All() []prometheus.Collector {
 		CacheSplits, CacheOverflows, CacheSoftBlocked, CacheStretches, CacheStretchInflight,
 		CacheAvgCopies, CacheAnchorBlocks,
 		CacheShallowAnchors, CacheShallowAnchorBlocks, CacheGuardRejects, SignalFired,
-		CachePoolSize, CacheTreeRuns, CacheTailSet, CacheBlocksExpired,
+		CachePoolSize, CacheTreeRuns, CacheTailSet, CacheBlocksExpired, VLLMMetricsEndpoints,
 		RequestsShed, SaturationRejects, BackendCapExceeded, observedShadow,
 	}
 }
@@ -505,6 +519,11 @@ var CapacityRetryReasons = []string{ReasonSaturated, ReasonGuardBlocked}
 // stay lazy: there is no complete list to enumerate, and inventing one would
 // fill the scrape with series for backends that do not exist.
 func warm() {
+	// Both states exist from startup: a router with aggregation on and nothing
+	// yet discovered must report 0, not nothing.
+	for _, st := range []string{"contributing", "asked"} {
+		VLLMMetricsEndpoints.WithLabelValues(st)
+	}
 	for _, r := range CapacityRetryReasons {
 		for _, o := range []string{"retried", "exhausted"} {
 			RetriesTotal.WithLabelValues(r, o)
