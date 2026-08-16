@@ -88,6 +88,22 @@ type AutoBenchmarkConfig struct {
 	// count, so the serving tokenizer's counts land near the original
 	// capture's. 0 = byte-faithful sizing (default).
 	ReplayCharsPerToken float64
+	// VLLMMetricsURLs overrides where upstream counters are scraped from.
+	//
+	// By default the sampler derives /metrics from the serving spec, which only
+	// works when the thing serving inference is also the thing exposing the
+	// counters. Behind a router it is not: the router refuses /metrics on the
+	// serving port on purpose — proxying it would answer with ONE backend's
+	// counters, which is worse than nothing because it looks like a fleet total
+	// — and serves the aggregate on its metrics listener instead. Nothing in
+	// the model spec names that address, so it has to be given.
+	//
+	// Either point this at the router's metrics listener (with the router run
+	// with --vllm-metrics, which is what produces a real fleet aggregate) or at
+	// every backend directly, in which case the per-endpoint delta accumulator
+	// sums them correctly across restarts and departures.
+	VLLMMetricsURLs []string
+
 	// Real-time replay: sessions keep the think time they were captured with,
 	// and load grows by admitting sessions under a TTFT governor rather than by
 	// setting a concurrency number.
@@ -1593,7 +1609,7 @@ func runSingleModelBenchmark(
 		ttft:              newTTFTWindow(cfg.TTFTWindow),
 		skipClk:           newSkipClock(cfg.ReplayRealtime && cfg.ReplaySkipIdle),
 	}
-	if sampler := startVLLMMetricsSampler(benchCtx, cfg.Model, st.datasetTracker, rdw); sampler != nil {
+	if sampler := startVLLMMetricsSampler(benchCtx, cfg.Model, cfg.VLLMMetricsURLs, st.datasetTracker, rdw); sampler != nil {
 		// stop() is deferred after rdw's close, so it runs first (LIFO) and
 		// waits for the goroutine — no sample write can race the file close.
 		defer sampler.stop()

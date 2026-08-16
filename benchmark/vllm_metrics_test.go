@@ -294,16 +294,29 @@ func TestSamplerSampleOnceWritesRecord(t *testing.T) {
 	if got.RecordType != recordTypeVLLMMetricsSample {
 		t.Errorf("record_type = %q", got.RecordType)
 	}
-	if got.Sources.Compute != 1500 || got.Sources.LocalCache != 300 || got.Sources.ExternalCache != 42 {
-		t.Errorf("sources = %+v", got.Sources)
+	// The first sighting of an endpoint sets a BASELINE and contributes nothing.
+	// Totals are a running sum of deltas, and these pods carry counters from
+	// whatever ran before the benchmark started; importing that history would
+	// attribute another run's work to this one.
+	if got.Sources != (vllmSourceCounters{}) {
+		t.Errorf("first sample = %+v, want all zero: it is the baseline, not a measurement", got.Sources)
+	}
+	if got.EndpointsOK != 1 || got.EndpointsTotal != 1 {
+		t.Errorf("coverage = %d/%d, want 1/1", got.EndpointsOK, got.EndpointsTotal)
 	}
 	if got.ActiveDatasetTokens != 5000 || got.ActiveSeries != 2 {
 		t.Errorf("active dataset = %d/%d, want 5000/2", got.ActiveDatasetTokens, got.ActiveSeries)
 	}
 }
 
+// TestSamplerGracefulDegradation: an endpoint that cannot be read contributes
+// no delta and no panic — but the interval is still RECORDED, at zero coverage.
+//
+// Omitting it was the old behaviour and it was wrong: a missing row and an idle
+// fleet are different claims, and the report drew both as nothing. On a loaded
+// fleet /metrics competes with inference for the same event loop, so the
+// intervals lost this way were disproportionately the interesting ones.
 func TestSamplerGracefulDegradation(t *testing.T) {
-	// 404 endpoint: sample skipped, nothing written, no panic.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}))
@@ -336,8 +349,20 @@ func TestSamplerGracefulDegradation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(samples) != 0 {
-		t.Fatalf("degraded endpoint must not produce samples, got %d", len(samples))
+	if len(samples) != 2 {
+		t.Fatalf("got %d samples, want 2: an interval nobody could observe is still an interval, "+
+			"and dropping it leaves a gap in the report with no explanation", len(samples))
+	}
+	for i, smp := range samples {
+		if smp.EndpointsOK != 0 {
+			t.Errorf("sample %d: EndpointsOK = %d, want 0", i, smp.EndpointsOK)
+		}
+		if smp.EndpointsTotal != 1 {
+			t.Errorf("sample %d: EndpointsTotal = %d, want 1", i, smp.EndpointsTotal)
+		}
+		if smp.Sources != (vllmSourceCounters{}) {
+			t.Errorf("sample %d: an unreadable endpoint contributed %+v", i, smp.Sources)
+		}
 	}
 	if s.skipped.Load() != 2 {
 		t.Errorf("skipped = %d, want 2", s.skipped.Load())
@@ -357,16 +382,16 @@ func TestStartVLLMMetricsSamplerLifecycle(t *testing.T) {
 	}
 
 	// Non-chat/completions spec or nil writer: sampler must not start.
-	if s := startVLLMMetricsSampler(context.Background(), "dynamic/"+srv.URL+"/v1,type=anthropic", newActiveDatasetTracker(), rdw); s != nil {
+	if s := startVLLMMetricsSampler(context.Background(), "dynamic/"+srv.URL+"/v1,type=anthropic", nil, newActiveDatasetTracker(), rdw); s != nil {
 		t.Fatal("sampler started for non-chat/completions spec")
 	}
-	if s := startVLLMMetricsSampler(context.Background(), "dynamic/"+srv.URL+"/v1,type=openai_vllm", newActiveDatasetTracker(), nil); s != nil {
+	if s := startVLLMMetricsSampler(context.Background(), "dynamic/"+srv.URL+"/v1,type=openai_vllm", nil, newActiveDatasetTracker(), nil); s != nil {
 		t.Fatal("sampler started without writer")
 	}
 
 	tracker := newActiveDatasetTracker()
 	tracker.Update(1, 123)
-	s := startVLLMMetricsSampler(context.Background(), "dynamic/"+srv.URL+"/v1,type=openai_vllm", tracker, rdw)
+	s := startVLLMMetricsSampler(context.Background(), "dynamic/"+srv.URL+"/v1,type=openai_vllm", nil, tracker, rdw)
 	if s == nil {
 		t.Fatal("sampler did not start for openai_vllm spec")
 	}
@@ -409,7 +434,7 @@ func TestStartVLLMMetricsSamplerSpeculativeCollects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := startVLLMMetricsSampler(context.Background(), "dynamic/"+srv.URL+"/v1,type=openai", newActiveDatasetTracker(), rdw)
+	s := startVLLMMetricsSampler(context.Background(), "dynamic/"+srv.URL+"/v1,type=openai", nil, newActiveDatasetTracker(), rdw)
 	if s == nil {
 		t.Fatal("sampler did not start for a chat/completions spec")
 	}

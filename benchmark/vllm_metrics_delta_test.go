@@ -283,3 +283,65 @@ func TestCoverageReachesTheReport(t *testing.T) {
 			"the report, not drawn as a short bar", mix[0].EndpointsOK, mix[0].EndpointsTotal)
 	}
 }
+
+// TestMetricsURLOverrideReachesTheSampler.
+//
+// The default derives /metrics from the serving spec, which is right only when
+// the thing serving inference is also the thing exposing the counters. Behind a
+// router it never is: the router refuses /metrics on its serving port on
+// purpose, because proxying it answers with ONE backend's counters — a number
+// that looks like a fleet total and is not. Without a way to name the real
+// address, an entire campaign records zero samples and the report shows nothing
+// where the interesting half of the comparison should be.
+func TestMetricsURLOverrideReachesTheSampler(t *testing.T) {
+	a, b := newFakeVLLM(t), newFakeVLLM(t)
+	dir := t.TempDir()
+	rdw, err := newRequestDataWriter(dir, "override_model", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A serving spec pointing somewhere with no /metrics at all — the router.
+	s := startVLLMMetricsSampler(context.Background(),
+		"dynamic/http://router.invalid:9000/v1,type=openai_vllm",
+		[]string{a.srv.URL, b.url()}, // bare endpoint AND explicit /metrics
+		newActiveDatasetTracker(), rdw)
+	if s == nil {
+		t.Fatal("no sampler started despite explicit metrics URLs")
+	}
+	defer s.stop()
+
+	want := map[string]bool{a.url(): true, b.url(): true}
+	for _, u := range s.urls {
+		if !want[u] {
+			t.Errorf("sampler is scraping %q; want exactly %v — a bare endpoint must be normalised "+
+				"to /metrics rather than fetched as-is", u, want)
+		}
+		delete(want, u)
+	}
+	if len(want) != 0 {
+		t.Errorf("sampler never resolved %v", want)
+	}
+	if !s.explicit {
+		t.Error("explicitly named endpoints must poll forever rather than spending a speculative " +
+			"budget; the operator said where they are and a backend loading weights must not cost " +
+			"the rest of the run")
+	}
+}
+
+func TestNormalizeMetricsURLs(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"http://h:29000", "http://h:29000/metrics"},
+		{"http://h:29000/", "http://h:29000/metrics"},
+		{"http://h:29000/metrics", "http://h:29000/metrics"},
+		{"http://h:8000/v1", "http://h:8000/metrics"},
+		{"http://h:8000/v1/", "http://h:8000/metrics"},
+	} {
+		got := normalizeMetricsURLs([]string{tc.in})
+		if len(got) != 1 || got[0] != tc.want {
+			t.Errorf("%q -> %v, want [%s]", tc.in, got, tc.want)
+		}
+	}
+	if got := normalizeMetricsURLs([]string{"", "  "}); len(got) != 0 {
+		t.Errorf("blank entries survived as %v", got)
+	}
+}

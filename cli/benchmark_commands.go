@@ -270,6 +270,7 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		ReplaySeries:               c.ReplaySeries,
 		LimitContext:               c.LimitContext,
 		ReplayCharsPerToken:        c.ReplayCharsPerToken,
+		VLLMMetricsURLs:            c.VLLMMetricsURLs,
 		ReplayRealtime:             c.ReplayRealtime,
 		AdmitEvery:                 c.AdmitEvery,
 		TTFTLimit:                  c.TTFTLimit,

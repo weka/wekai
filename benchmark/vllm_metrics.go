@@ -248,6 +248,25 @@ func vllmMetricsEndpoints(model string) vllmMetricsEligibility {
 	return out
 }
 
+// normalizeMetricsURLs accepts either a bare endpoint or a full /metrics URL,
+// because both are natural to type and guessing wrong costs a whole run's
+// cache-source breakdown.
+func normalizeMetricsURLs(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, u := range in {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		u = strings.TrimRight(u, "/")
+		if !strings.HasSuffix(u, "/metrics") {
+			u = strings.TrimSuffix(u, "/v1") + "/metrics"
+		}
+		out = append(out, u)
+	}
+	return out
+}
+
 // vllmMetricsSampler polls one model's endpoints and writes samples to rdw.
 type vllmMetricsSampler struct {
 	model    string
@@ -283,11 +302,17 @@ type vllmMetricsSampler struct {
 // Starting is not a promise that samples will land: a speculatively-started
 // sampler shuts itself down once it establishes the endpoint has no vLLM
 // metrics (see noteFailure). stop() stays safe to call either way.
-func startVLLMMetricsSampler(ctx context.Context, model string, tracker *activeDatasetTracker, rdw *requestDataWriter) *vllmMetricsSampler {
+func startVLLMMetricsSampler(ctx context.Context, model string, override []string, tracker *activeDatasetTracker, rdw *requestDataWriter) *vllmMetricsSampler {
 	if rdw == nil || tracker == nil {
 		return nil
 	}
 	elig := vllmMetricsEndpoints(model)
+	if len(override) > 0 {
+		// Explicit addresses are explicit: keep polling them forever rather than
+		// spending a speculative budget, because the operator named them and a
+		// backend still loading weights must not cost the rest of the run.
+		elig = vllmMetricsEligibility{urls: normalizeMetricsURLs(override), explicit: true}
+	}
 	if len(elig.urls) == 0 {
 		return nil
 	}
@@ -401,7 +426,18 @@ func (s *vllmMetricsSampler) sampleOnce(ctx context.Context) (keepPolling bool) 
 }
 
 // fold adds one endpoint's delta since its last reading into the totals.
+//
+// The maps are created here rather than only in the constructor: a sampler
+// built as a struct literal is a reasonable thing for a caller to do, and
+// panicking on a nil map would make the accumulator's correctness depend on how
+// it was constructed.
 func (s *vllmMetricsSampler) fold(url string, vals map[string]float64) {
+	if s.prev == nil {
+		s.prev = map[string]map[string]float64{}
+	}
+	if s.totals == nil {
+		s.totals = map[string]float64{}
+	}
 	prev := s.prev[url]
 	if prev == nil {
 		prev = map[string]float64{}
@@ -433,6 +469,9 @@ func (s *vllmMetricsSampler) fold(url string, vals map[string]float64) {
 
 // write persists the accumulated totals with this round's coverage.
 func (s *vllmMetricsSampler) write(endpointsOK int) {
+	if s.rdw == nil || s.tracker == nil {
+		return
+	}
 	adt, active := s.tracker.Sum()
 	rec := vllmMetricsSample{
 		RecordType: recordTypeVLLMMetricsSample,

@@ -64,6 +64,9 @@ spec:
                 {{- else if .Values.replay.series }}
                 --series={{ .Values.replay.series | int64 }} \
                 {{- end }}
+                {{- range .Values.replay.vllmMetricsUrls }}
+                --vllm-metrics-url={{ . }} \
+                {{- end }}
                 {{- if .Values.replay.replayNoStamp }}
                 --replay-no-stamp \
                 {{- end }}

@@ -86,6 +86,24 @@ replay:
   # cheaper habit is to set it far above any plausible ceiling.
   maxSessions: 100000
 
+  # Where to scrape vllm:prompt_tokens_by_source_total for the cache-source
+  # breakdown in the report. Needed whenever the thing serving inference is not
+  # the thing exposing the counters — BEHIND A ROUTER IT NEVER IS. The router
+  # refuses /metrics on its serving port on purpose: proxying it would answer
+  # with one backend's counters, which looks like a fleet total and is not.
+  #
+  # Two working choices:
+  #   - the router's metrics listener, with the router run with --vllm-metrics
+  #     (it knows its backend set, so it is the only component that can produce
+  #     a correct fleet aggregate):
+  #       vllmMetricsUrls: ["http://router:29000"]
+  #   - every backend directly, which the per-endpoint delta accumulator sums
+  #     correctly across restarts and departures:
+  #       vllmMetricsUrls: ["http://node:8000", "http://node:8001", ...]
+  #
+  # Empty derives /metrics from `endpoint`, which is right only when serving it
+  # directly. A bare endpoint or a full /metrics URL both work.
+  vllmMetricsUrls: []
   replayNoStamp: false     # disable per-run cache-busting stamp (bitwise-faithful replay)
   maxOutputTokens: 0       # override max output tokens per request (0 = use replay-file's own budgets)
   concurrency: 28          # fixed concurrency (0 = auto hill-climber)
