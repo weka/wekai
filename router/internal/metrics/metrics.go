@@ -517,8 +517,20 @@ func warm() {
 
 // Handler serves the metrics endpoint. It is mounted on its own listener, never
 // on the inference mux (GW-13).
+//
+// Compression is DISABLED here and negotiated by the caller instead. The router
+// appends upstream vLLM totals to this exposition so one scrape covers both,
+// and a handler that had already gzipped its own output produced a body of
+// [gzip member][plain text]. Go's reader treats a gzip stream as multistream:
+// having finished the first member it read the appended text as the next
+// member's header and failed with "gzip: invalid header". The scrape then
+// worked without Accept-Encoding and failed with it — which is every Go client,
+// since the transport sets that header itself and decompresses transparently.
+//
+// One body, one encoding, chosen once, after everything that contributes to it
+// has written.
 func Handler(reg *prometheus.Registry) http.Handler {
-	return promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg})
+	return promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg, DisableCompression: true})
 }
 
 // StatusClass buckets a status code so the `status` label stays a closed enum

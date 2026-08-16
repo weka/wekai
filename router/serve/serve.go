@@ -13,6 +13,8 @@
 package serve
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -21,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -492,14 +495,41 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 	if opts.MetricsListen != "" {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-			metrics.Handler(metrics.Registry()).ServeHTTP(w, r)
-			// Upstream totals are appended to the router's own exposition, so
-			// one scrape target covers both. They are rendered rather than
+			// Both expositions are rendered into one buffer and encoded once.
+			//
+			// Upstream totals are appended to the router's own exposition so a
+			// single scrape target covers both. They are rendered rather than
 			// registered as collectors because their names and labels come from
-			// the upstreams, not from anything declared here.
+			// the upstreams, not from anything declared here — but that means a
+			// second writer touches the response after promhttp has finished,
+			// and promhttp negotiates compression. Letting it compress and then
+			// appending plain text yields [gzip member][plain text], which a Go
+			// client reads as a malformed second member. So promhttp renders
+			// uncompressed and the encoding is chosen here, once, with the whole
+			// body in hand.
+			var body bytes.Buffer
+			rec := &metricsBuffer{hdr: http.Header{}, buf: &body, status: http.StatusOK}
+			metrics.Handler(metrics.Registry()).ServeHTTP(rec, r)
 			if agg != nil {
-				_ = agg.Render(w)
+				_ = agg.Render(&body)
 			}
+
+			h := w.Header()
+			for k, v := range rec.hdr {
+				h[k] = v
+			}
+			h.Del("Content-Length") // the buffer's length is the real one
+			if acceptsGzip(r) {
+				h.Set("Content-Encoding", "gzip")
+				w.WriteHeader(rec.status)
+				zw := gzip.NewWriter(w)
+				_, _ = zw.Write(body.Bytes())
+				_ = zw.Close()
+				return
+			}
+			h.Set("Content-Length", strconv.Itoa(body.Len()))
+			w.WriteHeader(rec.status)
+			_, _ = w.Write(body.Bytes())
 		})
 		// The kubelet's probes live here, not on the inference listener: their
 		// answer is operational detail — fleet size, health, and why the router
@@ -833,4 +863,28 @@ func signalSummary(c affinity.Config) string {
 		out += fmt.Sprintf(",imbalance=%.3g", c.RebalanceRatio)
 	}
 	return out
+}
+
+// metricsBuffer captures a handler's output so a second writer can append to it
+// before anything reaches the wire.
+type metricsBuffer struct {
+	hdr    http.Header
+	buf    *bytes.Buffer
+	status int
+}
+
+func (m *metricsBuffer) Header() http.Header         { return m.hdr }
+func (m *metricsBuffer) Write(b []byte) (int, error) { return m.buf.Write(b) }
+func (m *metricsBuffer) WriteHeader(code int)        { m.status = code }
+
+// acceptsGzip reports whether the client offered gzip, matching the token
+// rather than the raw string so "x-gzip" or "gzipfoo" cannot false-positive.
+func acceptsGzip(r *http.Request) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		name, _, _ := strings.Cut(strings.TrimSpace(part), ";")
+		if strings.EqualFold(name, "gzip") {
+			return true
+		}
+	}
+	return false
 }
