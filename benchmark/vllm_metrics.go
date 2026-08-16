@@ -6,8 +6,20 @@ package benchmark
 // vllmMetricsSampleInterval and persists per-source cumulative prompt-token
 // counters into the same --save-request-data JSONL stream as the request rows,
 // as records of their own type ("vllm_metrics_sample"). Sampling is strictly
-// best-effort: any fetch/parse failure skips that sample and can never affect
-// the benchmark itself.
+// best-effort and can never affect the benchmark itself.
+//
+// The persisted totals are a CONTINUOUS SUM OF PER-ENDPOINT DELTAS, not a sum
+// of the raw counters. Summing raw counters breaks the moment the fleet moves:
+// a pod restarting resets its counter to zero and the fleet sum drops, which
+// downstream reads as a counter reset and discards the interval; a pod leaving
+// subtracts everything it ever did. Deltas survive both — a restart contributes
+// its post-restart value from zero, and an endpoint that goes away simply stops
+// adding while the work it already did stays counted.
+//
+// One endpoint failing therefore costs only that endpoint's contribution for
+// that interval, not the whole sample. What IS lost is recorded: every sample
+// carries how many endpoints answered, so a flat interval can be told apart
+// from an unobserved one.
 //
 // Eligibility is deliberately looser than type=openai_vllm. Any chat/completions
 // endpoint — type=openai, the default type, or an autodiscovered bare host:port
@@ -73,12 +85,25 @@ type vllmSourceCounters struct {
 // JSONL alongside requestDataRecord rows. record_type distinguishes it from
 // request rows (which carry no record_type field).
 type vllmMetricsSample struct {
-	RecordType          string             `json:"record_type"`
-	TS                  time.Time          `json:"ts"`
-	Model               string             `json:"model"`
-	Sources             vllmSourceCounters `json:"sources"`
-	ActiveDatasetTokens int64              `json:"active_dataset_tokens"`
-	ActiveSeries        int                `json:"active_series"`
+	RecordType string             `json:"record_type"`
+	TS         time.Time          `json:"ts"`
+	Model      string             `json:"model"`
+	Sources    vllmSourceCounters `json:"sources"`
+
+	// EndpointsOK of EndpointsTotal answered this round. Without them a flat
+	// interval and an unobserved one look identical, and the natural reading of
+	// a flat one — "the fleet did nothing" — is the wrong one.
+	EndpointsOK    int `json:"endpoints_ok"`
+	EndpointsTotal int `json:"endpoints_total"`
+
+	// Resets seen so far, cumulative. A pod restart is normal and handled; the
+	// same address resetting repeatedly means each scrape reads a DIFFERENT
+	// process, which is what a Service or load balancer in place of a pod looks
+	// like, and no delta scheme can work through that.
+	Resets int `json:"resets"`
+
+	ActiveDatasetTokens int64 `json:"active_dataset_tokens"`
+	ActiveSeries        int   `json:"active_series"`
 }
 
 var promSourceLabelRe = regexp.MustCompile(`\bsource="([^"]*)"`)
@@ -240,6 +265,12 @@ type vllmMetricsSampler struct {
 	consecFails   int
 	everSucceeded bool
 
+	// The delta accumulator. prev is the last raw counter seen per endpoint per
+	// source; totals is the running sum of deltas, which is what gets persisted.
+	prev   map[string]map[string]float64
+	totals map[string]float64
+	resets int
+
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -270,6 +301,8 @@ func startVLLMMetricsSampler(ctx context.Context, model string, tracker *activeD
 		interval: vllmMetricsSampleInterval,
 		client:   &http.Client{},
 		now:      time.Now,
+		prev:     map[string]map[string]float64{},
+		totals:   map[string]float64{},
 		logf:     func(f string, a ...any) { fmt.Fprintf(os.Stderr, "[vllm-metrics] "+f+"\n", a...) },
 		cancel:   cancel,
 		done:     make(chan struct{}),
@@ -306,47 +339,118 @@ func (s *vllmMetricsSampler) run(ctx context.Context) {
 	}
 }
 
-// sampleOnce fetches every endpoint and writes one sample record. Any
-// endpoint failing (refused/timeout/non-200/parse failure/family absent)
-// skips the whole sample so the cumulative sums stay consistent across the
-// endpoint set — a partial sum would read as a counter reset downstream.
+// sampleOnce fetches every endpoint, folds each one's DELTA into the running
+// totals, and writes one sample record.
 //
-// It reports whether the sampler should keep polling; false means the
-// endpoint has been established as one that will never answer.
+// Per endpoint, and by delta, because the alternative breaks on any fleet that
+// moves. Summing raw counters means a pod restart drops the fleet sum — read
+// downstream as a counter reset — and a pod leaving subtracts its entire
+// history. Requiring every endpoint to answer before recording anything means
+// one slow node costs the whole fleet's interval, which on a loaded fleet is
+// most of them: /metrics is served by the same event loop as inference, so the
+// backends most worth measuring are the ones most likely to miss the timeout.
+//
+// So: an endpoint that fails contributes nothing this round and keeps its
+// baseline, an endpoint whose counter went backwards restarted and contributes
+// from zero, and an endpoint that never comes back stops contributing while
+// what it already did stays counted. The sample is written either way, carrying
+// how many endpoints answered so a flat interval is distinguishable from an
+// unobserved one.
+//
+// It reports whether the sampler should keep polling; false means the endpoint
+// set has been established as one that will never answer.
 func (s *vllmMetricsSampler) sampleOnce(ctx context.Context) (keepPolling bool) {
-	sums := map[string]float64{}
+	ok := 0
+	var lastErr error
+	var lastBadURL string
 	for _, u := range s.urls {
 		vals, err := s.fetchOne(ctx, u)
 		if err != nil {
-			s.skipped.Add(1)
-			// A cancelled run is the benchmark ending, not the endpoint
-			// failing; don't spend the speculative budget on it.
+			// A cancelled run is the benchmark ending, not the endpoint failing.
 			if ctx.Err() != nil {
 				return false
 			}
-			return s.noteFailure(u, err)
+			lastErr, lastBadURL = err, u
+			continue
 		}
-		for k, v := range vals {
-			sums[k] += v
-		}
+		ok++
+		s.fold(u, vals)
 	}
-	s.noteSuccess()
+
+	if ok == 0 {
+		s.skipped.Add(1)
+		// Nothing answered. Still record the interval — with EndpointsOK at 0 it
+		// reads as unobserved rather than idle, which is the true statement and
+		// the one a flat bar cannot make on its own.
+		s.write(0)
+		return s.noteFailure(lastBadURL, lastErr)
+	}
+	if ok < len(s.urls) {
+		s.skipped.Add(1)
+		if s.consecFails == 0 {
+			s.log("%d of %d endpoints answered (%v: %v) — their deltas are missing from this "+
+				"interval; totals stay correct because they are sums of deltas",
+				ok, len(s.urls), lastBadURL, lastErr)
+		}
+		s.consecFails++
+	} else {
+		s.noteSuccess()
+	}
+	s.write(ok)
+	return true
+}
+
+// fold adds one endpoint's delta since its last reading into the totals.
+func (s *vllmMetricsSampler) fold(url string, vals map[string]float64) {
+	prev := s.prev[url]
+	if prev == nil {
+		prev = map[string]float64{}
+		s.prev[url] = prev
+	}
+	for key, cur := range vals {
+		last, had := prev[key]
+		switch {
+		case !had:
+			// First sighting establishes a BASELINE and contributes nothing.
+			//
+			// This is the one place the benchmark deliberately differs from the
+			// router's aggregator, which adds the whole first value so its
+			// fleet totals include work done before it started. A run wants only
+			// what happened DURING it, and these pods carry counters from
+			// whatever ran before. The cost is at most one interval of a pod
+			// that joins mid-run, which starts near zero anyway.
+		case cur < last:
+			// Restarted. Treating this as a decrease is the bug the scheme exists
+			// to avoid, so the post-restart value counts from zero.
+			s.totals[key] += cur
+			s.resets++
+		default:
+			s.totals[key] += cur - last
+		}
+		prev[key] = cur
+	}
+}
+
+// write persists the accumulated totals with this round's coverage.
+func (s *vllmMetricsSampler) write(endpointsOK int) {
 	adt, active := s.tracker.Sum()
 	rec := vllmMetricsSample{
 		RecordType: recordTypeVLLMMetricsSample,
 		TS:         s.now(),
 		Model:      s.model,
 		Sources: vllmSourceCounters{
-			Compute:       int64(sums["local_compute"]),
-			LocalCache:    int64(sums["local_cache_hit"]),
-			ExternalCache: int64(sums["external_kv_transfer"]),
+			Compute:       int64(s.totals["local_compute"]),
+			LocalCache:    int64(s.totals["local_cache_hit"]),
+			ExternalCache: int64(s.totals["external_kv_transfer"]),
 		},
+		EndpointsOK:         endpointsOK,
+		EndpointsTotal:      len(s.urls),
+		Resets:              s.resets,
 		ActiveDatasetTokens: adt,
 		ActiveSeries:        active,
 	}
 	// Write errors are swallowed: sampling must never affect the benchmark.
 	_ = s.rdw.writeAny(rec)
-	return true
 }
 
 // noteSuccess records a landed sample. The first one is announced, and it
@@ -422,11 +526,16 @@ func (s *vllmMetricsSampler) fetchOne(ctx context.Context, url string) (map[stri
 // (cumulative counter diffs, clamped at 0 so counter resets don't render as
 // negative), embedded into the visualization data.
 type vizSampleSegment struct {
-	T0            float64 `json:"t0"` // interval start, unix ms
-	T1            float64 `json:"t1"` // interval end, unix ms
-	Compute       float64 `json:"c"`
-	LocalCache    float64 `json:"lc"`
-	ExternalCache float64 `json:"ec"`
+	T0 float64 `json:"t0"` // interval start, unix ms
+	T1 float64 `json:"t1"` // interval end, unix ms
+	// EndpointsOK/Total for the sample that CLOSED this interval. A segment
+	// whose deltas are zero means the fleet was idle only if the endpoints
+	// answered; with none answering it means nobody looked.
+	EndpointsOK    int     `json:"endpoints_ok"`
+	EndpointsTotal int     `json:"endpoints_total"`
+	Compute        float64 `json:"c"`
+	LocalCache     float64 `json:"lc"`
+	ExternalCache  float64 `json:"ec"`
 }
 
 // vizAdtPoint is one active-dataset observation for the overlay line.
@@ -446,6 +555,10 @@ func buildSampleViz(samples []vllmMetricsSample) (mix []vizSampleSegment, adt []
 	copy(sorted, samples)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].TS.Before(sorted[j].TS) })
 
+	// Totals are sums of per-endpoint deltas and so never decrease. The clamp
+	// stays as a floor against a malformed or hand-edited JSONL rather than as
+	// the thing that makes restarts survivable — that is the accumulator's job,
+	// upstream, where the endpoint identity is still known.
 	clamp := func(cur, prev int64) float64 {
 		d := cur - prev
 		if d < 0 {
@@ -464,11 +577,13 @@ func buildSampleViz(samples []vllmMetricsSample) (mix []vizSampleSegment, adt []
 		}
 		prev := sorted[i-1]
 		mix = append(mix, vizSampleSegment{
-			T0:            float64(prev.TS.UnixMilli()),
-			T1:            float64(smp.TS.UnixMilli()),
-			Compute:       clamp(smp.Sources.Compute, prev.Sources.Compute),
-			LocalCache:    clamp(smp.Sources.LocalCache, prev.Sources.LocalCache),
-			ExternalCache: clamp(smp.Sources.ExternalCache, prev.Sources.ExternalCache),
+			T0:             float64(prev.TS.UnixMilli()),
+			T1:             float64(smp.TS.UnixMilli()),
+			Compute:        clamp(smp.Sources.Compute, prev.Sources.Compute),
+			LocalCache:     clamp(smp.Sources.LocalCache, prev.Sources.LocalCache),
+			ExternalCache:  clamp(smp.Sources.ExternalCache, prev.Sources.ExternalCache),
+			EndpointsOK:    smp.EndpointsOK,
+			EndpointsTotal: smp.EndpointsTotal,
 		})
 	}
 	return mix, adt
