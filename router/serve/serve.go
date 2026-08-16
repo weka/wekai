@@ -525,8 +525,20 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			}
 			return out
 		}
-		log.Info("aggregating upstream vLLM metrics from the live backend set",
-			"backends", len(eps()), "interval", agg.Interval())
+		// The count is a snapshot of a set that is about to change, so an empty
+		// one says so explicitly. A pool populated by pod discovery has nothing
+		// in it yet at this point, and "backends=0" beside "aggregating" reads
+		// as nothing to scrape — the same absent-versus-zero misreading that has
+		// already cost this project fleet time.
+		if n := len(eps()); n > 0 {
+			log.Info("aggregating upstream vLLM metrics from the live backend set",
+				"backends", n, "interval", agg.Interval())
+		} else {
+			log.Info("aggregating upstream vLLM metrics from the live backend set, which is "+
+				"empty right now: discovery and health populate it, and the aggregator re-reads "+
+				"it every cycle rather than freezing this list",
+				"backends", 0, "interval", agg.Interval())
+		}
 		go agg.Run(ctx, eps)
 	}
 
