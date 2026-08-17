@@ -745,7 +745,7 @@ func runRouterReplayInstance(
 		// Hold until this turn is due. Already-late turns return at once, which
 		// is the normal case on a fleet slower than the capture: the session
 		// falls behind rather than firing a backlog.
-		pacer.Wait(ctx, req.Ts)
+		st.lag.observe(pacer.Wait(ctx, req.Ts))
 		if ctx.Err() != nil {
 			return
 		}

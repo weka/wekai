@@ -236,3 +236,61 @@ func TestGovernorDefaultsAreOff(t *testing.T) {
 		t.Error("a fresh window must open the gate so a run can start")
 	}
 }
+
+// Lateness is what says whether a real-time replay was real-time. A run whose
+// sessions all fell an hour behind produces the same request count, token
+// totals and cache curve as one that kept up, and differs only in how much
+// captured conversation it actually covered — which nothing else records.
+func TestPacerReportsHowLateItWas(t *testing.T) {
+	origin := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	// Origin an hour in the past: every turn is already overdue.
+	p := newSessionPacer("2026-05-12T08:50:06Z", origin.Add(-time.Hour), true, newSkipClock(false))
+	p.origin = time.Now().Add(-time.Hour)
+
+	late := p.Wait(context.Background(), "2026-05-12T08:50:06Z")
+	if late < 50*time.Minute {
+		t.Errorf("reported %v late on a turn due an hour ago; a fleet slower than the capture "+
+			"makes every session fall behind and this is the only thing that says so", late)
+	}
+}
+
+func TestPacerReportsZeroWhenItActuallyWaited(t *testing.T) {
+	p := newSessionPacer("2026-05-12T08:50:06Z", time.Now(), true, newSkipClock(false))
+	// Due 50ms out: Wait blocks and is therefore not late.
+	if late := p.Wait(context.Background(), "2026-05-12T08:50:06.05Z"); late != 0 {
+		t.Errorf("reported %v late on a turn it waited for", late)
+	}
+}
+
+func TestPacingLagSummarySeparatesLateFromOnTime(t *testing.T) {
+	var l pacingLag
+	for range 7 {
+		l.observe(0) // on time
+	}
+	l.observe(2 * time.Second)
+	l.observe(30 * time.Second)
+	l.observe(20 * time.Minute)
+
+	s := l.summary()
+	for _, want := range []string{"paced=10", "late=3", ">1s=3", ">10s=2", ">1m=1", ">10m=1"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("summary %q is missing %q", s, want)
+		}
+	}
+	// The mean must be over LATE requests only — (2s + 30s + 20m) / 3 — not over
+	// all ten. Averaging in the on-time zeros would report this run as 2m03s
+	// behind when the requests that were late averaged 6m51s, which flatters
+	// exactly the runs worth catching.
+	if !strings.Contains(s, "mean_late=6m50.667s") {
+		t.Errorf("summary %q: mean_late must average the late requests only, giving 6m50.667s", s)
+	}
+}
+
+// TestPacingLagSaysNothingWhenNothingWasPaced: a flat-out run must not emit a
+// line implying it was paced.
+func TestPacingLagSaysNothingWhenNothingWasPaced(t *testing.T) {
+	var l pacingLag
+	if s := l.summary(); s != "" {
+		t.Errorf("summary = %q on a run that paced nothing", s)
+	}
+}

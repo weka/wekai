@@ -919,9 +919,11 @@ type autoState struct {
 	cacheWarning bool // server doesn't appear to support caching
 
 	// Real-time replay governor. ttft is what the admission gate reads; skipClk
-	// is the shared clock the pacers wait against.
+	// is the shared clock the pacers wait against; lag records how far behind
+	// their captured schedule requests are actually going out.
 	ttft    *ttftWindow
 	skipClk *skipClock
+	lag     *pacingLag
 
 	allTimePeakRPS    float64 // highest req/s ever seen (never reset)
 	allTimePeakConc   int     // concurrency at which allTimePeakRPS was achieved
@@ -1634,6 +1636,7 @@ func runSingleModelBenchmark(
 		datasetTracker:    newActiveDatasetTracker(),
 		ttft:              newTTFTWindow(cfg.TTFTWindow),
 		skipClk:           newSkipClock(cfg.ReplayRealtime && cfg.ReplaySkipIdle),
+		lag:               &pacingLag{},
 	}
 	if sampler := startVLLMMetricsSampler(benchCtx, cfg.Model, cfg.VLLMMetricsURLs, st.datasetTracker, rdw); sampler != nil {
 		// stop() is deferred after rdw's close, so it runs first (LIFO) and
@@ -2059,6 +2062,33 @@ func runSingleModelBenchmark(
 	// relative to how fast the fleet answers; overshoot is bounded, not
 	// runaway, and simulation puts it around 0.9s past a 5s limit at the most
 	// aggressive rate worth using.
+	// The mode's own vital signs, on a slow cadence: how far behind the captured
+	// schedule the run is, how much dead time was skipped, and how many sessions
+	// are live. Without the first of these a run that fell an hour behind is
+	// indistinguishable from one that kept up.
+	if cfg.ReplayRealtime {
+		go func() {
+			t := time.NewTicker(time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-benchCtx.Done():
+					fmt.Fprintf(os.Stderr, "[realtime] final %s skipped=%s\n",
+						st.lag.summary(), st.skipClk.Skew().Round(time.Second))
+					return
+				case <-t.C:
+				}
+				st.mu.Lock()
+				series := st.series
+				st.mu.Unlock()
+				mean, n := st.ttft.Mean(time.Now())
+				fmt.Fprintf(os.Stderr, "[realtime] sessions=%d ttft_win=%s/%d %s skipped=%s\n",
+					series, mean.Round(time.Millisecond), n, st.lag.summary(),
+					st.skipClk.Skew().Round(time.Second))
+			}
+		}()
+	}
+
 	if cfg.AdmitEvery > 0 {
 		go func() {
 			t := time.NewTicker(cfg.AdmitEvery)

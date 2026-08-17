@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -142,17 +143,27 @@ func (p *sessionPacer) dueAt(ts string) (time.Time, bool) {
 	return p.origin.Add(off), true
 }
 
-// Wait blocks until the request is due, or returns immediately if it is already
-// late — which is the common case on a fleet slower than the capture.
-func (p *sessionPacer) Wait(ctx context.Context, ts string) {
+// Wait blocks until the request is due, and reports how LATE it was — zero if it
+// waited, positive if the moment had already passed.
+//
+// Lateness is the mode's defining measurement and nothing else exposes it. A
+// fleet slower than the capture makes every session fall behind its own
+// schedule, and the run then replays less captured time than it spent: eight
+// hours of wall clock covering three hours of conversation is a different
+// experiment from the one that was asked for, and the totals look identical
+// either way. Only the lag says which happened.
+func (p *sessionPacer) Wait(ctx context.Context, ts string) time.Duration {
 	due, ok := p.dueAt(ts)
 	if !ok {
-		return
+		return 0
+	}
+	if late := p.clk.Now().Sub(due); late > 0 {
+		return late
 	}
 	for {
 		now := p.clk.Now()
 		if !due.After(now) {
-			return
+			return 0
 		}
 		p.clk.enterWait(due)
 		t := time.NewTimer(due.Sub(now))
@@ -160,10 +171,10 @@ func (p *sessionPacer) Wait(ctx context.Context, ts string) {
 		case <-ctx.Done():
 			t.Stop()
 			p.clk.leaveWait()
-			return
+			return 0
 		case <-t.C:
 			p.clk.leaveWait()
-			return
+			return 0
 		case <-p.clk.skipped():
 			// The clock jumped forward while every session was idle; re-read it
 			// rather than trusting the timer we set against the old reading.
@@ -304,4 +315,58 @@ func (c *skipClock) Skew() time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.skew
+}
+
+// ---------------------------------------------------------------- lag
+
+// pacingLag accumulates how far behind their captured schedule requests are
+// going out.
+//
+// Reported rather than inferred, because the alternative is unanswerable after
+// the fact: a run whose sessions all fell an hour behind produces the same
+// request count, token totals and cache curve as one that kept up, and differs
+// only in how much captured conversation it actually covered.
+type pacingLag struct {
+	mu    sync.Mutex
+	n     int64
+	late  int64 // requests that went out after their due time
+	sum   time.Duration
+	max   time.Duration
+	overs [4]int64 // > 1s, > 10s, > 1m, > 10m
+}
+
+func (l *pacingLag) observe(d time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.n++
+	if d <= 0 {
+		return
+	}
+	l.late++
+	l.sum += d
+	if d > l.max {
+		l.max = d
+	}
+	for i, t := range [4]time.Duration{time.Second, 10 * time.Second, time.Minute, 10 * time.Minute} {
+		if d > t {
+			l.overs[i]++
+		}
+	}
+}
+
+// summary is one line, empty when nothing was paced.
+func (l *pacingLag) summary() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.n == 0 {
+		return ""
+	}
+	var mean time.Duration
+	if l.late > 0 {
+		mean = l.sum / time.Duration(l.late)
+	}
+	return fmt.Sprintf(
+		"paced=%d late=%d (%.1f%%) mean_late=%s max_late=%s >1s=%d >10s=%d >1m=%d >10m=%d",
+		l.n, l.late, 100*float64(l.late)/float64(l.n), mean.Round(time.Millisecond),
+		l.max.Round(time.Millisecond), l.overs[0], l.overs[1], l.overs[2], l.overs[3])
 }

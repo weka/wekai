@@ -59,7 +59,7 @@ replay:
   # so a faithful replay is mostly a replay of nobody typing. Safe because the
   # idle precondition means no in-flight request can have its latency distorted.
   # Rarely fires once the run is loaded, which is the intent.
-  skipIdle: false
+  skipIdle: true
   # admitEvery is how fast the count climbs under realtime: one session, then
   # one more this often while the fleet keeps up. Concurrency is then whatever
   # the fleet's latency implies rather than a number set here. Ignored unless
