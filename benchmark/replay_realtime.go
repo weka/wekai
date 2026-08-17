@@ -434,6 +434,14 @@ func (l *pacingLag) summary(now time.Time) string {
 	// so far been alive is exactly as meaningful as a finished session's, and
 	// leaving them out is what made the ratio a statement about which sessions
 	// happened to be short.
+	// `now` MUST come from the same clock the origins did — the skip clock, not
+	// wall time. Sessions are stamped with skipClk.Now(), which runs ahead of
+	// the wall by however much idle time was compressed, so a wall-clock `now`
+	// makes every session admitted after a skip look as though it started in the
+	// future. The guard below then dropped them from the DENOMINATOR while their
+	// coverage still counted in the numerator, and fidelity came out above 1.0 —
+	// which is not a physically possible number, since a turn cannot fire before
+	// its captured offset.
 	covered, wall := l.covered, l.wall
 	for _, s := range l.live {
 		covered += time.Duration(s.covered.Load())

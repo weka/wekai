@@ -221,9 +221,14 @@ type requestDataRecord struct {
 	RequestNum int    `json:"request_num"`
 
 	// Cache status
-	CacheHit             bool `json:"cache_hit"`              // implicit or explicit
-	ServerCacheConfirmed bool `json:"server_cache_confirmed"` // explicit only
-	IsColdStart          bool `json:"is_cold_start"`
+	CacheHit bool `json:"cache_hit"` // server-reported where available, else the TTFT heuristic
+	// CacheHitRatio is the share of prompt tokens the SERVER said it reused. A
+	// partial prefix hit is the normal case on agentic traffic and is neither a
+	// hit nor a miss, so the boolean above loses what this keeps. 1.0 where only
+	// the TTFT heuristic was available and it fired.
+	CacheHitRatio        float64 `json:"cache_hit_ratio"`
+	ServerCacheConfirmed bool    `json:"server_cache_confirmed"` // explicit only
+	IsColdStart          bool    `json:"is_cold_start"`
 
 	// Token usage
 	InputTokens  int `json:"input_tokens"`
@@ -1987,7 +1992,35 @@ func runSingleModelBenchmark(
 					st.ttftDegradedCount.Add(1)
 				}
 
-				cacheHit := !isCold && !ttftDegraded && implicitCache
+				// The SERVER'S OWN ANSWER WINS wherever it exists.
+				//
+				// It did not. cacheHit was the TTFT heuristic alone, and explicitCache was
+				// recorded in a separate column that nothing consulted — so a request the
+				// server said reused 90k of a 100k prompt was written down as a miss because
+				// its first token was not fast. Sampled on a live arm, 55% of the requests
+				// called misses had a non-zero cached_tokens. The heuristic exists for
+				// servers that report no usage at all; where usage exists it is a guess
+				// standing in front of a fact.
+				//
+				// And a hit is not really a boolean. The server reports HOW MANY tokens it
+				// reused, and a partial prefix hit — the normal case on agentic traffic — is
+				// neither a hit nor a miss. cacheHitRatio carries that; the boolean is kept
+				// only because the progress line and the report have always had one. Where
+				// the heuristic is all there is, a hit implies the whole prompt, so the ratio
+				// is 1.
+				usageReported := metrics.UsageData.InputTokens.Count+metrics.UsageData.CachedTokens.Count > 0
+				cacheHitRatio := 0.0
+				if usageReported {
+					cacheHitRatio = float64(metrics.UsageData.CachedTokens.Count) /
+						float64(metrics.UsageData.InputTokens.Count+metrics.UsageData.CachedTokens.Count)
+				}
+				cacheHit := explicitCache
+				if !usageReported {
+					cacheHit = !isCold && !ttftDegraded && implicitCache
+					if cacheHit {
+						cacheHitRatio = 1
+					}
+				}
 				if cacheHit && metrics.TimeToFirstToken > 0 {
 					st.earlyHitMu.Lock()
 					if len(st.earlyHitTTFTs) < maxEarlyHit {
@@ -2015,6 +2048,7 @@ func runSingleModelBenchmark(
 						SeriesNum:            seriesNum,
 						RequestNum:           requestNum,
 						CacheHit:             cacheHit,
+						CacheHitRatio:        cacheHitRatio,
 						ServerCacheConfirmed: serverCacheConfirmed,
 						IsColdStart:          isCold,
 						InputTokens:          metrics.UsageData.InputTokens.Count,
@@ -2099,7 +2133,7 @@ func runSingleModelBenchmark(
 				select {
 				case <-benchCtx.Done():
 					fmt.Fprintf(os.Stderr, "[realtime] final %s skipped=%s\n",
-						st.lag.summary(time.Now()), st.skipClk.Skew().Round(time.Second))
+						st.lag.summary(st.skipClk.Now()), st.skipClk.Skew().Round(time.Second))
 					return
 				case <-t.C:
 				}
@@ -2113,7 +2147,7 @@ func runSingleModelBenchmark(
 				// adding it to the retired count double-counts every worker that
 				// has finished one and started another.
 				fmt.Fprintf(os.Stderr, "[realtime] slots=%d ttft_win=%s/%d %s skipped=%s\n",
-					series, mean.Round(time.Millisecond), n, st.lag.summary(time.Now()),
+					series, mean.Round(time.Millisecond), n, st.lag.summary(st.skipClk.Now()),
 					st.skipClk.Skew().Round(time.Second))
 			}
 		}()

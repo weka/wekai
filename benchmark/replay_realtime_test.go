@@ -439,3 +439,44 @@ func TestGateSeesBackoffWait(t *testing.T) {
 			"plateau above the honest one")
 	}
 }
+
+// TestFidelityCannotExceedOne. A turn cannot fire before its captured offset,
+// so covered can never outrun alive — a ratio above 1.0 is not a bad estimate,
+// it is arithmetic from two different clocks.
+//
+// That is exactly what happened: sessions are stamped with the skip clock,
+// which runs ahead of the wall by the idle time compressed so far, and the
+// summary was handed wall time. Every session admitted after a skip looked as
+// though it started in the future, so it was dropped from the denominator while
+// its coverage still counted in the numerator. Reported 3.83.
+func TestFidelityCannotExceedOne(t *testing.T) {
+	clk := newSkipClock(true)
+	var l pacingLag
+	l.observe(0)
+
+	// A session stamped on the skip clock, which is four minutes ahead of the
+	// wall because that much dead time was compressed.
+	clk.mu.Lock()
+	clk.skew = 4 * time.Minute
+	clk.mu.Unlock()
+	origin := clk.Now()
+
+	var covered atomic.Int64
+	covered.Store(int64(30 * time.Second))
+	l.beginSession(&covered, origin)
+
+	// Reported against the SAME clock the origin came from, a minute later.
+	got := l.summary(origin.Add(time.Minute))
+	if strings.Contains(got, "fidelity 3.") || strings.Contains(got, "fidelity 2.") {
+		t.Fatalf("summary %q: the denominator is dropping sessions", got)
+	}
+	if !strings.Contains(got, "fidelity 0.50") {
+		t.Errorf("summary %q, want fidelity 0.50 (30s covered in 60s alive)", got)
+	}
+
+	// And the failure mode itself: wall time against a skewed origin.
+	wallNow := origin.Add(-3 * time.Minute) // wall lags the skip clock
+	if bad := l.summary(wallNow); strings.Contains(bad, "fidelity 0.50") {
+		t.Error("premise check: a mismatched clock should NOT produce the right answer")
+	}
+}

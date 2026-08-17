@@ -371,6 +371,24 @@ func recordReplayRequest(
 		recentColdBaseline = *coldStartTTFT
 	}
 
+	// What `cache=%` in the progress line is, and what it is NOT.
+	//
+	// This infers a cache hit from a first token arriving faster than the recent
+	// cold baseline. It is a CALLER-EXPERIENCE heuristic and not a cache
+	// measurement, and the two diverge badly on agentic traffic: sampled against
+	// the servers' own usage on a live arm, 55% of requests it called misses had
+	// a non-zero cached_tokens. Partial prefix hits are the reason — a request
+	// that reuses 90k of a 100k prompt still pays real prefill, so it is slow by
+	// this test and cached by the server's.
+	//
+	// Since TTFT now includes 429 backoff, it reads stricter still on a
+	// saturated fleet. That is intended: a fleet that made the caller queue did
+	// not serve them from cache in any sense they experienced.
+	//
+	// The cache MEASUREMENTS are token-denominated and untouched by any of this:
+	// `scached`/`in` from the servers' reported cached_tokens, and the router's
+	// aggregated vllm:prompt_tokens_by_source_total. Quote those. A reader
+	// seeing both will assume they measure the same thing; they do not.
 	var implicitCache bool
 	if recentColdBaseline > 0 {
 		hitThresh := time.Duration(float64(recentColdBaseline) * cfg.TTFTHitThreshold)
@@ -384,7 +402,35 @@ func recordReplayRequest(
 		st.ttftDegradedCount.Add(1)
 	}
 
-	cacheHit := !isCold && !ttftDegraded && implicitCache
+	// The SERVER'S OWN ANSWER WINS wherever it exists.
+	//
+	// It did not. cacheHit was the TTFT heuristic alone, and explicitCache was
+	// recorded in a separate column that nothing consulted — so a request the
+	// server said reused 90k of a 100k prompt was written down as a miss because
+	// its first token was not fast. Sampled on a live arm, 55% of the requests
+	// called misses had a non-zero cached_tokens. The heuristic exists for
+	// servers that report no usage at all; where usage exists it is a guess
+	// standing in front of a fact.
+	//
+	// And a hit is not really a boolean. The server reports HOW MANY tokens it
+	// reused, and a partial prefix hit — the normal case on agentic traffic — is
+	// neither a hit nor a miss. cacheHitRatio carries that; the boolean is kept
+	// only because the progress line and the report have always had one. Where
+	// the heuristic is all there is, a hit implies the whole prompt, so the ratio
+	// is 1.
+	usageReported := metrics.UsageData.InputTokens.Count+metrics.UsageData.CachedTokens.Count > 0
+	cacheHitRatio := 0.0
+	if usageReported {
+		cacheHitRatio = float64(metrics.UsageData.CachedTokens.Count) /
+			float64(metrics.UsageData.InputTokens.Count+metrics.UsageData.CachedTokens.Count)
+	}
+	cacheHit := explicitCache
+	if !usageReported {
+		cacheHit = !isCold && !ttftDegraded && implicitCache
+		if cacheHit {
+			cacheHitRatio = 1
+		}
+	}
 	if cacheHit && metrics.TimeToFirstToken > 0 {
 		st.earlyHitMu.Lock()
 		if len(st.earlyHitTTFTs) < maxEarlyHit {
@@ -411,6 +457,7 @@ func recordReplayRequest(
 			SeriesNum:            metrics.SeriesNum,
 			RequestNum:           metrics.RequestNum,
 			CacheHit:             cacheHit,
+			CacheHitRatio:        cacheHitRatio,
 			ServerCacheConfirmed: serverCacheConfirmed,
 			IsColdStart:          isCold,
 			InputTokens:          metrics.UsageData.InputTokens.Count,
