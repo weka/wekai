@@ -575,6 +575,20 @@ func runRouterReplaySession(
 	st.skipClk.AddSession(1)
 	defer st.skipClk.AddSession(-1)
 
+	// ONE origin for the whole session, taken here rather than inside each
+	// instance.
+	//
+	// A sub-agent does not start when the session does — it blocks on the turn
+	// that spawned it — so an origin taken at instance start is already minutes
+	// into the session, while its request offsets are still measured from the
+	// session's own beginning. Adding the two counts that elapsed time twice and
+	// schedules every fan-out branch about as far into the future as it already
+	// was into the past. It shows up as fidelity rather than lateness: the
+	// branch simply waits, so nothing is reported late while the replay runs
+	// slower than the capture it is reproducing.
+	sessionOrigin := st.skipClk.Now()
+	var covered atomic.Int64 // furthest capture offset any instance reached, ns
+
 	// Build done-channels for every included request id. Helpers and
 	// ephemerals carry an implicit parent_spawn_request_id baked in at
 	// prepare time (see router replay-prepare), so the tree is complete:
@@ -619,10 +633,14 @@ func runRouterReplaySession(
 				return
 			}
 			runRouterReplayInstance(benchCtx, cfg, st, rdw,
-				sess.SessionID, sess.StartTs, seriesNum, inst, picker, reqTimeout, docs, requestDone, gate)
+				sess.SessionID, sess.StartTs, sessionOrigin, &covered,
+				seriesNum, inst, picker, reqTimeout, docs, requestDone, gate)
 		}()
 	}
 	wg.Wait()
+	if cfg.ReplayRealtime {
+		st.lag.observeSession(time.Duration(covered.Load()), st.skipClk.Now().Sub(sessionOrigin))
+	}
 }
 
 // buildRoleFilter returns a predicate: empty list -> include everything;
@@ -662,6 +680,8 @@ func runRouterReplayInstance(
 	rdw *requestDataWriter,
 	sessionID string,
 	sessionStartTs string,
+	sessionOrigin time.Time,
+	covered *atomic.Int64,
 	seriesNum int,
 	inst RouterReplayInstance,
 	picker endpointPicker,
@@ -733,7 +753,7 @@ func runRouterReplayInstance(
 	// Real-time pacing is anchored on the SESSION's start, not the instance's,
 	// so every instance of a fan-out shares one timeline and the sub-agents keep
 	// their offsets relative to the turn that spawned them.
-	pacer := newSessionPacer(sessionStartTs, st.skipClk.Now(), cfg.ReplayRealtime, st.skipClk)
+	pacer := newSessionPacer(sessionStartTs, sessionOrigin, cfg.ReplayRealtime, st.skipClk)
 
 	for ti, req := range inst.Requests {
 		if ctx.Err() != nil {
@@ -746,6 +766,18 @@ func runRouterReplayInstance(
 		// is the normal case on a fleet slower than the capture: the session
 		// falls behind rather than firing a backlog.
 		st.lag.observe(pacer.Wait(ctx, req.Ts))
+		// How far into its captured conversation this session has reached. The
+		// furthest offset any of its instances dispatched is the session's own
+		// progress through the capture, and summed across sessions it is what
+		// says how much recorded conversation a run of N hours actually covered.
+		if off, ok := pacer.offsetOf(req.Ts); ok {
+			for {
+				prev := covered.Load()
+				if int64(off) <= prev || covered.CompareAndSwap(prev, int64(off)) {
+					break
+				}
+			}
+		}
 		if ctx.Err() != nil {
 			return
 		}

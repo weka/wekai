@@ -294,3 +294,68 @@ func TestPacingLagSaysNothingWhenNothingWasPaced(t *testing.T) {
 		t.Errorf("summary = %q on a run that paced nothing", s)
 	}
 }
+
+// TestFanOutSharesTheSessionTimeline is the defect this pins.
+//
+// A sub-agent does not start when its session does — it blocks on the turn that
+// spawned it — but its request offsets are still measured from the session's own
+// beginning. An origin taken when the INSTANCE starts therefore adds the elapsed
+// time twice and schedules the branch about as far into the future as it already
+// was into the past.
+//
+// It hides as fidelity rather than lateness: the branch simply waits, so nothing
+// is reported late while the replay runs slower than the capture it reproduces.
+func TestFanOutSharesTheSessionTimeline(t *testing.T) {
+	const start = "2026-05-12T08:50:06Z"
+	sessionOrigin := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+
+	// A sub-agent unblocks five minutes in, and its first turn was captured five
+	// minutes into the session. Anchored on the session it is due NOW; anchored
+	// on the instance it is due five minutes from now.
+	root := newSessionPacer(start, sessionOrigin, true, nil)
+	branch := newSessionPacer(start, sessionOrigin, true, nil) // same origin: the fix
+
+	const turn = "2026-05-12T08:55:06Z" // +5m
+	rootDue, _ := root.dueAt(turn)
+	branchDue, _ := branch.dueAt(turn)
+	if !rootDue.Equal(branchDue) {
+		t.Errorf("root and branch disagree on when a turn is due (%v vs %v); every instance of a "+
+			"session shares one timeline or the fan-out drifts", rootDue, branchDue)
+	}
+	if got := branchDue.Sub(sessionOrigin); got != 5*time.Minute {
+		t.Errorf("turn due at +%v, want +5m: the offset is measured from the session's start, so "+
+			"anchoring anywhere later counts the elapsed time twice", got)
+	}
+
+	// And the instance-anchored form is what was wrong: five minutes of double count.
+	instanceAnchored := newSessionPacer(start, sessionOrigin.Add(5*time.Minute), true, nil)
+	wrongDue, _ := instanceAnchored.dueAt(turn)
+	if wrongDue.Sub(sessionOrigin) != 10*time.Minute {
+		t.Fatalf("premise check failed: instance-anchored due is +%v", wrongDue.Sub(sessionOrigin))
+	}
+}
+
+// TestCoverageIsCapturedTimeOverWallTime. A run that fell behind covers less
+// recorded conversation than its duration implies, and the request totals look
+// identical either way — this ratio is what separates them.
+func TestCoverageIsCapturedTimeOverWallTime(t *testing.T) {
+	var l pacingLag
+	l.observe(0)
+	l.observeSession(30*time.Minute, time.Hour) // half fidelity
+	l.observeSession(time.Hour, time.Hour)      // faithful
+
+	s := l.summary()
+	for _, want := range []string{"retired=2", "covered=1h30m0s", "of 2h0m0s alive", "fidelity 0.75"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("summary %q is missing %q", s, want)
+		}
+	}
+}
+
+func TestCoverageAbsentUntilASessionRetires(t *testing.T) {
+	var l pacingLag
+	l.observe(0)
+	if strings.Contains(l.summary(), "fidelity") {
+		t.Error("fidelity reported before any session finished; it would be a ratio of nothing")
+	}
+}

@@ -143,6 +143,16 @@ func (p *sessionPacer) dueAt(ts string) (time.Time, bool) {
 	return p.origin.Add(off), true
 }
 
+// offsetOf is how far into the captured conversation a turn sits, measured from
+// the session's own start.
+func (p *sessionPacer) offsetOf(ts string) (time.Duration, bool) {
+	due, ok := p.dueAt(ts)
+	if !ok {
+		return 0, false
+	}
+	return due.Sub(p.origin), true
+}
+
 // Wait blocks until the request is due, and reports how LATE it was — zero if it
 // waited, positive if the moment had already passed.
 //
@@ -333,6 +343,24 @@ type pacingLag struct {
 	sum   time.Duration
 	max   time.Duration
 	overs [4]int64 // > 1s, > 10s, > 1m, > 10m
+
+	// Per-session coverage: how much captured conversation was replayed against
+	// how much wall time the session was alive for. Their ratio is the run's
+	// fidelity — 1.0 means an hour of wall clock replayed an hour of capture,
+	// and anything less means the run covered less conversation than its
+	// duration suggests. Nothing else distinguishes those.
+	sessions int64
+	covered  time.Duration
+	wall     time.Duration
+}
+
+// observeSession records one finished session's progress through its capture.
+func (l *pacingLag) observeSession(covered, wall time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sessions++
+	l.covered += covered
+	l.wall += wall
 }
 
 func (l *pacingLag) observe(d time.Duration) {
@@ -365,8 +393,14 @@ func (l *pacingLag) summary() string {
 	if l.late > 0 {
 		mean = l.sum / time.Duration(l.late)
 	}
-	return fmt.Sprintf(
+	out := fmt.Sprintf(
 		"paced=%d late=%d (%.1f%%) mean_late=%s max_late=%s >1s=%d >10s=%d >1m=%d >10m=%d",
 		l.n, l.late, 100*float64(l.late)/float64(l.n), mean.Round(time.Millisecond),
 		l.max.Round(time.Millisecond), l.overs[0], l.overs[1], l.overs[2], l.overs[3])
+	if l.sessions > 0 && l.wall > 0 {
+		out += fmt.Sprintf(" | retired=%d covered=%s of %s alive (fidelity %.2f)",
+			l.sessions, l.covered.Round(time.Second), l.wall.Round(time.Second),
+			float64(l.covered)/float64(l.wall))
+	}
+	return out
 }
