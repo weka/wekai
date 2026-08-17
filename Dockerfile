@@ -19,11 +19,21 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+# TARGETARCH is set by buildkit from the platform being built, so one
+# Dockerfile produces every architecture in the manifest list. Hardcoding
+# amd64 here silently pinned the binary even when the container platform said
+# otherwise — an arm64 node would have pulled an arm64 image containing an
+# amd64 executable, which fails at exec with no useful message.
+ARG TARGETARCH
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH
 RUN go build -o /out/wekai .
 
 # ---- Replay artifact source ----
-FROM ${REPLAY_IMAGE} AS replay
+# Pinned to amd64 deliberately: this stage contributes only replay.jsonl, a
+# platform-independent data file, and the replay image is published as a single
+# amd64 manifest. Without the pin an arm64 build would look for an arm64 variant
+# that does not exist and fail the whole build for a file with no architecture.
+FROM --platform=linux/amd64 ${REPLAY_IMAGE} AS replay
 
 # ---- Runtime ----
 FROM alpine:latest

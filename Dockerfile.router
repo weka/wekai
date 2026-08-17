@@ -20,7 +20,13 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+# TARGETARCH is set by buildkit from the platform being built, so one
+# Dockerfile produces every architecture in the manifest list. Hardcoding
+# amd64 here silently pinned the binary even when the container platform said
+# otherwise — an arm64 node would have pulled an arm64 image containing an
+# amd64 executable, which fails at exec with no useful message.
+ARG TARGETARCH
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH
 # Trimpath and stripped symbols: this image is shipped, and neither the build
 # host's paths nor the DWARF tables belong in it.
 RUN go build -trimpath -ldflags="-s -w" -o /out/wekai .

@@ -5,6 +5,18 @@ from dagger import BuildArg, Ignore, dag, function, object_type
 
 LINUX_AMD64 = dagger.Platform("linux/amd64")
 
+# Every published image is a manifest list covering both architectures, so one
+# tag installs on an x86 fleet and on an arm workstation without the chart or
+# the operator choosing. A single-arch image does not fail at pull time on the
+# wrong node — it fails at exec, with no message that names the cause.
+#
+# The cost is a second build per publish. It is paid because the alternative is
+# an image that works everywhere it has been tried and nowhere it has not.
+PUBLISH_PLATFORMS = [
+    dagger.Platform("linux/amd64"),
+    dagger.Platform("linux/arm64"),
+]
+
 # Mirrors wekai's own .gitignore so a publish digest isn't polluted by
 # local build artifacts, IDE state, or the dagger module's own generated
 # sdk/. Leading "/" anchors to the repo root — an unanchored "wekai"
@@ -67,12 +79,18 @@ async def _publish_image(
     """
     if not version:
         version = await _calc_version(source)
-    container = source.docker_build(
-        platform=LINUX_AMD64,
-        build_args=[BuildArg(name="REPLAY_IMAGE", value=replay_image)],
-    )
+    variants = [
+        source.docker_build(
+            platform=p,
+            build_args=[BuildArg(name="REPLAY_IMAGE", value=replay_image)],
+        )
+        for p in PUBLISH_PLATFORMS
+    ]
     image_name = f"{registry}:{version}"
-    await container.publish(image_name)
+    # Published from an empty container so no single architecture is the
+    # "real" one and the others attachments — every variant is equal in the
+    # resulting manifest list.
+    await dag.container().publish(image_name, platform_variants=variants)
     return image_name, version
 
 
@@ -89,12 +107,12 @@ async def _publish_router_image(
     """
     if not version:
         version = await _calc_version(source)
-    container = source.docker_build(
-        platform=LINUX_AMD64,
-        dockerfile=ROUTER_DOCKERFILE,
-    )
+    variants = [
+        source.docker_build(platform=p, dockerfile=ROUTER_DOCKERFILE)
+        for p in PUBLISH_PLATFORMS
+    ]
     image_name = f"{registry}:{version}"
-    await container.publish(image_name)
+    await dag.container().publish(image_name, platform_variants=variants)
     return image_name, version
 
 
@@ -294,10 +312,14 @@ class WekaiCoreFlows:
         if not version:
             version = await _calc_version(source)
         # Built, not published: this proves the Dockerfile still builds, which
-        # is the other half of what a pre-merge check is for.
-        await source.docker_build(
-            platform=LINUX_AMD64, dockerfile=ROUTER_DOCKERFILE,
-        ).sync()
+        # is the other half of what a pre-merge check is for. Both platforms,
+        # because the publish ships both and a Go cross-compile can fail on one
+        # target while the other is clean — checking only amd64 would let an
+        # arm64 break through to the release.
+        for p in PUBLISH_PLATFORMS:
+            await source.docker_build(
+                platform=p, dockerfile=ROUTER_DOCKERFILE,
+            ).sync()
         packaged = _package_chart(source.directory(ROUTER_CHART_DIR), registry, version)
         return packaged.directory("/out")
 
