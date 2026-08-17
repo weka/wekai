@@ -23,7 +23,16 @@ import (
 // advance. The governor adds one per tick while windowed TTFT stays under the
 // limit and pauses above it, so the fleet's latency is the only throttle.
 
-// ttftWindow is the mean TTFT over a trailing wall-clock window.
+// ttftWindow is the ARITHMETIC MEAN TTFT over a trailing wall-clock window.
+//
+// Mean and not median, deliberately, and it decides the answer rather than
+// decorating it. This workload's TTFT is heavily skewed — a median of 4.3s
+// against a mean of 8.7s, p99 52s, max 193s — so a mean gate closes at roughly
+// half the session count a median gate would, and one 193s request in a window
+// of 300 moves it 0.64s on its own. The gate is therefore tail-driven, which is
+// the intended reading: the tail is real callers waiting, and a fleet whose p99
+// is 52s is not comfortably carrying that load however healthy its median
+// looks. Anton's call, taken with the distribution in front of him.
 //
 // A DURATION window, not a count of requests: a count is a different amount of
 // history at every load level — at 140 req/s the last 32 requests are a fifth

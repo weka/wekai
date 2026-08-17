@@ -75,9 +75,13 @@ replay:
   # sessions at 5s and at 1s are different capacity numbers for one fleet — so
   # it belongs in the record whether or not you change it.
   ttftLimit: "5s"
-  # ttftWindow is how far back the gate averages. A duration and not a request
-  # count on purpose: a count is a different amount of history at every load
-  # level, so a count-based gate tightens as the fleet fills.
+  # ttftWindow is how far back the gate averages, using the ARITHMETIC MEAN —
+  # not the median, not a percentile. That choice decides the answer: TTFT on
+  # this workload is heavily skewed, so a mean gate is tail-driven and closes at
+  # roughly half the session count a median gate would. Intended: the tail is
+  # real callers waiting. A duration and not a request count for a related
+  # reason — a count is a different amount of history at every load level, so a
+  # count-based gate tightens as the fleet fills.
   ttftWindow: "30s"
   # maxSessions is the safety cap on the governor, nothing more. Simulation of
   # this workload reaches ~2,500 sessions on a cache-starved fleet and >12,000
