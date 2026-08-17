@@ -48,7 +48,7 @@ spec:
                 --replay-series={{ .Values.replay.replaySeries | int64 }} \
                 {{- end }}
                 {{- if .Values.replay.realtime }}
-                {{/* Real-time replay grows the session count itself, so --series
+                {{- /* Real-time replay grows the session count itself, so --series
                      must NOT be passed: it pins max-series too, and the run
                      would stop at the pool size and report that as the fleet's
                      ceiling. Start at one and let it climb. */}}
@@ -81,7 +81,7 @@ spec:
                 --hot-series-concurrency={{ .Values.replay.hotConcurrency | int64 }} \
                 {{- end }}
                 {{- else if .Values.replay.concurrencyCap }}
-                {{/* Under realtime the gate is out of the way unless asked for.
+                {{- /* Under realtime the gate is out of the way unless asked for.
                      A cap here is a deliberate ceiling, not the default 28. */}}
                 --concurrency={{ .Values.replay.concurrencyCap | int64 }} \
                 {{- end }}
@@ -116,6 +116,19 @@ spec:
                 {{- end }}
                 {{- end }}
                 --save-request-data={{ include "wekai.results.dataPath" . }}
+
+              # --save-request-data is rendered last, so its presence proves the
+              # whole flag list survived. A truncated `set --` does not fail: sh
+              # reports the first dropped flag as an unknown command, non-fatally,
+              # and "$@" then runs a valid benchmark answering a different
+              # question. That is worse than a crash, so make it one.
+              case " $* " in
+                *" --save-request-data="*) ;;
+                *) echo "FATAL: argv was truncated before --save-request-data — the flag list" \
+                        "did not survive rendering, and this run would silently measure" \
+                        "something else. argv was: $*" >&2
+                   exit 1 ;;
+              esac
 
               echo "+ $*"
               "$@" || echo "wekai benchmark auto exited with status $?"

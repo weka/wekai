@@ -598,3 +598,80 @@ func TestRealtimeCapIsSeparateFromTheFlatOutDefault(t *testing.T) {
 		t.Error("the flat-out default leaked into a realtime run")
 	}
 }
+
+// A whitespace-only line inside a shell continuation silently truncates the
+// command, and this template builds its argv across ~15 continued lines.
+//
+// The failure it caused is worse than a crash. `set --` succeeds with a short
+// argv, sh reports the first dropped flag as an unknown command NON-FATALLY,
+// and "$@" then runs a perfectly valid benchmark answering a different
+// question — with --save-request-data among the flags dropped, so there is no
+// output left to notice it from. A pod that goes Ready and prints healthy
+// progress lines for eight hours.
+//
+// The cause was `{{/* comment */}}` on its own line: the preceding `{{- if }}`
+// trims up to the comment, but the comment's own indentation and newline
+// survive. `{{- /* ... */}}` is the form that does not.
+func TestRenderedArgvHasNoBrokenContinuations(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"flat-out", nil},
+		{"realtime", []string{"--set", "replay.realtime=true"}},
+		{"realtime with cap", []string{"--set", "replay.realtime=true", "--set", "replay.concurrencyCap=512"}},
+		{"realtime with metrics urls", []string{"--set", "replay.realtime=true", "--set", "replay.vllmMetricsUrls={http://r:29000}"}},
+		{"dry run", []string{"--set", "replay.dryRun=true"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lines := strings.Split(render(t, tc.args...), "\n")
+			for i := 1; i < len(lines); i++ {
+				if !strings.HasSuffix(strings.TrimRight(lines[i-1], " \t"), "\\") {
+					continue
+				}
+				if strings.TrimSpace(lines[i]) == "" {
+					t.Fatalf("line %d is whitespace-only after a continuation; every flag from "+
+						"here on is dropped and the run proceeds anyway:\n  %q\n  %q",
+						i, lines[i-1], lines[i])
+				}
+			}
+		})
+	}
+}
+
+// TestRenderedArgvKeepsItsTailFlag. --save-request-data is rendered last, so its
+// presence is a proof that the whole list survived — which is also what the
+// pod's own runtime guard checks before executing.
+func TestRenderedArgvKeepsItsTailFlag(t *testing.T) {
+	for _, args := range [][]string{
+		nil,
+		{"--set", "replay.realtime=true"},
+		{"--set", "replay.realtime=true", "--set", "replay.skipIdle=true"},
+	} {
+		out := render(t, args...)
+		i := strings.Index(out, "set -- wekai benchmark auto")
+		if i < 0 {
+			t.Fatal("no argv block rendered")
+		}
+		block := out[i:]
+		if j := strings.Index(block, "\n\n"); j > 0 {
+			block = block[:j]
+		}
+		if !strings.Contains(block, "--save-request-data=") {
+			t.Errorf("args %v: the argv block does not reach its tail flag", args)
+		}
+	}
+}
+
+// TestPodRefusesATruncatedArgv: the static check above cannot see a truncation
+// introduced by anything other than rendering, so the pod asserts it too.
+func TestPodRefusesATruncatedArgv(t *testing.T) {
+	out := render(t, "--set", "replay.realtime=true")
+	if !strings.Contains(out, `*" --save-request-data="*)`) {
+		t.Error("the pod script does not assert its own argv survived; a truncated `set --` is " +
+			"not a shell error, so nothing else would catch it")
+	}
+	if !strings.Contains(out, "FATAL: argv was truncated") {
+		t.Error("no fatal path for a truncated argv")
+	}
+}

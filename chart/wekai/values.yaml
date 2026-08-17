@@ -87,10 +87,10 @@ replay:
   maxSessions: 100000
 
   # Where to scrape vllm:prompt_tokens_by_source_total for the cache-source
-  # breakdown in the report. Needed whenever the thing serving inference is not
-  # the thing exposing the counters — BEHIND A ROUTER IT NEVER IS. The router
-  # refuses /metrics on its serving port on purpose: proxying it would answer
-  # with one backend's counters, which looks like a fleet total and is not.
+  # breakdown in the report. Usually NOT needed against a current router: since
+  # the serving port carries the correct aggregate when the router has no API
+  # key, `endpoint` alone resolves. Set this when the router HAS a key — the key
+  # moves /metrics to the metrics listener only — or to scrape backends directly.
   #
   # Two working choices:
   #   - the router's metrics listener, with the router run with --vllm-metrics
