@@ -1,5 +1,31 @@
 // Package proxy forwards a request to a selected backend.
 //
+// THIS PACKAGE HAS NO TESTS, and three defects were found in it in one week —
+// a stream abort that recorded a metric and dropped the error, a label naming a
+// cause nothing established, and an attribution that would have blamed a
+// caller's own hang-up on the backend. That is not three coincidences. The
+// breaker this file feeds is well covered by internal/circuit, so every
+// hypothesis about a misbehaving circuit was searched where the light was —
+// and the light is where the bugs are not, because the tests already removed
+// them.
+//
+// The assertion that would have caught all three is on the INPUT rather than
+// the outcome: for each way a request can end, what pair does Classify receive?
+//
+//	upstream 500          -> {status: 500, err: nil}   Failure
+//	upstream truncation   -> {status: 200, err: set}   Failure
+//	client cancel         -> {status: 200, err: nil}   not the backend's fault
+//	clean EOF             -> {status: 200, err: nil}   Success
+//
+// Three of those four rows would have failed this week. A test that only asks
+// "does the breaker open on 500s" catches none of the other two.
+//
+// Still open when this was written: a backend answering 53 consecutive 500s in
+// one window — rate 1.0, MinRequests exceeded 2.6x, Closed state — did not open
+// its breaker on a live fleet, while the same sequence replayed against the
+// breaker in isolation opens it at attempt 21. The divergence is somewhere
+// between attempt() returning and Record receiving, which is this file.
+//
 // It owns the three lifecycles that v1 got wrong:
 //
 //   - The load lease. Acquired once per attempt, released when the response body
