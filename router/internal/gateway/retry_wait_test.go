@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -56,7 +58,14 @@ func TestRetryWaitCountsRequestsNotAttempts(t *testing.T) {
 
 	sel := &refusingSelector{err: policy.ErrSplitGuardBlocked}
 	sel.remaining.Store(3) // three refusals, then the fleet frees a slot
-	srv, clk := retryHarness(t, sel, 10*time.Second, nil)
+	// An hour, because drive() advances a fake second per real millisecond: a
+	// budget denominated in fake seconds is really one denominated in
+	// milliseconds of goroutine scheduling, and on a loaded machine the refusals
+	// alone can spend it. The request would then expire rather than be
+	// satisfied, and this test would fail for a reason it is not about. Where
+	// the budget's edge is under test the fixture says so — see
+	// TestRetryWaitSeparatesRescuedFromExpired.
+	srv, clk := retryHarness(t, sel, time.Hour, nil)
 
 	done := make(chan struct{})
 	go drive(clk, done)
@@ -160,27 +169,39 @@ func TestRetryWaitIgnoresRequestsThatNeverWaited(t *testing.T) {
 func TestRetryWaitExcludesTheServiceTimeOfTheAttemptThatSucceeded(t *testing.T) {
 	const (
 		reason  = metrics.ReasonGuardBlocked
-		budget  = 10 * time.Second
+		budget  = time.Hour // see TestRetryWaitCountsRequestsNotAttempts
 		service = 4 * time.Minute
 	)
-	_, sumBefore := waitStats(t, reason, "satisfied")
-	countBefore, _ := waitStats(t, reason, "satisfied")
+	countBefore, sumBefore := waitStats(t, reason, "satisfied")
 
 	sel := &refusingSelector{err: policy.ErrSplitGuardBlocked}
 	sel.remaining.Store(2)
 
-	var clk *clock.Fake
+	var (
+		clk  *clock.Fake
+		stop sync.Once
+		// Unix nanos rather than a time.Time: written on the server goroutine,
+		// read on this one.
+		serviceBegan atomic.Int64
+	)
+	done := make(chan struct{})
 	srv, c := retryHarness(t, sel, budget, func(w http.ResponseWriter, r *http.Request) {
+		// The driver stops before the service leg, so this handler is the only
+		// writer of the clock while it runs. That gives the span under test an
+		// exact ceiling rather than one that moves with how often the driver
+		// goroutine happened to be scheduled.
+		stop.Do(func() { close(done) })
+		serviceBegan.Store(clk.Now().UnixNano())
 		clk.Advance(service) // a slow completion, on the attempt that succeeds
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"c","object":"chat.completion","choices":[]}`))
 	})
 	clk = c
+	start := clk.Now()
 
-	done := make(chan struct{})
 	go drive(clk, done)
 	resp, err := post(srv)
-	close(done)
+	stop.Do(func() { close(done) })
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
@@ -190,12 +211,14 @@ func TestRetryWaitExcludesTheServiceTimeOfTheAttemptThatSucceeded(t *testing.T) 
 	if countAfter-countBefore != 1 {
 		t.Fatalf("observations moved by %d, want 1", countAfter-countBefore)
 	}
-	// The driver advances the clock freely while the handler runs, so the exact
-	// value is not pinned — only that the four-minute service leg is not in it.
-	if got := sumAfter - sumBefore; got >= service.Seconds() {
-		t.Errorf("observed %.1fs on a request whose successful attempt alone took %v: the "+
-			"attempt that ends the wait is inside the span, which makes this series mean one "+
-			"thing for satisfied and another for expired", got, service)
+	// The wait can only cover clock advanced before the successful attempt
+	// began, so that is its exact ceiling — and the ceiling sits four minutes
+	// below where including the service leg would put it.
+	ceiling := time.Unix(0, serviceBegan.Load()).Sub(start).Seconds()
+	if got := sumAfter - sumBefore; got > ceiling {
+		t.Errorf("observed %.1fs against a ceiling of %.1fs, on a request whose successful attempt "+
+			"alone took %v: the attempt that ends the wait is inside the span, which makes this "+
+			"series mean one thing for satisfied and another for expired", got, ceiling, service)
 	}
 }
 
