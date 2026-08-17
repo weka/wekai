@@ -61,6 +61,9 @@ spec:
                 {{- if .Values.replay.skipIdle }}
                 --replay-skip-idle \
                 {{- end }}
+                {{- if .Values.replay.reuseSessions }}
+                --replay-reuse-sessions \
+                {{- end }}
                 {{- if .Values.replay.allowUnderfill }}
                 --replay-allow-underfill \
                 {{- end }}

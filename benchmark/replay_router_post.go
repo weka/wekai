@@ -432,9 +432,9 @@ func (p *replayPoster) do(
 	var err error
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
+		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	default:
-		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
+		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	}
 	// --limit-context uses the capture's production-measured token counts
 	// (usage.input_tokens + cache read/creation), not a chars heuristic:
@@ -928,9 +928,9 @@ func (p *replayPoster) dryDo(
 	var canonical string
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
+		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	default:
-		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, p.runID, p.outputRatio, p.forceOutput, p.replayCharsPerToken)
+		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken)
 	}
 	var ratio float64
 	if p.estimator != nil {
@@ -972,4 +972,18 @@ func (p *replayPoster) dryDo(
 		Error:   nil,
 		IsEmpty: false,
 	}
+}
+
+// stampFor is the content stamp for one request: the pass's, when the corpus is
+// being replayed more than once, else the run's.
+//
+// Per REQUEST rather than on the poster because a poster is shared across a
+// series and outlives any one pass. Uniform within a pass by construction —
+// every session on that pass carries the same string — which is what keeps
+// cross-session prefix sharing identical to the first pass.
+func stampFor(p *replayPoster, req RouterReplayRequest) string {
+	if req.passStamp != "" {
+		return req.passStamp
+	}
+	return p.runID
 }

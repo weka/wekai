@@ -139,6 +139,21 @@ type AutoBenchmarkConfig struct {
 	// are not late.
 	ReplayAllowUnderfill bool
 
+	// ReplayReuseSessions replays the corpus again from the top instead of
+	// draining, so a run can outlast its own dataset.
+	//
+	// Each pass gets its OWN stamp, applied uniformly across the whole pass.
+	// That is the property the whole thing turns on: within a pass, two sessions
+	// that shared a system prompt in the capture still share it, so the sharing
+	// topology the benchmark exists to measure is identical to pass one's;
+	// across passes the keyspace is disjoint, so pass two cannot trivially hit
+	// pass one's cache entries and inflate the hit rate toward 100%.
+	//
+	// A per-SESSION stamp would satisfy the second property and destroy the
+	// first, and it would still produce a cache hit rate — just a meaningless
+	// one. That is why the stamp is per pass and never per session.
+	ReplayReuseSessions bool
+
 	// RunID is populated internally by RunAutoBenchmark at the start of each
 	// run. It's the UUID injected into every conversation's system prompt
 	// (when ReplayNoStamp is false). Per-run scope — conversations that share
@@ -1766,7 +1781,7 @@ func runSingleModelBenchmark(
 	// concurrently both open the file; that's fine, each gets its own
 	// independent producer.)
 	if cfg.RouterReplayFile != "" {
-		stream, err := openRouterReplayStream(cfg.RouterReplayFile, 8, cfg.ReplaySeries, cfg.RouterReplaySeriesIndices)
+		stream, err := openRouterReplayStream(cfg.RouterReplayFile, 8, cfg.ReplaySeries, cfg.RouterReplaySeriesIndices, cfg.ReplayReuseSessions)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[auto][%s] open router-replay file: %v\n",
 				shortModelName(cfg.Model), err)
@@ -2163,8 +2178,16 @@ func runSingleModelBenchmark(
 				// It is the concurrency of conversations, not a total of them —
 				// adding it to the retired count double-counts every worker that
 				// has finished one and started another.
-				fmt.Fprintf(os.Stderr, "[realtime] slots=%d ttft_win=%s/%d %s skipped=%s\n",
-					series, mean.Round(time.Millisecond), n, st.lag.summary(st.skipClk.Now()),
+				// The pass count is reported, not inferred. A hit rate spanning
+				// several passes is a different quantity from a single-pass one,
+				// and leaving it to be deduced from the session count exceeding
+				// the corpus size is how it reaches a ledger uncaught.
+				passInfo := ""
+				if st.routerReplay != nil && st.routerReplay.Pass() > 0 {
+					passInfo = fmt.Sprintf(" corpus_pass=%d", st.routerReplay.Pass()+1)
+				}
+				fmt.Fprintf(os.Stderr, "[realtime] slots=%d%s ttft_win=%s/%d %s skipped=%s\n",
+					series, passInfo, mean.Round(time.Millisecond), n, st.lag.summary(st.skipClk.Now()),
 					st.skipClk.Skew().Round(time.Second))
 			}
 		}()

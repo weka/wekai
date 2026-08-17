@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -70,7 +71,10 @@ type RouterReplaySummary struct {
 }
 
 type RouterReplaySession struct {
-	SessionID string                 `json:"session_id"`
+	SessionID string `json:"session_id"`
+	// pass is which time through the corpus this session was handed out on,
+	// 0-based. Not from the file — set by the producer on wraparound.
+	pass      int
 	StartTs   string                 `json:"start_ts"`
 	Instances []RouterReplayInstance `json:"instances"`
 }
@@ -89,6 +93,10 @@ type RouterReplayInstance struct {
 type RouterReplayRequest struct {
 	RequestID uint64 `json:"request_id"`
 	Ts        string `json:"ts"`
+	// passStamp overrides the poster's run-level stamp for this request. Set at
+	// dispatch from the session's pass, because a poster is shared across a
+	// series and cannot hold a value that varies per pass.
+	passStamp string
 	Model     string `json:"model"`
 	Stream    bool   `json:"stream"`
 	MaxTokens int    `json:"max_tokens"`
@@ -154,14 +162,19 @@ type RouterReplayMessage struct {
 // Only Pull, Total, and Remaining are externally visible; the producer
 // goroutine is internal.
 type routerReplayStream struct {
-	header         RouterReplayHeader
-	f              *os.File
-	br             *bufio.Reader
-	ch             chan RouterReplaySession
-	idx            atomic.Int64 // monotonic pull counter
-	total          int          // total sessions the producer will emit (capped by sessionLimit if set)
-	produced       atomic.Int64 // how many sessions the producer has emitted so far
-	limit          int          // 0 = no cap; >0 stop after this many sessions
+	header   RouterReplayHeader
+	f        *os.File
+	br       *bufio.Reader
+	ch       chan RouterReplaySession
+	idx      atomic.Int64 // monotonic pull counter
+	total    int          // total sessions the producer will emit (capped by sessionLimit if set)
+	produced atomic.Int64 // how many sessions the producer has emitted so far
+	limit    int          // 0 = no cap; >0 stop after this many sessions
+	// reuse replays the corpus again from the top instead of draining. Each
+	// pass gets its own stamp, so prefixes are disjoint between passes while
+	// the sharing structure WITHIN a pass is identical to the first.
+	reuse          bool
+	pass           atomic.Int64
 	allowedIndices map[int]bool // nil = allow all; non-nil = only emit sessions at these 0-based line indices
 	done           chan struct{}
 	ctx            context.Context
@@ -203,7 +216,7 @@ func readRouterReplayHeader(path string) (RouterReplayHeader, error) {
 // sessions at other positions are read and discarded. sessionLimit is
 // applied independently and still stops the producer after N sessions
 // from the beginning of the file regardless of allowedIndices.
-func openRouterReplayStream(path string, chanCap, sessionLimit int, allowedIndices map[int]bool) (*routerReplayStream, error) {
+func openRouterReplayStream(path string, chanCap, sessionLimit int, allowedIndices map[int]bool, reuse bool) (*routerReplayStream, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -250,6 +263,7 @@ func openRouterReplayStream(path string, chanCap, sessionLimit int, allowedIndic
 		total:          total,
 		limit:          sessionLimit,
 		allowedIndices: allowedIndices,
+		reuse:          reuse,
 		done:           make(chan struct{}),
 		ctx:            ctx,
 		cancel:         cancel,
@@ -297,6 +311,7 @@ func (s *routerReplayStream) produce() {
 				}
 				var sess RouterReplaySession
 				if jerr := json.Unmarshal(line, &sess); jerr == nil {
+					sess.pass = int(s.pass.Load())
 					// Backpressure: blocks when ch is full, so the next
 					// file read happens only after a worker pulls.
 					// Respect ctx so Close() can unblock us when the
@@ -311,7 +326,23 @@ func (s *routerReplayStream) produce() {
 			}
 		}
 		if err != nil {
-			return
+			if !s.reuse {
+				return
+			}
+			// Another pass. Rewind, re-consume the header, and bump the stamp
+			// generation. Sessions are independent, so replaying them is
+			// legitimate — what must NOT be reused is their content keyspace,
+			// and that is what the per-pass stamp separates.
+			if _, serr := s.f.Seek(0, io.SeekStart); serr != nil {
+				return
+			}
+			s.br.Reset(s.f)
+			if _, herr := s.br.ReadBytes('\n'); herr != nil {
+				return
+			}
+			s.pass.Add(1)
+			lineIdx = 0
+			continue
 		}
 	}
 }
@@ -333,6 +364,12 @@ func (s *routerReplayStream) Pull(ctx context.Context) (RouterReplaySession, int
 	}
 }
 
+// Pass is how many times the corpus has been replayed so far, 0-based. A run
+// that reports a cache hit rate across several passes is reporting something
+// different from a single-pass run, so it has to be visible rather than
+// inferred from the session count exceeding the corpus size.
+func (s *routerReplayStream) Pass() int { return int(s.pass.Load()) }
+
 // Total returns the session count from the header summary. May be 0 if the
 // producer didn't populate it.
 func (s *routerReplayStream) Total() int { return s.total }
@@ -341,6 +378,11 @@ func (s *routerReplayStream) Total() int { return s.total }
 // It does NOT count sessions still buffered in the channel (those count as
 // "remaining" for the consumer's purposes).
 func (s *routerReplayStream) Remaining() int {
+	if s.reuse {
+		// Never drains: the corpus is replayed again rather than exhausted, so
+		// the underfill abort has nothing to fire on.
+		return s.total
+	}
 	r := s.total - int(s.idx.Load())
 	if r < 0 {
 		r = 0
@@ -570,6 +612,16 @@ func runRouterReplaySession(
 ) {
 	includeRole := buildRoleFilter(cfg.RouterReplayRoles)
 
+	// One stamp for the whole pass, never per session. Pass 0 keeps the run's
+	// own stamp so a single-pass run is byte-identical to before this existed.
+	passStamp := ""
+	if !cfg.ReplayNoStamp {
+		passStamp = cfg.RunID
+		if sess.pass > 0 {
+			passStamp = fmt.Sprintf("%s-p%d", cfg.RunID, sess.pass+1)
+		}
+	}
+
 	// The skip clock only advances with every ACTIVE session parked, so a
 	// session has to register while it runs or the idle test can never be true.
 	st.skipClk.AddSession(1)
@@ -638,7 +690,7 @@ func runRouterReplaySession(
 			}
 			runRouterReplayInstance(benchCtx, cfg, st, rdw,
 				sess.SessionID, sess.StartTs, sessionOrigin, &covered,
-				seriesNum, inst, picker, reqTimeout, docs, requestDone, gate)
+				passStamp, seriesNum, inst, picker, reqTimeout, docs, requestDone, gate)
 		}()
 	}
 	wg.Wait()
@@ -686,6 +738,7 @@ func runRouterReplayInstance(
 	sessionStartTs string,
 	sessionOrigin time.Time,
 	covered *atomic.Int64,
+	passStamp string,
 	seriesNum int,
 	inst RouterReplayInstance,
 	picker endpointPicker,
@@ -766,6 +819,7 @@ func runRouterReplayInstance(
 		if cfg.Total > 0 && st.totalEmitted.Load() >= int64(cfg.Total) {
 			return
 		}
+		req.passStamp = passStamp
 		// Hold until this turn is due. Already-late turns return at once, which
 		// is the normal case on a fleet slower than the capture: the session
 		// falls behind rather than firing a backlog.
