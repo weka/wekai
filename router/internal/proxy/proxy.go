@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -324,6 +325,9 @@ func (p *Proxy) attempt(
 	var upstreamStatus int
 	var upstreamErr error
 	var rejectedForRetry bool
+	// Hoisted out of the response hook so the caller can ask, after the copy,
+	// whether the stream ended cleanly.
+	var sb *scanBody
 
 	rp := *p.rp // shallow copy: per-attempt hooks, shared transport and pool
 	rp.Rewrite = func(pr *httputil.ProxyRequest) {
@@ -419,7 +423,7 @@ func (p *Proxy) attempt(
 		// Content-Type is passed through untouched. v1 forcibly rewrote it to
 		// text/event-stream whenever the request asked to stream, so a JSON error
 		// body reached the client as a malformed SSE stream (STR-2, STR-N2).
-		sb := &scanBody{rc: resp.Body, sc: scanner, d: d, backend: b.URL}
+		sb = &scanBody{rc: resp.Body, sc: scanner, d: d, backend: b.URL}
 		if p.cfg.IdleTimeout > 0 && cancelAttempt != nil {
 			sb.idleTimeout = p.cfg.IdleTimeout
 			sb.idle = time.AfterFunc(p.cfg.IdleTimeout, func() {
@@ -440,6 +444,14 @@ func (p *Proxy) attempt(
 	}
 
 	rp.ServeHTTP(aw, r)
+
+	// A stream that died mid-flight is an upstream failure even though its
+	// headers were fine. Without this the breaker sees a 200 and records a
+	// success, so a backend that answers every request with a truncated stream
+	// looks perfectly healthy to the one mechanism meant to eject it.
+	if upstreamErr == nil && sb != nil && sb.aborted != nil {
+		upstreamErr = sb.aborted
+	}
 
 	out := attemptOut{status: upstreamStatus, err: upstreamErr}
 	out.retryable = (rejectedForRetry || isRetryable(upstreamStatus, upstreamErr)) && !*committed
@@ -529,6 +541,15 @@ type scanBody struct {
 	d       dialect.Dialect
 	backend string
 	sawEnd  bool
+	// aborted records a stream that ended without its terminal marker, so the
+	// caller can report it as the upstream failure it is.
+	//
+	// Counting it and nothing else was the defect: attemptOut carried
+	// {status: 200, err: nil} for a request whose stream died, so the circuit
+	// breaker recorded a SUCCESS for a failed request. A backend whose engine
+	// had crashed kept answering 200-then-abort, its breaker never opened, and
+	// the router went on dispatching to it until the kubelet noticed.
+	aborted error
 
 	// tail retains the last maxSniff bytes so usage can be read on Close without
 	// buffering the whole response. For a non-streaming reply the body is usually
@@ -558,6 +579,9 @@ func (s *scanBody) Read(p []byte) (int, error) {
 	}
 	if err != nil && err != io.EOF && !s.sawEnd {
 		metrics.StreamAborted.WithLabelValues("upstream_error").Inc()
+		if s.aborted == nil {
+			s.aborted = fmt.Errorf("upstream stream aborted before its terminal marker: %w", err)
+		}
 	}
 	return n, err
 }
