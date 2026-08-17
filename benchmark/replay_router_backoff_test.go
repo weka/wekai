@@ -186,8 +186,13 @@ func TestReplayGivesUpAfterTheRetryBudget(t *testing.T) {
 	if m.Error == nil {
 		t.Fatal("a fleet that never recovers must eventually surface the 429")
 	}
-	if !strings.Contains(m.Error.Error(), "429") || !strings.Contains(m.Error.Error(), "backoff") {
-		t.Errorf("error %q does not say the 429 survived the backoff", m.Error)
+	// The message must carry BOTH times. They differ by however long the server
+	// held each attempt, and that difference is what shows a shed saying "retry
+	// shortly" arriving three and a half minutes in.
+	for _, want := range []string{"429", "elapsed", "sleeping", "retries"} {
+		if !strings.Contains(m.Error.Error(), want) {
+			t.Errorf("error %q is missing %q", m.Error, want)
+		}
 	}
 	if m.RetryWait > budget {
 		t.Errorf("waited %v, over the %v budget", m.RetryWait, budget)

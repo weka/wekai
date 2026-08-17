@@ -58,7 +58,16 @@ spec:
                 --admit-every={{ .Values.replay.admitEvery }} \
                 --ttft-limit={{ .Values.replay.ttftLimit }} \
                 --ttft-window={{ .Values.replay.ttftWindow }} \
-                --ttft-limit-stat={{ .Values.replay.ttftLimitStat }} \
+                {{- /* Guarded, and defaulted empty, so the chart can still deploy
+                       an image from before this flag existed. A/B against a
+                       previous build is the normal way this chart is used, and
+                       an unconditional flag removes that — failing at startup
+                       with an unknown-flag exit, from a chart the operator did
+                       not think they had changed. mean is the binary's default
+                       anyway, so omitting it changes nothing. */}}
+                {{- with .Values.replay.ttftLimitStat }}
+                --ttft-limit-stat={{ . }} \
+                {{- end }}
                 {{- if .Values.replay.skipIdle }}
                 --replay-skip-idle \
                 {{- end }}

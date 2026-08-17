@@ -373,6 +373,22 @@ const (
 // Jittered by +/-30%. Without it, a fleet-wide shed puts every waiting client
 // on the same schedule and they return in a synchronised burst, which sheds
 // them again — the backoff would convert one overload into a standing wave.
+// backoff429 decides whether to wait again, and for how long.
+//
+// `spent` is ELAPSED WALL TIME since the request began, not the sum of the
+// sleeps. That distinction is the whole of a defect measured on hardware: the
+// budget bounded sleeping only, while each attempt also sat inside the router
+// for up to --retry-time-limit before being refused. The two composed as
+//
+//	total = 30s sleep budget + (retries + 1) x 10s router hold
+//
+// which put 2,514 failures on exactly 200/210/220/230/240s, variance under a
+// second, from a 30s budget. Nothing summed to those numbers because the second
+// term is a PRODUCT, with a multiplier that varies as exponential backoff fits
+// more or fewer attempts into the sleep allowance.
+//
+// Measuring elapsed makes the budget a bound again: 30s means 30s, whatever the
+// server does with each attempt.
 func backoff429(base, spent, budget time.Duration) (time.Duration, bool) {
 	if budget <= 0 {
 		budget = retry429Budget
@@ -528,7 +544,7 @@ func (p *replayPoster) do(
 		if resp.StatusCode != http.StatusTooManyRequests {
 			break
 		}
-		wait, ok := backoff429(backoff, retryWait, p.retryBudget)
+		wait, ok := backoff429(backoff, time.Since(startTime), p.retryBudget)
 		if !ok {
 			// Budget exhausted: keep this 429 and let it be recorded as the
 			// error it now genuinely is.
@@ -569,9 +585,16 @@ func (p *replayPoster) do(
 		m.Error = fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		if resp.StatusCode == http.StatusTooManyRequests {
 			// Only reachable once the whole budget is spent, so say so: a 429
-			// here means the fleet stayed saturated for 30s, not that it shed
-			// once.
-			m.Error = fmt.Errorf("status 429 after %v of backoff over %d retries: %s",
+			// here means the fleet stayed saturated throughout, not that it
+			// shed once.
+			//
+			// ELAPSED is stated as well as the sleeping, because the two differ
+			// by however long the server held each attempt and the difference is
+			// the finding. A shed that says "retry shortly" and arrives three and
+			// a half minutes in is a slow failure wearing a fast failure's
+			// words, and only the elapsed figure shows it.
+			m.Error = fmt.Errorf("status 429 after %v elapsed (%v of it sleeping) over %d retries: %s",
+				time.Since(startTime).Round(time.Millisecond),
 				retryWait.Round(time.Millisecond), retries, strings.TrimSpace(string(body)))
 		}
 		m.Retries429, m.RetryWait = retries, retryWait

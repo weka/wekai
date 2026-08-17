@@ -552,3 +552,39 @@ func TestGateStatsAreNamedInTheLine(t *testing.T) {
 		t.Errorf("line %q does not name the gating statistic", got)
 	}
 }
+
+// TestGateSeesFailedWaits. --ttft-limit is an SLO, and a caller who waited 40s
+// and then got a 429 has had it violated more thoroughly than one served slowly.
+//
+// Those requests carry no first token, so a gate that only observes TTFT saw
+// none of them — blindest to the worst outcomes, admitting hardest exactly as
+// the fleet stopped answering. On the arm that exposed this, 76% of failures
+// were 429s arriving after 210s and the gate never saw one.
+func TestGateSeesFailedWaits(t *testing.T) {
+	base := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	const limit = 5 * time.Second
+
+	servedOnly := newTTFTWindow(30 * time.Second)
+	withFailures := newTTFTWindow(30 * time.Second)
+
+	// Ten requests served in 1s, and ten that waited 40s and got a 429.
+	for i := range 10 {
+		at := base.Add(time.Duration(i) * time.Second)
+		servedOnly.Observe(at, time.Second)
+		withFailures.Observe(at, time.Second)
+	}
+	for i := range 10 {
+		at := base.Add(time.Duration(10+i) * time.Second)
+		// The old behaviour: nothing observed at all.
+		withFailures.Observe(at, 40*time.Second)
+	}
+	now := base.Add(20 * time.Second)
+
+	if !servedOnly.Open(now, limit, "mean") {
+		t.Fatal("premise: served requests alone leave the gate open")
+	}
+	if withFailures.Open(now, limit, "mean") {
+		t.Error("the gate still admits with half its traffic failing after 40s; a request that " +
+			"waited and got nothing is an SLO violation, not an absence")
+	}
+}

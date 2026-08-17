@@ -320,11 +320,27 @@ func recordReplayRequest(
 	// see RequestMetrics — so nothing is added here; doing so would count the
 	// wait twice.
 	//
-	// Only real first-token latencies count: a request that produced none
-	// reports 0, and averaging that in would pull the mean down and admit
-	// hardest exactly when the fleet had stopped answering.
-	if st.ttft != nil && metrics.TimeToFirstToken > 0 {
-		st.ttft.Observe(time.Now(), metrics.TimeToFirstToken)
+	// A request that never produced a token still waited, and the gate has to
+	// see that wait.
+	//
+	// Skipping it was wrong in the direction that matters: --ttft-limit is an
+	// SLO, and a caller who waited 40s — ten in the router, thirty backing off —
+	// and then got a 429 has had the SLO violated more thoroughly than one served
+	// slowly. Excluding those made the gate blindest to the worst outcomes and
+	// admit hardest exactly as the fleet stopped answering. On the arm that
+	// exposed this, 76% of failures were 429s after 210s, and the gate saw none
+	// of them.
+	//
+	// Observing zero would be the opposite error, dragging the mean down. What
+	// the caller actually experienced is the elapsed time, so that is what goes
+	// in.
+	if st.ttft != nil {
+		switch {
+		case metrics.TimeToFirstToken > 0:
+			st.ttft.Observe(time.Now(), metrics.TimeToFirstToken)
+		case metrics.Error != nil && metrics.TotalResponseTime > 0:
+			st.ttft.Observe(time.Now(), metrics.TotalResponseTime)
+		}
 	}
 
 	if cfg.PrintResponses {

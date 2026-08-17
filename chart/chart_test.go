@@ -675,3 +675,49 @@ func TestPodRefusesATruncatedArgv(t *testing.T) {
 		t.Error("no fatal path for a truncated argv")
 	}
 }
+
+// A flag rendered unconditionally makes the chart undeployable against every
+// image older than that flag — and A/B against a previous build is the normal
+// way this chart is used. It fails in the least helpful way too: an unknown-flag
+// exit at startup, from a chart the operator did not think they had changed.
+//
+// This is an allowlist rather than a scan, so ADDING a flag to the default
+// render fails here and forces the decision to be made deliberately: either it
+// shipped alongside --replay-realtime and every image that accepts one accepts
+// the other, or it needs a guard and an empty default.
+func TestDefaultRealtimeRenderEmitsOnlyFlagsThatShippedWithIt(t *testing.T) {
+	allowed := map[string]bool{
+		// Present on any build that has --replay-realtime at all.
+		"--replay-realtime": true, "--start-series": true, "--max-series": true,
+		"--admit-every": true, "--ttft-limit": true, "--ttft-window": true,
+		"--replay-skip-idle": true,
+		// Older than realtime.
+		"--router-replay-file": true, "--models": true, "--timeout": true,
+		"--print-errors-threshold": true, "--save-request-data": true,
+	}
+	out := render(t, "--set", "replay.realtime=true")
+	seen := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.TrimSpace(line)
+		f = strings.TrimPrefix(f, "- ")
+		f = strings.Trim(f, `"\ `)
+		// "---" is the YAML document separator, not a flag.
+		if !strings.HasPrefix(f, "--") || f == "---" {
+			continue
+		}
+		if i := strings.IndexAny(f, "= "); i > 0 {
+			f = f[:i]
+		}
+		seen[f] = true
+	}
+	for f := range seen {
+		if !allowed[f] {
+			t.Errorf("%s renders by default; if it postdates --replay-realtime it makes the chart "+
+				"undeployable against every earlier image. Guard it with `with` and default it "+
+				"empty, or add it here if it shipped alongside realtime", f)
+		}
+	}
+	if !seen["--replay-realtime"] {
+		t.Error("premise check: the realtime render is missing --replay-realtime")
+	}
+}

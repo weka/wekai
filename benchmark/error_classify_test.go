@@ -71,3 +71,33 @@ func TestMidStreamReportsTimeSinceFirstToken(t *testing.T) {
 		t.Errorf("%q should say how long it streamed before being cut", err.Error())
 	}
 }
+
+// The 429 retry budget bounds WALL TIME, not the sum of the sleeps.
+//
+// Bounding sleeping only let a second cost compound invisibly: each attempt also
+// sat inside the router for up to --retry-time-limit before being refused, so
+// total = budget + (retries+1) x hold. On hardware that put 2,514 failures on
+// exactly 200/210/220/230/240s out of a 30s budget, variance under a second.
+// Nothing summed to those numbers because the second term is a PRODUCT.
+func TestRetryBudgetBoundsWallTimeNotSleep(t *testing.T) {
+	const budget = 30 * time.Second
+
+	// Well inside the budget by either measure: keep going.
+	if _, ok := backoff429(time.Second, 5*time.Second, budget); !ok {
+		t.Error("gave up 5s into a 30s budget")
+	}
+	// Elapsed has reached the budget even though little of it was spent
+	// sleeping — which is exactly the case that used to keep retrying.
+	if _, ok := backoff429(time.Second, budget, budget); ok {
+		t.Error("kept retrying at the budget; the bound must be on elapsed time, or a server that " +
+			"holds each attempt multiplies the budget by the attempt count")
+	}
+	// And the last wait never overruns what is left.
+	w, ok := backoff429(10*time.Second, budget-time.Second, budget)
+	if !ok {
+		t.Fatal("refused a retry with a second still left")
+	}
+	if w > time.Second {
+		t.Errorf("waited %v with 1s of budget left", w)
+	}
+}
