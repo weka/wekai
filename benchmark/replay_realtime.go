@@ -355,10 +355,28 @@ type pacingLag struct {
 	overs [4]int64 // > 1s, > 10s, > 1m, > 10m
 
 	// Per-session coverage: how much captured conversation was replayed against
-	// how much wall time the session was alive for. Their ratio is the run's
-	// fidelity — 1.0 means an hour of wall clock replayed an hour of capture,
-	// and anything less means the run covered less conversation than its
-	// duration suggests. Nothing else distinguishes those.
+	// how much wall time the session was alive for. 1.0 means an hour of wall
+	// clock replayed an hour of capture.
+	//
+	// What it actually measures is THIS FLEET'S SPEED AGAINST THE CAPTURE
+	// FLEET'S, and that is not what it was built to be. The pacer targets
+	// absolute offsets, so a session hits every target exactly while its turns
+	// finish inside the captured gaps and falls behind proportionally once they
+	// do not. Fidelity therefore settles near captured_gap / our_turn_duration —
+	// a ratio of two fleets, with load almost absent from it.
+	//
+	// Measured: flat at 0.36-0.50 across a twenty-fold range of admitted slots,
+	// including 60 slots on a nearly idle fleet, and never once above 0.50 in 44
+	// samples. If contention drove it, it would fall as load rose. It does not.
+	// This corpus has a median start-to-start gap of 7.5s, and turns here take
+	// upwards of twice that whatever else is happening.
+	//
+	// Two consequences worth knowing before anyone builds on it. It is useless
+	// as an admission signal — at 0.9 it admits nothing and at 0.5 it is
+	// indistinguishable from no gate, because it does not respond to the control
+	// variable. And it is a good instrument for COMPARING fleets on one corpus,
+	// better than throughput in one respect: it is normalised against the same
+	// recorded workload, so two fleets' numbers mean the same thing.
 	sessions int64
 	covered  time.Duration
 	wall     time.Duration

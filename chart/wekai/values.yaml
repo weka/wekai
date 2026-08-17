@@ -43,6 +43,15 @@ replay:
   # Turning them on asks "what is the most load this fleet can carry", and the
   # answer is no longer a number set here.
   #
+  # A note on the `fidelity` figure this mode reports: it is the ratio of
+  # captured conversation replayed to wall time elapsed, and it measures THIS
+  # FLEET'S SPEED AGAINST THE CAPTURE FLEET'S far more than it measures load.
+  # Observed flat at 0.36-0.50 across a twenty-fold range of concurrency,
+  # including a nearly idle fleet — because a session falls behind whenever its
+  # turns take longer than the gaps they were recorded with, whatever else is
+  # happening. Useful for comparing two fleets on one corpus; useless as a
+  # saturation signal.
+  #
   # realtime is the switch. It paces each session by the timestamps it was
   # captured with, so a conversation keeps its own think time instead of firing
   # back-to-back — the recorded gap includes the ORIGINAL response time, which
