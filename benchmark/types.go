@@ -10,12 +10,23 @@ import (
 type RequestMetrics struct {
 	// Skipped: request filtered out pre-send (--limit-context); counted as
 	// neither completed nor error by the auto aggregator.
-	Skipped           bool
-	RequestNum        int           // Request number (1-based) within a series
-	SeriesNum         int           // Series number (1-based) within a cycle
-	CycleNum          int           // Cycle number (1-based)
-	SeriesGUID        string        // GUID for the series this request belongs to
-	TimeToFirstToken  time.Duration // Time until first content callback
+	Skipped    bool
+	RequestNum int    // Request number (1-based) within a series
+	SeriesNum  int    // Series number (1-based) within a cycle
+	CycleNum   int    // Cycle number (1-based)
+	SeriesGUID string // GUID for the series this request belongs to
+	// TimeToFirstToken is what the CALLER waited: every 429 backed off plus the
+	// attempt that finally answered. There is no per-attempt variant, on
+	// purpose.
+	//
+	// Retries are a client transport detail and must not become a dimension a
+	// reader has to reason about. A caller who waited twelve seconds waited
+	// twelve seconds, and "the last attempt was fast" is not a fact any consumer
+	// of a benchmark needs — including the cache-hit heuristic, which will
+	// therefore call more requests misses on a saturated fleet. That is Anton's
+	// call and it is the right one: a fleet that made the client queue did not
+	// serve that request from cache in any sense the caller experienced.
+	TimeToFirstToken  time.Duration
 	TotalResponseTime time.Duration // Total time for request
 	UsageData         tools.ExecutionUsageData
 	Error             error

@@ -316,24 +316,15 @@ func recordReplayRequest(
 	isCold bool,
 	coldStartTTFT *time.Duration,
 ) {
-	// Feed the admission governor with the CALLER's time to first token: the
-	// attempt's own latency plus every 429 it waited out.
-	//
-	// TimeToFirstToken alone is per-attempt by design, timed from the attempt
-	// the server actually ran so that backoff cannot make a healthy fleet look
-	// slow. That is the right number to report. It is the wrong number to gate
-	// on, because --ttft-limit decides whether to admit another session, and a
-	// gate blind to backoff reads the fleet's speed on the requests that got
-	// through while callers wait far longer. Under saturation those diverge
-	// hard — this arm shows requests spending 30s across 17 attempts — so the
-	// governor would keep admitting past the point the fleet is actually
-	// sustaining, and the plateau it reports would sit above the honest one.
+	// Feed the admission governor. TimeToFirstToken already includes backoff —
+	// see RequestMetrics — so nothing is added here; doing so would count the
+	// wait twice.
 	//
 	// Only real first-token latencies count: a request that produced none
 	// reports 0, and averaging that in would pull the mean down and admit
 	// hardest exactly when the fleet had stopped answering.
 	if st.ttft != nil && metrics.TimeToFirstToken > 0 {
-		st.ttft.Observe(time.Now(), metrics.TimeToFirstToken+metrics.RetryWait)
+		st.ttft.Observe(time.Now(), metrics.TimeToFirstToken)
 	}
 
 	if cfg.PrintResponses {

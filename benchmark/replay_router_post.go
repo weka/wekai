@@ -591,9 +591,18 @@ func (p *replayPoster) do(
 		m.TotalResponseTime = time.Since(attemptStart)
 	}
 	// End to end, as the caller experienced it: server time plus every 429 it
-	// waited out.
+	// waited out. TTFT is folded the same way and for the same reason — a
+	// request that took seventeen attempts did not have a fast first token,
+	// whatever the seventeenth attempt measured.
+	//
+	// A request that never produced a token keeps a zero TTFT rather than
+	// inheriting the wait: it has no time-to-first-token to report, and
+	// inventing one would put backoff into a statistic about tokens.
 	m.Retries429, m.RetryWait = retries, retryWait
 	m.TotalResponseTime += retryWait
+	if m.TimeToFirstToken > 0 {
+		m.TimeToFirstToken += retryWait
+	}
 	if m.Error == nil && strings.TrimSpace(m.Response) == "" && m.UsageData.OutputTokens.Count == 0 {
 		m.IsEmpty = true
 		m.Error = fmt.Errorf("empty response from model")

@@ -151,11 +151,17 @@ func TestReplayWaitsOut429sRatherThanFailing(t *testing.T) {
 	if m.RetryWait > time.Second {
 		t.Errorf("RetryWait = %v for three sheds, want the ~70ms schedule", m.RetryWait)
 	}
-	// TTFT must describe the attempt the server ran, not the waiting; the wait
-	// belongs to TotalResponseTime.
-	if m.TimeToFirstToken >= m.RetryWait {
-		t.Errorf("TimeToFirstToken %v absorbed the %v backoff; it must time the served attempt only",
-			m.TimeToFirstToken, m.RetryWait)
+	// TTFT must ABSORB the waiting. A caller who backed off three times and then
+	// got a token waited for all of it, and reporting only the served attempt
+	// describes a fleet that answered promptly to someone who was made to queue.
+	//
+	// This inverts what the field used to promise. The old contract protected
+	// the fleet's apparent latency from the client's backoff; it also meant a
+	// saturating fleet looked fast precisely as it stopped keeping up, and the
+	// admission governor — which gates on this number — kept adding load.
+	if m.TimeToFirstToken <= m.RetryWait {
+		t.Errorf("TimeToFirstToken %v excludes the %v spent backing off; retries must be inside "+
+			"TTFT for every consumer, not accounted separately", m.TimeToFirstToken, m.RetryWait)
 	}
 	if m.TotalResponseTime < m.RetryWait {
 		t.Errorf("TotalResponseTime %v excludes the %v the caller spent waiting",

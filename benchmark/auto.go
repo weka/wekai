@@ -204,10 +204,15 @@ type AutoBenchmarkConfig struct {
 // requestDataRecord holds per-request data written to JSONL output.
 type requestDataRecord struct {
 	// Timing
-	StartTime  time.Time `json:"start_time"`
-	EndTime    time.Time `json:"end_time"`
-	TTFT       float64   `json:"ttft_ms"`          // milliseconds
-	ResponseMs float64   `json:"response_time_ms"` // milliseconds
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
+	// TTFT and ResponseMs are both CALLER-experienced: every 429 the client
+	// backed off is inside them. There is no retry-excluded variant to compare
+	// against, deliberately — reporting retries as their own dimension invites a
+	// reader to subtract them back out, and a request that took seventeen
+	// attempts did not have a fast first token.
+	TTFT       float64 `json:"ttft_ms"`          // milliseconds
+	ResponseMs float64 `json:"response_time_ms"` // milliseconds
 
 	// Identity
 	Model      string `json:"model"`
