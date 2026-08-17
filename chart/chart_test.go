@@ -569,3 +569,32 @@ func TestAdmitEveryIsTunableUnderRealtime(t *testing.T) {
 			"is how a result is shown to have converged")
 	}
 }
+
+// Under realtime the client gate must be out of the way. It is a SECOND,
+// independent limiter — the flat-out default of 28 would cap a run simulation
+// puts in the hundreds, and the result would be a measurement of that number
+// rather than of the fleet. Same class as --series, which the chart already
+// refuses to pass here.
+func TestRealtimeDropsTheClientConcurrencyGate(t *testing.T) {
+	on := render(t, "--set", "replay.realtime=true")
+	for _, unwanted := range []string{"--concurrency=", "--hot-series-concurrency=", "--series="} {
+		if strings.Contains(on, unwanted) {
+			t.Errorf("%s is passed under realtime; it bounds the client, and realtime exists to "+
+				"let the fleet's latency do the bounding", unwanted)
+		}
+	}
+}
+
+// TestRealtimeCapIsSeparateFromTheFlatOutDefault: a run that genuinely wants a
+// ceiling can have one, but it has to be asked for by its own name so the
+// ordinary default cannot leak into a realtime run.
+func TestRealtimeCapIsSeparateFromTheFlatOutDefault(t *testing.T) {
+	out := render(t, "--set", "replay.realtime=true", "--set", "replay.concurrencyCap=512")
+	if !strings.Contains(out, "--concurrency=512") {
+		t.Error("concurrencyCap did not reach the rendered command")
+	}
+	// And the flat-out value must still be inert here.
+	if strings.Contains(out, "--concurrency=28") {
+		t.Error("the flat-out default leaked into a realtime run")
+	}
+}

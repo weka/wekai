@@ -73,11 +73,17 @@ spec:
                 {{- if .Values.replay.maxOutputTokens }}
                 --max-output-tokens={{ .Values.replay.maxOutputTokens | int64 }} \
                 {{- end }}
+                {{- if not .Values.replay.realtime }}
                 {{- if .Values.replay.concurrency }}
                 --concurrency={{ .Values.replay.concurrency | int64 }} \
                 {{- end }}
                 {{- if .Values.replay.hotConcurrency }}
                 --hot-series-concurrency={{ .Values.replay.hotConcurrency | int64 }} \
+                {{- end }}
+                {{- else if .Values.replay.concurrencyCap }}
+                {{/* Under realtime the gate is out of the way unless asked for.
+                     A cap here is a deliberate ceiling, not the default 28. */}}
+                --concurrency={{ .Values.replay.concurrencyCap | int64 }} \
                 {{- end }}
                 {{- if .Values.replay.maxConcurrency }}
                 --max-concurrency={{ .Values.replay.maxConcurrency | int64 }} \

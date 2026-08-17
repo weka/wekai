@@ -106,8 +106,18 @@ replay:
   vllmMetricsUrls: []
   replayNoStamp: false     # disable per-run cache-busting stamp (bitwise-faithful replay)
   maxOutputTokens: 0       # override max output tokens per request (0 = use replay-file's own budgets)
+  # Fixed request concurrency, and a 'hot' sub-pool with its own gate. Both are
+  # IGNORED under realtime: they bound the client, and realtime exists to let the
+  # fleet's latency do the bounding. Leaving the 28 below in play would cap a run
+  # simulation puts in the hundreds, and the result would be a measurement of
+  # this number.
   concurrency: 28          # fixed concurrency (0 = auto hill-climber)
   hotConcurrency: 4        # H workers form a 'hot' pool with a dedicated gate (--hot-series-concurrency; 0 = off)
+  # A deliberate ceiling under realtime, for a run that wants one anyway. Unset
+  # (0) leaves the gate out of the way, which is the point of the mode. This is
+  # separate from `concurrency` above so the ordinary default cannot leak into a
+  # realtime run by accident.
+  concurrencyCap: 0
   maxConcurrency: 0        # hill-climber upper bound, only relevant when concurrency=0 (0 = binary default)
   requestTimeout: ""       # per-request timeout, e.g. "5m"
   abortOnCollapse: false   # abort if windowed cache hit rate collapses

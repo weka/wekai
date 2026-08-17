@@ -896,6 +896,11 @@ func (r autoTermReason) String() string {
 }
 
 // autoState holds the mutable benchmark state shared between evaluator and series goroutines.
+// realtimeUngatedConcurrency is the client gate under --replay-realtime with no
+// explicit --concurrency: high enough to be out of the way, finite enough that a
+// runaway meets a limit rather than the file-descriptor table.
+const realtimeUngatedConcurrency = 100000
+
 type autoState struct {
 	mu sync.Mutex
 
@@ -1594,6 +1599,27 @@ func runSingleModelBenchmark(
 	initConc := 1
 	if cfg.Concurrency > 0 {
 		initConc = cfg.Concurrency
+	} else if cfg.ReplayRealtime {
+		// Real-time replay means the FLEET's latency is the throttle, so the
+		// client's own gate has to be out of the way. Left at the default it is
+		// a second, independent limiter: it starts at 1 and is raised by a
+		// hill-climber watching cache hit rate, which has nothing to do with the
+		// TTFT governor deciding how many sessions to admit. Two limiters, one
+		// of them ignorant of the experiment.
+		//
+		// Bounded rather than truly unlimited so a runaway still hits something
+		// before the process runs out of sockets. Simulation of this workload
+		// tops out near 2,500 concurrent at the most aggressive ramp worth
+		// using, so this is out of the way by a wide margin without being a
+		// blank cheque. An explicit --concurrency still caps, for an operator
+		// who wants one.
+		initConc = realtimeUngatedConcurrency
+		cfg.Concurrency = initConc // fixed, so the hill-climber stays out too
+		fmt.Fprintf(os.Stderr,
+			"[realtime] client concurrency gate set to %d: --replay-realtime lets the fleet's "+
+				"latency decide the load, and a gate below what the session governor reaches "+
+				"would silently become the bottleneck. Pass --concurrency to cap it deliberately.\n",
+			initConc)
 	}
 	st := &autoState{
 		series:            cfg.StartSeries,
