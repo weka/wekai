@@ -2094,7 +2094,7 @@ func runSingleModelBenchmark(
 				select {
 				case <-benchCtx.Done():
 					fmt.Fprintf(os.Stderr, "[realtime] final %s skipped=%s\n",
-						st.lag.summary(), st.skipClk.Skew().Round(time.Second))
+						st.lag.summary(time.Now()), st.skipClk.Skew().Round(time.Second))
 					return
 				case <-t.C:
 				}
@@ -2102,8 +2102,13 @@ func runSingleModelBenchmark(
 				series := st.series
 				st.mu.Unlock()
 				mean, n := st.ttft.Mean(time.Now())
-				fmt.Fprintf(os.Stderr, "[realtime] sessions=%d ttft_win=%s/%d %s skipped=%s\n",
-					series, mean.Round(time.Millisecond), n, st.lag.summary(),
+				// `slots` and not `sessions`: this is the admitted worker count,
+				// and a worker runs one session at a time then pulls the next.
+				// It is the concurrency of conversations, not a total of them —
+				// adding it to the retired count double-counts every worker that
+				// has finished one and started another.
+				fmt.Fprintf(os.Stderr, "[realtime] slots=%d ttft_win=%s/%d %s skipped=%s\n",
+					series, mean.Round(time.Millisecond), n, st.lag.summary(time.Now()),
 					st.skipClk.Skew().Round(time.Second))
 			}
 		}()

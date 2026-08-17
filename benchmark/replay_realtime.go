@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -352,12 +353,44 @@ type pacingLag struct {
 	sessions int64
 	covered  time.Duration
 	wall     time.Duration
+
+	// Sessions still running, included in the ratio.
+	//
+	// Computing fidelity over finished sessions ONLY is survivorship bias, and
+	// on this workload it is severe rather than subtle: a session that finishes
+	// early is a short one, and the long conversations — the ones carrying the
+	// four-minute think gaps this mode exists to reproduce — are precisely the
+	// ones still running and therefore excluded. The ratio then moves with the
+	// mix of what has retired rather than with how the fleet is doing, and it
+	// can fall by a third between two samples without the fleet changing at all.
+	live   map[int64]*liveSession
+	nextID int64
+}
+
+// liveSession is a session in progress: how far into its capture it has reached
+// so far, and when it started.
+type liveSession struct {
+	covered *atomic.Int64
+	origin  time.Time
+}
+
+// beginSession registers a running session and returns its handle.
+func (l *pacingLag) beginSession(covered *atomic.Int64, origin time.Time) int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.live == nil {
+		l.live = map[int64]*liveSession{}
+	}
+	l.nextID++
+	l.live[l.nextID] = &liveSession{covered: covered, origin: origin}
+	return l.nextID
 }
 
 // observeSession records one finished session's progress through its capture.
-func (l *pacingLag) observeSession(covered, wall time.Duration) {
+func (l *pacingLag) observeSession(id int64, covered, wall time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	delete(l.live, id)
 	l.sessions++
 	l.covered += covered
 	l.wall += wall
@@ -383,7 +416,7 @@ func (l *pacingLag) observe(d time.Duration) {
 }
 
 // summary is one line, empty when nothing was paced.
-func (l *pacingLag) summary() string {
+func (l *pacingLag) summary(now time.Time) string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.n == 0 {
@@ -397,10 +430,22 @@ func (l *pacingLag) summary() string {
 		"paced=%d late=%d (%.1f%%) mean_late=%s max_late=%s >1s=%d >10s=%d >1m=%d >10m=%d",
 		l.n, l.late, 100*float64(l.late)/float64(l.n), mean.Round(time.Millisecond),
 		l.max.Round(time.Millisecond), l.overs[0], l.overs[1], l.overs[2], l.overs[3])
-	if l.sessions > 0 && l.wall > 0 {
-		out += fmt.Sprintf(" | retired=%d covered=%s of %s alive (fidelity %.2f)",
-			l.sessions, l.covered.Round(time.Second), l.wall.Round(time.Second),
-			float64(l.covered)/float64(l.wall))
+	// Live sessions count too. Their coverage so far against the time they have
+	// so far been alive is exactly as meaningful as a finished session's, and
+	// leaving them out is what made the ratio a statement about which sessions
+	// happened to be short.
+	covered, wall := l.covered, l.wall
+	for _, s := range l.live {
+		covered += time.Duration(s.covered.Load())
+		if d := now.Sub(s.origin); d > 0 {
+			wall += d
+		}
+	}
+	if wall > 0 {
+		out += fmt.Sprintf(" | sessions=%d(%d done) covered=%s of %s alive (fidelity %.2f)",
+			int64(len(l.live))+l.sessions, l.sessions,
+			covered.Round(time.Second), wall.Round(time.Second),
+			float64(covered)/float64(wall))
 	}
 	return out
 }

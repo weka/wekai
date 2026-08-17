@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -271,7 +272,7 @@ func TestPacingLagSummarySeparatesLateFromOnTime(t *testing.T) {
 	l.observe(30 * time.Second)
 	l.observe(20 * time.Minute)
 
-	s := l.summary()
+	s := l.summary(time.Now())
 	for _, want := range []string{"paced=10", "late=3", ">1s=3", ">10s=2", ">1m=1", ">10m=1"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("summary %q is missing %q", s, want)
@@ -290,7 +291,7 @@ func TestPacingLagSummarySeparatesLateFromOnTime(t *testing.T) {
 // line implying it was paced.
 func TestPacingLagSaysNothingWhenNothingWasPaced(t *testing.T) {
 	var l pacingLag
-	if s := l.summary(); s != "" {
+	if s := l.summary(time.Now()); s != "" {
 		t.Errorf("summary = %q on a run that paced nothing", s)
 	}
 }
@@ -341,21 +342,62 @@ func TestFanOutSharesTheSessionTimeline(t *testing.T) {
 func TestCoverageIsCapturedTimeOverWallTime(t *testing.T) {
 	var l pacingLag
 	l.observe(0)
-	l.observeSession(30*time.Minute, time.Hour) // half fidelity
-	l.observeSession(time.Hour, time.Hour)      // faithful
+	l.observeSession(l.beginSession(&atomic.Int64{}, time.Now()), 30*time.Minute, time.Hour) // half fidelity
+	l.observeSession(l.beginSession(&atomic.Int64{}, time.Now()), time.Hour, time.Hour)      // faithful
 
-	s := l.summary()
-	for _, want := range []string{"retired=2", "covered=1h30m0s", "of 2h0m0s alive", "fidelity 0.75"} {
+	s := l.summary(time.Now())
+	for _, want := range []string{"sessions=2(2 done)", "covered=1h30m0s", "of 2h0m0s alive", "fidelity 0.75"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("summary %q is missing %q", s, want)
 		}
 	}
 }
 
-func TestCoverageAbsentUntilASessionRetires(t *testing.T) {
+func TestCoverageAbsentUntilThereIsASession(t *testing.T) {
 	var l pacingLag
 	l.observe(0)
-	if strings.Contains(l.summary(), "fidelity") {
-		t.Error("fidelity reported before any session finished; it would be a ratio of nothing")
+	if strings.Contains(l.summary(time.Now()), "fidelity") {
+		t.Error("fidelity reported with no sessions at all; it would be a ratio of nothing")
+	}
+}
+
+// TestFidelityCountsRunningSessions is the bias this exists to remove.
+//
+// Computed over FINISHED sessions only, the ratio is a statement about which
+// sessions happened to be short — and on this workload that is severe rather
+// than subtle, because the long conversations carrying the four-minute think
+// gaps are exactly the ones still running. It then moves with the retiring mix
+// rather than with the fleet, and can fall by a third between two samples while
+// nothing about the fleet has changed.
+func TestFidelityCountsRunningSessions(t *testing.T) {
+	now := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	var l pacingLag
+	l.observe(0)
+
+	// One short session finished, perfectly faithful.
+	l.observeSession(l.beginSession(&atomic.Int64{}, now), time.Minute, time.Minute)
+	if got := l.summary(now); !strings.Contains(got, "fidelity 1.00") {
+		t.Fatalf("premise: %q", got)
+	}
+
+	// A long one is still running and badly behind: an hour alive, ten minutes
+	// of capture covered. Reporting only the retired session would still say
+	// 1.00 while the run is plainly not keeping up.
+	var covered atomic.Int64
+	covered.Store(int64(10 * time.Minute))
+	l.beginSession(&covered, now.Add(-time.Hour))
+
+	got := l.summary(now)
+	if strings.Contains(got, "fidelity 1.00") {
+		t.Errorf("summary %q ignores a running session an hour old that has covered ten minutes; "+
+			"survivorship over retired sessions is what made this number drift with composition", got)
+	}
+	// (1m + 10m) / (1m + 60m) = 0.18
+	if !strings.Contains(got, "fidelity 0.18") {
+		t.Errorf("summary %q: want the ratio over all sessions, live and done", got)
+	}
+	if !strings.Contains(got, "sessions=2(1 done)") {
+		t.Errorf("summary %q must say how many of the sessions have finished, since the two "+
+			"populations answer different questions", got)
 	}
 }

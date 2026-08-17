@@ -588,6 +588,10 @@ func runRouterReplaySession(
 	// slower than the capture it is reproducing.
 	sessionOrigin := st.skipClk.Now()
 	var covered atomic.Int64 // furthest capture offset any instance reached, ns
+	sessionID := int64(0)
+	if cfg.ReplayRealtime {
+		sessionID = st.lag.beginSession(&covered, sessionOrigin)
+	}
 
 	// Build done-channels for every included request id. Helpers and
 	// ephemerals carry an implicit parent_spawn_request_id baked in at
@@ -639,7 +643,7 @@ func runRouterReplaySession(
 	}
 	wg.Wait()
 	if cfg.ReplayRealtime {
-		st.lag.observeSession(time.Duration(covered.Load()), st.skipClk.Now().Sub(sessionOrigin))
+		st.lag.observeSession(sessionID, time.Duration(covered.Load()), st.skipClk.Now().Sub(sessionOrigin))
 	}
 }
 
