@@ -531,6 +531,13 @@ var CapacityRetryReasons = []string{ReasonSaturated, ReasonGuardBlocked}
 // stay lazy: there is no complete list to enumerate, and inventing one would
 // fill the scrape with series for backends that do not exist.
 func warm() {
+	// Both abort reasons exist from startup, so an operator can see that
+	// upstream aborts are zero while client disconnects are not — which is the
+	// distinction the label previously destroyed by asserting a cause.
+	for _, r := range []string{"upstream_error", "client_disconnect", "idle_timeout"} {
+		StreamAborted.WithLabelValues(r)
+	}
+
 	// Circuit transitions exist from startup for the states a breaker can move
 	// between, so "no breaker ever opened" is readable rather than merely
 	// absent.

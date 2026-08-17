@@ -578,13 +578,26 @@ func (s *scanBody) Read(p []byte) (int, error) {
 		s.appendTail(p[:n])
 	}
 	if err != nil && err != io.EOF && !s.sawEnd {
-		metrics.StreamAborted.WithLabelValues("upstream_error").Inc()
-		// A client that hung up mid-response is not the backend's fault, and
-		// blaming it would eject healthy backends on a fleet where callers time
-		// out — which is every saturated fleet. The counter still records the
-		// abort; only the attribution is withheld.
-		if s.aborted == nil && !errors.Is(err, context.Canceled) {
-			s.aborted = fmt.Errorf("upstream stream aborted before its terminal marker: %w", err)
+		// The label has to name what actually happened, and for most of these
+		// it is the CALLER hanging up rather than the upstream stopping.
+		//
+		// A client that goes away cancels the request context, which fails the
+		// read of the upstream body — so it arrives here looking exactly like an
+		// upstream abort. Labelling it "upstream_error" asserts a cause the code
+		// has not established, and on a saturated fleet it is the whole
+		// population: measured live, this counter tracked
+		// router_client_disconnects_total sample for sample.
+		//
+		// Same reasoning as the attribution below. A caller giving up is not the
+		// backend's fault, and blaming it would eject healthy backends on
+		// exactly the fleet that can least afford to lose one.
+		if errors.Is(err, context.Canceled) {
+			metrics.StreamAborted.WithLabelValues("client_disconnect").Inc()
+		} else {
+			metrics.StreamAborted.WithLabelValues("upstream_error").Inc()
+			if s.aborted == nil {
+				s.aborted = fmt.Errorf("upstream stream aborted before its terminal marker: %w", err)
+			}
 		}
 	}
 	return n, err
