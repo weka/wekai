@@ -252,13 +252,60 @@ func fetchFirstModelID(url string) (string, int, error) {
 
 // endpointAttempts returns the URL(s) to try for a request: the latched
 // endpoint once resolved, else primary then /v1 fallback.
+//
+// Resolution is shared PROCESS-WIDE, keyed by the primary form, not kept per
+// poster. A poster is built per replay instance, so a per-poster answer meant
+// every instance re-probed from scratch and paid a 404 before falling back —
+// and because this is called inside the 429 backoff loop, a poster whose first
+// request kept getting shed re-probed on every iteration. The two compound: the
+// 404s stayed invisible on an idle fleet and became 16.5% of all requests once
+// the fleet saturated and retries began.
+//
+// Against a bare endpoint only. An operator who writes /v1 themselves never
+// sees it, which is how seven arms and a million requests passed over it.
 func (p *replayPoster) endpointAttempts() []string {
 	p.epMu.Lock()
-	defer p.epMu.Unlock()
 	if p.epResolved != "" {
+		defer p.epMu.Unlock()
 		return []string{p.epResolved}
 	}
+	p.epMu.Unlock()
+
+	// Someone else already answered this question.
+	if known := lookupResolvedEndpoint(p.epPrimary); known != "" {
+		p.epMu.Lock()
+		if p.epResolved == "" {
+			p.epResolved = known
+			p.epFellBack = known == p.epFallback && p.epFallback != p.epPrimary
+		}
+		p.epMu.Unlock()
+		return []string{known}
+	}
+	// Genuinely first: probe both. Deliberately no single-flight, so a
+	// high-concurrency launch is never serialised behind one resolver; the
+	// duplicate probes last only until the first latch.
 	return []string{p.epPrimary, p.epFallback}
+}
+
+// Endpoint resolutions shared across every poster in the process, keyed by the
+// primary form so two different bases never see each other's answer.
+var (
+	epSharedMu sync.RWMutex
+	epShared   = map[string]string{}
+)
+
+func lookupResolvedEndpoint(primary string) string {
+	epSharedMu.RLock()
+	defer epSharedMu.RUnlock()
+	return epShared[primary]
+}
+
+func shareResolvedEndpoint(primary, resolved string) {
+	epSharedMu.Lock()
+	if _, ok := epShared[primary]; !ok {
+		epShared[primary] = resolved
+	}
+	epSharedMu.Unlock()
 }
 
 // Endpoint resolutions logged so far, PACKAGE-scoped: replayPoster is
@@ -285,6 +332,7 @@ func (p *replayPoster) latchEndpoint(url string) {
 	}
 	resolved, fellBack := p.epResolved, p.epFellBack
 	p.epMu.Unlock()
+	shareResolvedEndpoint(p.epPrimary, resolved)
 	epLogMu.Lock()
 	seen := epLogSeen[resolved]
 	if !seen {
