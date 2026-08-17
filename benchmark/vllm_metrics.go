@@ -561,6 +561,23 @@ func (s *vllmMetricsSampler) fetchOne(ctx context.Context, url string) (map[stri
 
 // ── Report-side transforms ──────────────────────────────────────────────────
 
+// Reading the cache-mix strip: the external-KV SHARE is a decaying function of
+// elapsed time on a corpus with a bounded working set, not a property of the
+// fleet.
+//
+// The shape is populate-then-serve. A shared tier is read to fill local cache
+// early and is barely touched once the working set is resident. Measured on one
+// arm: 15.8% of prompt tokens at minute 1, 4.9% at minute 6, 3.8% at minute 11,
+// while local_cache_hit climbed 73.8% to 88.9% over the same span. Any single
+// share figure is therefore a statement about WHEN it was read.
+//
+// Which means the share cannot answer "is the shared tier doing anything" past
+// the opening minutes: a connector working well and one doing nothing both
+// trend toward a small number. They differ in the CUMULATIVE total, which is
+// what the router's aggregated vllm:prompt_tokens_by_source_total carries and
+// what does not move under a reader. Quote that, or quote the share with its
+// elapsed time attached.
+//
 // vizSampleSegment is one inter-sample interval with per-source token DELTAS
 // (cumulative counter diffs, clamped at 0 so counter resets don't render as
 // negative), embedded into the visualization data.
