@@ -15,6 +15,19 @@
 # the answer: the point where adding clients only adds queueing.
 set -euo pipefail
 
+# NEVER touch the caller's kubeconfig. Two things here write to whatever
+# $KUBECONFIG points at: `k3d cluster create` merges the new cluster in and
+# switches the current context, and `kubectl config set-context --current`
+# rewrites the file to add a namespace. Both rewrite the whole document, so a
+# hand-maintained file loses its comments and formatting even when the
+# credentials survive — and the file a developer has exported is routinely a
+# real cluster's, sometimes a production one, with no recovery path from here.
+#
+# A scratch file costs nothing and removes the possibility entirely.
+KUBECONFIG="$(mktemp -t wekai-kubeconfig)"
+export KUBECONFIG
+
+
 CLUSTER=${CLUSTER:-wekai-perf}
 NS=${NS:-wekai-perf}
 TAG=perf
@@ -35,6 +48,7 @@ for tool in k3d kubectl helm docker; do
 done
 
 cleanup() {
+  rm -f "$KUBECONFIG"
   if [ "$KEEP" = "1" ]; then
     echo "==> KEEP=1, leaving cluster '$CLUSTER' up. Remove with: k3d cluster delete $CLUSTER"
     return

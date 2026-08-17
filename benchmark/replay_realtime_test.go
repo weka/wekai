@@ -401,3 +401,41 @@ func TestFidelityCountsRunningSessions(t *testing.T) {
 			"populations answer different questions", got)
 	}
 }
+
+// The admission gate must read the CALLER's time to first token, not the
+// attempt's.
+//
+// TimeToFirstToken is per-attempt by design — timed from the attempt the server
+// actually ran, so backoff cannot make a healthy fleet look slow — and that is
+// the right number to report. It is the wrong number to gate on: --ttft-limit
+// decides whether to admit another session, and a gate blind to backoff reads
+// the fleet's speed on the requests that got through while callers wait far
+// longer. Observed on hardware: requests spending 30s across 17 attempts while
+// the reported per-attempt p50 was 1.7s.
+func TestGateSeesBackoffWait(t *testing.T) {
+	base := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	const limit = 5 * time.Second
+
+	// Per-attempt latency well under the limit, but each request also waited out
+	// eight seconds of 429 backoff before the attempt that worked.
+	perAttempt := 2 * time.Second
+	backoff := 8 * time.Second
+
+	attemptOnly := newTTFTWindow(30 * time.Second)
+	callerSees := newTTFTWindow(30 * time.Second)
+	for i := range 20 {
+		at := base.Add(time.Duration(i) * time.Second)
+		attemptOnly.Observe(at, perAttempt)
+		callerSees.Observe(at, perAttempt+backoff)
+	}
+	now := base.Add(20 * time.Second)
+
+	if !attemptOnly.Open(now, limit) {
+		t.Fatal("premise: per-attempt latency alone is under the limit")
+	}
+	if callerSees.Open(now, limit) {
+		t.Error("a gate reading attempt-plus-backoff still admits at 10s against a 5s limit; the " +
+			"governor would keep adding sessions past what the fleet sustains and report a " +
+			"plateau above the honest one")
+	}
+}
