@@ -531,6 +531,23 @@ var CapacityRetryReasons = []string{ReasonSaturated, ReasonGuardBlocked}
 // stay lazy: there is no complete list to enumerate, and inventing one would
 // fill the scrape with series for backends that do not exist.
 func warm() {
+	// Circuit transitions exist from startup for the states a breaker can move
+	// between, so "no breaker ever opened" is readable rather than merely
+	// absent.
+	//
+	// This was the one metric that could have answered whether a breaker fired
+	// during a 13-second backend failure, and it did not exist — a CounterVec
+	// with nothing to create it until the first transition. circuit_state is a
+	// gauge, so a breaker that opened and closed between scrapes left no trace
+	// anywhere at all, and an operator could not distinguish "never opened"
+	// from "not instrumented".
+	for _, t := range [][2]string{
+		{"closed", "open"}, {"open", "half-open"},
+		{"half-open", "closed"}, {"half-open", "open"},
+	} {
+		CircuitTransitions.WithLabelValues("", t[0], t[1])
+	}
+
 	// Both states exist from startup: a router with aggregation on and nothing
 	// yet discovered must report 0, not nothing.
 	for _, st := range []string{"contributing", "asked"} {
