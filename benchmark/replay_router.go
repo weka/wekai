@@ -716,7 +716,7 @@ func runRouterReplayInstance(
 	// With a multi-endpoint spec the posters were built once per series loop and
 	// live on the picker; this per-instance poster is only the single-endpoint
 	// fallback. err is still checked so a bad model spec fails the same way.
-	poster, err := newReplayPoster(cfg.Model, config.GetAPIKeys(), "", replayRunID, cfg.DryRun, cfg.DryRunColdTPS, cfg.DryRunWarmTPS, cfg.DryRunOutputTPS, st.estimator)
+	poster, err := newReplayPoster(cfg.Model, config.GetAPIKeys(), "", replayRunID, cfg.DryRun, cfg.DryRunColdTPS, cfg.DryRunWarmTPS, cfg.DryRunOutputTPS, st.estimator, &st.dispatched)
 	if err == nil {
 		poster.outputRatio = cfg.ReplayOutputRatio
 		poster.forceOutput = cfg.ReplayForceOutput

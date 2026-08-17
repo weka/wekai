@@ -22,6 +22,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/weka/wekai/llm"
@@ -78,7 +79,7 @@ type replayPoster struct {
 	replayCharsPerToken float64
 }
 
-func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string, runID string, dryRun bool, coldTPS, warmTPS, outputTPS int, estimator *cacheEstimator) (*replayPoster, error) {
+func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string, runID string, dryRun bool, coldTPS, warmTPS, outputTPS int, estimator *cacheEstimator, dispatched *atomic.Int64) (*replayPoster, error) {
 	if !llm.IsDynamicModel(modelSpec) {
 		return nil, fmt.Errorf("router-replay requires a dynamic/ model spec; got %q", modelSpec)
 	}
@@ -158,7 +159,7 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 			warmTPS   int
 			outputTPS int
 		}{coldTPS, warmTPS, outputTPS},
-		client:      &http.Client{},
+		client:      &http.Client{Transport: newInflightTransport(nil, dispatched)},
 		retryBudget: retry429Budget,
 	}, nil
 }

@@ -55,7 +55,7 @@ func buildReplayPosterForDoubleCount(t *testing.T, responseBody string, streamin
 	}))
 	modelSpec := fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL)
 	keys := llm.APIKeys{OpenAI: "sk-test"}
-	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil)
+	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil, nil)
 	if err != nil {
 		ts.Close()
 		t.Fatalf("newReplayPoster: %v", err)
@@ -84,7 +84,7 @@ func buildAnthropicReplayPosterForDoubleCount(t *testing.T, responseBody string,
 	}))
 	modelSpec := fmt.Sprintf("dynamic/%s,type=anthropic,model=claude-test", ts.URL)
 	keys := llm.APIKeys{Anthropic: "ak-test"}
-	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil)
+	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil, nil)
 	if err != nil {
 		ts.Close()
 		t.Fatalf("newReplayPoster: %v", err)

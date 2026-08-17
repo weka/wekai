@@ -930,6 +930,12 @@ type autoState struct {
 	allTimePeakSeries int     // series count at which allTimePeakRPS was achieved
 
 	// Atomic counters (no lock needed for reads/writes)
+	// dispatched is requests whose HTTP exchange is open: counted from the
+	// round trip starting to the response body being closed. Distinct from the
+	// gate's active count, which also covers building and uploading a body —
+	// see inflight_transport.go.
+	dispatched atomic.Int64
+
 	totalCompleted atomic.Int64
 	totalEmitted   atomic.Int64
 	totalErrors    atomic.Int64
@@ -1119,11 +1125,16 @@ type displaySnapshot struct {
 	gateActive           int
 	gateColdWaiting      int
 	gateNormalWait       int
-	gateHotActive        int   // active slots in the hot-pool gate (non-zero only with hot-series-concurrency)
-	totalInput           int64 // total full-prompt input tokens (cold + warm)
-	totalInputWarm       int64 // warm full-prompt input tokens
-	totalCached          int64 // server-reported cached prompt tokens (subset of totalInput)
-	totalOutput          int64 // total output tokens
+	gateHotActive        int // active slots in the hot-pool gate (non-zero only with hot-series-concurrency)
+	// gateDispatched is requests whose HTTP exchange is actually open. gateActive
+	// counts gate slots, which are held from before the body is built until after
+	// the response is consumed, so the difference is the client's own prep and
+	// upload — real work, in a real place, but not concurrency the fleet carried.
+	gateDispatched int
+	totalInput     int64 // total full-prompt input tokens (cold + warm)
+	totalInputWarm int64 // warm full-prompt input tokens
+	totalCached    int64 // server-reported cached prompt tokens (subset of totalInput)
+	totalOutput    int64 // total output tokens
 
 	// Replay-mode progress (replayTotal > 0 enables the replay panel in render)
 	replayTotal     int   // total conversations queued (fixed at start)
@@ -1294,17 +1305,24 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 		replayPrefix = fmt.Sprintf("replay=%d/%d(queue=%d,active=%d) ",
 			snap.replayCompleted, snap.replayTotal, snap.replayRemaining, snap.replayActive)
 	}
-	// in_flight: HTTP requests currently sitting in the gate's "active"
-	// counter. Useful for spotting (a) long-tail drops (in_flight < series)
-	// and (b) fan-out bursts (in_flight > series when sub-agents fire in
-	// parallel and concurrency cap is higher than series count).
+	// Two counts, because they answer different questions and were being read
+	// as one. in_flight is requests whose HTTP exchange is open — the
+	// concurrency the FLEET is carrying, and the number to quote against its own
+	// num_requests_running. held is gate slots, taken before the body is built
+	// and released after the response is consumed, so held-minus-in_flight is
+	// the client synthesising and uploading several hundred kilobytes per
+	// request. On this workload that gap ran to about a third of the total, and
+	// quoting the gate figure as fleet concurrency overstated it by that much.
+	//
+	// held is still worth seeing: below the series count it means long-tail
+	// drops, above it means fan-out bursts.
 	if snap.termReason != "" {
 		hotInfo := ""
 		if snap.gateHotActive > 0 {
 			hotInfo = fmt.Sprintf(" hot=%d", snap.gateHotActive)
 		}
-		return fmt.Sprintf("DONE(%s) %sseries=%d conc=%d in_flight=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d in=%s warm=%s scached=%s out=%s",
-			snap.termReason, replayPrefix, snap.series, snap.concurrency, snap.gateActive, hotInfo,
+		return fmt.Sprintf("DONE(%s) %sseries=%d conc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d in=%s warm=%s scached=%s out=%s",
+			snap.termReason, replayPrefix, snap.series, snap.concurrency, snap.gateDispatched, snap.gateActive, hotInfo,
 			formatFloat(snap.reqPerSec), snap.cacheHitRate*100, snap.globalLocalCacheRate*100, ttftStr, snap.totalCompleted, snap.totalErrors,
 			formatKiloInt(snap.totalInput), formatKiloInt(snap.totalInputWarm), formatKiloInt(snap.totalCached), formatKiloInt(snap.totalOutput))
 	}
@@ -1312,8 +1330,8 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 	if snap.gateHotActive > 0 {
 		hotInfo = fmt.Sprintf(" hot=%d", snap.gateHotActive)
 	}
-	return fmt.Sprintf("%sseries=%d conc=%d in_flight=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d elapsed=%s in=%s warm=%s scached=%s out=%s",
-		replayPrefix, snap.series, snap.concurrency, snap.gateActive, hotInfo,
+	return fmt.Sprintf("%sseries=%d conc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d elapsed=%s in=%s warm=%s scached=%s out=%s",
+		replayPrefix, snap.series, snap.concurrency, snap.gateDispatched, snap.gateActive, hotInfo,
 		formatFloat(snap.reqPerSec), snap.cacheHitRate*100, snap.globalLocalCacheRate*100, ttftStr, snap.totalCompleted, snap.totalErrors,
 		formatDuration(snap.elapsed),
 		formatKiloInt(snap.totalInput), formatKiloInt(snap.totalInputWarm), formatKiloInt(snap.totalCached), formatKiloInt(snap.totalOutput))
@@ -1563,6 +1581,7 @@ func runSingleModelBenchmark(
 			totalOutput:          tt.output,
 		}
 		gateActive, gateColdWaiting, gateNormalWait := st.gate.GateStats()
+		gateDispatched := int(st.dispatched.Load())
 		gateHotActive := 0
 		if st.hotGate != nil {
 			ha, _, _ := st.hotGate.GateStats()
@@ -1573,6 +1592,7 @@ func runSingleModelBenchmark(
 		snap.gateColdWaiting = gateColdWaiting
 		snap.gateNormalWait = gateNormalWait
 		snap.gateHotActive = gateHotActive
+		snap.gateDispatched = gateDispatched
 		if st.replay != nil {
 			snap.replayTotal = st.replay.Total()
 			snap.replayCompleted = st.seriesReplayCompleted.Load()
@@ -1683,7 +1703,7 @@ func runSingleModelBenchmark(
 		ok := true
 		for i, ep := range eps {
 			pp, perr := newReplayPoster(cfg.Model, config.GetAPIKeys(), ep, replayRunID,
-				cfg.DryRun, cfg.DryRunColdTPS, cfg.DryRunWarmTPS, cfg.DryRunOutputTPS, st.estimator)
+				cfg.DryRun, cfg.DryRunColdTPS, cfg.DryRunWarmTPS, cfg.DryRunOutputTPS, st.estimator, &st.dispatched)
 			if perr != nil {
 				ok = false
 				break

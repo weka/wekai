@@ -53,7 +53,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 	newState := func() *autoState { return &autoState{stream: newCompletionStream(200)} }
 	mustPoster := func(t *testing.T, spec string) *replayPoster {
 		t.Helper()
-		p, err := newReplayPoster(spec, keys, "", "", false, 0, 0, 0, nil)
+		p, err := newReplayPoster(spec, keys, "", "", false, 0, 0, 0, nil, nil)
 		if err != nil {
 			t.Fatalf("newReplayPoster: %v", err)
 		}
@@ -255,7 +255,7 @@ func TestNewReplayPoster_OpenAI(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := newReplayPoster(tt.modelSpec, keys, "", "", false, 0, 0, 0, nil)
+			p, err := newReplayPoster(tt.modelSpec, keys, "", "", false, 0, 0, 0, nil, nil)
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("expected error, got nil")
@@ -344,7 +344,7 @@ func TestOpenAIReplayEndToEnd(t *testing.T) {
 
 	modelSpec := fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL)
 	keys := llm.APIKeys{OpenAI: "sk-test-123"}
-	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil)
+	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("newReplayPoster: %v", err)
 	}
@@ -645,7 +645,7 @@ func TestOpenAINonStreamingEndToEnd(t *testing.T) {
 
 	modelSpec := fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL)
 	keys := llm.APIKeys{OpenAI: "sk-test"}
-	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil)
+	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("newReplayPoster: %v", err)
 	}
@@ -692,7 +692,7 @@ func TestOpenAIErrorResponse(t *testing.T) {
 
 	modelSpec := fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL)
 	keys := llm.APIKeys{OpenAI: "sk-test"}
-	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil)
+	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("newReplayPoster: %v", err)
 	}
@@ -734,7 +734,7 @@ func TestOpenAISSEWithoutUsage(t *testing.T) {
 
 	modelSpec := fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL)
 	keys := llm.APIKeys{OpenAI: "sk-test"}
-	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil)
+	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("newReplayPoster: %v", err)
 	}

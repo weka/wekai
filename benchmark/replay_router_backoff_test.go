@@ -117,7 +117,7 @@ func backoffTestPoster(t *testing.T, base string, budget time.Duration) *replayP
 	t.Helper()
 	p, err := newReplayPoster(
 		fmt.Sprintf("dynamic/%s/v1,type=openai_vllm,model=m", base),
-		llm.APIKeys{OpenAI: "sk-test"}, "", "", false, 0, 0, 0, nil)
+		llm.APIKeys{OpenAI: "sk-test"}, "", "", false, 0, 0, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("newReplayPoster: %v", err)
 	}
