@@ -111,7 +111,15 @@ type AutoBenchmarkConfig struct {
 	AdmitEvery     time.Duration // 0 = off, no session admission governor
 	TTFTLimit      time.Duration // gate closes at or above this windowed mean
 	TTFTWindow     time.Duration // how far back the gate looks; default 30s
-	ReplaySkipIdle bool          // compress dead time when the whole run is idle
+	// TTFTLimitStat is which statistic over that window the gate compares
+	// against TTFTLimit: mean (default), p50, p95 or p99.
+	//
+	// It decides the answer rather than decorating it. TTFT here is heavily
+	// skewed, so a mean gate closes at roughly half the session count a p50 gate
+	// would. All four are reported whichever is chosen, so one run says what its
+	// plateau would have been under each.
+	TTFTLimitStat  string
+	ReplaySkipIdle bool // compress dead time when the whole run is idle
 
 	ReplayNoStamp   bool // when true, skip the per-run <ignore>RUN_GUID</ignore> prefix injection (default is to stamp so each run starts with a pristine server prefix cache while still permitting within-run cross-series cache hits)
 	AbortOnCollapse bool // when true, abort if windowed cache hit rate < 50% for 2 minutes (legacy collapse detector, off by default — fires spuriously on legitimate low-reuse workloads)
@@ -2172,7 +2180,7 @@ func runSingleModelBenchmark(
 				st.mu.Lock()
 				series := st.series
 				st.mu.Unlock()
-				mean, n := st.ttft.Mean(time.Now())
+				tstats := st.ttft.Stats(time.Now())
 				// `slots` and not `sessions`: this is the admitted worker count,
 				// and a worker runs one session at a time then pulls the next.
 				// It is the concurrency of conversations, not a total of them —
@@ -2186,9 +2194,9 @@ func runSingleModelBenchmark(
 				if st.routerReplay != nil && st.routerReplay.Pass() > 0 {
 					passInfo = fmt.Sprintf(" corpus_pass=%d", st.routerReplay.Pass()+1)
 				}
-				fmt.Fprintf(os.Stderr, "[realtime] slots=%d%s ttft_win=%s/%d %s skipped=%s\n",
-					series, passInfo, mean.Round(time.Millisecond), n, st.lag.summary(st.skipClk.Now()),
-					st.skipClk.Skew().Round(time.Second))
+				fmt.Fprintf(os.Stderr, "[realtime] slots=%d%s %s %s skipped=%s\n",
+					series, passInfo, tstats.String(cfg.TTFTLimitStat),
+					st.lag.summary(st.skipClk.Now()), st.skipClk.Skew().Round(time.Second))
 			}
 		}()
 	}
@@ -2216,7 +2224,7 @@ func runSingleModelBenchmark(
 					st.mu.Unlock()
 					return
 				}
-				if !st.ttft.Open(time.Now(), cfg.TTFTLimit) {
+				if !st.ttft.Open(time.Now(), cfg.TTFTLimit, cfg.TTFTLimitStat) {
 					continue // over the limit: hold, and re-check next tick
 				}
 				next++

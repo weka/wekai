@@ -58,6 +58,7 @@ spec:
                 --admit-every={{ .Values.replay.admitEvery }} \
                 --ttft-limit={{ .Values.replay.ttftLimit }} \
                 --ttft-window={{ .Values.replay.ttftWindow }} \
+                --ttft-limit-stat={{ .Values.replay.ttftLimitStat }} \
                 {{- if .Values.replay.skipIdle }}
                 --replay-skip-idle \
                 {{- end }}

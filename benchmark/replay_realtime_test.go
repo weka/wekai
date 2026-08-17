@@ -48,13 +48,13 @@ func TestGateReopensWhenLatencyRecovers(t *testing.T) {
 	w := newTTFTWindow(30 * time.Second)
 	const limit = 5 * time.Second
 
-	if !w.Open(base, limit) {
+	if !w.Open(base, limit, "mean") {
 		t.Error("an empty window must open the gate; a run has to be able to start")
 	}
 	for i := range 20 {
 		w.Observe(base.Add(time.Duration(i)*time.Second), 8*time.Second)
 	}
-	if w.Open(base.Add(20*time.Second), limit) {
+	if w.Open(base.Add(20*time.Second), limit, "mean") {
 		t.Error("gate open with a windowed mean of 8s against a 5s limit")
 	}
 	// Recovery: the slow samples age out and fast ones replace them.
@@ -62,7 +62,7 @@ func TestGateReopensWhenLatencyRecovers(t *testing.T) {
 	for i := range 20 {
 		w.Observe(recov.Add(time.Duration(i)*time.Millisecond), 200*time.Millisecond)
 	}
-	if !w.Open(recov.Add(20*time.Millisecond), limit) {
+	if !w.Open(recov.Add(20*time.Millisecond), limit, "mean") {
 		t.Error("gate still shut after latency recovered; it must resume admitting, not latch")
 	}
 }
@@ -88,7 +88,7 @@ func TestZeroTTFTIsNotASample(t *testing.T) {
 	if mean != 8*time.Second {
 		t.Errorf("mean=%v, want 8s", mean)
 	}
-	if w.Open(base, 5*time.Second) {
+	if w.Open(base, 5*time.Second, "mean") {
 		t.Error("failures pulled the mean under the limit and reopened the gate — the governor " +
 			"would admit hardest exactly when the fleet is worst")
 	}
@@ -233,7 +233,7 @@ func TestGovernorDefaultsAreOff(t *testing.T) {
 	if w.window != 30*time.Second {
 		t.Errorf("zero window resolved to %v, want the 30s default", w.window)
 	}
-	if !w.Open(time.Now(), 5*time.Second) {
+	if !w.Open(time.Now(), 5*time.Second, "mean") {
 		t.Error("a fresh window must open the gate so a run can start")
 	}
 }
@@ -430,10 +430,10 @@ func TestGateSeesBackoffWait(t *testing.T) {
 	}
 	now := base.Add(20 * time.Second)
 
-	if !attemptOnly.Open(now, limit) {
+	if !attemptOnly.Open(now, limit, "mean") {
 		t.Fatal("premise: per-attempt latency alone is under the limit")
 	}
-	if callerSees.Open(now, limit) {
+	if callerSees.Open(now, limit, "mean") {
 		t.Error("a gate reading attempt-plus-backoff still admits at 10s against a 5s limit; the " +
 			"governor would keep adding sessions past what the fleet sustains and report a " +
 			"plateau above the honest one")
@@ -478,5 +478,77 @@ func TestFidelityCannotExceedOne(t *testing.T) {
 	wallNow := origin.Add(-3 * time.Minute) // wall lags the skip clock
 	if bad := l.summary(wallNow); strings.Contains(bad, "fidelity 0.50") {
 		t.Error("premise check: a mismatched clock should NOT produce the right answer")
+	}
+}
+
+// The gate's statistic is selectable, and the choice moves the answer by about
+// a factor of two on a distribution this skewed. All four are computed whichever
+// one gates, so a single run says what its plateau would have been under each —
+// the alternative is one eight-hour arm per statistic.
+func TestGateStatisticSelectsWhatCloses(t *testing.T) {
+	base := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	w := newTTFTWindow(30 * time.Second)
+
+	// 90 fast requests and 10 very slow ones: mean 5.6s, p50 1s, p95/p99 far above.
+	for i := range 90 {
+		w.Observe(base.Add(time.Duration(i)*time.Millisecond), time.Second)
+	}
+	for i := range 10 {
+		w.Observe(base.Add(time.Duration(90+i)*time.Millisecond), 47*time.Second)
+	}
+	now := base.Add(time.Second)
+
+	s := w.Stats(now)
+	if s.N != 100 {
+		t.Fatalf("n = %d, want 100", s.N)
+	}
+	if s.P50 != time.Second {
+		t.Errorf("p50 = %v, want 1s", s.P50)
+	}
+	if s.Mean < 5*time.Second || s.Mean > 6*time.Second {
+		t.Errorf("mean = %v, want ~5.6s", s.Mean)
+	}
+	if s.P95 != 47*time.Second || s.P99 != 47*time.Second {
+		t.Errorf("p95/p99 = %v/%v, want 47s", s.P95, s.P99)
+	}
+
+	// The same window against the same 5s limit closes or opens depending only
+	// on which statistic is asked for. That is the whole point of the flag, and
+	// the reason it has to be named in the log line.
+	const limit = 5 * time.Second
+	if w.Open(now, limit, "p50") != true {
+		t.Error("a p50 gate should still admit: half the callers are served in 1s")
+	}
+	if w.Open(now, limit, "mean") != false {
+		t.Error("a mean gate should hold: the tail drags the average over the limit")
+	}
+	if w.Open(now, limit, "p95") != false || w.Open(now, limit, "p99") != false {
+		t.Error("a tail gate should hold")
+	}
+	// An unrecognised name must behave as the documented default rather than
+	// silently admitting everything.
+	if w.Open(now, limit, "") != w.Open(now, limit, "mean") {
+		t.Error("the empty statistic must mean the default, not something else")
+	}
+}
+
+// TestGateStatsAreNamedInTheLine: "ttft_win=6.8s" does not say what it is, and
+// under a selectable gate that is genuinely ambiguous. This campaign has lost
+// arms to numbers that did not say what they were.
+func TestGateStatsAreNamedInTheLine(t *testing.T) {
+	base := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	w := newTTFTWindow(30 * time.Second)
+	for i := range 10 {
+		w.Observe(base.Add(time.Duration(i)*time.Millisecond), 2*time.Second)
+	}
+	line := w.Stats(base.Add(time.Second)).String("p95")
+	for _, want := range []string{"ttft_win(p95)=", "mean=", "p50=", "p95=", "p99=", "n=10"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("line %q is missing %q — all four are reported so one run answers what the "+
+				"plateau would have been under each", line, want)
+		}
+	}
+	if got := w.Stats(base).String("mean"); !strings.Contains(got, "ttft_win(mean)") {
+		t.Errorf("line %q does not name the gating statistic", got)
 	}
 }

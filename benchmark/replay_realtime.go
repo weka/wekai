@@ -3,6 +3,7 @@ package benchmark
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -84,13 +85,72 @@ func (w *ttftWindow) expireLocked(now time.Time) {
 
 // Mean returns the windowed mean TTFT and how many samples it rests on.
 func (w *ttftWindow) Mean(now time.Time) (time.Duration, int) {
+	st := w.Stats(now)
+	return st.Mean, st.N
+}
+
+// ttftStats is every statistic the gate could be asked for, over one window.
+//
+// All of them are computed whether or not they are the one gating, because the
+// cost is a sort of a few hundred samples and the value is that ONE run reports
+// what its plateau would have been under each. The alternative is an eight-hour
+// arm per statistic, and the choice moves the answer by about a factor of two.
+type ttftStats struct {
+	Mean, P50, P95, P99 time.Duration
+	N                   int
+}
+
+// Stats computes them all over the current window.
+func (w *ttftWindow) Stats(now time.Time) ttftStats {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.expireLocked(now)
-	if len(w.val) == 0 {
-		return 0, 0
+	n := len(w.val)
+	if n == 0 {
+		return ttftStats{}
 	}
-	return w.sum / time.Duration(len(w.val)), len(w.val)
+	sorted := make([]time.Duration, n)
+	copy(sorted, w.val)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	q := func(p float64) time.Duration {
+		i := int(float64(n) * p)
+		if i >= n {
+			i = n - 1
+		}
+		return sorted[i]
+	}
+	return ttftStats{
+		Mean: w.sum / time.Duration(n),
+		P50:  q(0.50), P95: q(0.95), P99: q(0.99),
+		N: n,
+	}
+}
+
+// pick returns the statistic named, defaulting to the mean.
+func (s ttftStats) pick(name string) time.Duration {
+	switch name {
+	case "p50":
+		return s.P50
+	case "p95":
+		return s.P95
+	case "p99":
+		return s.P99
+	default:
+		return s.Mean
+	}
+}
+
+// String renders every statistic with the gating one named, because
+// "ttft_win=6.8s" does not say what it is and under a selectable gate that is
+// genuinely ambiguous.
+func (s ttftStats) String(gating string) string {
+	if s.N == 0 {
+		return "ttft_win(" + gating + ")=-"
+	}
+	return fmt.Sprintf("ttft_win(%s)=%s [mean=%s p50=%s p95=%s p99=%s n=%d]",
+		gating, s.pick(gating).Round(time.Millisecond),
+		s.Mean.Round(time.Millisecond), s.P50.Round(time.Millisecond),
+		s.P95.Round(time.Millisecond), s.P99.Round(time.Millisecond), s.N)
 }
 
 // Open reports whether the admission gate should let another session in.
@@ -99,12 +159,12 @@ func (w *ttftWindow) Mean(now time.Time) (time.Duration, int) {
 // stalled one the sessions already admitted are the evidence — holding the gate
 // shut because nothing has COMPLETED would let one slow request freeze the ramp
 // for the rest of the run, which reports the stall as a capacity ceiling.
-func (w *ttftWindow) Open(now time.Time, limit time.Duration) bool {
-	mean, n := w.Mean(now)
-	if n == 0 {
+func (w *ttftWindow) Open(now time.Time, limit time.Duration, stat string) bool {
+	s := w.Stats(now)
+	if s.N == 0 {
 		return true
 	}
-	return mean < limit
+	return s.pick(stat) < limit
 }
 
 // ---------------------------------------------------------------- pacing

@@ -112,6 +112,12 @@ replay:
   # reason — a count is a different amount of history at every load level, so a
   # count-based gate tightens as the fleet fills.
   ttftWindow: "30s"
+  # Which statistic over that window the gate compares against ttftLimit:
+  # mean (default), p50, p95 or p99. This decides the answer — TTFT here is
+  # heavily skewed, so a mean gate closes at roughly half the session count a
+  # p50 gate would. All four are reported whichever gates, so one run says what
+  # its plateau would have been under each.
+  ttftLimitStat: "mean"
   # maxSessions is the safety cap on the governor, nothing more. Simulation of
   # this workload reaches ~2,500 sessions on a cache-starved fleet and >12,000
   # on a well-cached one, so a cap near either is a cap you will hit. If the run
