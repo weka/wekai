@@ -579,7 +579,11 @@ func (s *scanBody) Read(p []byte) (int, error) {
 	}
 	if err != nil && err != io.EOF && !s.sawEnd {
 		metrics.StreamAborted.WithLabelValues("upstream_error").Inc()
-		if s.aborted == nil {
+		// A client that hung up mid-response is not the backend's fault, and
+		// blaming it would eject healthy backends on a fleet where callers time
+		// out — which is every saturated fleet. The counter still records the
+		// abort; only the attribution is withheld.
+		if s.aborted == nil && !errors.Is(err, context.Canceled) {
 			s.aborted = fmt.Errorf("upstream stream aborted before its terminal marker: %w", err)
 		}
 	}
