@@ -426,6 +426,14 @@ func (p *replayPoster) do(
 	st *autoState,
 ) RequestMetrics {
 	startTime := time.Now()
+	// The configured limit, read from the deadline the caller set, so the error
+	// can name it rather than leaving "context deadline exceeded" to stand for
+	// any of several.
+	reqLimit := time.Duration(0)
+	if dl, ok := ctx.Deadline(); ok {
+		reqLimit = dl.Sub(startTime)
+	}
+	gotResponse := false
 
 	var bodyBytes []byte
 	var canonical string
@@ -482,6 +490,7 @@ func (p *replayPoster) do(
 		for i, u := range attempts {
 			resp, err = p.sendOnce(ctx, u, bodyBytes, req.Stream)
 			if err != nil {
+				err = classifyDeadline(err, reqLimit, time.Since(startTime), gotResponse, &RequestMetrics{})
 				return RequestMetrics{
 					RequestNum:        int(st.totalCompleted.Load()) + 1,
 					SeriesNum:         seriesNum,
@@ -569,6 +578,7 @@ func (p *replayPoster) do(
 		m.TotalResponseTime = time.Since(startTime)
 		return m
 	}
+	gotResponse = true
 	// Timed from attemptStart, not startTime: TTFT and the response time the
 	// consumers compute must describe the attempt the server actually ran, so
 	// that backoff cannot make a healthy fleet look slow. The client-side wait
@@ -600,6 +610,9 @@ func (p *replayPoster) do(
 	// inventing one would put backoff into a statistic about tokens.
 	m.Retries429, m.RetryWait = retries, retryWait
 	m.TotalResponseTime += retryWait
+	// One classification point for every path out of here: the consumers know
+	// the error but not which deadline was set, and do() knows both.
+	m.Error = classifyDeadline(m.Error, reqLimit, time.Since(startTime), gotResponse, &m)
 	if m.TimeToFirstToken > 0 {
 		m.TimeToFirstToken += retryWait
 	}
@@ -986,4 +999,42 @@ func stampFor(p *replayPoster, req RouterReplayRequest) string {
 		return req.passStamp
 	}
 	return p.runID
+}
+
+// classifyDeadline turns a bare "context deadline exceeded" into something that
+// says which limit fired, what it was set to, how far the request got and how
+// long it ran.
+//
+// The bare string is unusable for the one job an error has here. Across two
+// realtime arms every client-visible failure was that one sentence, and
+// classifying them retrospectively — from response times, because the message
+// gave nothing — showed the two fleets were not failing the same way at all:
+// one died at the configured cap having streamed for five minutes, the other
+// died before a first token in a tight cluster nowhere near any cap. Comparing
+// the two error rates as though they counted the same event was wrong, and
+// nothing in the output said so.
+//
+// Phase is the part that separates them. A request that hung before any bytes
+// came back and one cut mid-generation at 4m59s are the same string today and
+// mean opposite things about where to look.
+func classifyDeadline(err error, limit time.Duration, elapsed time.Duration, gotResponse bool, m *RequestMetrics) error {
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	phase := "before the response headers arrived"
+	switch {
+	case m.TimeToFirstToken > 0:
+		phase = fmt.Sprintf("mid-stream, %s after its first token", (elapsed - m.TimeToFirstToken).Round(time.Millisecond))
+	case gotResponse:
+		phase = "after headers, before any token"
+	}
+	// The elapsed time is stated even though the limit is, because they differ
+	// whenever something OTHER than this deadline cut the request — and a gap
+	// between them is the signal that the limit named here is not the one that
+	// fired.
+	return fmt.Errorf("exceeded request timeout %s after %s: died %s",
+		limit.Round(time.Second), elapsed.Round(time.Millisecond), phase)
 }
