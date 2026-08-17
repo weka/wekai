@@ -60,6 +60,15 @@ replay:
   # idle precondition means no in-flight request can have its latency distorted.
   # Rarely fires once the run is loaded, which is the intent.
   skipIdle: true
+  # Let the run CONTINUE after the corpus runs out and admitted session slots
+  # can no longer be filled. Default false, so it aborts.
+  #
+  # Aborting is the point. Idle slots keep counting toward the governor's
+  # session number while the fleet does less work, so the reported concurrency
+  # stays authoritative as the thing beneath it decays — and nothing else in
+  # the output moves, because a session that never starts is not late and
+  # contributes nothing to fidelity either.
+  allowUnderfill: false
   # admitEvery is how fast the count climbs under realtime: one session, then
   # one more this often while the fleet keeps up. Concurrency is then whatever
   # the fleet's latency implies rather than a number set here. Ignored unless

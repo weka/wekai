@@ -125,6 +125,20 @@ type AutoBenchmarkConfig struct {
 	// remains the normal budget C (--concurrency).
 	ReplayStopAtLowConcurrency bool
 
+	// ReplayAllowUnderfill lets a real-time run CONTINUE after the corpus runs
+	// out and admitted slots can no longer be filled. Off by default, so the run
+	// aborts.
+	//
+	// Aborting is the point. The governor admits slots and the queue supplies
+	// sessions to fill them; when the queue is empty the slots stay admitted and
+	// idle, so `slots` keeps reading N while the fleet is doing less than N
+	// sessions' worth of work. Nothing else in the output moves — the number
+	// stays authoritative while the thing beneath it decays, and totals
+	// accumulated over that stretch are diluted by an amount nothing reveals.
+	// Neither `late` nor `fidelity` catches it either: sessions that never start
+	// are not late.
+	ReplayAllowUnderfill bool
+
 	// RunID is populated internally by RunAutoBenchmark at the start of each
 	// run. It's the UUID injected into every conversation's system prompt
 	// (when ReplayNoStamp is false). Per-run scope — conversations that share
@@ -881,6 +895,7 @@ const (
 	termReasonTotal                                      // total requests reached
 	termReasonReplayDone                                 // replay queue drained, all series done
 	termReasonReplayLowConcurrency                       // replay queue drained and active workers fell below target concurrency
+	termReasonReplayUnderfilled                          // the corpus ran out, so admitted slots could not be filled
 )
 
 func (r autoTermReason) String() string {
@@ -899,6 +914,8 @@ func (r autoTermReason) String() string {
 		return "Total completed requests reached"
 	case termReasonReplayDone:
 		return "Replay dataset fully processed"
+	case termReasonReplayUnderfilled:
+		return "Corpus exhausted: admitted slots could not be filled, so offered load had fallen below the governor's session count"
 	case termReasonReplayLowConcurrency:
 		return "Replay stopped: active workers fell below target concurrency"
 	}
@@ -2213,6 +2230,49 @@ func runSingleModelBenchmark(
 			}
 		}()
 	}
+	// Underfill watcher: the corpus ran out and the admitted slots cannot be
+	// filled, so the run has stopped measuring the load it reports.
+	//
+	// Distinguished from a slow fleet ON PURPOSE, because the two look identical
+	// in throughput and mean opposite things. This fires only when the producer
+	// is drained — an empty queue is a statement about the corpus, not about the
+	// backends.
+	if st.routerReplay != nil && cfg.ReplayRealtime && !cfg.ReplayAllowUnderfill {
+		go func() {
+			t := time.NewTicker(15 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-benchCtx.Done():
+					return
+				case <-t.C:
+				}
+				if st.routerReplay.Remaining() > 0 {
+					continue
+				}
+				st.mu.Lock()
+				admitted := st.series
+				st.mu.Unlock()
+				running := int(st.activeReplayWorkers.Load())
+				if running >= admitted {
+					continue // drained but still fully occupied: a clean finish
+				}
+				fmt.Fprintf(os.Stderr,
+					"[realtime] ABORT: the corpus is exhausted and %d of %d admitted slots have no "+
+						"session to run. The fleet is not slow — the queue is empty — so offered load "+
+						"has fallen below the %d this run reports, and every total from here is "+
+						"diluted by an amount nothing in the output shows. Pass "+
+						"--replay-allow-underfill to continue anyway.\n",
+					admitted-running, admitted, admitted)
+				select {
+				case termChan <- termReasonReplayUnderfilled:
+				default:
+				}
+				return
+			}
+		}()
+	}
+
 	// Same drain watcher for tree-aware router replay.
 	if st.routerReplay != nil {
 		go func() {
