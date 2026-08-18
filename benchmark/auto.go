@@ -161,6 +161,50 @@ type AutoBenchmarkConfig struct {
 	// first, and it would still produce a cache hit rate — just a meaningless
 	// one. That is why the stamp is per pass and never per session.
 	ReplayReuseSessions bool
+	// UUID-based cache-coherency validation (--replay-inject-uuids). ROUTER
+	// PATH ONLY (cfg.RouterReplayFile != ""); the CLI rejects this combined
+	// with --from-dataset (see cli/benchmark_commands.go). One deterministic
+	// UUID is injected per user turn, spread through the conversation
+	// (rather than clustered at a session boundary) — see the package doc
+	// in replay_router_uuid.go for the full design. Each request recites a
+	// bounded WINDOW (first turn + up to 3 most-recent turns, excluding the
+	// current turn, capped at 4), keeping the recite cost/response budget
+	// constant regardless of session length.
+	ReplayInjectUUIDs bool
+	// ReplayUUIDSeed seeds the UUID generator (see newUUIDGenerator); 0 = crypto/rand
+	// (non-deterministic across runs).
+	ReplayUUIDSeed int64
+	// ReplayReciteEveryRequest: ask the model to recite the first-line UUID
+	// window on EVERY request (default true), not just each instance's
+	// final request.
+	ReplayReciteEveryRequest bool
+	// replaySessionTurnHashes is the precomputed per-session ordered list of
+	// qualifying user-turn hashes, populated once by RunAutoBenchmark before
+	// any per-model goroutine spawns — see computeSessionTurnHashes.
+	// replaySessionTurnHashes[i][t] = session i's turn-t message hash.
+	// Shared, read-only, across every model in a multi-model run (same
+	// sharing rationale as replayConversations below).
+	replaySessionTurnHashes [][]string
+	// replayUUIDSets is the precomputed per-session-per-turn UUID
+	// assignment, populated once alongside replaySessionTurnHashes — see
+	// buildSessionTurnUUIDs. Index i = session i's ordered turn-UUID list
+	// (index t = turn t's UUID); i corresponds to seriesNum-1, the order
+	// sessions are dispatched in (see the sizing note at the router-replay
+	// precompute call site). Shared, read-only, across every model in a
+	// multi-model run so every model sees the identical assignment.
+	replayUUIDSets [][]string
+	// replayBlockSessionCounts maps a replay-v3 block hash to the number of
+	// DISTINCT SESSIONS that reference it (see computeBlockSessionCounts) —
+	// a hash referenced by more than one session is never eligible for
+	// turn-stamping (isQualifyingUserTurn requires count==1). Populated once
+	// alongside replayUUIDSets.
+	replayBlockSessionCounts map[string]int
+	// replayUUIDOwner is the precomputed reverse uuid -> owning-session-index
+	// map, populated once alongside replayUUIDSets — see
+	// buildSessionTurnUUIDs. Read-only after precompute; used by
+	// findLeakedUUIDsByOwner (replay_uuid.go) to flag cross-session
+	// contamination in O(response) time.
+	replayUUIDOwner map[string]int
 
 	// RunID is populated internally by RunAutoBenchmark at the start of each
 	// run. It's the UUID injected into every conversation's system prompt
@@ -284,6 +328,18 @@ type requestDataRecord struct {
 	Question        string `json:"question,omitempty"`
 	ResponseText    string `json:"response_text,omitempty"`
 	RawResponseTail string `json:"raw_response_tail,omitempty"`
+
+	// UUID validation (router-replay --replay-inject-uuids only). The three
+	// counts are always populated (0 when the feature is off); the raw detail
+	// lists are populated ONLY on a miss or a leak (mirrors the
+	// failed-request-only policy above — avoid bloating every row).
+	UUIDExpected     int      `json:"uuid_expected"`
+	UUIDFound        int      `json:"uuid_found"`
+	UUIDLeaked       int      `json:"uuid_leaked"`
+	UUIDExactMatch   bool     `json:"uuid_exact_match"`
+	ExpectedUUIDsRaw []string `json:"expected_uuids_raw,omitempty"`
+	FoundMask        []bool   `json:"found_mask,omitempty"`
+	LeakedUUIDsRaw   []string `json:"leaked_uuids_raw,omitempty"`
 }
 
 // requestDataWriter writes requestDataRecord entries as JSONL, safe for concurrent use.
@@ -1048,6 +1104,18 @@ type autoState struct {
 	coldStartTTFTCount atomic.Int64 // count of cold-start samples (used for series-scaling gate)
 	ttftDegradedCount  atomic.Int64 // requests disqualified from cache-hit by TTFT degradation
 
+	// UUID validation (replay --replay-inject-uuids only). All zero when the
+	// feature is off — recordReplayRequest only touches these when
+	// metrics.ExpectedUUIDs is non-empty.
+	valReqs              atomic.Int64 // requests that carried >=1 expected UUID (i.e. validation ran)
+	valUUIDChecks        atomic.Int64 // total per-UUID presence checks made
+	valUUIDFound         atomic.Int64 // per-UUID presence checks that found the UUID
+	valExactMatchReqs    atomic.Int64 // requests whose first line was the exact ordered UUID list (output conformity)
+	valPresenceMissUUIDs atomic.Int64 // per-UUID PRESENCE_MISS count (expected UUID absent)
+	valCrossContamUUIDs  atomic.Int64 // per-UUID CROSS_CONTAMINATION count (other-conversation UUID present)
+	valPresenceMissReqs  atomic.Int64 // requests with >=1 PRESENCE_MISS
+	valCrossContamReqs   atomic.Int64 // requests with >=1 CROSS_CONTAMINATION
+
 	// Persistent early-sample buffers — never trimmed, survive stream eviction.
 	printMu sync.Mutex // serialises --print-responses output across concurrent series
 
@@ -1143,6 +1211,17 @@ type autoBenchmarkResult struct {
 	totalInputWarm    int64 // input tokens from warm requests (prefix was cached)
 	totalOutput       int64 // output tokens across all requests
 	totalCachedTokens int64 // server-reported cached prompt tokens
+
+	// UUID validation (replay --replay-inject-uuids only); all zero when the
+	// feature is off. See autoState's val* atomics for field meanings.
+	valReqs              int64
+	valUUIDChecks        int64
+	valUUIDFound         int64
+	valExactMatchReqs    int64
+	valPresenceMissUUIDs int64
+	valCrossContamUUIDs  int64
+	valPresenceMissReqs  int64
+	valCrossContamReqs   int64
 }
 
 // displaySnapshot is an atomic snapshot of state for the display goroutine.
@@ -1309,6 +1388,19 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		mean := res.totalRetryWait / time.Duration(res.totalRetries429)
 		fmt.Printf(" 429 backoff        : %d retries, %s total wait (mean %s/retry)\n",
 			res.totalRetries429, formatDur(res.totalRetryWait), formatDur(mean))
+	}
+	if cfg.ReplayInjectUUIDs {
+		fmt.Println(strings.Repeat("-", 62))
+		fmt.Println(" UUID validation (replay)")
+		fmt.Printf("   Requests validated                  : %d\n", res.valReqs)
+		// Two tests, mirroring the cache-coherency eval CLI's layout: UUID
+		// correctness (per-stamp presence, Contains anywhere in the response)
+		// and output conformity (first line is exactly the ordered,
+		// comma-joined UUID list — see firstLineConformity).
+		fmt.Printf("   UUID correctness (presence)          : %d/%d\n", res.valUUIDFound, res.valUUIDChecks)
+		fmt.Printf("   Output conformity (first-line exact) : %d/%d\n", res.valExactMatchReqs, res.valReqs)
+		fmt.Printf("   PRESENCE_MISS (expected UUID absent) : %d across %d requests\n", res.valPresenceMissUUIDs, res.valPresenceMissReqs)
+		fmt.Printf("   CROSS_CONTAMINATION (other-conv)     : %d across %d requests\n", res.valCrossContamUUIDs, res.valCrossContamReqs)
 	}
 	fmt.Println(strings.Repeat("=", 62))
 }
@@ -1762,6 +1854,23 @@ func runSingleModelBenchmark(
 			pp.limitContext = cfg.LimitContext
 			pp.replayCharsPerToken = cfg.ReplayCharsPerToken
 			pp.forceOutput = cfg.ReplayForceOutput
+			// UUID cache-coherency injection (--replay-inject-uuids). Same
+			// global/read-only refs set on the per-instance poster in
+			// replay_router.go — every poster in the run, per-instance or
+			// pooled-per-endpoint, shares these identical slices/maps, so
+			// this poster (potentially shared across many concurrent
+			// sessions once picked by the router) can safely serve any
+			// session: do()/dryDo() derive the per-request sessionIdx from
+			// seriesNum and buildInjection looks up that session's data from
+			// these globals, with no mutable per-session state on the
+			// poster itself.
+			if cfg.ReplayInjectUUIDs {
+				pp.uuidEnabled = true
+				pp.allUUIDSets = cfg.replayUUIDSets
+				pp.sessionTurnHashes = cfg.replaySessionTurnHashes
+				pp.owner = cfg.replayUUIDOwner
+				pp.reciteEveryRequest = cfg.ReplayReciteEveryRequest
+			}
 			posters[i] = pp
 		}
 		if ok {
@@ -2695,6 +2804,14 @@ func runSingleModelBenchmark(
 	res.totalInputWarm = tt.inputWarm
 	res.totalOutput = tt.output
 	res.totalCachedTokens = tt.cached
+	res.valReqs = st.valReqs.Load()
+	res.valUUIDChecks = st.valUUIDChecks.Load()
+	res.valUUIDFound = st.valUUIDFound.Load()
+	res.valExactMatchReqs = st.valExactMatchReqs.Load()
+	res.valPresenceMissUUIDs = st.valPresenceMissUUIDs.Load()
+	res.valCrossContamUUIDs = st.valCrossContamUUIDs.Load()
+	res.valPresenceMissReqs = st.valPresenceMissReqs.Load()
+	res.valCrossContamReqs = st.valCrossContamReqs.Load()
 
 	// Send a final snapshot with termReason set so multi-model display shows DONE.
 	{
@@ -2927,6 +3044,82 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		fmt.Printf("Header: %d sessions / %d instances / %d requests / %d fan-out turns / max fan-out %d\n\n",
 			hdr.Summary.Sessions, hdr.Summary.Instances, hdr.Summary.Requests,
 			hdr.Summary.FanOutTurns, hdr.Summary.MaxFanOutInOneTurn)
+
+		// Precompute UUID cache-coherency injection ONCE here, before any
+		// per-model goroutine spawns below, so every model's
+		// runSingleModelBenchmark sees the identical per-session assignment
+		// (same sharing rationale as replayConversations above).
+		if cfg.ReplayInjectUUIDs {
+			// Effective session count: the SAME formula
+			// openRouterReplayStream uses to compute its own `total` (see
+			// replay_router.go), so the array is sized to exactly the
+			// number of sessions that will ever be dispatched (dispatch
+			// order == array index, since both walk the file in the same
+			// filtered, sequential order). This is what makes true
+			// lazy-growth unnecessary: the count is fully determined by
+			// the header + --replay-series + --replay-series-indices/
+			// --replay-series-range before any session is ever pulled.
+			effectiveSessions := hdr.Summary.Sessions
+			if cfg.ReplaySeries > 0 && cfg.ReplaySeries < effectiveSessions {
+				effectiveSessions = cfg.ReplaySeries
+			}
+			if len(cfg.RouterReplaySeriesIndices) > 0 {
+				effectiveSessions = len(cfg.RouterReplaySeriesIndices)
+				if cfg.ReplaySeries > 0 && cfg.ReplaySeries < effectiveSessions {
+					effectiveSessions = cfg.ReplaySeries
+				}
+			}
+			if effectiveSessions <= 0 {
+				fmt.Fprintf(os.Stderr,
+					"[router-replay] WARNING: --replay-inject-uuids could not determine an effective session count (header sessions=%d) — UUID injection disabled for this run\n",
+					hdr.Summary.Sessions)
+			} else {
+				counts, cerr := computeBlockSessionCounts(cfg.RouterReplayFile, cfg.RouterReplaySeriesIndices, cfg.ReplaySeries)
+				if cerr != nil {
+					return fmt.Errorf("compute block session counts for --replay-inject-uuids: %w", cerr)
+				}
+				cfg.replayBlockSessionCounts = counts
+
+				// Per-session ordered list of qualifying user-turn hashes
+				// (role=="user", has a text block, hash referenced by
+				// exactly this one session — see isQualifyingUserTurn),
+				// each turn getting its own UUID (buildSessionTurnUUIDs)
+				// rather than N stamps clustered at a session boundary.
+				turnHashes, terr := computeSessionTurnHashes(cfg.RouterReplayFile, cfg.RouterReplaySeriesIndices, cfg.ReplaySeries, counts)
+				if terr != nil {
+					return fmt.Errorf("compute session turn hashes for --replay-inject-uuids: %w", terr)
+				}
+				cfg.replaySessionTurnHashes = turnHashes
+
+				turnCounts := make([]int, len(turnHashes))
+				for i, h := range turnHashes {
+					turnCounts[i] = len(h)
+				}
+				cfg.replayUUIDSets, cfg.replayUUIDOwner = buildSessionTurnUUIDs(turnCounts, cfg.ReplayUUIDSeed)
+
+				sharedHashes := 0
+				for _, n := range counts {
+					if n > 1 {
+						sharedHashes++
+					}
+				}
+				totalTurns, minTurns, maxTurns := 0, 0, 0
+				if len(turnCounts) > 0 {
+					minTurns, maxTurns = turnCounts[0], turnCounts[0]
+					for _, n := range turnCounts {
+						totalTurns += n
+						if n < minTurns {
+							minTurns = n
+						}
+						if n > maxTurns {
+							maxTurns = n
+						}
+					}
+				}
+				fmt.Printf("UUID validation enabled: %d session(s) prepared, %d turn(s) total, %d-%d turns/session, %d cross-session-shared block hash(es), seed=%d, recite-every-request=%v\n",
+					effectiveSessions, totalTurns, minTurns, maxTurns, sharedHashes, cfg.ReplayUUIDSeed, cfg.ReplayReciteEveryRequest)
+			}
+		}
 	}
 
 	// Cancellable context for all benchmark goroutines.

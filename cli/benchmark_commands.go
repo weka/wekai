@@ -282,6 +282,9 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		ReplayNoStamp:              c.ReplayNoStamp,
 		AbortOnCollapse:            c.AbortOnCollapse,
 		ReplayStopAtLowConcurrency: c.ReplayStopAtLowConcurrency,
+		ReplayInjectUUIDs:          c.ReplayInjectUUIDs,
+		ReplayUUIDSeed:             c.ReplayUUIDSeed,
+		ReplayReciteEveryRequest:   c.ReplayReciteEveryRequest != "false",
 		RouterReplayFile:           c.RouterReplayFile,
 		RouterReplayRoles:          c.RouterReplayRoles,
 		ReplayOutputRatio:          c.ReplayOutputRatio,
@@ -298,6 +301,20 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 
 	if c.FromDataset != "" && c.RouterReplayFile != "" {
 		return fmt.Errorf("--from-dataset and --router-replay-file are mutually exclusive")
+	}
+
+	// --replay-inject-uuids is ROUTER-REPLAY PATH ONLY: it splices a
+	// per-session UUID marker at the boundary between cross-session-shared
+	// prefix blocks (computed from the replay-v3 block-hash schema) and
+	// per-session content — the dataset-replay path has no such block-hash
+	// schema to compute that boundary from.
+	if c.ReplayInjectUUIDs {
+		if c.RouterReplayFile == "" {
+			return fmt.Errorf("--replay-inject-uuids requires --router-replay-file")
+		}
+		if c.FromDataset != "" {
+			return fmt.Errorf("--replay-inject-uuids and --from-dataset are mutually exclusive")
+		}
 	}
 	if c.DryRun && c.RouterReplayFile == "" {
 		return fmt.Errorf("--dry-run requires --router-replay-file")

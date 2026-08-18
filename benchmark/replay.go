@@ -101,7 +101,7 @@ func runReplaySeriesLoop(
 		seriesNum := convIdx + 1
 		seriesGUID := conv.ID
 
-		fullyWalked := runReplayConversation(benchCtx, cfg, st, rdw, conv, seriesNum, seriesGUID, endpointOverride, reqTimeout, gate)
+		fullyWalked := runReplayConversation(benchCtx, cfg, st, rdw, conv, convIdx, seriesNum, seriesGUID, endpointOverride, reqTimeout, gate)
 		// The conversation's slot is retired — its context no longer counts
 		// toward the active dataset.
 		st.datasetTracker.Reset(seriesNum)
@@ -116,6 +116,9 @@ func runReplaySeriesLoop(
 // benchmark request per gpt turn. Errors on individual requests are recorded
 // but don't abort the series — the next turn still runs.
 //
+// convIdx is this conversation's index into cfg.replayConversations
+// (== seriesNum-1, passed explicitly rather than re-derived).
+//
 // Returns true if the whole conversation was walked; false if a stop signal
 // (--total reached, context cancel) cut it short mid-walk.
 func runReplayConversation(
@@ -124,6 +127,7 @@ func runReplayConversation(
 	st *autoState,
 	rdw *requestDataWriter,
 	conv Conversation,
+	convIdx int,
 	seriesNum int,
 	seriesGUID string,
 	endpointOverride string,
@@ -200,7 +204,7 @@ func runReplayConversation(
 	var pending strings.Builder
 	turnNum := 0
 
-	flush := func() bool {
+	flush := func(gptIdx int) bool {
 		userContent := strings.TrimSpace(pending.String())
 		pending.Reset()
 		if userContent == "" {
@@ -232,7 +236,11 @@ func runReplayConversation(
 		requestNum := int(st.totalCompleted.Load()) + 1
 
 		// Observe the accumulated history (including this turn's user message)
-		// with the content-level estimator BEFORE the server responds.
+		// with the content-level estimator BEFORE the server responds. The
+		// recite-instruction tail (below) is deliberately NOT part of what the
+		// estimator/history see — it's per-request boilerplate, not
+		// conversation content, and would otherwise skew the cache-ratio
+		// estimate every single turn (recite-every-turn is the default).
 		history.WriteString(userContent)
 		ratio := st.estimator.Observe(history.String())
 
@@ -281,6 +289,7 @@ func runReplayConversation(
 		}
 
 		metrics.LocalCacheRatio = ratio
+
 		recordReplayRequest(cfg, st, rdw, metrics, isFirstRequest, &coldStartTTFT)
 		isFirstRequest = false
 		return true
@@ -289,7 +298,7 @@ func runReplayConversation(
 	for i := firstIdx; i < len(conv.Turns); i++ {
 		t := conv.Turns[i]
 		if t.From == "gpt" {
-			if !flush() {
+			if !flush(i) {
 				return false
 			}
 			continue
@@ -373,6 +382,34 @@ func recordReplayRequest(
 
 	isErr := metrics.Error != nil
 	explicitCache := metrics.UsageData.CachedTokens.Count > 0
+
+	// UUID validation tallies (--replay-inject-uuids only). metrics.ExpectedUUIDs
+	// is nil/empty for every request when the feature is off (default), so this
+	// block — and the val* counters it touches — is fully inert then.
+	uuidExpectedCount := len(metrics.ExpectedUUIDs)
+	uuidFoundCount := 0
+	for _, found := range metrics.UUIDFound {
+		if found {
+			uuidFoundCount++
+		}
+	}
+	uuidLeakedCount := len(metrics.LeakedUUIDs)
+	if uuidExpectedCount > 0 {
+		st.valReqs.Add(1)
+		st.valUUIDChecks.Add(int64(uuidExpectedCount))
+		st.valUUIDFound.Add(int64(uuidFoundCount))
+		if metrics.ExactMatch {
+			st.valExactMatchReqs.Add(1)
+		}
+		if missCount := uuidExpectedCount - uuidFoundCount; missCount > 0 {
+			st.valPresenceMissUUIDs.Add(int64(missCount))
+			st.valPresenceMissReqs.Add(1)
+		}
+		if uuidLeakedCount > 0 {
+			st.valCrossContamUUIDs.Add(int64(uuidLeakedCount))
+			st.valCrossContamReqs.Add(1)
+		}
+	}
 
 	earlyColdBaseline := st.earlyColdStartTTFT()
 
@@ -463,7 +500,7 @@ func recordReplayRequest(
 		if metrics.Error != nil {
 			errMsg = metrics.Error.Error()
 		}
-		if writeErr := rdw.write(requestDataRecord{
+		rec := requestDataRecord{
 			StartTime:            reqStart,
 			EndTime:              reqEnd,
 			TTFT:                 float64(metrics.TimeToFirstToken.Milliseconds()),
@@ -483,7 +520,21 @@ func recordReplayRequest(
 			ErrorMessage:         errMsg,
 			IsEmpty:              metrics.IsEmpty,
 			LocalCacheRatio:      metrics.LocalCacheRatio,
-		}); writeErr != nil {
+			UUIDExpected:         uuidExpectedCount,
+			UUIDFound:            uuidFoundCount,
+			UUIDLeaked:           uuidLeakedCount,
+			UUIDExactMatch:       metrics.ExactMatch,
+		}
+		// Raw detail lists only on a miss or a leak — mirrors the
+		// failed-request-only policy on PromptText/ResponseText/RawResponseTail
+		// above (avoid bloating every row with data that matters only when
+		// something's wrong).
+		if uuidFoundCount < uuidExpectedCount || uuidLeakedCount > 0 {
+			rec.ExpectedUUIDsRaw = metrics.ExpectedUUIDs
+			rec.FoundMask = metrics.UUIDFound
+			rec.LeakedUUIDsRaw = metrics.LeakedUUIDs
+		}
+		if writeErr := rdw.write(rec); writeErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to write request data: %v\n", writeErr)
 		}
 	}

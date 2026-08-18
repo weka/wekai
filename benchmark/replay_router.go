@@ -783,6 +783,21 @@ func runRouterReplayInstance(
 		// until it was caught on 2026-08-06.
 		poster.limitContext = cfg.LimitContext
 		poster.replayCharsPerToken = cfg.ReplayCharsPerToken
+		// UUID cache-coherency injection (--replay-inject-uuids, router
+		// path). All UUID state set here is GLOBAL and READ-ONLY — the same
+		// cfg.replayUUIDSets/replaySessionTurnHashes/replayUUIDOwner refs get
+		// set on every poster in the run (see also the picker pool in
+		// auto.go), so a poster shared across sessions under multi-endpoint
+		// routing is safe: buildInjection derives the per-session view
+		// (which sessionIdx, which turn hashes) from these globals per call
+		// rather than from any state cached on the poster itself.
+		if cfg.ReplayInjectUUIDs {
+			poster.uuidEnabled = true
+			poster.allUUIDSets = cfg.replayUUIDSets
+			poster.sessionTurnHashes = cfg.replaySessionTurnHashes
+			poster.owner = cfg.replayUUIDOwner
+			poster.reciteEveryRequest = cfg.ReplayReciteEveryRequest
+		}
 	}
 	if err != nil {
 		// Configuration error — record one error per request in this
@@ -864,6 +879,8 @@ func runRouterReplayInstance(
 			}
 		}
 
+		isLastRequest := ti == len(inst.Requests)-1
+
 		reqCtx, reqCancel := context.WithTimeout(ctx, reqTimeout)
 		var metrics RequestMetrics
 		// Per-request endpoint selection: prefer this series' home endpoint,
@@ -874,11 +891,18 @@ func runRouterReplayInstance(
 		if reqPoster == nil {
 			reqPoster = poster
 		}
+		// reqPoster may come from the picker's shared per-endpoint pool
+		// (built once in auto.go and reused by every series that lands on
+		// that endpoint) rather than this instance's own `poster`. No
+		// per-session copy-across is needed: every poster's UUID fields are
+		// global/read-only (set identically on construction — see auto.go
+		// and above), and do()/dryDo() derive this call's sessionIdx from
+		// seriesNum directly, so a shared poster safely serves any session.
 		st.skipClk.AddInflight(1)
 		if reqPoster.dryRun {
-			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
+			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest)
 		} else {
-			metrics = reqPoster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st)
+			metrics = reqPoster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest)
 		}
 		st.skipClk.AddInflight(-1)
 		picker.release(epIdx)

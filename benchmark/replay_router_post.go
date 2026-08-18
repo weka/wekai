@@ -77,6 +77,140 @@ type replayPoster struct {
 	// count, so the serving tokenizer's counts land near the original
 	// capture's. 0 = byte-faithful sizing (default).
 	replayCharsPerToken float64
+
+	// UUID cache-coherency injection (--replay-inject-uuids, router path —
+	// see replay_router_uuid.go). Set directly on the poster after
+	// construction, same rationale as outputRatio/forceOutput above.
+	// uuidEnabled gates everything: false leaves do()/dryDo() byte-for-byte
+	// identical to before this feature existed.
+	//
+	// EVERY field below this point is GLOBAL and READ-ONLY for the lifetime
+	// of the poster: with multi-endpoint routing a single replayPoster is
+	// SHARED across every session whose requests currently land on that
+	// endpoint (see endpointPicker in auto.go), so there is no such thing as
+	// "this poster's session" — a poster serves whichever sessionIdx the
+	// caller passes into buildInjection per-request. All per-session state is
+	// therefore looked up from these global slices/maps by an explicit
+	// sessionIdx argument rather than cached mutable fields on the poster —
+	// see buildInjection.
+	uuidEnabled bool
+	// allUUIDSets is cfg.replayUUIDSets: the full per-session-per-turn UUID
+	// assignment (index i = session i's ordered turn-UUID list, index t =
+	// turn t's UUID), shared read-only across every poster in the run.
+	allUUIDSets [][]string
+	// sessionTurnHashes is cfg.replaySessionTurnHashes: the full per-session
+	// ordered turn-hash list (index i = session i's ordered turn-hash list;
+	// sessionTurnHashes[i][t] is the hash of session i's turn t), shared
+	// read-only across every poster in the run. buildInjection indexes this
+	// by the caller-supplied sessionIdx and builds that session's
+	// hash-to-turn map locally, per call — see buildInjection.
+	sessionTurnHashes [][]string
+	// owner is cfg.replayUUIDOwner: the reverse uuid -> owning-session-index
+	// map (see buildSessionTurnUUIDs), shared read-only across every poster
+	// in the run — used by findLeakedUUIDsByOwner to flag cross-session
+	// contamination in O(response) time.
+	owner map[string]int
+	// reciteEveryRequest mirrors --replay-recite-every-request: true asks
+	// for the recite line on every request; false only on each instance's
+	// final request (see the isLastRequest parameter to do()/dryDo()).
+	reciteEveryRequest bool
+}
+
+// buildInjection returns this call's *uuidInjection (nil when UUID
+// injection is disabled, sessionIdx has no assigned turns — e.g. it fell
+// outside the precomputed array, or that session had zero qualifying turns
+// — or this particular request has no qualifying turn visible in its
+// message history yet). sessionIdx identifies which session's global UUID
+// assignment to use (== seriesNum-1 — see callers); it is passed explicitly
+// rather than cached on the poster because a single poster may be SHARED
+// across sessions under multi-endpoint routing (see the struct doc).
+// isLastRequest is whether req is the final request of the CURRENT
+// instance's request list (see runRouterReplayInstance) — with
+// --replay-recite-every-request=false, only that final request carries the
+// recite ask.
+//
+// Every VISIBLE qualifying turn in req.Messages gets stamped into
+// StampByHash (keeping every turn's marker warm in KV as later requests
+// repeat it) — see uuidInjection's doc. The recite WINDOW is separate and
+// bounded: the first (visible) turn plus up to 3 most-recent turns
+// EXCLUDING the current turn (the highest-index turn visible in THIS
+// request), deduplicated and capped at 4 (see the package doc in
+// replay_router_uuid.go for the design rationale and edge cases at turns
+// 1-3).
+func (p *replayPoster) buildInjection(req RouterReplayRequest, sessionIdx int, isLastRequest bool) *uuidInjection {
+	if !p.uuidEnabled || sessionIdx < 0 || sessionIdx >= len(p.allUUIDSets) || sessionIdx >= len(p.sessionTurnHashes) {
+		return nil
+	}
+	uuids := p.allUUIDSets[sessionIdx]
+	turnHashes := p.sessionTurnHashes[sessionIdx]
+	if len(uuids) == 0 || len(turnHashes) == 0 {
+		return nil
+	}
+	// hashToTurn is built fresh per call rather than cached: it's a small,
+	// cheap map (one entry per turn) with no shared mutable state, which is
+	// exactly the point — a shared poster can serve any sessionIdx
+	// concurrently with no data race.
+	hashToTurn := make(map[string]int, len(turnHashes))
+	for i, h := range turnHashes {
+		if h != "" {
+			hashToTurn[h] = i
+		}
+	}
+
+	stampByHash := map[string]turnStamp{}
+	var visible []int // turn indices visible in this request, in first-appearance order
+	seenTurn := map[int]bool{}
+	for _, m := range req.Messages {
+		t, ok := hashToTurn[m.Hash]
+		if !ok || t < 0 || t >= len(uuids) {
+			continue
+		}
+		stampByHash[m.Hash] = turnStamp{Idx: t, UUID: uuids[t], Label: fmt.Sprintf("turn-%d", t+1)}
+		if !seenTurn[t] {
+			seenTurn[t] = true
+			visible = append(visible, t)
+		}
+	}
+	if len(visible) == 0 {
+		return nil
+	}
+
+	// Window: first visible turn, plus up to 3 most-recent turns EXCLUDING
+	// the current turn (visible's last entry — the highest turn index
+	// present, since turns only ever get appended to a growing history).
+	first := visible[0]
+	var recentCandidates []int
+	if len(visible) > 1 {
+		recentCandidates = visible[:len(visible)-1]
+	}
+	recent := recentCandidates
+	if len(recent) > 3 {
+		recent = recent[len(recent)-3:]
+	}
+	window := []int{first}
+	for _, t := range recent {
+		if t == first {
+			continue
+		}
+		window = append(window, t)
+	}
+	if len(window) > 4 {
+		window = window[:4]
+	}
+
+	labels := make([]string, len(window))
+	reciteUUIDs := make([]string, len(window))
+	for i, t := range window {
+		labels[i] = fmt.Sprintf("turn-%d", t+1)
+		reciteUUIDs[i] = uuids[t]
+	}
+
+	return &uuidInjection{
+		StampByHash:  stampByHash,
+		Recite:       p.reciteEveryRequest || isLastRequest,
+		ReciteLabels: labels,
+		ReciteUUIDs:  reciteUUIDs,
+	}
 }
 
 func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string, runID string, dryRun bool, coldTPS, warmTPS, outputTPS int, estimator *cacheEstimator, dispatched *atomic.Int64) (*replayPoster, error) {
@@ -430,7 +564,9 @@ func (p *replayPoster) sendOnce(ctx context.Context, url string, bodyBytes []byt
 
 // do issues one request and returns its metrics. Honors ctx for
 // cancellation / deadline. Dispatches to the appropriate body builder
-// and response parser based on p.apiType.
+// and response parser based on p.apiType. isLastRequest is whether req is
+// the final request of the calling instance's request list — see
+// buildInjection.
 func (p *replayPoster) do(
 	ctx context.Context,
 	req RouterReplayRequest,
@@ -440,6 +576,7 @@ func (p *replayPoster) do(
 	instanceID string,
 	seriesNum int,
 	st *autoState,
+	isLastRequest bool,
 ) RequestMetrics {
 	startTime := time.Now()
 	// The configured limit, read from the deadline the caller set, so the error
@@ -451,14 +588,17 @@ func (p *replayPoster) do(
 	}
 	gotResponse := false
 
+	sessionIdx := seriesNum - 1
+	inj := p.buildInjection(req, sessionIdx, isLastRequest)
+
 	var bodyBytes []byte
 	var canonical string
 	var err error
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken)
+		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken, inj)
 	default:
-		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken)
+		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken, inj)
 	}
 	// --limit-context uses the capture's production-measured token counts
 	// (usage.input_tokens + cache read/creation), not a chars heuristic:
@@ -644,6 +784,43 @@ func (p *replayPoster) do(
 		m.Error = fmt.Errorf("empty response from model")
 	}
 	m.LocalCacheRatio = localCacheRatio
+
+	// UUID cache-coherency validation (--replay-inject-uuids, router path).
+	// consumeOpenAISSE/consumeOpenAIPlain/consumeSSE/consumePlain already
+	// merge reasoning/thinking into m.Response (see their doc comments), so
+	// a single Contains-scan of m.Response covers both — thinking is passed
+	// as "" here, mirroring the dataset path's own call shape.
+	//
+	// Two independent checks, mirroring the cache-coherency eval's two
+	// reported tests: per-UUID PRESENCE (Contains anywhere in the response,
+	// scored against inj.ReciteUUIDs — this request's recite WINDOW, not the
+	// session's full turn history) and output CONFORMITY (the FIRST LINE of
+	// the response is exactly the ordered, comma-joined window UUID list —
+	// see firstLineConformity/matchesExpectedUUIDList). Cross-contamination
+	// uses findLeakedUUIDsByOwner (replay_uuid.go), an O(response) reverse-
+	// map scan — NOT FindLeakedUUIDs, whose O(population) iteration over
+	// every session's UUID set no longer fits once turns (not sessions) are
+	// the stamping unit.
+	//
+	// Gated on inj.Recite, NOT just inj != nil: buildInjection returns a
+	// non-nil *uuidInjection whenever ANY qualifying turn is visible in this
+	// request (it always stamps every visible turn inline, so those stamps
+	// stay warm in KV across the session — see the package doc in
+	// replay_router_uuid.go), but only inj.Recite (reciteEveryRequest ||
+	// isLastRequest) says the model was actually ASKED to recite this turn.
+	// Scoring a non-recite turn would count "the model didn't volunteer the
+	// UUID list" as a PRESENCE_MISS/conformity failure even though nothing
+	// asked it to.
+	if inj != nil && inj.Recite && m.Error == nil && !m.IsEmpty {
+		m.ConvIdx = sessionIdx
+		m.ExpectedUUIDs = append([]string(nil), inj.ReciteUUIDs...)
+		m.UUIDFound = make([]bool, len(inj.ReciteUUIDs))
+		for i, u := range inj.ReciteUUIDs {
+			m.UUIDFound[i] = strings.Contains(m.Response, u)
+		}
+		m.LeakedUUIDs = findLeakedUUIDsByOwner(m.Response, "", sessionIdx, p.owner)
+		m.ExactMatch = firstLineConformity(m.Response, inj.ReciteUUIDs)
+	}
 	return m
 }
 
@@ -856,6 +1033,12 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 }
 
 // consumeOpenAIPlain reads a non-streaming OpenAI chat/completions response.
+// Like consumeOpenAISSE, this merges message.reasoning_content (or
+// message.reasoning, the vLLM field name) into m.Response ahead of
+// message.content — a non-streaming reasoning-model response carries its
+// full reasoning text on the message object rather than as incremental
+// deltas, and skipping it here would make a UUID recited/leaked only in the
+// reasoning channel invisible to the presence/leak scan.
 func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	b, err := io.ReadAll(body)
 	if err != nil {
@@ -866,7 +1049,9 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 	var resp struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				Reasoning        string `json:"reasoning"` // vLLM uses "reasoning"
 			} `json:"message"`
 		} `json:"choices"`
 		Usage struct {
@@ -883,7 +1068,12 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 		return
 	}
 	if len(resp.Choices) > 0 {
-		m.Response = resp.Choices[0].Message.Content
+		msg := resp.Choices[0].Message
+		reasoning := msg.ReasoningContent
+		if reasoning == "" {
+			reasoning = msg.Reasoning
+		}
+		m.Response = reasoning + msg.Content
 	}
 	cached := 0
 	if resp.Usage.PromptTokensDetails != nil {
@@ -892,7 +1082,12 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 	m.UsageData = buildReplayUsage(resp.Usage.PromptTokens, cached, resp.Usage.CompletionTokens)
 }
 
-// consumePlain reads a non-streaming Anthropic response.
+// consumePlain reads a non-streaming Anthropic response. Like consumeSSE,
+// this merges "thinking" content blocks into m.Response alongside "text"
+// blocks — a non-streaming extended-thinking response carries its thinking
+// block(s) as ordinary entries in the content array (field "thinking", not
+// "text"), and skipping them here would make a UUID recited/leaked only in
+// the thinking channel invisible to the presence/leak scan.
 func consumePlain(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	b, err := io.ReadAll(body)
 	if err != nil {
@@ -902,8 +1097,9 @@ func consumePlain(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	m.TimeToFirstToken = time.Since(startTime)
 	var resp struct {
 		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			Thinking string `json:"thinking"`
 		} `json:"content"`
 		StopReason string `json:"stop_reason"`
 		Usage      struct {
@@ -919,8 +1115,11 @@ func consumePlain(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	}
 	var sb strings.Builder
 	for _, c := range resp.Content {
-		if c.Type == "text" {
+		switch c.Type {
+		case "text":
 			sb.WriteString(c.Text)
+		case "thinking":
+			sb.WriteString(c.Thinking)
 		}
 	}
 	m.Response = sb.String()
@@ -959,14 +1158,21 @@ func (p *replayPoster) dryDo(
 	instanceID string,
 	seriesNum int,
 	st *autoState,
+	isLastRequest bool,
 ) RequestMetrics {
-	// Build canonical string for estimator and compute ratio.
+	// Build canonical string for estimator and compute ratio. Injection is
+	// threaded through purely so the canonical text (and therefore the
+	// cache-ratio estimate) stays consistent with a real do() call for the
+	// same request — dry-run never makes a real request, so there's no
+	// response to validate.
+	sessionIdx := seriesNum - 1
+	inj := p.buildInjection(req, sessionIdx, isLastRequest)
 	var canonical string
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken)
+		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken, inj)
 	default:
-		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken)
+		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken, inj)
 	}
 	var ratio float64
 	if p.estimator != nil {
