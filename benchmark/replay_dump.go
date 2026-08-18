@@ -69,10 +69,11 @@ type dumpMeta struct {
 	LeakChecked bool `json:"leak_checked"`
 }
 
-// dump writes one exchange. Errors are reported once and never fail the
+// dump writes one exchange: the request, the raw response, the readable
+// merge, and the verdict. Errors are reported once and never fail the
 // request: a capture is an observation, and an observation must not be able to
 // break the thing it observes.
-func (d *requestDumper) dump(meta dumpMeta, request, response []byte) {
+func (d *requestDumper) dump(meta dumpMeta, request, response, merged []byte) {
 	if d == nil {
 		return
 	}
@@ -96,6 +97,7 @@ func (d *requestDumper) dump(meta dumpMeta, request, response []byte) {
 	}
 	write(".request.json", request)
 	write(".response.raw", response)
+	write(".response.merged.txt", merged)
 	if b, err := json.MarshalIndent(meta, "", "  "); err == nil {
 		write(".meta.json", append(b, '\n'))
 	}

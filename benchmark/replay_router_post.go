@@ -854,7 +854,7 @@ func (p *replayPoster) do(
 			Expected: m.ExpectedUUIDs, Found: m.UUIDFound, Leaked: m.LeakedUUIDs,
 			ExactMatch: m.ExactMatch, LeakChecked: m.LeakChecked,
 			Error: errString(m.Error),
-		}, bodyBytes, respCapture.Bytes())
+		}, bodyBytes, respCapture.Bytes(), mergedResponse(m.Response, respCapture.Bytes()))
 	}
 	return m
 }

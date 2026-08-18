@@ -120,7 +120,7 @@ func TestDumpStopsAtItsLimitOutLoud(t *testing.T) {
 		t.Fatalf("newRequestDumper: %v", err)
 	}
 	for i := 0; i < 5; i++ {
-		d.dump(dumpMeta{Series: 1, Instance: "i", Turn: i}, []byte("req"), []byte("resp"))
+		d.dump(dumpMeta{Series: 1, Instance: "i", Turn: i}, []byte("req"), []byte("resp"), []byte("merged"))
 	}
 	got, _ := filepath.Glob(filepath.Join(dir, "*.request.json"))
 	if len(got) != 2 {
@@ -135,5 +135,5 @@ func TestDumperOffIsFree(t *testing.T) {
 	if err != nil || d != nil {
 		t.Fatalf("newRequestDumper(\"\") = %v, %v; want nil, nil", d, err)
 	}
-	d.dump(dumpMeta{}, nil, nil) // must not panic
+	d.dump(dumpMeta{}, nil, nil, nil) // must not panic
 }
