@@ -283,6 +283,8 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		AbortOnCollapse:            c.AbortOnCollapse,
 		ReplayStopAtLowConcurrency: c.ReplayStopAtLowConcurrency,
 		Verify:                     c.Verify,
+		DumpDir:                    c.DumpDir,
+		DumpLimit:                  c.DumpLimit,
 		Seed:                       c.Seed,
 		RouterReplayFile:           c.RouterReplayFile,
 		RouterReplayRoles:          c.RouterReplayRoles,

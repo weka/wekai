@@ -91,6 +91,9 @@ type replayPoster struct {
 	// poster's session": the caller passes the session's own view in per
 	// request, so nothing session-specific is ever cached here.
 	uuidEnabled bool
+	// dumper writes the verbatim exchange when --dump-dir is set; nil
+	// otherwise, and nil is the whole of the feature's cost when off.
+	dumper *requestDumper
 	// registry is the live marker set, shared by every poster in the run. It
 	// answers "is this UUID one of ours, right now" for leak scoring, and its
 	// refcounts are what make a block shared by concurrent sessions visible
@@ -701,21 +704,30 @@ func (p *replayPoster) do(
 		return m
 	}
 	gotResponse = true
+	// With --dump-dir, the consumers read through a tee so the capture is the
+	// bytes that actually arrived — SSE framing and all — rather than a
+	// re-rendering of what the parser made of them. A parser bug and a model
+	// behaviour are indistinguishable in parsed output and obvious here.
+	respReader := io.Reader(resp.Body)
+	var respCapture bytes.Buffer
+	if p.dumper != nil {
+		respReader = io.TeeReader(resp.Body, &respCapture)
+	}
 	// Timed from attemptStart, not startTime: TTFT and the response time the
 	// consumers compute must describe the attempt the server actually ran, so
 	// that backoff cannot make a healthy fleet look slow. The client-side wait
 	// is added back into TotalResponseTime below, where it belongs.
 	if p.apiType == "openai" || p.apiType == "openai_vllm" {
 		if req.Stream {
-			consumeOpenAISSE(resp.Body, attemptStart, &m)
+			consumeOpenAISSE(respReader, attemptStart, &m)
 		} else {
-			consumeOpenAIPlain(resp.Body, attemptStart, &m)
+			consumeOpenAIPlain(respReader, attemptStart, &m)
 		}
 	} else {
 		if req.Stream {
-			consumeSSE(resp.Body, attemptStart, &m)
+			consumeSSE(respReader, attemptStart, &m)
 		} else {
-			consumePlain(resp.Body, attemptStart, &m)
+			consumePlain(respReader, attemptStart, &m)
 		}
 	}
 
@@ -808,6 +820,20 @@ func (p *replayPoster) do(
 			m.UUIDFound[i] = strings.Contains(m.Response, u)
 		}
 		m.ExactMatch = firstLineConformity(m.Response, inj.ReciteUUIDs)
+	}
+
+	// Written after scoring, so the derived verdict and the bytes it came from
+	// land together: a PRESENCE_MISS beside a request that never carried the
+	// marker is a different defect from one beside a response that ignored it.
+	if p.dumper != nil {
+		p.dumper.dump(dumpMeta{
+			Series: seriesNum, Instance: instanceID, Turn: turnIdx,
+			URL: attemptURL, Status: resp.StatusCode, TTFTMillis: m.TimeToFirstToken.Milliseconds(),
+			InputTok: m.UsageData.InputTokens.Count, OutputTok: m.UsageData.OutputTokens.Count,
+			Expected: m.ExpectedUUIDs, Found: m.UUIDFound, Leaked: m.LeakedUUIDs,
+			ExactMatch: m.ExactMatch, LeakChecked: m.LeakChecked,
+			Error: errString(m.Error),
+		}, bodyBytes, respCapture.Bytes())
 	}
 	return m
 }
@@ -1253,4 +1279,13 @@ func classifyDeadline(err error, limit time.Duration, elapsed time.Duration, got
 	// fired.
 	return fmt.Errorf("exceeded request timeout %s after %s: died %s",
 		limit.Round(time.Second), elapsed.Round(time.Millisecond), phase)
+}
+
+// errString renders an error for the dump metadata without a nil check at
+// every call site.
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

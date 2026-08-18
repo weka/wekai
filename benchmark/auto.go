@@ -183,6 +183,11 @@ type AutoBenchmarkConfig struct {
 	// replay_uuid_registry.go for why none is needed and what the registry's
 	// detection window is.
 	uuidRegistry *uuidRegistry
+	// DumpDir/DumpLimit drive the verbatim exchange capture; see
+	// replay_dump.go. dumper is built once and shared by every poster.
+	DumpDir   string
+	DumpLimit int
+	dumper    *requestDumper
 
 	// RunID is populated internally by RunAutoBenchmark at the start of each
 	// run. It's the UUID injected into every conversation's system prompt
@@ -1858,6 +1863,7 @@ func runSingleModelBenchmark(
 				pp.uuidEnabled = true
 				pp.registry = cfg.uuidRegistry
 			}
+			pp.dumper = cfg.dumper
 			posters[i] = pp
 		}
 		if ok {
@@ -3048,6 +3054,14 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		// block hashes it already carries, when it is dispatched — see
 		// replay_uuid_registry.go for why the corpus-wide pass this replaced
 		// was answering a question the scoring no longer asks.
+		if cfg.DumpDir != "" {
+			d, err := newRequestDumper(cfg.DumpDir, cfg.DumpLimit)
+			if err != nil {
+				return err
+			}
+			cfg.dumper = d
+			fmt.Printf("Dumping verbatim exchanges to %s (limit %d)\n", cfg.DumpDir, cfg.DumpLimit)
+		}
 		if cfg.Verify {
 			cfg.uuidRegistry = newUUIDRegistry()
 			// The seed is not repeated here: it is printed once with the run

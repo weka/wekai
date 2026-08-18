@@ -795,6 +795,7 @@ func runRouterReplayInstance(
 		// these, --limit-context and --replay-chars-per-token are silent
 		// no-ops in the single-endpoint case — which was every golden run
 		// until it was caught on 2026-08-06.
+		poster.dumper = cfg.dumper
 		poster.limitContext = cfg.LimitContext
 		poster.replayCharsPerToken = cfg.ReplayCharsPerToken
 		// UUID cache-coherency injection (--verify, router
