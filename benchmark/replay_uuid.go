@@ -25,21 +25,34 @@ import (
 // front.
 var uuidRe = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
 
-// findLeakedUUIDsByOwner scans resp and thinking for UUID-shaped substrings
-// and flags any that are a KNOWN turn UUID (present in owner, the
-// uuid -> owning-session-index reverse map — see buildSessionTurnUUIDs)
-// belonging to a session OTHER than ownIdx. Unlike FindLeakedUUIDs (which
-// iterates every UUID ever assigned across the whole population — O(total
-// UUIDs)), this scans only the response/thinking text once via uuidRe and
-// does an O(1) map lookup per match — O(response), not O(population) —
-// which matters once turns (not sessions) are the stamping unit: the total
-// UUID population grows with conversation length instead of session count.
-// A UUID-shaped string with no entry in owner (or that happens to match a
-// hex pattern but isn't a real stamp) is silently ignored, not flagged.
-// Returns "uuid(series=N)" entries, one per distinct leaked UUID found, in
-// first-appearance (scan) order — deterministic for a given response.
-func findLeakedUUIDsByOwner(resp, thinking string, ownIdx int, owner map[string]int) []string {
-	if len(owner) == 0 {
+// findLeakedUUIDs scans resp and thinking for UUID-shaped substrings and
+// flags any that is a LIVE marker (some session currently holds it — see
+// uuidRegistry) which THIS request's own prompt did not carry.
+//
+// The comparison is against the prompt, not against a session's assigned
+// set. What the request sent is known exactly, so no ownership table and no
+// corpus-wide pass is needed to decide whether a marker belongs here; and
+// because a marker is derived from its block hash, a block two sessions
+// genuinely share yields the same marker in both, so each holds it
+// legitimately and neither is flagged for reciting it. The narrower question
+// this cannot answer — did the engine serve one session's copy of a block
+// that is byte-identical to another's — has no observable answer and no
+// defect behind it: serving identical content from a shared prefix entry is
+// what prefix caching is.
+//
+// Scoped per request rather than per session, it also catches a marker
+// surfacing in a response whose own prompt had not reached that turn yet,
+// which a per-session test cannot see at all.
+//
+// A UUID-shaped string no live session holds is ignored rather than flagged:
+// it is either a hallucination or a marker whose sessions have all finished,
+// and the registry is explicit that its window is the live set.
+//
+// Returns "uuid(series=N)" entries — with ",shared" when more than one live
+// session holds the marker — one per distinct leak, in first-appearance
+// order, so a given response always yields the same list.
+func findLeakedUUIDs(resp, thinking string, own map[string]bool, reg *uuidRegistry) []string {
+	if reg == nil {
 		return nil
 	}
 	combined := resp
@@ -49,15 +62,19 @@ func findLeakedUUIDsByOwner(resp, thinking string, ownIdx int, owner map[string]
 	var leaked []string
 	seen := map[string]bool{}
 	for _, u := range uuidRe.FindAllString(combined, -1) {
-		if seen[u] {
+		if seen[u] || own[u] {
 			continue
 		}
 		seen[u] = true
-		si, ok := owner[u]
-		if !ok || si == ownIdx {
+		e := reg.lookup(u)
+		if e == nil {
 			continue
 		}
-		leaked = append(leaked, fmt.Sprintf("%s(series=%d)", u, si))
+		if e.n.Load() > 1 {
+			leaked = append(leaked, fmt.Sprintf("%s(series=%d,shared)", u, e.series))
+		} else {
+			leaked = append(leaked, fmt.Sprintf("%s(series=%d)", u, e.series))
+		}
 	}
 	return leaked
 }

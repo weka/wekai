@@ -64,7 +64,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 		ts, seen := newVLLMStyleServer()
 		defer ts.Close()
 		p := mustPoster(t, fmt.Sprintf("dynamic/%s,type=openai_vllm,model=m", ts.URL))
-		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), true); m.Error != nil {
+		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), true, nil); m.Error != nil {
 			t.Fatalf("first request: %v", m.Error)
 		}
 		got := seen()
@@ -75,7 +75,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 			t.Errorf("latch = %q fellBack=%v, want fallback latched", p.epResolved, p.epFellBack)
 		}
 		// Latched: the second request goes straight to /v1, one wire call.
-		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState(), true); m.Error != nil {
+		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState(), true, nil); m.Error != nil {
 			t.Fatalf("second request: %v", m.Error)
 		}
 		if got = seen(); len(got) != 3 || got[2] != "/v1/chat/completions" {
@@ -87,7 +87,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 		ts, seen := newVLLMStyleServer()
 		defer ts.Close()
 		p := mustPoster(t, fmt.Sprintf("dynamic/%s/v1,type=openai_vllm,model=m", ts.URL))
-		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), true); m.Error != nil {
+		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), true, nil); m.Error != nil {
 			t.Fatalf("request: %v", m.Error)
 		}
 		got := seen()
@@ -110,7 +110,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 		}))
 		defer ts.Close()
 		p := mustPoster(t, fmt.Sprintf("dynamic/%s,type=openai_vllm,model=m", ts.URL))
-		m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), true)
+		m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), true, nil)
 		if m.Error == nil || !strings.Contains(m.Error.Error(), "status 500") {
 			t.Fatalf("expected status-500 error, got %v", m.Error)
 		}
@@ -144,7 +144,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				m := p.do(context.Background(), minimalReq, docs, 1, "s", fmt.Sprintf("i%d", i), 1, newState(), true)
+				m := p.do(context.Background(), minimalReq, docs, 1, "s", fmt.Sprintf("i%d", i), 1, newState(), true, nil)
 				errs[i] = m.Error
 			}(i)
 		}
@@ -160,7 +160,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 		// Duplicate probes during the race are allowed; once latched, a new
 		// request adds exactly one wire call.
 		before := len(seen())
-		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState(), true); m.Error != nil {
+		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState(), true, nil); m.Error != nil {
 			t.Fatalf("post-latch request: %v", m.Error)
 		}
 		after := seen()
@@ -386,7 +386,7 @@ func TestOpenAIReplayEndToEnd(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	metrics := p.do(ctx, req, docs, 1, "session-1", "instance-1", 1, st, true)
+	metrics := p.do(ctx, req, docs, 1, "session-1", "instance-1", 1, st, true, nil)
 
 	// Verify no error.
 	if metrics.Error != nil {
@@ -660,7 +660,7 @@ func TestOpenAINonStreamingEndToEnd(t *testing.T) {
 	}
 
 	st := &autoState{stream: newCompletionStream(200)}
-	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, true)
+	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, true, nil)
 
 	if metrics.Error != nil {
 		t.Fatalf("unexpected error: %v", metrics.Error)
@@ -706,7 +706,7 @@ func TestOpenAIErrorResponse(t *testing.T) {
 	}
 
 	st := &autoState{stream: newCompletionStream(200)}
-	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, true)
+	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, true, nil)
 
 	if metrics.Error == nil {
 		t.Fatal("expected error for 500 response, got nil")
@@ -748,7 +748,7 @@ func TestOpenAISSEWithoutUsage(t *testing.T) {
 	}
 
 	st := &autoState{stream: newCompletionStream(200)}
-	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, true)
+	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, true, nil)
 
 	if metrics.Error != nil {
 		// "empty response from model" is acceptable for no-usage streams.
@@ -795,15 +795,19 @@ func TestUUIDScoringGatedOnRecite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newReplayPoster: %v", err)
 	}
-	// Wire up UUID injection exactly as runRouterReplayInstance does (see
-	// replay_router.go): global/read-only slices indexed by sessionIdx
-	// (0, matching seriesNum=1 below via sessionIdx = seriesNum-1), with
-	// reciteEveryRequest=false so only the FINAL request of an instance's
-	// list carries the recite ask.
+	// Wire up UUID injection exactly as runRouterReplaySession does (see
+	// replay_router.go): the poster holds only the seed and the registry,
+	// and the session's own view is passed per request. reciteEveryRequest
+	// is false so only the FINAL request of an instance's list carries the
+	// recite ask.
 	p.uuidEnabled = true
-	p.allUUIDSets = [][]string{{"uuid-alpha", "uuid-beta"}}
-	p.sessionTurnHashes = [][]string{{"h1", "h2"}}
+	p.registry = newUUIDRegistry()
 	p.reciteEveryRequest = false
+	su := &sessionUUIDs{
+		hashToTurn: map[string]int{"h1": 0, "h2": 1},
+		uuids:      []string{uuidForHash("h1", 7), uuidForHash("h2", 7)},
+	}
+	p.registry.Acquire(su.uuids, 1)
 
 	req := RouterReplayRequest{
 		Stream:       false,
@@ -816,7 +820,7 @@ func TestUUIDScoringGatedOnRecite(t *testing.T) {
 
 	// isLastRequest=false -> inj.Recite=false (reciteEveryRequest is also
 	// false) -> the H1 gate must skip scoring entirely.
-	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, false)
+	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, false, su)
 
 	if metrics.Error != nil {
 		t.Fatalf("unexpected error: %v", metrics.Error)
@@ -837,7 +841,7 @@ func TestUUIDScoringGatedOnRecite(t *testing.T) {
 	// Sanity check the OTHER half of the invariant: the SAME request, with
 	// isLastRequest=true (recite asked), DOES get scored — otherwise this
 	// test could be vacuously passing because scoring never fires at all.
-	metrics2 := p.do(context.Background(), req, docs, 1, "s1", "i2", 1, st, true)
+	metrics2 := p.do(context.Background(), req, docs, 1, "s1", "i2", 1, st, true, su)
 	if metrics2.Error != nil {
 		t.Fatalf("unexpected error on recite request: %v", metrics2.Error)
 	}
@@ -904,5 +908,218 @@ func TestConsumePlainMergesThinking(t *testing.T) {
 	}
 	if !strings.Contains(m.Response, "here is my answer") {
 		t.Errorf("m.Response = %q, want it to also contain the text block", m.Response)
+	}
+}
+
+// TestCrossContaminationDetectedEndToEnd drives a real response through do()
+// from a server that deliberately leaks — the client-side check is exercised
+// as wiring, not as a function call.
+//
+// The scanner itself is covered in replay_router_uuid_test.go, but a passing
+// scanner proves nothing about whether a response arriving through do() is
+// ever handed to it. Both halves of this repo's worst instrumentation bugs
+// have been well-tested leaves reached by untested wiring, so the assertion
+// here is on RequestMetrics coming back out of do(), with the leak
+// manufactured upstream where a leaking engine would put it.
+//
+// Session 2 is the caller. The server plants session 1's marker in the
+// response body, which is exactly what a KV/scheduling leak looks like from
+// the client: content the request never sent.
+func TestCrossContaminationDetectedEndToEnd(t *testing.T) {
+	docs := strings.Repeat("contamination-docs ", 100)
+
+	const seed = 4242
+	// Two sessions with disjoint content, plus one block they genuinely
+	// share — the case that used to require a corpus-wide pass to recognise.
+	mine := buildSessionUUIDs(RouterReplaySession{Instances: []RouterReplayInstance{{
+		Requests: []RouterReplayRequest{{Messages: []RouterReplayMessage{
+			userText("s2-own", 40), userText("both-carry", 40),
+		}}},
+	}}}, seed)
+	theirs := buildSessionUUIDs(RouterReplaySession{Instances: []RouterReplayInstance{{
+		Requests: []RouterReplayRequest{{Messages: []RouterReplayMessage{
+			userText("s1-own", 40), userText("both-carry", 40),
+		}}},
+	}}}, seed)
+
+	foreign := theirs.uuids[theirs.hashToTurn["s1-own"]]
+	own := mine.uuids[mine.hashToTurn["s2-own"]]
+	shared := mine.uuids[mine.hashToTurn["both-carry"]]
+	if shared != theirs.uuids[theirs.hashToTurn["both-carry"]] {
+		t.Fatal("fixture is wrong: the shared block must derive the same marker in both sessions")
+	}
+
+	// What the server echoes back, set per subtest.
+	var plant string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		fmt.Fprintf(w, `{
+			"id": "chatcmpl-1",
+			"object": "chat.completion",
+			"model": "test-model",
+			"choices": [{"index": 0, "message": {"role": "assistant", "content": %q}, "finish_reason": "stop"}],
+			"usage": {"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35}
+		}`, "recalling: "+plant)
+	}))
+	defer ts.Close()
+
+	newPoster := func(t *testing.T) *replayPoster {
+		t.Helper()
+		modelSpec := fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL)
+		p, err := newReplayPoster(modelSpec, llm.APIKeys{OpenAI: "sk-test"}, "", "", false, 0, 0, 0, nil, nil)
+		if err != nil {
+			t.Fatalf("newReplayPoster: %v", err)
+		}
+		p.uuidEnabled = true
+		p.uuidSeed = seed
+		p.reciteEveryRequest = true
+		p.registry = newUUIDRegistry()
+		// Both sessions live, exactly as two concurrent series would be.
+		p.registry.Acquire(theirs.uuids, 1)
+		p.registry.Acquire(mine.uuids, 2)
+		return p
+	}
+
+	// The caller's request carries both of ITS blocks and nothing of the
+	// other session's.
+	req := RouterReplayRequest{
+		Stream:       false,
+		OutputTokens: 100,
+		Messages: []RouterReplayMessage{
+			userText("s2-own", 40), userText("both-carry", 40),
+		},
+	}
+
+	t.Run("foreign marker is reported as contamination", func(t *testing.T) {
+		plant = foreign
+		p := newPoster(t)
+		m := p.do(context.Background(), req, docs, 1, "s2", "i1", 2,
+			&autoState{stream: newCompletionStream(200)}, true, mine)
+		if m.Error != nil {
+			t.Fatalf("unexpected error: %v", m.Error)
+		}
+		if len(m.LeakedUUIDs) != 1 {
+			t.Fatalf("LeakedUUIDs = %v, want exactly one entry: the server returned a marker this "+
+				"request never sent and the client did not notice", m.LeakedUUIDs)
+		}
+		if !strings.Contains(m.LeakedUUIDs[0], foreign) || !strings.Contains(m.LeakedUUIDs[0], "series=1") {
+			t.Errorf("LeakedUUIDs[0] = %q, want %s attributed to series=1", m.LeakedUUIDs[0], foreign)
+		}
+	})
+
+	t.Run("own marker is not contamination", func(t *testing.T) {
+		// Negative control. Without it the test above could pass on a scanner
+		// that flags every UUID it sees.
+		plant = own
+		p := newPoster(t)
+		m := p.do(context.Background(), req, docs, 1, "s2", "i1", 2,
+			&autoState{stream: newCompletionStream(200)}, true, mine)
+		if len(m.LeakedUUIDs) != 0 {
+			t.Errorf("LeakedUUIDs = %v, want empty: the response recited the caller's own marker", m.LeakedUUIDs)
+		}
+	})
+
+	t.Run("shared block is not contamination", func(t *testing.T) {
+		// The case the deleted corpus pass existed to get right. Both
+		// sessions hold this marker legitimately and this request sent it,
+		// so reciting it back must not be flagged.
+		plant = shared
+		p := newPoster(t)
+		m := p.do(context.Background(), req, docs, 1, "s2", "i1", 2,
+			&autoState{stream: newCompletionStream(200)}, true, mine)
+		if len(m.LeakedUUIDs) != 0 {
+			t.Errorf("LeakedUUIDs = %v, want empty: a block both sessions carry is shared, not leaked", m.LeakedUUIDs)
+		}
+	})
+}
+
+// TestSessionRegistersItsMarkersAndDetectsLeaks drives runRouterReplaySession
+// — the dispatch path itself — rather than calling do() with a registry a
+// test built by hand.
+//
+// The gap this closes is specific and was found by mutation: deleting the
+// Acquire call in runRouterReplaySession left every other UUID test passing,
+// because they all supply their own registry. A session that never registers
+// its markers reports zero contamination forever, which is indistinguishable
+// from a clean fleet in the output and is exactly the failure this feature
+// exists to rule out.
+func TestSessionRegistersItsMarkersAndDetectsLeaks(t *testing.T) {
+	const seed = 31337
+
+	// Another session, already running, whose marker the server will leak.
+	other := buildSessionUUIDs(RouterReplaySession{Instances: []RouterReplayInstance{{
+		Requests: []RouterReplayRequest{{Messages: []RouterReplayMessage{userText("other-own", 40)}}},
+	}}}, seed)
+	foreign := other.uuids[other.hashToTurn["other-own"]]
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		fmt.Fprintf(w, `{
+			"id": "chatcmpl-1",
+			"object": "chat.completion",
+			"model": "test-model",
+			"choices": [{"index": 0, "message": {"role": "assistant", "content": %q}, "finish_reason": "stop"}],
+			"usage": {"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35}
+		}`, "as I recall, "+foreign)
+	}))
+	defer ts.Close()
+
+	reg := newUUIDRegistry()
+	reg.Acquire(other.uuids, 99) // the other session is live
+	cfg := AutoBenchmarkConfig{
+		Model:                    fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL),
+		ReplayInjectUUIDs:        true,
+		ReplayUUIDSeed:           seed,
+		ReplayReciteEveryRequest: true,
+		ReplayNoStamp:            true,
+		uuidRegistry:             reg,
+	}
+	sess := RouterReplaySession{
+		SessionID: "s-under-test",
+		Instances: []RouterReplayInstance{{
+			InstanceID: "i1",
+			Role:       "main",
+			Requests: []RouterReplayRequest{{
+				RequestID:    1,
+				OutputTokens: 100,
+				Messages:     []RouterReplayMessage{userText("mine-own", 40)},
+			}},
+		}},
+	}
+
+	// Mirrors the fields runAutoBenchmark builds that the replay dispatch
+	// path dereferences — see the autoState literal in auto.go.
+	st := &autoState{
+		stream:         newCompletionStream(200),
+		gate:           newConcurrencyGate(4, false),
+		datasetTracker: newActiveDatasetTracker(),
+		ttft:           newTTFTWindow(30 * time.Second),
+		skipClk:        newSkipClock(false),
+		lag:            &pacingLag{},
+		estimator:      newCacheEstimator(0),
+	}
+	runRouterReplaySession(context.Background(), cfg, st, nil, sess, 1,
+		endpointPicker{}, 30*time.Second,
+		strings.Repeat("session-docs ", 100), newConcurrencyGate(4, false))
+
+	if got := st.valCrossContamUUIDs.Load(); got != 1 {
+		t.Errorf("valCrossContamUUIDs = %d, want 1: the server returned another session's marker "+
+			"and the dispatch path did not report it", got)
+	}
+
+	// The session must have registered its own markers while it ran, and
+	// given them back on the way out — the refcount is both the shared-block
+	// signal and the bound on the live set.
+	live, peak := reg.Stats()
+	if peak < len(other.uuids)+1 {
+		t.Errorf("registry peak = %d, want at least %d: the session never registered its own markers, "+
+			"so nothing it holds could ever be recognised as leaked elsewhere",
+			peak, len(other.uuids)+1)
+	}
+	if live != len(other.uuids) {
+		t.Errorf("live markers = %d, want %d (only the still-running other session): the finished "+
+			"session did not release, so the live set grows without bound", live, len(other.uuids))
 	}
 }

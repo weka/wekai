@@ -638,6 +638,19 @@ func runRouterReplaySession(
 	// was into the past. It shows up as fidelity rather than lateness: the
 	// branch simply waits, so nothing is reported late while the replay runs
 	// slower than the capture it is reproducing.
+	// The session's markers, derived from the block hashes it already carries
+	// — no file pass, no lookahead. Held live for exactly as long as the
+	// session runs: the registry's refcount is what makes a block shared by
+	// two concurrent sessions visible, and what bounds the set that
+	// cross-contamination is scored against. See replay_uuid_registry.go.
+	var su *sessionUUIDs
+	if cfg.ReplayInjectUUIDs {
+		if su = buildSessionUUIDs(sess, cfg.ReplayUUIDSeed); su != nil {
+			cfg.uuidRegistry.Acquire(su.uuids, seriesNum)
+			defer cfg.uuidRegistry.Release(su.uuids)
+		}
+	}
+
 	sessionOrigin := st.skipClk.Now()
 	var covered atomic.Int64 // furthest capture offset any instance reached, ns
 	sessionID := int64(0)
@@ -690,7 +703,7 @@ func runRouterReplaySession(
 			}
 			runRouterReplayInstance(benchCtx, cfg, st, rdw,
 				sess.SessionID, sess.StartTs, sessionOrigin, &covered,
-				passStamp, seriesNum, inst, picker, reqTimeout, docs, requestDone, gate)
+				passStamp, seriesNum, inst, picker, reqTimeout, docs, requestDone, gate, su)
 		}()
 	}
 	wg.Wait()
@@ -746,6 +759,7 @@ func runRouterReplayInstance(
 	docs string,
 	requestDone map[uint64]chan struct{},
 	gate *concurrencyGate,
+	su *sessionUUIDs,
 ) {
 	defer func() {
 		for _, r := range inst.Requests {
@@ -784,18 +798,15 @@ func runRouterReplayInstance(
 		poster.limitContext = cfg.LimitContext
 		poster.replayCharsPerToken = cfg.ReplayCharsPerToken
 		// UUID cache-coherency injection (--replay-inject-uuids, router
-		// path). All UUID state set here is GLOBAL and READ-ONLY — the same
-		// cfg.replayUUIDSets/replaySessionTurnHashes/replayUUIDOwner refs get
-		// set on every poster in the run (see also the picker pool in
-		// auto.go), so a poster shared across sessions under multi-endpoint
-		// routing is safe: buildInjection derives the per-session view
-		// (which sessionIdx, which turn hashes) from these globals per call
-		// rather than from any state cached on the poster itself.
+		// path). Everything set here is global and read-only — the same seed
+		// and the same registry go on every poster in the run (see also the
+		// picker pool in auto.go) — so a poster shared across sessions under
+		// multi-endpoint routing is safe: the session's own turn view is
+		// passed in per request rather than cached here.
 		if cfg.ReplayInjectUUIDs {
 			poster.uuidEnabled = true
-			poster.allUUIDSets = cfg.replayUUIDSets
-			poster.sessionTurnHashes = cfg.replaySessionTurnHashes
-			poster.owner = cfg.replayUUIDOwner
+			poster.uuidSeed = cfg.ReplayUUIDSeed
+			poster.registry = cfg.uuidRegistry
 			poster.reciteEveryRequest = cfg.ReplayReciteEveryRequest
 		}
 	}
@@ -900,9 +911,9 @@ func runRouterReplayInstance(
 		// seriesNum directly, so a shared poster safely serves any session.
 		st.skipClk.AddInflight(1)
 		if reqPoster.dryRun {
-			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest)
+			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest, su)
 		} else {
-			metrics = reqPoster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest)
+			metrics = reqPoster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest, su)
 		}
 		st.skipClk.AddInflight(-1)
 		picker.release(epIdx)

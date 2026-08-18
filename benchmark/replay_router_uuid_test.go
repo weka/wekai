@@ -65,160 +65,164 @@ func toolResultOnly(hash string, bytes int) RouterReplayMessage {
 	return RouterReplayMessage{Role: "user", Hash: hash, BlockTypes: []string{"tool_result"}, Bytes: bytes, ToolResultIDs: []string{"tr1"}}
 }
 
-// turnFixtureSessions builds two sessions exercising every
-// isQualifyingUserTurn exclusion plus multi-instance turn ordering:
-//
-//   - both sessions' first request opens with the SAME message hash
-//     ("shared-msg", a role=="user" text message) — shared across sessions
-//     (count==2) so it must NEVER qualify as a turn despite being
-//     role==user with a text block.
-//   - each session's main instance accumulates 3 genuine user turns
-//     (u1,u2,u3) interleaved with assistant replies (never turns) and, for
-//     session 0 only, a tool_result-only message (never a turn, even
-//     though role=="user").
-//   - session 0 has a SECOND instance ("s0-sub") appearing AFTER the main
-//     instance in the Instances slice, contributing one more turn
-//     (s0-sub-u1) — verifies turn indices are session-global and ordered
-//     by instance/request/message file order, not per-instance.
-func turnFixtureSessions() []RouterReplaySession {
-	mkMainInstance := func(id, prefix string, includeToolResultOnly bool) RouterReplayInstance {
-		req1 := RouterReplayRequest{
-			RequestID: 1,
-			Messages:  []RouterReplayMessage{userText("shared-msg", 60)},
-		}
-		req2Msgs := []RouterReplayMessage{
-			userText("shared-msg", 60),
-			assistantText(prefix+"-a1", 80),
-			userText(prefix+"-u1", 100),
-		}
-		req2 := RouterReplayRequest{RequestID: 2, Messages: req2Msgs}
-
-		req3Msgs := append(append([]RouterReplayMessage{}, req2Msgs...),
-			assistantText(prefix+"-a2", 80),
-			userText(prefix+"-u2", 100),
-		)
-		req3 := RouterReplayRequest{RequestID: 3, Messages: req3Msgs}
-
-		req4Msgs := append([]RouterReplayMessage{}, req3Msgs...)
-		if includeToolResultOnly {
-			req4Msgs = append(req4Msgs, toolResultOnly(prefix+"-tool1", 40))
-		}
-		req4 := RouterReplayRequest{RequestID: 4, Messages: req4Msgs}
-
-		req5Msgs := append(append([]RouterReplayMessage{}, req4Msgs...),
-			assistantText(prefix+"-a3", 80),
-			userText(prefix+"-u3", 100),
-		)
-		req5 := RouterReplayRequest{RequestID: 5, Messages: req5Msgs}
-
-		return RouterReplayInstance{
-			InstanceID: id,
-			Role:       "main",
-			Requests:   []RouterReplayRequest{req1, req2, req3, req4, req5},
-		}
-	}
-
-	subInstance := RouterReplayInstance{
-		InstanceID: "s0-sub",
-		Role:       "sub-agent",
-		Requests: []RouterReplayRequest{
-			{RequestID: 6, Messages: []RouterReplayMessage{userText("s0-sub-u1", 90)}},
-		},
-	}
-
-	s0 := RouterReplaySession{
-		SessionID: "s0",
-		Instances: []RouterReplayInstance{
-			mkMainInstance("s0-main", "s0", true),
-			subInstance,
-		},
-	}
-	s1 := RouterReplaySession{
+// TestBuildSessionUUIDsIdentifiesQualifyingTurns: a turn is a role=="user"
+// message with a text block. Assistant and system messages, and messages
+// with no text block, never qualify. Order is first appearance across the
+// session's instances/requests/messages, and a hash repeated by the growing
+// history contributes one turn, not one per request.
+func TestBuildSessionUUIDsIdentifiesQualifyingTurns(t *testing.T) {
+	sess := RouterReplaySession{
 		SessionID: "s1",
-		Instances: []RouterReplayInstance{
-			mkMainInstance("s1-main", "s1", false),
-		},
+		Instances: []RouterReplayInstance{{
+			InstanceID: "i1",
+			Requests: []RouterReplayRequest{
+				{Messages: []RouterReplayMessage{userText("t1", 10)}},
+				{Messages: []RouterReplayMessage{
+					userText("t1", 10), // repeated history: still turn 0
+					assistantText("a1", 10),
+					{Role: "user", Hash: "tool-only", BlockTypes: []string{"tool_result"}},
+					userText("t2", 10),
+				}},
+			},
+		}},
 	}
-	return []RouterReplaySession{s0, s1}
-}
-
-func TestComputeSessionTurnHashesIdentifiesQualifyingTurns(t *testing.T) {
-	path := writeReplayV3File(t, turnFixtureSessions())
-	counts, err := computeBlockSessionCounts(path, nil, 0)
-	if err != nil {
-		t.Fatalf("computeBlockSessionCounts: %v", err)
+	su := buildSessionUUIDs(sess, 1)
+	if su == nil {
+		t.Fatal("buildSessionUUIDs returned nil for a session with qualifying turns")
 	}
-	if got := counts["shared-msg"]; got != 2 {
-		t.Fatalf("counts[shared-msg] = %d, want 2 (referenced by both sessions)", got)
+	if len(su.uuids) != 2 {
+		t.Fatalf("got %d turns, want 2 (t1, t2)", len(su.uuids))
 	}
-
-	turnHashes, err := computeSessionTurnHashes(path, nil, 0, counts)
-	if err != nil {
-		t.Fatalf("computeSessionTurnHashes: %v", err)
+	if su.hashToTurn["t1"] != 0 || su.hashToTurn["t2"] != 1 {
+		t.Errorf("turn indices = %v, want t1->0 t2->1", su.hashToTurn)
 	}
-	if len(turnHashes) != 2 {
-		t.Fatalf("len(turnHashes) = %d, want 2 sessions", len(turnHashes))
-	}
-
-	wantS0 := []string{"s0-u1", "s0-u2", "s0-u3", "s0-sub-u1"}
-	if !equalStrSlices(turnHashes[0], wantS0) {
-		t.Errorf("session 0 turnHashes = %v, want %v", turnHashes[0], wantS0)
-	}
-	wantS1 := []string{"s1-u1", "s1-u2", "s1-u3"}
-	if !equalStrSlices(turnHashes[1], wantS1) {
-		t.Errorf("session 1 turnHashes = %v, want %v", turnHashes[1], wantS1)
-	}
-
-	for _, session := range turnHashes {
-		for _, h := range session {
-			if h == "shared-msg" {
-				t.Error("shared-msg (count==2) qualified as a turn — cross-session-shared content must never be stamped")
-			}
-			if strings.Contains(h, "tool1") {
-				t.Errorf("tool_result-only hash %q qualified as a turn", h)
-			}
-			if strings.Contains(h, "-a") {
-				t.Errorf("assistant hash %q qualified as a turn", h)
-			}
+	for _, h := range []string{"a1", "tool-only"} {
+		if _, ok := su.hashToTurn[h]; ok {
+			t.Errorf("%q qualified as a turn; only user messages with a text block may", h)
 		}
 	}
 }
 
-func TestComputeSessionTurnHashesRespectsFilters(t *testing.T) {
-	path := writeReplayV3File(t, turnFixtureSessions())
-	counts, err := computeBlockSessionCounts(path, nil, 0)
-	if err != nil {
-		t.Fatalf("computeBlockSessionCounts: %v", err)
+// TestBuildSessionUUIDsNilWithoutQualifyingTurns: a session with nothing to
+// stamp must produce no view, so buildInjection short-circuits rather than
+// carrying an empty one through every request.
+func TestBuildSessionUUIDsNilWithoutQualifyingTurns(t *testing.T) {
+	sess := RouterReplaySession{Instances: []RouterReplayInstance{{
+		Requests: []RouterReplayRequest{{Messages: []RouterReplayMessage{assistantText("a1", 10)}}},
+	}}}
+	if su := buildSessionUUIDs(sess, 1); su != nil {
+		t.Errorf("got %d turns for a session with no qualifying turn, want nil", len(su.uuids))
 	}
-
-	t.Run("sessionLimit caps to the first N sessions", func(t *testing.T) {
-		turnHashes, err := computeSessionTurnHashes(path, nil, 1, counts)
-		if err != nil {
-			t.Fatalf("computeSessionTurnHashes: %v", err)
-		}
-		if len(turnHashes) != 1 {
-			t.Fatalf("len(turnHashes) = %d, want 1 (sessionLimit=1)", len(turnHashes))
-		}
-	})
-
-	t.Run("allowed index set restricts to those sessions only", func(t *testing.T) {
-		// counts computed globally (both sessions), but the turn-hash pass
-		// only walks session index 1 (s1).
-		allowed := map[int]bool{1: true}
-		turnHashes, err := computeSessionTurnHashes(path, allowed, 0, counts)
-		if err != nil {
-			t.Fatalf("computeSessionTurnHashes: %v", err)
-		}
-		if len(turnHashes) != 1 {
-			t.Fatalf("len(turnHashes) = %d, want 1 (only index 1 allowed)", len(turnHashes))
-		}
-		want := []string{"s1-u1", "s1-u2", "s1-u3"}
-		if !equalStrSlices(turnHashes[0], want) {
-			t.Errorf("turnHashes[0] = %v, want %v (session s1)", turnHashes[0], want)
-		}
-	})
 }
 
+// TestMarkerIsHashDerivedNotSessionDerived is the invariant that removes the
+// need for any corpus pass.
+//
+// Two sessions carrying the same block must stamp it identically. That is
+// what keeps a block they shared in the capture shared on the server's
+// prefix cache — the fidelity property the old design bought by scanning the
+// whole file to find such blocks and refusing to stamp them. Derived from
+// the hash, it holds by construction, for blocks nobody has looked for.
+func TestMarkerIsHashDerivedNotSessionDerived(t *testing.T) {
+	mk := func(id string, msgs ...RouterReplayMessage) RouterReplaySession {
+		return RouterReplaySession{SessionID: id, Instances: []RouterReplayInstance{{
+			Requests: []RouterReplayRequest{{Messages: msgs}},
+		}}}
+	}
+	// The shared block sits at a DIFFERENT turn index in each session, so a
+	// marker keyed by position rather than by content would diverge here.
+	a := buildSessionUUIDs(mk("a", userText("shared", 10), userText("a-only", 10)), 9)
+	b := buildSessionUUIDs(mk("b", userText("b-only", 10), userText("shared", 10)), 9)
+
+	if a.uuids[a.hashToTurn["shared"]] != b.uuids[b.hashToTurn["shared"]] {
+		t.Errorf("shared block stamped differently per session: %q vs %q — the prefix the two "+
+			"sessions shared in the capture no longer collides on the server",
+			a.uuids[a.hashToTurn["shared"]], b.uuids[b.hashToTurn["shared"]])
+	}
+	if a.uuids[a.hashToTurn["a-only"]] == b.uuids[b.hashToTurn["b-only"]] {
+		t.Error("distinct blocks produced the same marker, which would make a genuine leak unattributable")
+	}
+}
+
+// TestUUIDForHashShapeAndSeed: markers must be recognisable on the way back
+// out of a response (uuidRe) and must vary with the seed, or two runs
+// sharing a corpus could not be told apart.
+func TestUUIDForHashShapeAndSeed(t *testing.T) {
+	u := uuidForHash("block-a", 42)
+	if !uuidRe.MatchString(u) {
+		t.Fatalf("uuidForHash produced %q, which the response scanner would never match", u)
+	}
+	if u != uuidForHash("block-a", 42) {
+		t.Error("uuidForHash is not deterministic")
+	}
+	if u == uuidForHash("block-a", 43) {
+		t.Error("uuidForHash ignores the seed; two runs over one corpus would mint identical markers")
+	}
+	if u == uuidForHash("block-b", 42) {
+		t.Error("uuidForHash ignores the hash")
+	}
+}
+
+// TestUUIDRegistryHoldsWhileAnySessionDoes: the refcount is what makes a
+// block shared by concurrent sessions visible without a corpus pass, and it
+// is also the detection window — a marker must stay live until the LAST
+// holder finishes, or one session retiring would blind the check for the
+// others still running.
+func TestUUIDRegistryHoldsWhileAnySessionDoes(t *testing.T) {
+	r := newUUIDRegistry()
+	shared := uuidForHash("shared", 1)
+	aOnly := uuidForHash("a-only", 1)
+
+	r.Acquire([]string{shared, aOnly}, 1)
+	r.Acquire([]string{shared}, 2)
+
+	if e := r.lookup(shared); e == nil || e.n.Load() != 2 {
+		t.Fatalf("shared marker refcount = %v, want 2", e)
+	}
+	if e := r.lookup(shared); e.series != 1 {
+		t.Errorf("shared marker labelled series %d, want its first holder (1)", e.series)
+	}
+
+	r.Release([]string{shared, aOnly}) // session 1 finishes
+	if r.lookup(aOnly) != nil {
+		t.Error("marker held by nobody is still live; the window would grow without bound")
+	}
+	if e := r.lookup(shared); e == nil || e.n.Load() != 1 {
+		t.Fatalf("shared marker dropped while session 2 still holds it: %v", e)
+	}
+
+	r.Release([]string{shared}) // session 2 finishes
+	if r.lookup(shared) != nil {
+		t.Error("shared marker outlived its last holder")
+	}
+	if live, peak := r.Stats(); live != 0 || peak != 2 {
+		t.Errorf("Stats() = (%d live, %d peak), want (0, 2) — peak is what a run reports as the "+
+			"width of the window it actually checked against", live, peak)
+	}
+}
+
+// TestUUIDRegistryAcquireIsIdempotentPerCall: a session whose turn list
+// repeats a marker must take one hold, not several, or its own release
+// leaves the entry stranded and the live set never shrinks.
+func TestUUIDRegistryAcquireIsIdempotentPerCall(t *testing.T) {
+	r := newUUIDRegistry()
+	u := uuidForHash("h", 1)
+	r.Acquire([]string{u, u, u}, 1)
+	if e := r.lookup(u); e == nil || e.n.Load() != 1 {
+		t.Fatalf("refcount = %v after acquiring the same marker three times in one call, want 1", e)
+	}
+	r.Release([]string{u, u})
+	if r.lookup(u) != nil {
+		t.Error("marker survived its holder's release")
+	}
+}
+
+// newFixturePoster builds a replayPoster wired up exactly as
+// runRouterReplayInstance does (see replay_router.go), for a single session
+// (sessionIdx 0) with nTurns turns, without touching HTTP/newReplayPoster.
+// All UUID state is global/read-only on the poster (see replay_router_post.go);
+// callers pass the returned view into buildInjection, exactly as
+// runRouterReplaySession does.
 func equalStrSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -231,100 +235,21 @@ func equalStrSlices(a, b []string) bool {
 	return true
 }
 
-// TestBuildSessionTurnUUIDsDeterminism verifies buildSessionTurnUUIDs
-// matches the dataset path's determinism contract: same seed -> same
-// per-session-per-turn UUID assignment; different seed -> different
-// assignment; every UUID unique across the whole run; owner correctly
-// reverse-maps each UUID to its issuing session.
-func TestBuildSessionTurnUUIDsDeterminism(t *testing.T) {
-	turnCounts := []int{3, 2, 4}
-	setsA, ownerA := buildSessionTurnUUIDs(turnCounts, 42)
-	setsB, ownerB := buildSessionTurnUUIDs(turnCounts, 42)
-	if len(setsA) != 3 || len(setsB) != 3 {
-		t.Fatalf("expected 3 sets each, got %d and %d", len(setsA), len(setsB))
+func newFixturePoster(nTurns int, seed int64, reciteEveryRequest bool) (*replayPoster, *sessionUUIDs) {
+	su := &sessionUUIDs{hashToTurn: map[string]int{}}
+	for i := 0; i < nTurns; i++ {
+		h := fmt.Sprintf("h%d", i)
+		su.hashToTurn[h] = i
+		su.uuids = append(su.uuids, uuidForHash(h, seed))
 	}
-	for i := range setsA {
-		if len(setsA[i]) != turnCounts[i] || len(setsB[i]) != turnCounts[i] {
-			t.Fatalf("session %d: expected %d UUIDs, got %v / %v", i, turnCounts[i], setsA[i], setsB[i])
-		}
-		for j := range setsA[i] {
-			if setsA[i][j] != setsB[i][j] {
-				t.Errorf("session %d turn %d: same seed produced different UUIDs: %q vs %q", i, j, setsA[i][j], setsB[i][j])
-			}
-		}
-	}
-	if len(ownerA) != len(ownerB) {
-		t.Errorf("owner map sizes differ: %d vs %d", len(ownerA), len(ownerB))
-	}
-
-	setsC, _ := buildSessionTurnUUIDs(turnCounts, 43)
-	same := true
-	for i := range setsA {
-		if len(setsA[i]) > 0 && len(setsC[i]) > 0 && setsA[i][0] != setsC[i][0] {
-			same = false
-		}
-	}
-	if same {
-		t.Error("different seeds produced an identical UUID assignment")
-	}
-
-	seen := map[string]bool{}
-	for i, set := range setsA {
-		for _, u := range set {
-			if seen[u] {
-				t.Errorf("uuid %q assigned to more than one turn", u)
-			}
-			seen[u] = true
-			if got := ownerA[u]; got != i {
-				t.Errorf("owner[%q] = %d, want %d", u, got, i)
-			}
-		}
-	}
-
-	if sets, owner := buildSessionTurnUUIDs(nil, 42); sets != nil || len(owner) != 0 {
-		t.Errorf("buildSessionTurnUUIDs(nil, ...) = (%v, %v), want (nil, empty)", sets, owner)
-	}
-}
-
-// TestBuildSessionTurnUUIDsScalesWithTurnCount verifies each session gets
-// EXACTLY turnCounts[i] UUIDs (one per turn, no floor/multiplier — unlike
-// the retired per-session-N scheme) and a zero-turn session gets none.
-func TestBuildSessionTurnUUIDsScalesWithTurnCount(t *testing.T) {
-	turnCounts := []int{0, 1, 5}
-	sets, owner := buildSessionTurnUUIDs(turnCounts, 7)
-	if len(sets[0]) != 0 {
-		t.Errorf("session 0 (0 turns): len = %d, want 0", len(sets[0]))
-	}
-	if len(sets[1]) != 1 {
-		t.Errorf("session 1 (1 turn): len = %d, want 1", len(sets[1]))
-	}
-	if len(sets[2]) != 5 {
-		t.Errorf("session 2 (5 turns): len = %d, want 5", len(sets[2]))
-	}
-	if len(owner) != 6 {
-		t.Errorf("len(owner) = %d, want 6 (1+5 issued UUIDs)", len(owner))
-	}
-}
-
-// newFixturePoster builds a replayPoster wired up exactly as
-// runRouterReplayInstance does (see replay_router.go), for a single session
-// (sessionIdx 0) with nTurns turns, without touching HTTP/newReplayPoster.
-// All UUID state is global/read-only on the poster (see replay_router_post.go);
-// the fixture's session lives at index 0 in the global slices, and callers
-// pass sessionIdx=0 into buildInjection.
-func newFixturePoster(nTurns int, seed int64, reciteEveryRequest bool) *replayPoster {
-	turnHashes := make([]string, nTurns)
-	for i := range turnHashes {
-		turnHashes[i] = fmt.Sprintf("h%d", i)
-	}
-	sets, owner := buildSessionTurnUUIDs([]int{nTurns}, seed)
+	reg := newUUIDRegistry()
+	reg.Acquire(su.uuids, 1)
 	return &replayPoster{
 		uuidEnabled:        true,
-		allUUIDSets:        sets,
-		sessionTurnHashes:  [][]string{turnHashes},
-		owner:              owner,
+		uuidSeed:           seed,
+		registry:           reg,
 		reciteEveryRequest: reciteEveryRequest,
-	}
+	}, su
 }
 
 // visibleTurnsRequest builds a RouterReplayRequest whose Messages carry the
@@ -345,7 +270,7 @@ func visibleTurnsRequest(n int) RouterReplayRequest {
 // Exercises the edge cases at turns 1, 2, 3 explicitly (D1/D2/D3 in the
 // plan) plus the steady-state 4-cap and window-sliding behavior beyond it.
 func TestBuildInjectionWindowSelection(t *testing.T) {
-	p := newFixturePoster(6, 1, true)
+	p, su := newFixturePoster(6, 1, true)
 
 	cases := []struct {
 		turn       int      // 1-based "current turn" being requested
@@ -361,7 +286,7 @@ func TestBuildInjectionWindowSelection(t *testing.T) {
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("turn-%d", c.turn), func(t *testing.T) {
 			req := visibleTurnsRequest(c.turn)
-			inj := p.buildInjection(req, 0, false)
+			inj := p.buildInjection(req, su, false)
 			if inj == nil {
 				t.Fatal("buildInjection returned nil, want a non-nil injection")
 			}
@@ -374,10 +299,14 @@ func TestBuildInjectionWindowSelection(t *testing.T) {
 			if len(inj.ReciteUUIDs) != len(inj.ReciteLabels) {
 				t.Fatalf("ReciteUUIDs len = %d, want %d (matching ReciteLabels)", len(inj.ReciteUUIDs), len(inj.ReciteLabels))
 			}
-			// Every UUID in the window must be this session's own (index 0).
+			// Every UUID in the window must be one this session carries.
+			own := map[string]bool{}
+			for _, u := range su.uuids {
+				own[u] = true
+			}
 			for i, u := range inj.ReciteUUIDs {
-				if p.owner[u] != 0 {
-					t.Errorf("ReciteUUIDs[%d] = %q owned by session %d, want session 0", i, u, p.owner[u])
+				if !own[u] {
+					t.Errorf("ReciteUUIDs[%d] = %q is not a marker this session carries", i, u)
 				}
 			}
 			// StampByHash must cover EVERY visible turn (h0..h(turn-1)), not
@@ -411,28 +340,28 @@ func TestBuildInjectionWindowSelection(t *testing.T) {
 // turn at all.
 func TestBuildInjectionNilCases(t *testing.T) {
 	t.Run("uuidEnabled false", func(t *testing.T) {
-		p := newFixturePoster(3, 1, true)
+		p, su := newFixturePoster(3, 1, true)
 		p.uuidEnabled = false
-		if got := p.buildInjection(visibleTurnsRequest(2), 0, false); got != nil {
+		if got := p.buildInjection(visibleTurnsRequest(2), su, false); got != nil {
 			t.Errorf("buildInjection = %v, want nil (disabled)", got)
 		}
 	})
-	t.Run("sessionIdx out of range", func(t *testing.T) {
-		p := newFixturePoster(3, 1, true)
-		if got := p.buildInjection(visibleTurnsRequest(2), 5, false); got != nil {
-			t.Errorf("buildInjection = %v, want nil (sessionIdx out of range)", got)
+	t.Run("no session view", func(t *testing.T) {
+		p, _ := newFixturePoster(3, 1, true)
+		if got := p.buildInjection(visibleTurnsRequest(2), nil, false); got != nil {
+			t.Errorf("buildInjection = %v, want nil (session has no markers)", got)
 		}
 	})
 	t.Run("zero-turn session", func(t *testing.T) {
-		p := newFixturePoster(0, 1, true)
-		if got := p.buildInjection(visibleTurnsRequest(0), 0, false); got != nil {
+		p, su := newFixturePoster(0, 1, true)
+		if got := p.buildInjection(visibleTurnsRequest(0), su, false); got != nil {
 			t.Errorf("buildInjection = %v, want nil (no turns)", got)
 		}
 	})
 	t.Run("no qualifying turn visible in this request", func(t *testing.T) {
-		p := newFixturePoster(3, 1, true)
+		p, su := newFixturePoster(3, 1, true)
 		req := RouterReplayRequest{Messages: []RouterReplayMessage{assistantText("unrelated", 30)}}
-		if got := p.buildInjection(req, 0, false); got != nil {
+		if got := p.buildInjection(req, su, false); got != nil {
 			t.Errorf("buildInjection = %v, want nil (nothing visible)", got)
 		}
 	})
@@ -443,16 +372,16 @@ func TestBuildInjectionNilCases(t *testing.T) {
 func TestBuildInjectionRecite(t *testing.T) {
 	req := visibleTurnsRequest(2)
 
-	pAlways := newFixturePoster(3, 1, true)
-	if inj := pAlways.buildInjection(req, 0, false); inj == nil || !inj.Recite {
+	pAlways, suA := newFixturePoster(3, 1, true)
+	if inj := pAlways.buildInjection(req, suA, false); inj == nil || !inj.Recite {
 		t.Error("reciteEveryRequest=true, isLastRequest=false: expected Recite=true")
 	}
 
-	pFinalOnly := newFixturePoster(3, 1, false)
-	if inj := pFinalOnly.buildInjection(req, 0, false); inj == nil || inj.Recite {
+	pFinalOnly, suF := newFixturePoster(3, 1, false)
+	if inj := pFinalOnly.buildInjection(req, suF, false); inj == nil || inj.Recite {
 		t.Error("reciteEveryRequest=false, isLastRequest=false: expected Recite=false")
 	}
-	if inj := pFinalOnly.buildInjection(req, 0, true); inj == nil || !inj.Recite {
+	if inj := pFinalOnly.buildInjection(req, suF, true); inj == nil || !inj.Recite {
 		t.Error("reciteEveryRequest=false, isLastRequest=true: expected Recite=true")
 	}
 }
@@ -635,84 +564,81 @@ func TestCacheFidelitySharedBlockUnaffectedByInjection(t *testing.T) {
 	}
 }
 
-// TestFindLeakedUUIDsByOwner exercises the router path's O(response)
-// contamination scanner: a known OTHER-session UUID is flagged with the
-// correct series index; the caller's OWN uuid is never flagged; a
-// UUID-shaped string with no entry in owner is silently ignored; and
-// multiple leaks are returned in deterministic (scan-order) sequence.
-// Mirrors validateReplayResponse/FindLeakedUUIDs' semantics for the dataset
-// path, but via the reverse uuid->owner map instead of iterating every
-// session's UUID set.
-func TestFindLeakedUUIDsByOwner(t *testing.T) {
-	owner := map[string]int{
-		"11111111-1111-1111-1111-111111111111": 0,
-		"22222222-2222-2222-2222-222222222222": 0,
-		"33333333-3333-3333-3333-333333333333": 1,
-		"44444444-4444-4444-4444-444444444444": 2,
-	}
+// TestFindLeakedUUIDsRouterPath exercises the router path's contamination scanner.
+//
+// The comparison is against what THIS request sent, not against a
+// session-wide assignment, which is what lets markers be derived from block
+// hashes: a block two sessions genuinely share yields one marker that both
+// hold legitimately, and neither is flagged for reciting it.
+func TestFindLeakedUUIDsRouterPath(t *testing.T) {
+	reg := newUUIDRegistry()
+	mine := uuidForHash("mine", 1)
+	theirs := uuidForHash("theirs", 1)
+	shared := uuidForHash("shared", 1)
+	reg.Acquire([]string{mine, shared}, 1)
+	reg.Acquire([]string{theirs, shared}, 2)
 
-	t.Run("other-session uuid flagged with correct series", func(t *testing.T) {
-		resp := "here it is: 33333333-3333-3333-3333-333333333333"
-		got := findLeakedUUIDsByOwner(resp, "", 0, owner)
-		if len(got) != 1 || !strings.Contains(got[0], "33333333-3333-3333-3333-333333333333") || !strings.Contains(got[0], "series=1") {
-			t.Errorf("got %v, want one entry naming series=1", got)
+	own := map[string]bool{mine: true, shared: true}
+
+	t.Run("own marker is never flagged", func(t *testing.T) {
+		if got := findLeakedUUIDs("here it is: "+mine, "", own, reg); len(got) != 0 {
+			t.Errorf("findLeakedUUIDs = %v, want empty", got)
 		}
 	})
-
-	t.Run("own uuid never flagged", func(t *testing.T) {
-		resp := "own ids: 11111111-1111-1111-1111-111111111111, 22222222-2222-2222-2222-222222222222"
-		got := findLeakedUUIDsByOwner(resp, "", 0, owner)
-		if len(got) != 0 {
-			t.Errorf("got %v, want none (both are the caller's own uuids)", got)
+	t.Run("shared marker this request carried is not flagged", func(t *testing.T) {
+		// The point of hash-derived markers: session 2 also holds this one,
+		// but this request sent it, so reciting it is correct behaviour.
+		if got := findLeakedUUIDs("recall: "+shared, "", own, reg); len(got) != 0 {
+			t.Errorf("findLeakedUUIDs = %v, want empty — a block both sessions carry is not a leak", got)
 		}
 	})
-
-	t.Run("unowned uuid-shaped string ignored", func(t *testing.T) {
-		resp := "random: 99999999-9999-9999-9999-999999999999"
-		got := findLeakedUUIDsByOwner(resp, "", 0, owner)
-		if len(got) != 0 {
-			t.Errorf("got %v, want none (not a real stamp)", got)
+	t.Run("live marker this request did not carry is flagged", func(t *testing.T) {
+		got := findLeakedUUIDs("stray "+theirs, "", own, reg)
+		if len(got) != 1 || got[0] != theirs+"(series=2)" {
+			t.Errorf("findLeakedUUIDs = %v, want [%s(series=2)]", got, theirs)
 		}
 	})
-
-	t.Run("thinking channel scanned too", func(t *testing.T) {
-		got := findLeakedUUIDsByOwner("no leak here", "but here: 44444444-4444-4444-4444-444444444444", 0, owner)
-		if len(got) != 1 || !strings.Contains(got[0], "series=2") {
-			t.Errorf("got %v, want one entry naming series=2 (found in thinking)", got)
+	t.Run("shared marker this request did NOT carry names the shared hold", func(t *testing.T) {
+		got := findLeakedUUIDs("stray "+shared, "", map[string]bool{mine: true}, reg)
+		if len(got) != 1 || got[0] != shared+"(series=1,shared)" {
+			t.Errorf("findLeakedUUIDs = %v, want [%s(series=1,shared)] — the label must not "+
+				"claim a single owner for a marker two sessions hold", got, shared)
 		}
 	})
-
-	t.Run("deterministic scan order for multiple leaks", func(t *testing.T) {
-		resp := "first 44444444-4444-4444-4444-444444444444 then 33333333-3333-3333-3333-333333333333"
-		got1 := findLeakedUUIDsByOwner(resp, "", 0, owner)
-		got2 := findLeakedUUIDsByOwner(resp, "", 0, owner)
-		if len(got1) != 2 {
-			t.Fatalf("got %v, want 2 leaked entries", got1)
-		}
-		for i := range got1 {
-			if got1[i] != got2[i] {
-				t.Errorf("non-deterministic order: %v vs %v", got1, got2)
-			}
-		}
-		if !strings.Contains(got1[0], "series=2") || !strings.Contains(got1[1], "series=1") {
-			t.Errorf("got %v, want series=2 before series=1 (scan order)", got1)
+	t.Run("unknown UUID-shaped string is ignored", func(t *testing.T) {
+		if got := findLeakedUUIDs("deadbeef-0000-4000-8000-000000000000", "", own, reg); len(got) != 0 {
+			t.Errorf("findLeakedUUIDs = %v, want empty (no live session holds it)", got)
 		}
 	})
-
-	t.Run("empty owner map returns nil", func(t *testing.T) {
-		if got := findLeakedUUIDsByOwner("11111111-1111-1111-1111-111111111111", "", 0, map[string]int{}); got != nil {
-			t.Errorf("got %v, want nil", got)
+	t.Run("retired marker is ignored", func(t *testing.T) {
+		// The registry IS the detection window: once every holder finishes,
+		// its markers stop being recognisable. Narrower than "no session
+		// ever leaked", and the run reports the window it checked.
+		reg.Release([]string{theirs, shared})
+		if got := findLeakedUUIDs("stray "+theirs, "", own, reg); len(got) != 0 {
+			t.Errorf("findLeakedUUIDs = %v, want empty once the holding session retired", got)
+		}
+	})
+	t.Run("thinking is scanned too", func(t *testing.T) {
+		reg2 := newUUIDRegistry()
+		reg2.Acquire([]string{theirs}, 3)
+		if got := findLeakedUUIDs("clean", "leaked "+theirs, own, reg2); len(got) != 1 {
+			t.Errorf("findLeakedUUIDs = %v, want the leak found in the thinking blob", got)
+		}
+	})
+	t.Run("multiple leaks in scan order", func(t *testing.T) {
+		reg3 := newUUIDRegistry()
+		a := uuidForHash("a", 1)
+		b := uuidForHash("b", 1)
+		reg3.Acquire([]string{a}, 4)
+		reg3.Acquire([]string{b}, 5)
+		got := findLeakedUUIDs(b+" then "+a, "", nil, reg3)
+		if len(got) != 2 || got[0] != b+"(series=5)" || got[1] != a+"(series=4)" {
+			t.Errorf("findLeakedUUIDs = %v, want scan order [%s(series=5) %s(series=4)]", got, b, a)
 		}
 	})
 }
 
-// TestFirstLineConformity exercises firstLineConformity (the output-
-// conformity check --replay-inject-uuids scores, mirroring the coherency
-// eval's matchesExpectedUUIDList/ExactMatch): pass on an exact ordered
-// comma-joined first line; fail on missing, reordered, or chatty first
-// lines; pass when line 1 is exact even though LATER lines contain filler
-// (the whole point of front-loading the ask to line 1 while forced-output
-// keeps generating). expected here plays the role of inj.ReciteUUIDs — the
 // request's recite WINDOW, not the session's full turn history.
 func TestFirstLineConformity(t *testing.T) {
 	expected := []string{"uuid-a", "uuid-b", "uuid-c"}

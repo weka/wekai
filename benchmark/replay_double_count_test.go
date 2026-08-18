@@ -125,7 +125,7 @@ func TestReplayConsumerInputTokensAreNetOfCache_Streaming(t *testing.T) {
 	defer ts.Close()
 
 	st := &autoState{stream: newCompletionStream(200)}
-	metrics := p.do(context.Background(), minReplayReq(true), strings.Repeat("x", 300), 1, "s1", "i1", 1, st, true)
+	metrics := p.do(context.Background(), minReplayReq(true), strings.Repeat("x", 300), 1, "s1", "i1", 1, st, true, nil)
 	if metrics.Error != nil {
 		t.Fatalf("unexpected error: %v", metrics.Error)
 	}
@@ -180,7 +180,7 @@ func TestReplayConsumerInputTokensAreNetOfCache_Plain(t *testing.T) {
 	defer ts.Close()
 
 	st := &autoState{stream: newCompletionStream(200)}
-	metrics := p.do(context.Background(), minReplayReq(false), strings.Repeat("x", 300), 1, "s1", "i1", 1, st, true)
+	metrics := p.do(context.Background(), minReplayReq(false), strings.Repeat("x", 300), 1, "s1", "i1", 1, st, true, nil)
 	if metrics.Error != nil {
 		t.Fatalf("unexpected error: %v", metrics.Error)
 	}
@@ -247,7 +247,7 @@ func TestReplayConsumerInputTokensAreNetOfCache_AnthropicPlain(t *testing.T) {
 			{Role: "user", Hash: "h1", Bytes: 50, BlockTypes: []string{"text"}},
 		},
 	}
-	metrics := p.do(context.Background(), req, strings.Repeat("x", 300), 1, "s1", "i1", 1, st, true)
+	metrics := p.do(context.Background(), req, strings.Repeat("x", 300), 1, "s1", "i1", 1, st, true, nil)
 	if metrics.Error != nil {
 		t.Fatalf("unexpected error: %v", metrics.Error)
 	}

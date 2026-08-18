@@ -178,33 +178,12 @@ type AutoBenchmarkConfig struct {
 	// window on EVERY request (default true), not just each instance's
 	// final request.
 	ReplayReciteEveryRequest bool
-	// replaySessionTurnHashes is the precomputed per-session ordered list of
-	// qualifying user-turn hashes, populated once by RunAutoBenchmark before
-	// any per-model goroutine spawns — see computeSessionTurnHashes.
-	// replaySessionTurnHashes[i][t] = session i's turn-t message hash.
-	// Shared, read-only, across every model in a multi-model run (same
-	// sharing rationale as replayConversations below).
-	replaySessionTurnHashes [][]string
-	// replayUUIDSets is the precomputed per-session-per-turn UUID
-	// assignment, populated once alongside replaySessionTurnHashes — see
-	// buildSessionTurnUUIDs. Index i = session i's ordered turn-UUID list
-	// (index t = turn t's UUID); i corresponds to seriesNum-1, the order
-	// sessions are dispatched in (see the sizing note at the router-replay
-	// precompute call site). Shared, read-only, across every model in a
-	// multi-model run so every model sees the identical assignment.
-	replayUUIDSets [][]string
-	// replayBlockSessionCounts maps a replay-v3 block hash to the number of
-	// DISTINCT SESSIONS that reference it (see computeBlockSessionCounts) —
-	// a hash referenced by more than one session is never eligible for
-	// turn-stamping (isQualifyingUserTurn requires count==1). Populated once
-	// alongside replayUUIDSets.
-	replayBlockSessionCounts map[string]int
-	// replayUUIDOwner is the precomputed reverse uuid -> owning-session-index
-	// map, populated once alongside replayUUIDSets — see
-	// buildSessionTurnUUIDs. Read-only after precompute; used by
-	// findLeakedUUIDsByOwner (replay_uuid.go) to flag cross-session
-	// contamination in O(response) time.
-	replayUUIDOwner map[string]int
+	// uuidRegistry is the live marker set for --replay-inject-uuids, shared
+	// by every poster in the run. Built at run start and populated as
+	// sessions are dispatched — there is no precompute phase; see
+	// replay_uuid_registry.go for why none is needed and what the registry's
+	// detection window is.
+	uuidRegistry *uuidRegistry
 
 	// RunID is populated internally by RunAutoBenchmark at the start of each
 	// run. It's the UUID injected into every conversation's system prompt
@@ -1860,15 +1839,13 @@ func runSingleModelBenchmark(
 			// pooled-per-endpoint, shares these identical slices/maps, so
 			// this poster (potentially shared across many concurrent
 			// sessions once picked by the router) can safely serve any
-			// session: do()/dryDo() derive the per-request sessionIdx from
-			// seriesNum and buildInjection looks up that session's data from
-			// these globals, with no mutable per-session state on the
-			// poster itself.
+			// session: the caller passes that session's own turn view into
+			// do()/dryDo() per request, so nothing session-specific is ever
+			// cached on the poster.
 			if cfg.ReplayInjectUUIDs {
 				pp.uuidEnabled = true
-				pp.allUUIDSets = cfg.replayUUIDSets
-				pp.sessionTurnHashes = cfg.replaySessionTurnHashes
-				pp.owner = cfg.replayUUIDOwner
+				pp.uuidSeed = cfg.ReplayUUIDSeed
+				pp.registry = cfg.uuidRegistry
 				pp.reciteEveryRequest = cfg.ReplayReciteEveryRequest
 			}
 			posters[i] = pp
@@ -3045,80 +3022,18 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 			hdr.Summary.Sessions, hdr.Summary.Instances, hdr.Summary.Requests,
 			hdr.Summary.FanOutTurns, hdr.Summary.MaxFanOutInOneTurn)
 
-		// Precompute UUID cache-coherency injection ONCE here, before any
-		// per-model goroutine spawns below, so every model's
-		// runSingleModelBenchmark sees the identical per-session assignment
-		// (same sharing rationale as replayConversations above).
+		// One registry for the whole run, built before any per-model
+		// goroutine spawns so every model shares the identical live marker
+		// set (same sharing rationale as replayConversations above).
+		//
+		// Nothing is precomputed. A session's markers are derived from the
+		// block hashes it already carries, when it is dispatched — see
+		// replay_uuid_registry.go for why the corpus-wide pass this replaced
+		// was answering a question the scoring no longer asks.
 		if cfg.ReplayInjectUUIDs {
-			// Effective session count: the SAME formula
-			// openRouterReplayStream uses to compute its own `total` (see
-			// replay_router.go), so the array is sized to exactly the
-			// number of sessions that will ever be dispatched (dispatch
-			// order == array index, since both walk the file in the same
-			// filtered, sequential order). This is what makes true
-			// lazy-growth unnecessary: the count is fully determined by
-			// the header + --replay-series + --replay-series-indices/
-			// --replay-series-range before any session is ever pulled.
-			effectiveSessions := hdr.Summary.Sessions
-			if cfg.ReplaySeries > 0 && cfg.ReplaySeries < effectiveSessions {
-				effectiveSessions = cfg.ReplaySeries
-			}
-			if len(cfg.RouterReplaySeriesIndices) > 0 {
-				effectiveSessions = len(cfg.RouterReplaySeriesIndices)
-				if cfg.ReplaySeries > 0 && cfg.ReplaySeries < effectiveSessions {
-					effectiveSessions = cfg.ReplaySeries
-				}
-			}
-			if effectiveSessions <= 0 {
-				fmt.Fprintf(os.Stderr,
-					"[router-replay] WARNING: --replay-inject-uuids could not determine an effective session count (header sessions=%d) — UUID injection disabled for this run\n",
-					hdr.Summary.Sessions)
-			} else {
-				counts, cerr := computeBlockSessionCounts(cfg.RouterReplayFile, cfg.RouterReplaySeriesIndices, cfg.ReplaySeries)
-				if cerr != nil {
-					return fmt.Errorf("compute block session counts for --replay-inject-uuids: %w", cerr)
-				}
-				cfg.replayBlockSessionCounts = counts
-
-				// Per-session ordered list of qualifying user-turn hashes
-				// (role=="user", has a text block, hash referenced by
-				// exactly this one session — see isQualifyingUserTurn),
-				// each turn getting its own UUID (buildSessionTurnUUIDs)
-				// rather than N stamps clustered at a session boundary.
-				turnHashes, terr := computeSessionTurnHashes(cfg.RouterReplayFile, cfg.RouterReplaySeriesIndices, cfg.ReplaySeries, counts)
-				if terr != nil {
-					return fmt.Errorf("compute session turn hashes for --replay-inject-uuids: %w", terr)
-				}
-				cfg.replaySessionTurnHashes = turnHashes
-
-				turnCounts := make([]int, len(turnHashes))
-				for i, h := range turnHashes {
-					turnCounts[i] = len(h)
-				}
-				cfg.replayUUIDSets, cfg.replayUUIDOwner = buildSessionTurnUUIDs(turnCounts, cfg.ReplayUUIDSeed)
-
-				sharedHashes := 0
-				for _, n := range counts {
-					if n > 1 {
-						sharedHashes++
-					}
-				}
-				totalTurns, minTurns, maxTurns := 0, 0, 0
-				if len(turnCounts) > 0 {
-					minTurns, maxTurns = turnCounts[0], turnCounts[0]
-					for _, n := range turnCounts {
-						totalTurns += n
-						if n < minTurns {
-							minTurns = n
-						}
-						if n > maxTurns {
-							maxTurns = n
-						}
-					}
-				}
-				fmt.Printf("UUID validation enabled: %d session(s) prepared, %d turn(s) total, %d-%d turns/session, %d cross-session-shared block hash(es), seed=%d, recite-every-request=%v\n",
-					effectiveSessions, totalTurns, minTurns, maxTurns, sharedHashes, cfg.ReplayUUIDSeed, cfg.ReplayReciteEveryRequest)
-			}
+			cfg.uuidRegistry = newUUIDRegistry()
+			fmt.Printf("UUID validation enabled: markers derived per block hash, seed=%d, recite-every-request=%v\n",
+				cfg.ReplayUUIDSeed, cfg.ReplayReciteEveryRequest)
 		}
 	}
 
