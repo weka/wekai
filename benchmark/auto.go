@@ -1102,6 +1102,7 @@ type autoState struct {
 	valMissAbsent        atomic.Int64 // misses with no such evidence either way
 	valEchoedTagsReqs    atomic.Int64 // responses that repeated turn names instead of guids — an ASK defect
 	valNoIDsReqs         atomic.Int64 // responses containing no guid at all — an ASK defect
+	valGarbageReqs       atomic.Int64 // responses carrying decode-level corruption (U+FFFD, NUL, stray control chars)
 	valPresenceMissReqs  atomic.Int64 // requests with >=1 PRESENCE_MISS
 	valCrossContamReqs   atomic.Int64 // requests with >=1 CROSS_CONTAMINATION
 
@@ -1215,6 +1216,7 @@ type autoBenchmarkResult struct {
 	valMissAbsent        int64
 	valEchoedTagsReqs    int64
 	valNoIDsReqs         int64
+	valGarbageReqs       int64
 	valWindowSessions    int
 	valWindowMarkers     int
 	valPresenceMissReqs  int64
@@ -1229,29 +1231,38 @@ type displaySnapshot struct {
 	seriesStatus         string
 	concStatus           string
 	cacheHitRate         float64
-	globalLocalCacheRate float64 // all-time local hit rate (non-cold / total non-error)
-	reqPerSec            float64
-	inputTokPerSec       float64
-	outputTokPerSec      float64
-	allTimePeakRPS       float64
-	allTimePeakConc      int
-	allTimePeakSeries    int
-	ttftP50              time.Duration
-	ttftP95              time.Duration
-	ttftCutoff           time.Duration // degradation cutoff = earlyColdBaseline * factor
-	ttftDegradedCount    int64         // requests disqualified by TTFT cutoff
-	totalCompleted       int64
-	totalErrors          int64
-	totalRetries429      int64
-	totalRetryWait       time.Duration
-	elapsed              time.Duration
-	cacheWarning         bool
-	bothDone             bool
-	termReason           string // non-empty when model benchmark has finished
-	gateActive           int
-	gateColdWaiting      int
-	gateNormalWait       int
-	gateHotActive        int // active slots in the hot-pool gate (non-zero only with hot-series-concurrency)
+	globalLocalCacheRate float64
+	// --verify live counters for the progress line. verifyOn distinguishes
+	// "verification disabled" from "enabled but nothing scored yet", which
+	// would otherwise both render as nothing.
+	verifyOn          bool
+	verifyChecks      int64
+	verifyFound       int64
+	verifyLeaked      int64
+	verifyGarbage     int64
+	verifyAbsent      int64 // all-time local hit rate (non-cold / total non-error)
+	reqPerSec         float64
+	inputTokPerSec    float64
+	outputTokPerSec   float64
+	allTimePeakRPS    float64
+	allTimePeakConc   int
+	allTimePeakSeries int
+	ttftP50           time.Duration
+	ttftP95           time.Duration
+	ttftCutoff        time.Duration // degradation cutoff = earlyColdBaseline * factor
+	ttftDegradedCount int64         // requests disqualified by TTFT cutoff
+	totalCompleted    int64
+	totalErrors       int64
+	totalRetries429   int64
+	totalRetryWait    time.Duration
+	elapsed           time.Duration
+	cacheWarning      bool
+	bothDone          bool
+	termReason        string // non-empty when model benchmark has finished
+	gateActive        int
+	gateColdWaiting   int
+	gateNormalWait    int
+	gateHotActive     int // active slots in the hot-pool gate (non-zero only with hot-series-concurrency)
 	// gateDispatched is requests whose HTTP exchange is actually open. gateActive
 	// counts gate slots, which are held from before the body is built until after
 	// the response is consumed, so the difference is the client's own prep and
@@ -1408,6 +1419,7 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		// ratio above is describing the instruction, not the fleet.
 		fmt.Printf("   Ask quality: responses echoing tags  : %d\n", res.valEchoedTagsReqs)
 		fmt.Printf("   Ask quality: responses with no ids   : %d\n", res.valNoIDsReqs)
+		fmt.Printf("   Garbage responses (decode corruption): %d\n", res.valGarbageReqs)
 		// Both denominators, because they are different populations: presence
 		// is scored only where a recite was asked, contamination on every
 		// completed response. The window is printed with the count because a
@@ -1479,23 +1491,41 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 	//
 	// held is still worth seeing: below the series count it means long-tail
 	// drops, above it means fan-out bursts.
+	// The verify segment shows the guid hit rate and ONLY the counters whose
+	// non-zero value is genuinely bad on its own: a leaked marker, a corrupted
+	// response, and a miss with no evidence either way. Substitutions and
+	// ask-quality counters stay off the line — they describe the model and
+	// the prompt, and belong in the summary where their caveats are printed
+	// next to them.
+	verifyInfo := ""
+	if snap.verifyOn {
+		rate := 100.0
+		if snap.verifyChecks > 0 {
+			rate = 100 * float64(snap.verifyFound) / float64(snap.verifyChecks)
+		}
+		verifyInfo = fmt.Sprintf(" guid=%.1f%%", rate)
+		if snap.verifyLeaked > 0 || snap.verifyGarbage > 0 || snap.verifyAbsent > 0 {
+			verifyInfo += fmt.Sprintf(" BAD(leak=%d garbage=%d lost=%d)",
+				snap.verifyLeaked, snap.verifyGarbage, snap.verifyAbsent)
+		}
+	}
 	if snap.termReason != "" {
 		hotInfo := ""
 		if snap.gateHotActive > 0 {
 			hotInfo = fmt.Sprintf(" hot=%d", snap.gateHotActive)
 		}
-		return fmt.Sprintf("DONE(%s) %sseries=%d conc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d in=%s warm=%s scached=%s out=%s",
+		return fmt.Sprintf("DONE(%s) %sseries=%d conc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d%s in=%s warm=%s scached=%s out=%s",
 			snap.termReason, replayPrefix, snap.series, snap.concurrency, snap.gateDispatched, snap.gateActive, hotInfo,
-			formatFloat(snap.reqPerSec), snap.cacheHitRate*100, snap.globalLocalCacheRate*100, ttftStr, snap.totalCompleted, snap.totalErrors,
+			formatFloat(snap.reqPerSec), snap.cacheHitRate*100, snap.globalLocalCacheRate*100, ttftStr, snap.totalCompleted, snap.totalErrors, verifyInfo,
 			formatKiloInt(snap.totalInput), formatKiloInt(snap.totalInputWarm), formatKiloInt(snap.totalCached), formatKiloInt(snap.totalOutput))
 	}
 	hotInfo := ""
 	if snap.gateHotActive > 0 {
 		hotInfo = fmt.Sprintf(" hot=%d", snap.gateHotActive)
 	}
-	return fmt.Sprintf("%sseries=%d conc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d elapsed=%s in=%s warm=%s scached=%s out=%s",
+	return fmt.Sprintf("%sseries=%d conc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d%s elapsed=%s in=%s warm=%s scached=%s out=%s",
 		replayPrefix, snap.series, snap.concurrency, snap.gateDispatched, snap.gateActive, hotInfo,
-		formatFloat(snap.reqPerSec), snap.cacheHitRate*100, snap.globalLocalCacheRate*100, ttftStr, snap.totalCompleted, snap.totalErrors,
+		formatFloat(snap.reqPerSec), snap.cacheHitRate*100, snap.globalLocalCacheRate*100, ttftStr, snap.totalCompleted, snap.totalErrors, verifyInfo,
 		formatDuration(snap.elapsed),
 		formatKiloInt(snap.totalInput), formatKiloInt(snap.totalInputWarm), formatKiloInt(snap.totalCached), formatKiloInt(snap.totalOutput))
 }
@@ -1769,6 +1799,14 @@ func runSingleModelBenchmark(
 			snap.replayActive = st.activeReplayWorkers.Load()
 		}
 		snap.globalLocalCacheRate = st.stream.GlobalLocalCacheRate()
+		if cfg.Verify {
+			snap.verifyOn = true
+			snap.verifyChecks = st.valUUIDChecks.Load()
+			snap.verifyFound = st.valUUIDFound.Load()
+			snap.verifyLeaked = st.valCrossContamUUIDs.Load()
+			snap.verifyGarbage = st.valGarbageReqs.Load()
+			snap.verifyAbsent = st.valMissAbsent.Load()
+		}
 		display.updateSnapshot(snap)
 		sendSnap(snap)
 	}
@@ -2834,6 +2872,7 @@ func runSingleModelBenchmark(
 	res.valMissAbsent = st.valMissAbsent.Load()
 	res.valEchoedTagsReqs = st.valEchoedTagsReqs.Load()
 	res.valNoIDsReqs = st.valNoIDsReqs.Load()
+	res.valGarbageReqs = st.valGarbageReqs.Load()
 	if cfg.uuidRegistry != nil {
 		_, res.valWindowMarkers, res.valWindowSessions = cfg.uuidRegistry.Stats()
 	}
@@ -2897,6 +2936,14 @@ func runSingleModelBenchmark(
 			finalSnap.replayCompleted = st.seriesReplayCompleted.Load()
 			finalSnap.replayRemaining = st.routerReplay.Remaining()
 			finalSnap.replayActive = st.activeReplayWorkers.Load()
+		}
+		if cfg.Verify {
+			finalSnap.verifyOn = true
+			finalSnap.verifyChecks = st.valUUIDChecks.Load()
+			finalSnap.verifyFound = st.valUUIDFound.Load()
+			finalSnap.verifyLeaked = st.valCrossContamUUIDs.Load()
+			finalSnap.verifyGarbage = st.valGarbageReqs.Load()
+			finalSnap.verifyAbsent = st.valMissAbsent.Load()
 		}
 		// Populate token totals on the DONE snap (previously left zero, which
 		// showed up as in=0 warm=0 out=0 on the final rendered line).

@@ -822,6 +822,7 @@ func (p *replayPoster) do(
 		}
 		m.LeakChecked = true
 		m.LeakedUUIDs = findLeakedUUIDs(m.Response, "", own, p.registry)
+		m.ResponseGarbage = responseIsGarbage(m.Response)
 		// Contamination is unaffected by the output budget: a leaked marker
 		// arrives whether or not anything was asked for.
 		m.ReciteBudgetShort = inj != nil && inj.BudgetShort
@@ -860,8 +861,8 @@ func (p *replayPoster) do(
 			ExactMatch: m.ExactMatch, LeakChecked: m.LeakChecked,
 			MissSubstituted: m.MissSubstituted, MissAbsent: m.MissAbsent,
 			ReciteEchoedTags: m.ReciteEchoedTags, ReciteNoIDs: m.ReciteNoIDs,
-			BudgetShort: m.ReciteBudgetShort,
-			Error:       errString(m.Error),
+			BudgetShort: m.ReciteBudgetShort, Garbage: m.ResponseGarbage,
+			Error: errString(m.Error),
 		}, bodyBytes, respCapture.Bytes(), mergedResponse(m.Response, respCapture.Bytes()))
 	}
 	return m

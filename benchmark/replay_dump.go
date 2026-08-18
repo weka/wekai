@@ -76,6 +76,7 @@ type dumpMeta struct {
 	ReciteEchoedTags bool `json:"recite_echoed_tags,omitempty"`
 	ReciteNoIDs      bool `json:"recite_no_ids,omitempty"`
 	BudgetShort      bool `json:"recite_budget_short,omitempty"`
+	Garbage          bool `json:"response_garbage,omitempty"`
 }
 
 // dump writes one exchange: the request, the raw response, the readable

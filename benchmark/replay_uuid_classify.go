@@ -96,3 +96,30 @@ func indexOf(haystack, needle string) int {
 	}
 	return -1
 }
+
+// responseIsGarbage reports decode-level corruption in a response: replacement
+// characters, NUL bytes, or C0 control characters other than tab/newline/CR.
+//
+// This is the one bad signal besides contamination that needs no cooperation
+// from the model and no marker in the prompt. A model can decline to recite
+// and still be served intact context; it cannot emit U+FFFD on its own —
+// json.Unmarshal put it there because the bytes off the wire were not valid
+// UTF-8, which points at the serving stack, not at instruction-following.
+//
+// Deliberately narrow. Repetition loops, truncation and incoherent prose are
+// all real degradations, but each has innocent causes (sampling, max_tokens,
+// the corpus itself), and a "garbage" counter that fires on innocent causes
+// gets ignored — this one firing at all is worth reading the capture.
+func responseIsGarbage(resp string) bool {
+	for _, r := range resp {
+		switch {
+		case r == '\uFFFD':
+			return true
+		case r == 0:
+			return true
+		case r < 0x20 && r != '\n' && r != '\t' && r != '\r':
+			return true
+		}
+	}
+	return false
+}

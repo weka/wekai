@@ -68,6 +68,10 @@ type RequestMetrics struct {
 	MissAbsent       int
 	ReciteEchoedTags bool
 	ReciteNoIDs      bool
-	LeakedUUIDs      []string // "uuid(series=N)" entries for any OTHER session's UUID found here
-	ExactMatch       bool     // first line of Response is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
+	// ResponseGarbage: the response carried replacement characters, NULs or
+	// stray control characters — decode-level corruption from the serving
+	// stack, which no amount of model non-compliance can produce.
+	ResponseGarbage bool
+	LeakedUUIDs     []string // "uuid(series=N)" entries for any OTHER session's UUID found here
+	ExactMatch      bool     // first line of Response is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
 }
