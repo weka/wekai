@@ -67,11 +67,6 @@ type uuidInjection struct {
 	// KV as later requests repeat that history in full, not just the turns
 	// named in the recite window below.
 	StampByHash map[string]turnStamp
-	// Recite asks the model to output, on the FIRST line of its response,
-	// the ReciteUUIDs values (identified to the model by ReciteLabels'
-	// inline tags — see replayReciteWindowInstruction), then continue
-	// normally.
-	Recite bool
 	// ReciteLabels is the ordered window of turn labels ("turn-N") the
 	// instruction names — first (visible) turn, then up to 3 most-recent
 	// turns EXCLUDING the current turn, deduplicated, capped at 4.
@@ -121,7 +116,8 @@ func replayReciteWindowInstruction(labels []string) string {
 const replayReciteFloorMultiplier = 3.0
 
 // replayReciteFloorTokens returns the minimum max_tokens budget to enforce
-// on a request that carries the recite ask (see uuidInjection.Recite), sized
+// on a request that carries an injection — every request carrying a
+// qualifying turn asks for a recite — sized
 // to fit the FIRST-LINE numUUIDs-UUID comma-joined list this feature asks
 // for (reuses the cache-coherency eval's computeMaxOutputTokens sizing:
 // numUUIDs*36 chars + separating commas, /4 for an approximate token count,

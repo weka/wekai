@@ -66,7 +66,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 		ts, seen := newVLLMStyleServer()
 		defer ts.Close()
 		p := mustPoster(t, fmt.Sprintf("dynamic/%s,type=openai_vllm,model=m", ts.URL))
-		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), true, nil); m.Error != nil {
+		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), nil); m.Error != nil {
 			t.Fatalf("first request: %v", m.Error)
 		}
 		got := seen()
@@ -77,7 +77,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 			t.Errorf("latch = %q fellBack=%v, want fallback latched", p.epResolved, p.epFellBack)
 		}
 		// Latched: the second request goes straight to /v1, one wire call.
-		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState(), true, nil); m.Error != nil {
+		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState(), nil); m.Error != nil {
 			t.Fatalf("second request: %v", m.Error)
 		}
 		if got = seen(); len(got) != 3 || got[2] != "/v1/chat/completions" {
@@ -89,7 +89,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 		ts, seen := newVLLMStyleServer()
 		defer ts.Close()
 		p := mustPoster(t, fmt.Sprintf("dynamic/%s/v1,type=openai_vllm,model=m", ts.URL))
-		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), true, nil); m.Error != nil {
+		if m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), nil); m.Error != nil {
 			t.Fatalf("request: %v", m.Error)
 		}
 		got := seen()
@@ -112,7 +112,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 		}))
 		defer ts.Close()
 		p := mustPoster(t, fmt.Sprintf("dynamic/%s,type=openai_vllm,model=m", ts.URL))
-		m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), true, nil)
+		m := p.do(context.Background(), minimalReq, docs, 1, "s", "i", 1, newState(), nil)
 		if m.Error == nil || !strings.Contains(m.Error.Error(), "status 500") {
 			t.Fatalf("expected status-500 error, got %v", m.Error)
 		}
@@ -146,7 +146,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				m := p.do(context.Background(), minimalReq, docs, 1, "s", fmt.Sprintf("i%d", i), 1, newState(), true, nil)
+				m := p.do(context.Background(), minimalReq, docs, 1, "s", fmt.Sprintf("i%d", i), 1, newState(), nil)
 				errs[i] = m.Error
 			}(i)
 		}
@@ -162,7 +162,7 @@ func TestReplayEndpointResolution(t *testing.T) {
 		// Duplicate probes during the race are allowed; once latched, a new
 		// request adds exactly one wire call.
 		before := len(seen())
-		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState(), true, nil); m.Error != nil {
+		if m := p.do(context.Background(), minimalReq, docs, 2, "s", "i", 1, newState(), nil); m.Error != nil {
 			t.Fatalf("post-latch request: %v", m.Error)
 		}
 		after := seen()
@@ -388,7 +388,7 @@ func TestOpenAIReplayEndToEnd(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	metrics := p.do(ctx, req, docs, 1, "session-1", "instance-1", 1, st, true, nil)
+	metrics := p.do(ctx, req, docs, 1, "session-1", "instance-1", 1, st, nil)
 
 	// Verify no error.
 	if metrics.Error != nil {
@@ -662,7 +662,7 @@ func TestOpenAINonStreamingEndToEnd(t *testing.T) {
 	}
 
 	st := &autoState{stream: newCompletionStream(200)}
-	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, true, nil)
+	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, nil)
 
 	if metrics.Error != nil {
 		t.Fatalf("unexpected error: %v", metrics.Error)
@@ -708,7 +708,7 @@ func TestOpenAIErrorResponse(t *testing.T) {
 	}
 
 	st := &autoState{stream: newCompletionStream(200)}
-	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, true, nil)
+	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, nil)
 
 	if metrics.Error == nil {
 		t.Fatal("expected error for 500 response, got nil")
@@ -750,7 +750,7 @@ func TestOpenAISSEWithoutUsage(t *testing.T) {
 	}
 
 	st := &autoState{stream: newCompletionStream(200)}
-	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, true, nil)
+	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, nil)
 
 	if metrics.Error != nil {
 		// "empty response from model" is acceptable for no-usage streams.
@@ -758,103 +758,6 @@ func TestOpenAISSEWithoutUsage(t *testing.T) {
 	}
 	if metrics.Response != "ok" {
 		t.Errorf("response = %q, want %q", metrics.Response, "ok")
-	}
-}
-
-// TestUUIDScoringGatedOnRecite covers the H1 fix: buildInjection returns a
-// non-nil *uuidInjection on EVERY request once UUID injection is on (see
-// its doc comment), but only inj.Recite says the model was actually ASKED
-// to recite this turn. With --verify-recite=false, a
-// non-final request must still get the UUID block injected (so it stays
-// warm in KV — see replay_router_uuid.go's package doc) but must NOT be
-// scored: scoring it would count "the model didn't volunteer the UUID
-// list" as a false PRESENCE_MISS/conformity failure even though nothing
-// asked it to. This drives the poster through p.do() end-to-end (real HTTP
-// round trip against an httptest server) rather than calling buildInjection
-// directly, so the assertion covers the actual gate in do().
-func TestUUIDScoringGatedOnRecite(t *testing.T) {
-	docs := strings.Repeat("uuid-gate-docs ", 100)
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(200)
-		// Response deliberately omits the UUID list entirely — if this
-		// non-recite request were (wrongly) scored, it would register as a
-		// presence-miss on every expected UUID.
-		fmt.Fprintf(w, `{
-			"id": "chatcmpl-1",
-			"object": "chat.completion",
-			"model": "test-model",
-			"choices": [{"index": 0, "message": {"role": "assistant", "content": "just a normal answer, no uuids here"}, "finish_reason": "stop"}],
-			"usage": {"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35}
-		}`)
-	}))
-	defer ts.Close()
-
-	modelSpec := fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL)
-	keys := llm.APIKeys{OpenAI: "sk-test"}
-	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil, nil)
-	if err != nil {
-		t.Fatalf("newReplayPoster: %v", err)
-	}
-	// Wire up UUID injection exactly as runRouterReplaySession does (see
-	// replay_router.go): the poster holds only the registry,
-	// and the session's own view is passed per request. reciteEveryRequest
-	// is false so only the FINAL request of an instance's list carries the
-	// recite ask.
-	p.uuidEnabled = true
-	p.registry = newUUIDRegistry()
-	p.reciteEveryRequest = false
-	su := &sessionUUIDs{
-		hashToTurn: map[string]int{"h1": 0, "h2": 1},
-		uuids:      []string{uuidForHash("h1", "stamp-7"), uuidForHash("h2", "stamp-7")},
-	}
-	p.registry.Acquire(su.uuids, 1)
-
-	req := RouterReplayRequest{
-		Stream:       false,
-		OutputTokens: 100,
-		Messages: []RouterReplayMessage{
-			{Role: "user", Hash: "h1", Bytes: 50, BlockTypes: []string{"text"}},
-		},
-	}
-	st := &autoState{stream: newCompletionStream(200)}
-
-	// isLastRequest=false -> inj.Recite=false (reciteEveryRequest is also
-	// false) -> the recite gate must skip PRESENCE scoring. Contamination is
-	// deliberately not gated here: a leak needs no ask, so LeakChecked is
-	// true on this request even though nothing was asked to be recited.
-	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, false, su)
-
-	if metrics.Error != nil {
-		t.Fatalf("unexpected error: %v", metrics.Error)
-	}
-	if len(metrics.ExpectedUUIDs) != 0 {
-		t.Errorf("ExpectedUUIDs = %v, want empty (non-recite request must not be scored)", metrics.ExpectedUUIDs)
-	}
-	if len(metrics.UUIDFound) != 0 {
-		t.Errorf("UUIDFound = %v, want empty (non-recite request must not be scored)", metrics.UUIDFound)
-	}
-	if len(metrics.LeakedUUIDs) != 0 {
-		t.Errorf("LeakedUUIDs = %v, want empty (non-recite request must not be scored)", metrics.LeakedUUIDs)
-	}
-	if metrics.ExactMatch {
-		t.Error("ExactMatch = true, want false (non-recite request must not be scored)")
-	}
-	if !metrics.LeakChecked {
-		t.Error("LeakChecked = false on a non-recite request: contamination does not depend on the " +
-			"model being asked for anything, and gating it there is what left 18% of a run unchecked")
-	}
-
-	// Sanity check the OTHER half of the invariant: the SAME request, with
-	// isLastRequest=true (recite asked), DOES get scored — otherwise this
-	// test could be vacuously passing because scoring never fires at all.
-	metrics2 := p.do(context.Background(), req, docs, 1, "s1", "i2", 1, st, true, su)
-	if metrics2.Error != nil {
-		t.Fatalf("unexpected error on recite request: %v", metrics2.Error)
-	}
-	if len(metrics2.ExpectedUUIDs) == 0 {
-		t.Fatal("ExpectedUUIDs empty on a recite=true request — scoring gate is broken (never scores) rather than fixed")
 	}
 }
 
@@ -980,7 +883,6 @@ func TestCrossContaminationDetectedEndToEnd(t *testing.T) {
 			t.Fatalf("newReplayPoster: %v", err)
 		}
 		p.uuidEnabled = true
-		p.reciteEveryRequest = true
 		p.registry = newUUIDRegistry()
 		// Both sessions live, exactly as two concurrent series would be.
 		p.registry.Acquire(theirs.uuids, 1)
@@ -1002,7 +904,7 @@ func TestCrossContaminationDetectedEndToEnd(t *testing.T) {
 		plant = foreign
 		p := newPoster(t)
 		m := p.do(context.Background(), req, docs, 1, "s2", "i1", 2,
-			&autoState{stream: newCompletionStream(200)}, true, mine)
+			&autoState{stream: newCompletionStream(200)}, mine)
 		if m.Error != nil {
 			t.Fatalf("unexpected error: %v", m.Error)
 		}
@@ -1021,7 +923,7 @@ func TestCrossContaminationDetectedEndToEnd(t *testing.T) {
 		plant = own
 		p := newPoster(t)
 		m := p.do(context.Background(), req, docs, 1, "s2", "i1", 2,
-			&autoState{stream: newCompletionStream(200)}, true, mine)
+			&autoState{stream: newCompletionStream(200)}, mine)
 		if len(m.LeakedUUIDs) != 0 {
 			t.Errorf("LeakedUUIDs = %v, want empty: the response recited the caller's own marker", m.LeakedUUIDs)
 		}
@@ -1042,7 +944,7 @@ func TestCrossContaminationDetectedEndToEnd(t *testing.T) {
 			Messages:     []RouterReplayMessage{assistantText("no-qualifying-turn", 40)},
 		}
 		m := p.do(context.Background(), bare, docs, 1, "s2", "i1", 2,
-			&autoState{stream: newCompletionStream(200)}, true, mine)
+			&autoState{stream: newCompletionStream(200)}, mine)
 		if !m.LeakChecked {
 			t.Fatal("LeakChecked = false: a response with no markers in its own prompt was never scanned")
 		}
@@ -1061,7 +963,7 @@ func TestCrossContaminationDetectedEndToEnd(t *testing.T) {
 		plant = shared
 		p := newPoster(t)
 		m := p.do(context.Background(), req, docs, 1, "s2", "i1", 2,
-			&autoState{stream: newCompletionStream(200)}, true, mine)
+			&autoState{stream: newCompletionStream(200)}, mine)
 		if len(m.LeakedUUIDs) != 0 {
 			t.Errorf("LeakedUUIDs = %v, want empty: a block both sessions carry is shared, not leaked", m.LeakedUUIDs)
 		}
@@ -1103,11 +1005,10 @@ func TestSessionRegistersItsMarkersAndDetectsLeaks(t *testing.T) {
 	reg := newUUIDRegistry()
 	reg.Acquire(other.uuids, 99) // the other session is live
 	cfg := AutoBenchmarkConfig{
-		Model:             fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL),
-		Verify:            true,
-		VerifyReciteEvery: true,
-		ReplayNoStamp:     true,
-		uuidRegistry:      reg,
+		Model:         fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL),
+		Verify:        true,
+		ReplayNoStamp: true,
+		uuidRegistry:  reg,
 	}
 	sess := RouterReplaySession{
 		SessionID: "s-under-test",
@@ -1186,11 +1087,10 @@ func TestPassStampReachesTheMarkers(t *testing.T) {
 	defer ts.Close()
 
 	cfg := AutoBenchmarkConfig{
-		Model:             fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL),
-		Verify:            true,
-		VerifyReciteEvery: true,
-		RunID:             "3fa1c2d4-0000-4000-8000-000000000000",
-		uuidRegistry:      newUUIDRegistry(),
+		Model:        fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL),
+		Verify:       true,
+		RunID:        "3fa1c2d4-0000-4000-8000-000000000000",
+		uuidRegistry: newUUIDRegistry(),
 	}
 	sess := RouterReplaySession{
 		SessionID: "s1",

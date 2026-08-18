@@ -235,7 +235,7 @@ func equalStrSlices(a, b []string) bool {
 	return true
 }
 
-func newFixturePoster(nTurns int, stamp string, reciteEveryRequest bool) (*replayPoster, *sessionUUIDs) {
+func newFixturePoster(nTurns int, stamp string) (*replayPoster, *sessionUUIDs) {
 	su := &sessionUUIDs{hashToTurn: map[string]int{}}
 	for i := 0; i < nTurns; i++ {
 		h := fmt.Sprintf("h%d", i)
@@ -245,9 +245,8 @@ func newFixturePoster(nTurns int, stamp string, reciteEveryRequest bool) (*repla
 	reg := newUUIDRegistry()
 	reg.Acquire(su.uuids, 1)
 	return &replayPoster{
-		uuidEnabled:        true,
-		registry:           reg,
-		reciteEveryRequest: reciteEveryRequest,
+		uuidEnabled: true,
+		registry:    reg,
 	}, su
 }
 
@@ -269,7 +268,7 @@ func visibleTurnsRequest(n int) RouterReplayRequest {
 // Exercises the edge cases at turns 1, 2, 3 explicitly (D1/D2/D3 in the
 // plan) plus the steady-state 4-cap and window-sliding behavior beyond it.
 func TestBuildInjectionWindowSelection(t *testing.T) {
-	p, su := newFixturePoster(6, "fixture", true)
+	p, su := newFixturePoster(6, "fixture")
 
 	cases := []struct {
 		turn       int      // 1-based "current turn" being requested
@@ -285,7 +284,7 @@ func TestBuildInjectionWindowSelection(t *testing.T) {
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("turn-%d", c.turn), func(t *testing.T) {
 			req := visibleTurnsRequest(c.turn)
-			inj := p.buildInjection(req, su, false)
+			inj := p.buildInjection(req, su)
 			if inj == nil {
 				t.Fatal("buildInjection returned nil, want a non-nil injection")
 			}
@@ -339,57 +338,33 @@ func TestBuildInjectionWindowSelection(t *testing.T) {
 // turn at all.
 func TestBuildInjectionNilCases(t *testing.T) {
 	t.Run("uuidEnabled false", func(t *testing.T) {
-		p, su := newFixturePoster(3, "fixture", true)
+		p, su := newFixturePoster(3, "fixture")
 		p.uuidEnabled = false
-		if got := p.buildInjection(visibleTurnsRequest(2), su, false); got != nil {
+		if got := p.buildInjection(visibleTurnsRequest(2), su); got != nil {
 			t.Errorf("buildInjection = %v, want nil (disabled)", got)
 		}
 	})
 	t.Run("no session view", func(t *testing.T) {
-		p, _ := newFixturePoster(3, "fixture", true)
-		if got := p.buildInjection(visibleTurnsRequest(2), nil, false); got != nil {
+		p, _ := newFixturePoster(3, "fixture")
+		if got := p.buildInjection(visibleTurnsRequest(2), nil); got != nil {
 			t.Errorf("buildInjection = %v, want nil (session has no markers)", got)
 		}
 	})
 	t.Run("zero-turn session", func(t *testing.T) {
-		p, su := newFixturePoster(0, "fixture", true)
-		if got := p.buildInjection(visibleTurnsRequest(0), su, false); got != nil {
+		p, su := newFixturePoster(0, "fixture")
+		if got := p.buildInjection(visibleTurnsRequest(0), su); got != nil {
 			t.Errorf("buildInjection = %v, want nil (no turns)", got)
 		}
 	})
 	t.Run("no qualifying turn visible in this request", func(t *testing.T) {
-		p, su := newFixturePoster(3, "fixture", true)
+		p, su := newFixturePoster(3, "fixture")
 		req := RouterReplayRequest{Messages: []RouterReplayMessage{assistantText("unrelated", 30)}}
-		if got := p.buildInjection(req, su, false); got != nil {
+		if got := p.buildInjection(req, su); got != nil {
 			t.Errorf("buildInjection = %v, want nil (nothing visible)", got)
 		}
 	})
 }
 
-// TestBuildInjectionRecite verifies Recite = reciteEveryRequest ||
-// isLastRequest, independent of window selection.
-func TestBuildInjectionRecite(t *testing.T) {
-	req := visibleTurnsRequest(2)
-
-	pAlways, suA := newFixturePoster(3, "fixture", true)
-	if inj := pAlways.buildInjection(req, suA, false); inj == nil || !inj.Recite {
-		t.Error("reciteEveryRequest=true, isLastRequest=false: expected Recite=true")
-	}
-
-	pFinalOnly, suF := newFixturePoster(3, "fixture", false)
-	if inj := pFinalOnly.buildInjection(req, suF, false); inj == nil || inj.Recite {
-		t.Error("reciteEveryRequest=false, isLastRequest=false: expected Recite=false")
-	}
-	if inj := pFinalOnly.buildInjection(req, suF, true); inj == nil || !inj.Recite {
-		t.Error("reciteEveryRequest=false, isLastRequest=true: expected Recite=true")
-	}
-}
-
-// TestWireInjectionDeterminism verifies that, for a fixed set of turn
-// stamps, buildOpenAIChatCompletionsBody / buildAnthropicMessagesBody
-// produce byte-identical bodies across repeated calls (same request + same
-// injection in -> same bytes out) and across two DIFFERENT requests that
-// both carry the SAME turn message (the within-session cache-reuse
 // property), while two DIFFERENT sessions' turn stamps diverge the body.
 func TestWireInjectionDeterminism(t *testing.T) {
 	docs := strings.Repeat("wire-injection-docs ", 100)
@@ -723,7 +698,6 @@ func TestMaxTokensFloorAppliedInWireBuilders(t *testing.T) {
 	reciteUUIDs := []string{"uuid-floor-0", "uuid-floor-1"}
 	inj := &uuidInjection{
 		StampByHash:  map[string]turnStamp{"msg1": {Idx: 0, UUID: reciteUUIDs[0], Label: "turn-1"}},
-		Recite:       true,
 		ReciteLabels: []string{"turn-1"},
 		ReciteUUIDs:  reciteUUIDs,
 	}

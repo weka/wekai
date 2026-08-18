@@ -177,7 +177,6 @@ type AutoBenchmarkConfig struct {
 	// VerifyReciteEvery: ask the model to recite the first-line UUID
 	// window on EVERY request (default true), not just each instance's
 	// final request.
-	VerifyReciteEvery bool
 	// uuidRegistry is the live marker set for --verify, shared
 	// by every poster in the run. Built at run start and populated as
 	// sessions are dispatched — there is no precompute phase; see
@@ -1858,7 +1857,6 @@ func runSingleModelBenchmark(
 			if cfg.Verify {
 				pp.uuidEnabled = true
 				pp.registry = cfg.uuidRegistry
-				pp.reciteEveryRequest = cfg.VerifyReciteEvery
 			}
 			posters[i] = pp
 		}
@@ -3052,13 +3050,9 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		// was answering a question the scoring no longer asks.
 		if cfg.Verify {
 			cfg.uuidRegistry = newUUIDRegistry()
-			recite := "last"
-			if cfg.VerifyReciteEvery {
-				recite = "every"
-			}
 			// The seed is not repeated here: it is printed once with the run
 			// stamp it produced, and markers derive from that stamp.
-			fmt.Printf("Coherency verification enabled: markers derived per block hash, recite=%s\n", recite)
+			fmt.Println("Coherency verification enabled: markers derived per block hash, recited on every request")
 		}
 	}
 

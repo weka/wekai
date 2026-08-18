@@ -54,7 +54,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 	}
 	body := map[string]interface{}{
 		"model":      modelName,
-		"max_tokens": applyReciteFloor(pickMaxTokens(req, outputRatio), inj != nil && inj.Recite, injNumUUIDs),
+		"max_tokens": applyReciteFloor(pickMaxTokens(req, outputRatio), inj != nil, injNumUUIDs),
 		"stream":     req.Stream,
 	}
 	if req.Temperature != nil {
@@ -98,7 +98,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 	if len(req.Messages) > 0 {
 		msgs = buildMessages(req.Messages, docs, charsPerToken, stampByHash)
 	}
-	if inj != nil && inj.Recite {
+	if inj != nil {
 		msgs = appendTailMessageAnthropic(msgs, replayReciteWindowInstruction(inj.ReciteLabels))
 	}
 	if len(msgs) > 0 {
@@ -153,7 +153,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 			}
 		}
 	}
-	if inj != nil && inj.Recite {
+	if inj != nil {
 		canonical.WriteString(replayReciteWindowInstruction(inj.ReciteLabels))
 	}
 
@@ -571,7 +571,7 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 	}
 	body := map[string]interface{}{
 		"model":      modelName,
-		"max_tokens": applyReciteFloor(pickMaxTokens(req, outputRatio), inj != nil && inj.Recite, injNumUUIDs),
+		"max_tokens": applyReciteFloor(pickMaxTokens(req, outputRatio), inj != nil, injNumUUIDs),
 		"stream":     req.Stream,
 	}
 	if req.Temperature != nil {
@@ -637,7 +637,7 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		messages = append(messages, openaiMsgs...)
 	}
 
-	if inj != nil && inj.Recite {
+	if inj != nil {
 		messages = appendTailMessageOpenAI(messages, replayReciteWindowInstruction(inj.ReciteLabels))
 	}
 
@@ -672,7 +672,7 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 			}
 		}
 	}
-	if inj != nil && inj.Recite {
+	if inj != nil {
 		canonical.WriteString(replayReciteWindowInstruction(inj.ReciteLabels))
 	}
 

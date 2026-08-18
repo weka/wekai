@@ -806,7 +806,6 @@ func runRouterReplayInstance(
 		if cfg.Verify {
 			poster.uuidEnabled = true
 			poster.registry = cfg.uuidRegistry
-			poster.reciteEveryRequest = cfg.VerifyReciteEvery
 		}
 	}
 	if err != nil {
@@ -889,8 +888,6 @@ func runRouterReplayInstance(
 			}
 		}
 
-		isLastRequest := ti == len(inst.Requests)-1
-
 		reqCtx, reqCancel := context.WithTimeout(ctx, reqTimeout)
 		var metrics RequestMetrics
 		// Per-request endpoint selection: prefer this series' home endpoint,
@@ -910,9 +907,9 @@ func runRouterReplayInstance(
 		// seriesNum directly, so a shared poster safely serves any session.
 		st.skipClk.AddInflight(1)
 		if reqPoster.dryRun {
-			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest, su)
+			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, su)
 		} else {
-			metrics = reqPoster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, isLastRequest, su)
+			metrics = reqPoster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, su)
 		}
 		st.skipClk.AddInflight(-1)
 		picker.release(epIdx)

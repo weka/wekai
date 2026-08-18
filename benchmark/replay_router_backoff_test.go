@@ -132,7 +132,7 @@ func TestReplayWaitsOut429sRatherThanFailing(t *testing.T) {
 	p := backoffTestPoster(t, ts.URL, retry429Budget)
 	st := &autoState{stream: newCompletionStream(200)}
 
-	m := p.do(context.Background(), backoffTestReq(), strings.Repeat("x", 400), 1, "s", "i", 1, st, true, nil)
+	m := p.do(context.Background(), backoffTestReq(), strings.Repeat("x", 400), 1, "s", "i", 1, st, nil)
 
 	if m.Error != nil {
 		t.Fatalf("request failed despite the fleet recovering: %v", m.Error)
@@ -180,7 +180,7 @@ func TestReplayGivesUpAfterTheRetryBudget(t *testing.T) {
 	st := &autoState{stream: newCompletionStream(200)}
 
 	start := time.Now()
-	m := p.do(context.Background(), backoffTestReq(), strings.Repeat("x", 400), 1, "s", "i", 1, st, true, nil)
+	m := p.do(context.Background(), backoffTestReq(), strings.Repeat("x", 400), 1, "s", "i", 1, st, nil)
 	elapsed := time.Since(start)
 
 	if m.Error == nil {
@@ -223,7 +223,7 @@ func TestReplayDoesNotRetryOtherStatuses(t *testing.T) {
 
 			p := backoffTestPoster(t, ts.URL, retry429Budget)
 			st := &autoState{stream: newCompletionStream(200)}
-			m := p.do(context.Background(), backoffTestReq(), strings.Repeat("x", 400), 1, "s", "i", 1, st, true, nil)
+			m := p.do(context.Background(), backoffTestReq(), strings.Repeat("x", 400), 1, "s", "i", 1, st, nil)
 
 			if m.Error == nil {
 				t.Fatalf("status %d was not reported as an error", status)

@@ -96,10 +96,6 @@ type replayPoster struct {
 	// refcounts are what make a block shared by concurrent sessions visible
 	// without a corpus pass. See replay_uuid_registry.go.
 	registry *uuidRegistry
-	// reciteEveryRequest mirrors --verify-recite: true asks for
-	// the recite line on every request; false only on each instance's final
-	// request (see the isLastRequest parameter to do()/dryDo()).
-	reciteEveryRequest bool
 }
 
 // buildInjection returns this call's *uuidInjection, or nil when injection is
@@ -108,10 +104,7 @@ type replayPoster struct {
 //
 // su is the session's own turn view (see buildSessionUUIDs), passed in per
 // call rather than cached on the poster because a poster may be shared across
-// sessions under multi-endpoint routing. isLastRequest is whether req is the
-// final request of the CURRENT instance's request list (see
-// runRouterReplayInstance) — with --verify-recite=false, only
-// that final request carries the recite ask.
+// sessions under multi-endpoint routing.
 //
 // Every VISIBLE qualifying turn in req.Messages gets stamped into StampByHash
 // (keeping every turn's marker warm in KV as later requests repeat it) — see
@@ -120,7 +113,7 @@ type replayPoster struct {
 // (the highest-index turn visible in THIS request), deduplicated and capped
 // at 4 (see the package doc in replay_router_uuid.go for the design rationale
 // and edge cases at turns 1-3).
-func (p *replayPoster) buildInjection(req RouterReplayRequest, su *sessionUUIDs, isLastRequest bool) *uuidInjection {
+func (p *replayPoster) buildInjection(req RouterReplayRequest, su *sessionUUIDs) *uuidInjection {
 	if !p.uuidEnabled || su == nil || len(su.uuids) == 0 {
 		return nil
 	}
@@ -174,7 +167,6 @@ func (p *replayPoster) buildInjection(req RouterReplayRequest, su *sessionUUIDs,
 
 	return &uuidInjection{
 		StampByHash:  stampByHash,
-		Recite:       p.reciteEveryRequest || isLastRequest,
 		ReciteLabels: labels,
 		ReciteUUIDs:  reciteUUIDs,
 	}
@@ -543,7 +535,6 @@ func (p *replayPoster) do(
 	instanceID string,
 	seriesNum int,
 	st *autoState,
-	isLastRequest bool,
 	su *sessionUUIDs,
 ) RequestMetrics {
 	startTime := time.Now()
@@ -557,7 +548,7 @@ func (p *replayPoster) do(
 	gotResponse := false
 
 	sessionIdx := seriesNum - 1
-	inj := p.buildInjection(req, su, isLastRequest)
+	inj := p.buildInjection(req, su)
 
 	var bodyBytes []byte
 	var canonical string
@@ -809,7 +800,7 @@ func (p *replayPoster) do(
 	// but only Recite says the model was ASKED to repeat this turn. Scoring a
 	// turn nobody asked about would count "the model did not volunteer a
 	// list" as a presence miss.
-	if inj != nil && inj.Recite && m.Error == nil && !m.IsEmpty {
+	if inj != nil && m.Error == nil && !m.IsEmpty {
 		m.ConvIdx = sessionIdx
 		m.ExpectedUUIDs = append([]string(nil), inj.ReciteUUIDs...)
 		m.UUIDFound = make([]bool, len(inj.ReciteUUIDs))
@@ -1155,7 +1146,6 @@ func (p *replayPoster) dryDo(
 	instanceID string,
 	seriesNum int,
 	st *autoState,
-	isLastRequest bool,
 	su *sessionUUIDs,
 ) RequestMetrics {
 	// Build canonical string for estimator and compute ratio. Injection is
@@ -1163,7 +1153,7 @@ func (p *replayPoster) dryDo(
 	// cache-ratio estimate) stays consistent with a real do() call for the
 	// same request — dry-run never makes a real request, so there's no
 	// response to validate.
-	inj := p.buildInjection(req, su, isLastRequest)
+	inj := p.buildInjection(req, su)
 	var canonical string
 	switch p.apiType {
 	case "openai", "openai_vllm":

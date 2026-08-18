@@ -284,7 +284,6 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		ReplayStopAtLowConcurrency: c.ReplayStopAtLowConcurrency,
 		Verify:                     c.Verify,
 		Seed:                       c.Seed,
-		VerifyReciteEvery:          c.VerifyReciteEvery != "last",
 		RouterReplayFile:           c.RouterReplayFile,
 		RouterReplayRoles:          c.RouterReplayRoles,
 		ReplayOutputRatio:          c.ReplayOutputRatio,
