@@ -61,6 +61,13 @@ type RequestMetrics struct {
 	// Counted and reported separately: an unanswerable question recorded as a
 	// miss would read as a coherency failure.
 	ReciteBudgetShort bool
-	LeakedUUIDs       []string // "uuid(series=N)" entries for any OTHER session's UUID found here
-	ExactMatch        bool     // first line of Response is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
+	// Miss attribution and ask-quality signals — see classifyRecite. A raw
+	// PRESENCE_MISS count sums unrelated causes; these separate them so a
+	// prompt defect can never be read as a cache result.
+	MissSubstituted  int
+	MissAbsent       int
+	ReciteEchoedTags bool
+	ReciteNoIDs      bool
+	LeakedUUIDs      []string // "uuid(series=N)" entries for any OTHER session's UUID found here
+	ExactMatch       bool     // first line of Response is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
 }

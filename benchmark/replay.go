@@ -418,6 +418,14 @@ func recordReplayRequest(
 		if missCount := uuidExpectedCount - uuidFoundCount; missCount > 0 {
 			st.valPresenceMissUUIDs.Add(int64(missCount))
 			st.valPresenceMissReqs.Add(1)
+			st.valMissSubstituted.Add(int64(metrics.MissSubstituted))
+			st.valMissAbsent.Add(int64(metrics.MissAbsent))
+		}
+		if metrics.ReciteEchoedTags {
+			st.valEchoedTagsReqs.Add(1)
+		}
+		if metrics.ReciteNoIDs {
+			st.valNoIDsReqs.Add(1)
 		}
 	}
 

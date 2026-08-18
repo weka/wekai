@@ -841,6 +841,11 @@ func (p *replayPoster) do(
 			m.UUIDFound[i] = strings.Contains(m.Response, u)
 		}
 		m.ExactMatch = firstLineConformity(m.Response, inj.ReciteUUIDs)
+		// Attribute every miss while the injection is still in hand: only here
+		// is it known which markers this request actually sent.
+		cls := classifyRecite(m.Response, inj, m.UUIDFound)
+		m.MissSubstituted, m.MissAbsent = cls.Substituted, cls.Absent
+		m.ReciteEchoedTags, m.ReciteNoIDs = cls.EchoedTags, cls.NoIDs
 	}
 
 	// Written after scoring, so the derived verdict and the bytes it came from
@@ -853,7 +858,10 @@ func (p *replayPoster) do(
 			InputTok: m.UsageData.InputTokens.Count, OutputTok: m.UsageData.OutputTokens.Count,
 			Expected: m.ExpectedUUIDs, Found: m.UUIDFound, Leaked: m.LeakedUUIDs,
 			ExactMatch: m.ExactMatch, LeakChecked: m.LeakChecked,
-			Error: errString(m.Error),
+			MissSubstituted: m.MissSubstituted, MissAbsent: m.MissAbsent,
+			ReciteEchoedTags: m.ReciteEchoedTags, ReciteNoIDs: m.ReciteNoIDs,
+			BudgetShort: m.ReciteBudgetShort,
+			Error:       errString(m.Error),
 		}, bodyBytes, respCapture.Bytes(), mergedResponse(m.Response, respCapture.Bytes()))
 	}
 	return m

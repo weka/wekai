@@ -1098,6 +1098,10 @@ type autoState struct {
 	valCrossContamUUIDs  atomic.Int64 // per-UUID CROSS_CONTAMINATION count (other-conversation UUID present)
 	valLeakCheckedReqs   atomic.Int64 // responses actually scanned for contamination — the denominator that zero belongs to
 	valBudgetShortReqs   atomic.Int64 // requests whose captured output budget could not carry one id, so presence was never asked
+	valMissSubstituted   atomic.Int64 // misses where the response carried another marker from this same prompt
+	valMissAbsent        atomic.Int64 // misses with no such evidence either way
+	valEchoedTagsReqs    atomic.Int64 // responses that repeated turn names instead of guids — an ASK defect
+	valNoIDsReqs         atomic.Int64 // responses containing no guid at all — an ASK defect
 	valPresenceMissReqs  atomic.Int64 // requests with >=1 PRESENCE_MISS
 	valCrossContamReqs   atomic.Int64 // requests with >=1 CROSS_CONTAMINATION
 
@@ -1207,6 +1211,10 @@ type autoBenchmarkResult struct {
 	valCrossContamUUIDs  int64
 	valLeakCheckedReqs   int64
 	valBudgetShortReqs   int64
+	valMissSubstituted   int64
+	valMissAbsent        int64
+	valEchoedTagsReqs    int64
+	valNoIDsReqs         int64
 	valWindowSessions    int
 	valWindowMarkers     int
 	valPresenceMissReqs  int64
@@ -1389,6 +1397,17 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		fmt.Printf("   UUID correctness (presence)          : %d/%d\n", res.valUUIDFound, res.valUUIDChecks)
 		fmt.Printf("   Output conformity (first-line exact) : %d/%d\n", res.valExactMatchReqs, res.valReqs)
 		fmt.Printf("   PRESENCE_MISS (expected UUID absent) : %d across %d requests\n", res.valPresenceMissUUIDs, res.valPresenceMissReqs)
+		// Attributed, because the raw count sums unrelated causes. A
+		// substitution proves the tagged content was there to read and the
+		// model picked the wrong tag; only the unattributed remainder is
+		// consistent with a loss, and even that shares its bucket with "the
+		// model declined to answer".
+		fmt.Printf("     wrong turn, from this prompt       : %d (content was present)\n", res.valMissSubstituted)
+		fmt.Printf("     no evidence either way             : %d\n", res.valMissAbsent)
+		// These two measure the ASK. Anything but near-zero and the presence
+		// ratio above is describing the instruction, not the fleet.
+		fmt.Printf("   Ask quality: responses echoing tags  : %d\n", res.valEchoedTagsReqs)
+		fmt.Printf("   Ask quality: responses with no ids   : %d\n", res.valNoIDsReqs)
 		// Both denominators, because they are different populations: presence
 		// is scored only where a recite was asked, contamination on every
 		// completed response. The window is printed with the count because a
@@ -2811,6 +2830,10 @@ func runSingleModelBenchmark(
 	res.valCrossContamUUIDs = st.valCrossContamUUIDs.Load()
 	res.valLeakCheckedReqs = st.valLeakCheckedReqs.Load()
 	res.valBudgetShortReqs = st.valBudgetShortReqs.Load()
+	res.valMissSubstituted = st.valMissSubstituted.Load()
+	res.valMissAbsent = st.valMissAbsent.Load()
+	res.valEchoedTagsReqs = st.valEchoedTagsReqs.Load()
+	res.valNoIDsReqs = st.valNoIDsReqs.Load()
 	if cfg.uuidRegistry != nil {
 		_, res.valWindowMarkers, res.valWindowSessions = cfg.uuidRegistry.Stats()
 	}

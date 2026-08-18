@@ -67,6 +67,15 @@ type dumpMeta struct {
 	// LeakChecked distinguishes "scanned, found nothing" from "never scanned",
 	// which the file would otherwise render identically as an absent list.
 	LeakChecked bool `json:"leak_checked"`
+	// The miss attribution for THIS exchange, so a single file explains its own
+	// result. Without it a reader has to re-derive from the bytes what the
+	// summary already worked out — which is exactly the re-derivation this
+	// capture exists to spare them.
+	MissSubstituted  int  `json:"miss_substituted,omitempty"`
+	MissAbsent       int  `json:"miss_absent,omitempty"`
+	ReciteEchoedTags bool `json:"recite_echoed_tags,omitempty"`
+	ReciteNoIDs      bool `json:"recite_no_ids,omitempty"`
+	BudgetShort      bool `json:"recite_budget_short,omitempty"`
 }
 
 // dump writes one exchange: the request, the raw response, the readable
