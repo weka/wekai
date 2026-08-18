@@ -2,7 +2,7 @@ package benchmark
 
 // Path-agnostic UUID-based response validation primitives, shared by the
 // router-replay UUID cache-coherency check (replay_router_uuid.go,
-// --replay-inject-uuids + --router-replay-file) and the cache-coherency eval
+// --verify + --router-replay-file) and the cache-coherency eval
 // CLI (cli/eval_commands.go). Distinct UUIDs are stamped somewhere in a
 // request's content; the model is later asked (directly or implicitly) to
 // recall them, and the response is scored for presence (did it recall its

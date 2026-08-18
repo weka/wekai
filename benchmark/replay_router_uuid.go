@@ -1,7 +1,7 @@
 package benchmark
 
 // UUID-based cache-coherency validation for the ROUTER-REPLAY path
-// (--router-replay-file, --replay-inject-uuids).
+// (--router-replay-file, --verify).
 //
 // Strategy: a deterministic UUID is injected inline into every qualifying
 // user turn — a role=="user" message with >=1 text block — spread through

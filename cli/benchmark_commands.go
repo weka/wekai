@@ -282,9 +282,9 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		ReplayNoStamp:              c.ReplayNoStamp,
 		AbortOnCollapse:            c.AbortOnCollapse,
 		ReplayStopAtLowConcurrency: c.ReplayStopAtLowConcurrency,
-		ReplayInjectUUIDs:          c.ReplayInjectUUIDs,
-		ReplayUUIDSeed:             c.ReplayUUIDSeed,
-		ReplayReciteEveryRequest:   c.ReplayReciteEveryRequest != "false",
+		Verify:                     c.Verify,
+		Seed:                       c.Seed,
+		VerifyReciteEvery:          c.VerifyReciteEvery != "last",
 		RouterReplayFile:           c.RouterReplayFile,
 		RouterReplayRoles:          c.RouterReplayRoles,
 		ReplayOutputRatio:          c.ReplayOutputRatio,
@@ -303,18 +303,8 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		return fmt.Errorf("--from-dataset and --router-replay-file are mutually exclusive")
 	}
 
-	// --replay-inject-uuids is ROUTER-REPLAY PATH ONLY: it splices a
-	// per-session UUID marker at the boundary between cross-session-shared
-	// prefix blocks (computed from the replay-v3 block-hash schema) and
-	// per-session content — the dataset-replay path has no such block-hash
-	// schema to compute that boundary from.
-	if c.ReplayInjectUUIDs {
-		if c.RouterReplayFile == "" {
-			return fmt.Errorf("--replay-inject-uuids requires --router-replay-file")
-		}
-		if c.FromDataset != "" {
-			return fmt.Errorf("--replay-inject-uuids and --from-dataset are mutually exclusive")
-		}
+	if err := c.validateVerify(); err != nil {
+		return err
 	}
 	if c.DryRun && c.RouterReplayFile == "" {
 		return fmt.Errorf("--dry-run requires --router-replay-file")
@@ -718,6 +708,33 @@ func (c *BenchmarkAutoCommand) validateRealtime(w io.Writer) error {
 	if c.ReplaySkipIdle && !c.ReplayRealtime {
 		fmt.Fprintln(w, "warning: --replay-skip-idle has nothing to skip without --replay-realtime; "+
 			"a pool that fires back-to-back has no dead time")
+	}
+	return nil
+}
+
+func (c *BenchmarkAutoOptions) validateVerify() error {
+	// --verify is ROUTER-REPLAY ONLY, and says so at startup rather than
+	// running and reporting nothing.
+	//
+	// A marker is derived from a replay-v3 block hash and appended to that
+	// block's synthesized content, which is what keeps two requests carrying
+	// the same turn byte-identical. No other mode has block hashes: synthetic
+	// prompts are generated per request and the dataset path replays raw text,
+	// so there is nothing stable to key a marker to. Silently ignoring the
+	// flag there would produce a run whose validation section reads all
+	// zeroes — indistinguishable from a fleet that passed.
+	if c.Verify {
+		switch {
+		case c.RouterReplayFile == "":
+			return fmt.Errorf("--verify requires --router-replay-file: coherency markers key off " +
+				"replay-v3 block hashes, which no other benchmark mode has")
+		case c.FromDataset != "":
+			return fmt.Errorf("--verify is not supported with --from-dataset: the dataset path " +
+				"replays raw text with no block hashes to key a marker to")
+		case c.DocsDir != "":
+			return fmt.Errorf("--verify is not supported with --docs-dir (synthetic mode): prompts " +
+				"are generated per request, so a marker has nothing stable to attach to")
+		}
 	}
 	return nil
 }

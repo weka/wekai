@@ -644,8 +644,8 @@ func runRouterReplaySession(
 	// two concurrent sessions visible, and what bounds the set that
 	// cross-contamination is scored against. See replay_uuid_registry.go.
 	var su *sessionUUIDs
-	if cfg.ReplayInjectUUIDs {
-		if su = buildSessionUUIDs(sess, cfg.ReplayUUIDSeed); su != nil {
+	if cfg.Verify {
+		if su = buildSessionUUIDs(sess, cfg.Seed); su != nil {
 			cfg.uuidRegistry.Acquire(su.uuids, seriesNum)
 			defer cfg.uuidRegistry.Release(su.uuids)
 		}
@@ -797,17 +797,17 @@ func runRouterReplayInstance(
 		// until it was caught on 2026-08-06.
 		poster.limitContext = cfg.LimitContext
 		poster.replayCharsPerToken = cfg.ReplayCharsPerToken
-		// UUID cache-coherency injection (--replay-inject-uuids, router
+		// UUID cache-coherency injection (--verify, router
 		// path). Everything set here is global and read-only — the same seed
 		// and the same registry go on every poster in the run (see also the
 		// picker pool in auto.go) — so a poster shared across sessions under
 		// multi-endpoint routing is safe: the session's own turn view is
 		// passed in per request rather than cached here.
-		if cfg.ReplayInjectUUIDs {
+		if cfg.Verify {
 			poster.uuidEnabled = true
-			poster.uuidSeed = cfg.ReplayUUIDSeed
+			poster.uuidSeed = cfg.Seed
 			poster.registry = cfg.uuidRegistry
-			poster.reciteEveryRequest = cfg.ReplayReciteEveryRequest
+			poster.reciteEveryRequest = cfg.VerifyReciteEvery
 		}
 	}
 	if err != nil {

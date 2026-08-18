@@ -78,7 +78,7 @@ type replayPoster struct {
 	// capture's. 0 = byte-faithful sizing (default).
 	replayCharsPerToken float64
 
-	// UUID cache-coherency injection (--replay-inject-uuids, router path —
+	// UUID cache-coherency injection (--verify, router path —
 	// see replay_router_uuid.go). Set directly on the poster after
 	// construction, same rationale as outputRatio/forceOutput above.
 	// uuidEnabled gates everything: false leaves do()/dryDo() byte-for-byte
@@ -98,7 +98,7 @@ type replayPoster struct {
 	// refcounts are what make a block shared by concurrent sessions visible
 	// without a corpus pass. See replay_uuid_registry.go.
 	registry *uuidRegistry
-	// reciteEveryRequest mirrors --replay-recite-every-request: true asks for
+	// reciteEveryRequest mirrors --verify-recite: true asks for
 	// the recite line on every request; false only on each instance's final
 	// request (see the isLastRequest parameter to do()/dryDo()).
 	reciteEveryRequest bool
@@ -112,7 +112,7 @@ type replayPoster struct {
 // call rather than cached on the poster because a poster may be shared across
 // sessions under multi-endpoint routing. isLastRequest is whether req is the
 // final request of the CURRENT instance's request list (see
-// runRouterReplayInstance) — with --replay-recite-every-request=false, only
+// runRouterReplayInstance) — with --verify-recite=false, only
 // that final request carries the recite ask.
 //
 // Every VISIBLE qualifying turn in req.Messages gets stamped into StampByHash
@@ -755,7 +755,7 @@ func (p *replayPoster) do(
 	}
 	m.LocalCacheRatio = localCacheRatio
 
-	// UUID cache-coherency validation (--replay-inject-uuids, router path).
+	// UUID cache-coherency validation (--verify, router path).
 	// consumeOpenAISSE/consumeOpenAIPlain/consumeSSE/consumePlain already
 	// merge reasoning/thinking into m.Response (see their doc comments), so
 	// a single Contains-scan of m.Response covers both — thinking is passed

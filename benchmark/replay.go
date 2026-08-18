@@ -383,7 +383,7 @@ func recordReplayRequest(
 	isErr := metrics.Error != nil
 	explicitCache := metrics.UsageData.CachedTokens.Count > 0
 
-	// UUID validation tallies (--replay-inject-uuids only). metrics.ExpectedUUIDs
+	// UUID validation tallies (--verify only). metrics.ExpectedUUIDs
 	// is nil/empty for every request when the feature is off (default), so this
 	// block — and the val* counters it touches — is fully inert then.
 	uuidExpectedCount := len(metrics.ExpectedUUIDs)

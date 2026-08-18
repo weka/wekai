@@ -45,7 +45,7 @@ type RequestMetrics struct {
 	Retries429 int
 	RetryWait  time.Duration
 
-	// UUID validation (router-replay --replay-inject-uuids only). All nil/zero
+	// UUID validation (router-replay --verify only). All nil/zero
 	// when the feature is off (default) or on the synthetic path, which never
 	// populates these.
 	ConvIdx       int      // session index within cfg.replayUUIDSets (== seriesNum-1)

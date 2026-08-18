@@ -42,7 +42,7 @@ const verboseOutputInstruction = "Provide a thorough, detailed response and keep
 // string (all synthesized content concatenated in generation order) for
 // feeding into the content-level cache estimator.
 //
-// inj carries the UUID cache-coherency injection (--replay-inject-uuids,
+// inj carries the UUID cache-coherency injection (--verify,
 // router path — see replay_router_uuid.go); nil means "no injection",
 // leaving the body byte-for-byte identical to before this feature existed.
 func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
@@ -261,7 +261,7 @@ func buildTools(spec *RouterReplayToolsSpec, docs string, charsPerToken float64)
 // share of the message's total Bytes. For tool_use and tool_result blocks
 // we preserve the original ids verbatim so the conversation maintains a
 // valid reference graph that matches what the original capture sent.
-// stampByHash is inj.StampByHash (nil when --replay-inject-uuids is off) —
+// stampByHash is inj.StampByHash (nil when --verify is off) —
 // threaded down to buildMessageContent, which appends each qualifying
 // turn's inline UUID marker to its own synthesized content.
 func buildMessages(msgs []RouterReplayMessage, docs string, charsPerToken float64, stampByHash map[string]turnStamp) []map[string]interface{} {
@@ -333,7 +333,7 @@ func appendTailMessageAnthropic(msgs []map[string]interface{}, text string) []ma
 // tool_result_ids to populate ids on the matching blocks (in order of
 // appearance in block_types).
 //
-// stampByHash is inj.StampByHash (nil when --replay-inject-uuids is off, or
+// stampByHash is inj.StampByHash (nil when --verify is off, or
 // when this message isn't a qualifying turn). When m.Hash is a key in
 // stampByHash, the labeled marker "\n\n[turn-N id: <uuid>]" is appended to
 // the LAST "text"-type block's synthesized content, at a position wholly
@@ -560,7 +560,7 @@ func buildOpenAITools(spec *RouterReplayToolsSpec, docs string, charsPerToken fl
 //   - Stream options with include_usage are set so we get token counts in
 //     the final SSE chunk.
 //
-// inj carries the UUID cache-coherency injection (--replay-inject-uuids,
+// inj carries the UUID cache-coherency injection (--verify,
 // router path — see replay_router_uuid.go); nil means "no injection".
 func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
 	var stampByHash map[string]turnStamp

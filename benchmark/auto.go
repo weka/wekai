@@ -163,7 +163,7 @@ type AutoBenchmarkConfig struct {
 	// first, and it would still produce a cache hit rate — just a meaningless
 	// one. That is why the stamp is per pass and never per session.
 	ReplayReuseSessions bool
-	// UUID-based cache-coherency validation (--replay-inject-uuids). ROUTER
+	// UUID-based cache-coherency validation (--verify). ROUTER
 	// PATH ONLY (cfg.RouterReplayFile != ""); the CLI rejects this combined
 	// with --from-dataset (see cli/benchmark_commands.go). One deterministic
 	// UUID is injected per user turn, spread through the conversation
@@ -172,15 +172,15 @@ type AutoBenchmarkConfig struct {
 	// bounded WINDOW (first turn + up to 3 most-recent turns, excluding the
 	// current turn, capped at 4), keeping the recite cost/response budget
 	// constant regardless of session length.
-	ReplayInjectUUIDs bool
-	// ReplayUUIDSeed seeds the UUID generator (see newUUIDGenerator); 0 = crypto/rand
+	Verify bool
+	// Seed seeds the UUID generator (see newUUIDGenerator); 0 = crypto/rand
 	// (non-deterministic across runs).
-	ReplayUUIDSeed int64
-	// ReplayReciteEveryRequest: ask the model to recite the first-line UUID
+	Seed int64
+	// VerifyReciteEvery: ask the model to recite the first-line UUID
 	// window on EVERY request (default true), not just each instance's
 	// final request.
-	ReplayReciteEveryRequest bool
-	// uuidRegistry is the live marker set for --replay-inject-uuids, shared
+	VerifyReciteEvery bool
+	// uuidRegistry is the live marker set for --verify, shared
 	// by every poster in the run. Built at run start and populated as
 	// sessions are dispatched — there is no precompute phase; see
 	// replay_uuid_registry.go for why none is needed and what the registry's
@@ -310,7 +310,7 @@ type requestDataRecord struct {
 	ResponseText    string `json:"response_text,omitempty"`
 	RawResponseTail string `json:"raw_response_tail,omitempty"`
 
-	// UUID validation (router-replay --replay-inject-uuids only). The three
+	// UUID validation (router-replay --verify only). The three
 	// counts are always populated (0 when the feature is off); the raw detail
 	// lists are populated ONLY on a miss or a leak (mirrors the
 	// failed-request-only policy above — avoid bloating every row).
@@ -1085,7 +1085,7 @@ type autoState struct {
 	coldStartTTFTCount atomic.Int64 // count of cold-start samples (used for series-scaling gate)
 	ttftDegradedCount  atomic.Int64 // requests disqualified from cache-hit by TTFT degradation
 
-	// UUID validation (replay --replay-inject-uuids only). All zero when the
+	// UUID validation (replay --verify only). All zero when the
 	// feature is off — recordReplayRequest only touches these when
 	// metrics.ExpectedUUIDs is non-empty.
 	valReqs              atomic.Int64 // requests that carried >=1 expected UUID (i.e. validation ran)
@@ -1194,7 +1194,7 @@ type autoBenchmarkResult struct {
 	totalOutput       int64 // output tokens across all requests
 	totalCachedTokens int64 // server-reported cached prompt tokens
 
-	// UUID validation (replay --replay-inject-uuids only); all zero when the
+	// UUID validation (replay --verify only); all zero when the
 	// feature is off. See autoState's val* atomics for field meanings.
 	valReqs              int64
 	valUUIDChecks        int64
@@ -1374,7 +1374,7 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		fmt.Printf(" 429 backoff        : %d retries, %s total wait (mean %s/retry)\n",
 			res.totalRetries429, formatDur(res.totalRetryWait), formatDur(mean))
 	}
-	if cfg.ReplayInjectUUIDs {
+	if cfg.Verify {
 		fmt.Println(strings.Repeat("-", 62))
 		fmt.Println(" UUID validation (replay)")
 		fmt.Printf("   Requests validated                  : %d\n", res.valReqs)
@@ -1848,7 +1848,7 @@ func runSingleModelBenchmark(
 			pp.limitContext = cfg.LimitContext
 			pp.replayCharsPerToken = cfg.ReplayCharsPerToken
 			pp.forceOutput = cfg.ReplayForceOutput
-			// UUID cache-coherency injection (--replay-inject-uuids). Same
+			// UUID cache-coherency injection (--verify). Same
 			// global/read-only refs set on the per-instance poster in
 			// replay_router.go — every poster in the run, per-instance or
 			// pooled-per-endpoint, shares these identical slices/maps, so
@@ -1857,11 +1857,11 @@ func runSingleModelBenchmark(
 			// session: the caller passes that session's own turn view into
 			// do()/dryDo() per request, so nothing session-specific is ever
 			// cached on the poster.
-			if cfg.ReplayInjectUUIDs {
+			if cfg.Verify {
 				pp.uuidEnabled = true
-				pp.uuidSeed = cfg.ReplayUUIDSeed
+				pp.uuidSeed = cfg.Seed
 				pp.registry = cfg.uuidRegistry
-				pp.reciteEveryRequest = cfg.ReplayReciteEveryRequest
+				pp.reciteEveryRequest = cfg.VerifyReciteEvery
 			}
 			posters[i] = pp
 		}
@@ -3049,7 +3049,7 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		// block hashes it already carries, when it is dispatched — see
 		// replay_uuid_registry.go for why the corpus-wide pass this replaced
 		// was answering a question the scoring no longer asks.
-		if cfg.ReplayInjectUUIDs {
+		if cfg.Verify {
 			cfg.uuidRegistry = newUUIDRegistry()
 			// Seed 0 means "pick one", not "use zero". Markers are derived
 			// from the block hash, so a fixed seed makes them identical in
@@ -3057,15 +3057,19 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 			// (an A/B pair, say) would then mint the same markers, hiding a
 			// genuine leak between them as each session's own. Drawn once and
 			// printed, so a run stays reproducible by passing it back.
-			if cfg.ReplayUUIDSeed == 0 {
+			if cfg.Seed == 0 {
 				var b [8]byte
 				if _, err := crand.Read(b[:]); err != nil {
-					return fmt.Errorf("draw --replay-uuid-seed: %w", err)
+					return fmt.Errorf("draw --seed: %w", err)
 				}
-				cfg.ReplayUUIDSeed = int64(binary.LittleEndian.Uint64(b[:]) >> 1)
+				cfg.Seed = int64(binary.LittleEndian.Uint64(b[:]) >> 1)
 			}
-			fmt.Printf("UUID validation enabled: markers derived per block hash, seed=%d, recite-every-request=%v\n",
-				cfg.ReplayUUIDSeed, cfg.ReplayReciteEveryRequest)
+			recite := "last"
+			if cfg.VerifyReciteEvery {
+				recite = "every"
+			}
+			fmt.Printf("Coherency verification enabled: markers derived per block hash, seed=%d, recite=%s\n",
+				cfg.Seed, recite)
 		}
 	}
 

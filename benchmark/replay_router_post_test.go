@@ -762,7 +762,7 @@ func TestOpenAISSEWithoutUsage(t *testing.T) {
 // TestUUIDScoringGatedOnRecite covers the H1 fix: buildInjection returns a
 // non-nil *uuidInjection on EVERY request once UUID injection is on (see
 // its doc comment), but only inj.Recite says the model was actually ASKED
-// to recite this turn. With --replay-recite-every-request=false, a
+// to recite this turn. With --verify-recite=false, a
 // non-final request must still get the UUID block injected (so it stays
 // warm in KV — see replay_router_uuid.go's package doc) but must NOT be
 // scored: scoring it would count "the model didn't volunteer the UUID
@@ -1102,12 +1102,12 @@ func TestSessionRegistersItsMarkersAndDetectsLeaks(t *testing.T) {
 	reg := newUUIDRegistry()
 	reg.Acquire(other.uuids, 99) // the other session is live
 	cfg := AutoBenchmarkConfig{
-		Model:                    fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL),
-		ReplayInjectUUIDs:        true,
-		ReplayUUIDSeed:           seed,
-		ReplayReciteEveryRequest: true,
-		ReplayNoStamp:            true,
-		uuidRegistry:             reg,
+		Model:             fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL),
+		Verify:            true,
+		Seed:              seed,
+		VerifyReciteEvery: true,
+		ReplayNoStamp:     true,
+		uuidRegistry:      reg,
 	}
 	sess := RouterReplaySession{
 		SessionID: "s-under-test",
