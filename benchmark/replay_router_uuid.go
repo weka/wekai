@@ -80,21 +80,22 @@ type uuidInjection struct {
 	ReciteUUIDs []string
 }
 
-// firstLineConformity implements this feature's output-conformity check:
-// whether the FIRST LINE of resp (up to the first '\n', trimmed) is EXACTLY
-// the comma-separated expected UUID list, in order (see
-// matchesExpectedUUIDList) — the router-replay analogue of the coherency
-// eval's ExactMatch, adapted for a recite-FIRST instruction that lets the
-// model keep generating after line 1 (so forced-output/ignore_eos still
-// fills the remainder of the output budget with a normal continuation).
-// expected is inj.ReciteUUIDs — the current request's recite WINDOW, not
-// every UUID ever stamped in the session.
+// firstLineConformity implements this feature's output-conformity check: the
+// response LEADS with the expected ordered, comma-joined GUID list.
+//
+// Leads with — not "the first line equals". The strict form was measured
+// against a real fleet and turned out to test whether the model emits a
+// newline after complying: 31 of 33 responses began with the complete,
+// correctly-ordered list and then continued on the same line, and rewording
+// the instruction moved nothing. A newline is a decoding habit with no
+// bearing on ordering, position or completeness, which are the properties
+// this check exists to add on top of presence. A response that buries the
+// list mid-prose, reorders it, or leads with something else still fails.
 func firstLineConformity(resp string, expected []string) bool {
-	line := resp
-	if idx := strings.Index(resp, "\n"); idx >= 0 {
-		line = resp[:idx]
+	if len(expected) == 0 {
+		return false
 	}
-	return matchesExpectedUUIDList(strings.TrimSpace(line), expected)
+	return strings.HasPrefix(strings.TrimSpace(resp), strings.Join(expected, ", "))
 }
 
 // recall from cached KV context, not an echo of the ask.
@@ -115,13 +116,24 @@ func replayReciteWindowInstruction(labels []string) string {
 	// Naming what a guid looks like, showing one worked example, and saying
 	// outright that the turn names are not the answer removes every reading in
 	// which echoing the list is correct.
+	// The first line's terms are spelled out to the point of pedantry because
+	// each clause closes a failure that was actually observed. Naming the
+	// turns without brackets stops the tag list being echoed back; "end the
+	// line immediately after the last GUID" stops prose being appended to a
+	// correct list with no newline; "do not repeat any GUID" stops the
+	// degenerate tail-babble a smaller model produces after complying. None
+	// of these change what is measured — presence is a substring test — but
+	// each rescues the conformity signal from a failure mode that is about
+	// formatting, not about the fleet.
 	return "\n\nSome messages above end with a tag of the form [turn-N id: GUID], where GUID is a " +
 		"36-character identifier like 550e8400-e29b-41d4-a716-446655440000. On the FIRST line of your " +
 		"reply output ONLY those GUID values, comma-separated, for these turns in this order: " +
-		strings.Join(labels, ", ") + ". Output the GUID values themselves — never the turn names, " +
-		"and never the square brackets. For example, if a message ends with " +
+		strings.Join(labels, ", ") + ". End that line immediately after the last GUID and start a new " +
+		"line — no words, symbols or repeated GUIDs may follow on the first line, and no GUID appears " +
+		"twice. Output the GUID values themselves — never the turn names, and never the square " +
+		"brackets. For example, if a message ends with " +
 		"[turn-7 id: 550e8400-e29b-41d4-a716-446655440000] then for turn-7 you output " +
-		"550e8400-e29b-41d4-a716-446655440000. Then continue normally."
+		"550e8400-e29b-41d4-a716-446655440000. From the second line on, continue normally."
 }
 
 // ---- how many ids this request's own output budget can carry ----

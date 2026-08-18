@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -1406,7 +1407,7 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		// and output conformity (first line is exactly the ordered,
 		// comma-joined UUID list — see firstLineConformity).
 		fmt.Printf("   UUID correctness (presence)          : %d/%d\n", res.valUUIDFound, res.valUUIDChecks)
-		fmt.Printf("   Output conformity (first-line exact) : %d/%d\n", res.valExactMatchReqs, res.valReqs)
+		fmt.Printf("   Output conformity (leads with list)  : %d/%d\n", res.valExactMatchReqs, res.valReqs)
 		fmt.Printf("   PRESENCE_MISS (expected UUID absent) : %d across %d requests\n", res.valPresenceMissUUIDs, res.valPresenceMissReqs)
 		// Attributed, because the raw count sums unrelated causes. A
 		// substitution proves the tagged content was there to read and the
@@ -1434,6 +1435,14 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		fmt.Printf("   Responses scanned for leaks          : %d\n", res.valLeakCheckedReqs)
 		fmt.Printf("   CROSS_CONTAMINATION (other-conv)     : %d across %d requests\n", res.valCrossContamUUIDs, res.valCrossContamReqs)
 		fmt.Printf("   Detection window (peak concurrent)   : %d session(s), %d marker(s)\n", res.valWindowSessions, res.valWindowMarkers)
+		if dir, n := cfg.dumper.Written(); dir != "" {
+			// Absolute, so the line is copy-pastable from any shell regardless
+			// of where the run was started.
+			if abs, err := filepath.Abs(dir); err == nil {
+				dir = abs
+			}
+			fmt.Printf("   Captured exchanges                   : %d in %s\n", n, dir)
+		}
 	}
 	fmt.Println(strings.Repeat("=", 62))
 }

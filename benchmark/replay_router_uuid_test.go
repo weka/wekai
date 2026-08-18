@@ -678,6 +678,11 @@ func TestFirstLineConformity(t *testing.T) {
 		{"chatty first line", "Sure! The UUIDs are uuid-a, uuid-b, uuid-c", false},
 		{"uuids only on line 2, not line 1", "Sure, here you go:\nuuid-a, uuid-b, uuid-c", false},
 		{"empty response", "", false},
+		// The observed fleet behaviour that redefined this check: a complete,
+		// correctly-ordered list with the continuation on the SAME line. The
+		// newline is a decoding habit; ordering and position are the check.
+		{"list then prose, no newline", "uuid-a, uuid-b, uuid-c### Heading follows", true},
+		{"list then degenerate babble", "uuid-a, uuid-b, uuid-cuuid-c-c-c-c", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

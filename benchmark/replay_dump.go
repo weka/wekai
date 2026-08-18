@@ -1,6 +1,8 @@
 package benchmark
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -28,6 +30,19 @@ type requestDumper struct {
 	limit int64
 	n     atomic.Int64
 	warn  sync.Once
+}
+
+// Written reports how many exchanges landed on disk, and where — the summary
+// prints this so a reader can go from a number straight to the bytes behind it.
+func (d *requestDumper) Written() (dir string, n int64) {
+	if d == nil {
+		return "", 0
+	}
+	n = d.n.Load()
+	if n > d.limit {
+		n = d.limit
+	}
+	return d.dir, n
 }
 
 func newRequestDumper(dir string, limit int) (*requestDumper, error) {
@@ -115,6 +130,13 @@ func (d *requestDumper) dump(meta dumpMeta, request, response, merged []byte) {
 
 // sanitizeName keeps an instance id usable as a filename. Replay instance ids
 // come from captured traffic, so nothing guarantees they are path-safe.
+//
+// Long ids are shortened to a prefix PLUS a hash of the whole id, never a bare
+// prefix. Instance ids in this corpus share their first 40+ characters — the
+// session uuid, then "::sha256:..." — so a plain truncation collides across
+// every instance of a session, and each instance's t001 silently overwrites
+// the last one's. A capture that loses exchanges without saying so is worse
+// than none: the count in the summary and the files on disk stop agreeing.
 func sanitizeName(s string) string {
 	if s == "" {
 		return "none"
@@ -127,8 +149,9 @@ func sanitizeName(s string) string {
 			out[i] = '_'
 		}
 	}
-	if len(out) > 40 {
-		out = out[:40]
+	if len(out) <= 40 {
+		return string(out)
 	}
-	return string(out)
+	sum := sha256.Sum256([]byte(s))
+	return string(out[:31]) + "-" + hex.EncodeToString(sum[:4])
 }
