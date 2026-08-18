@@ -819,7 +819,9 @@ func TestUUIDScoringGatedOnRecite(t *testing.T) {
 	st := &autoState{stream: newCompletionStream(200)}
 
 	// isLastRequest=false -> inj.Recite=false (reciteEveryRequest is also
-	// false) -> the H1 gate must skip scoring entirely.
+	// false) -> the recite gate must skip PRESENCE scoring. Contamination is
+	// deliberately not gated here: a leak needs no ask, so LeakChecked is
+	// true on this request even though nothing was asked to be recited.
 	metrics := p.do(context.Background(), req, docs, 1, "s1", "i1", 1, st, false, su)
 
 	if metrics.Error != nil {
@@ -836,6 +838,10 @@ func TestUUIDScoringGatedOnRecite(t *testing.T) {
 	}
 	if metrics.ExactMatch {
 		t.Error("ExactMatch = true, want false (non-recite request must not be scored)")
+	}
+	if !metrics.LeakChecked {
+		t.Error("LeakChecked = false on a non-recite request: contamination does not depend on the " +
+			"model being asked for anything, and gating it there is what left 18% of a run unchecked")
 	}
 
 	// Sanity check the OTHER half of the invariant: the SAME request, with
@@ -1020,6 +1026,33 @@ func TestCrossContaminationDetectedEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("request carrying no marker of its own is still leak-checked", func(t *testing.T) {
+		// The coverage gap this closes: buildInjection returns nil when no
+		// qualifying user turn is visible, and scoring used to sit entirely
+		// behind that. 18% of a measured run went unchecked, and the zero it
+		// produced read as if it had covered everything. With no markers of
+		// its own, own is empty and any live marker in the response is
+		// unambiguously another session's — the cleanest signal there is.
+		plant = foreign
+		p := newPoster(t)
+		bare := RouterReplayRequest{
+			Stream:       false,
+			OutputTokens: 100,
+			Messages:     []RouterReplayMessage{assistantText("no-qualifying-turn", 40)},
+		}
+		m := p.do(context.Background(), bare, docs, 1, "s2", "i1", 2,
+			&autoState{stream: newCompletionStream(200)}, true, mine)
+		if !m.LeakChecked {
+			t.Fatal("LeakChecked = false: a response with no markers in its own prompt was never scanned")
+		}
+		if len(m.ExpectedUUIDs) != 0 {
+			t.Errorf("ExpectedUUIDs = %v, want empty: nothing was asked to be recited", m.ExpectedUUIDs)
+		}
+		if len(m.LeakedUUIDs) != 1 || !strings.Contains(m.LeakedUUIDs[0], foreign) {
+			t.Errorf("LeakedUUIDs = %v, want the foreign marker flagged", m.LeakedUUIDs)
+		}
+	})
+
 	t.Run("shared block is not contamination", func(t *testing.T) {
 		// The case the deleted corpus pass existed to get right. Both
 		// sessions hold this marker legitimately and this request sent it,
@@ -1112,11 +1145,15 @@ func TestSessionRegistersItsMarkersAndDetectsLeaks(t *testing.T) {
 	// The session must have registered its own markers while it ran, and
 	// given them back on the way out — the refcount is both the shared-block
 	// signal and the bound on the live set.
-	live, peak := reg.Stats()
+	live, peak, peakSessions := reg.Stats()
 	if peak < len(other.uuids)+1 {
 		t.Errorf("registry peak = %d, want at least %d: the session never registered its own markers, "+
 			"so nothing it holds could ever be recognised as leaked elsewhere",
 			peak, len(other.uuids)+1)
+	}
+	if peakSessions != 2 {
+		t.Errorf("peak concurrent sessions = %d, want 2: the reported detection window must count "+
+			"the session under test alongside the one already running", peakSessions)
 	}
 	if live != len(other.uuids) {
 		t.Errorf("live markers = %d, want %d (only the still-running other session): the finished "+

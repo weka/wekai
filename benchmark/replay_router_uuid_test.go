@@ -195,9 +195,9 @@ func TestUUIDRegistryHoldsWhileAnySessionDoes(t *testing.T) {
 	if r.lookup(shared) != nil {
 		t.Error("shared marker outlived its last holder")
 	}
-	if live, peak := r.Stats(); live != 0 || peak != 2 {
-		t.Errorf("Stats() = (%d live, %d peak), want (0, 2) — peak is what a run reports as the "+
-			"width of the window it actually checked against", live, peak)
+	if live, peak, sessions := r.Stats(); live != 0 || peak != 2 || sessions != 2 {
+		t.Errorf("Stats() = (%d live, %d peak, %d peak sessions), want (0, 2, 2) — the peaks are what "+
+			"a run reports as the width of the window it actually checked against", live, peak, sessions)
 	}
 }
 

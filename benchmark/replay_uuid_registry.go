@@ -47,10 +47,13 @@ type uuidRegistry struct {
 	mu sync.RWMutex
 	m  map[string]*uuidEntry
 
-	// peak is the largest the live set ever reached, so a run can report the
-	// width of its own detection window rather than leaving a reader to
-	// assume it covered the corpus.
-	peak int
+	// peak is the largest the live set ever reached, and peakSessions the
+	// most sessions ever holding at once, so a run can report the width of
+	// its own detection window rather than leaving a reader to assume it
+	// covered the corpus.
+	peak         int
+	liveSessions int
+	peakSessions int
 }
 
 type uuidEntry struct {
@@ -74,6 +77,13 @@ func (r *uuidRegistry) Acquire(uuids []string, series int) {
 	if r == nil || len(uuids) == 0 {
 		return
 	}
+	r.mu.Lock()
+	r.liveSessions++
+	if r.liveSessions > r.peakSessions {
+		r.peakSessions = r.liveSessions
+	}
+	r.mu.Unlock()
+
 	seen := make(map[string]bool, len(uuids))
 	var missing []string
 	r.mu.RLock()
@@ -118,6 +128,7 @@ func (r *uuidRegistry) Release(uuids []string) {
 	}
 	seen := make(map[string]bool, len(uuids))
 	r.mu.Lock()
+	r.liveSessions--
 	for _, u := range uuids {
 		if seen[u] {
 			continue
@@ -141,15 +152,17 @@ func (r *uuidRegistry) lookup(u string) *uuidEntry {
 	return e
 }
 
-// Stats reports the live set and its high-water mark — the width of the
-// window cross-contamination was actually checked against.
-func (r *uuidRegistry) Stats() (live, peak int) {
+// Stats reports the live set and its high-water marks — the width of the
+// window cross-contamination was actually checked against. peakSessions is
+// the figure a reader needs: "no session saw another's content" is only ever
+// true of sessions that were live at the same time, and that is how many.
+func (r *uuidRegistry) Stats() (live, peak, peakSessions int) {
 	if r == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return len(r.m), r.peak
+	return len(r.m), r.peak, r.peakSessions
 }
 
 // uuidForHash derives a stable UUID-shaped marker from a block hash.

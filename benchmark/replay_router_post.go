@@ -781,6 +781,36 @@ func (p *replayPoster) do(
 	// Scoring a non-recite turn would count "the model didn't volunteer the
 	// UUID list" as a PRESENCE_MISS/conformity failure even though nothing
 	// asked it to.
+	// Contamination is scored on EVERY completed request, including ones
+	// carrying no marker of their own.
+	//
+	// A leak needs no cooperation from the model and no marker in the prompt:
+	// it is a live marker in the response that this request did not send.
+	// Scoring it behind the recite ask made coverage a function of what the
+	// model was asked for — 18% of a measured run was never checked, because
+	// a request whose visible history holds no qualifying user turn produced
+	// no injection at all — and the resulting zero read as if it covered the
+	// run. Requests carrying nothing of their own are in fact the cleanest
+	// signal available: own is empty, so any live marker in the response is
+	// unambiguously another session's.
+	if p.uuidEnabled && m.Error == nil && !m.IsEmpty {
+		var own map[string]bool
+		if inj != nil {
+			own = make(map[string]bool, len(inj.StampByHash))
+			for _, st := range inj.StampByHash {
+				own[st.UUID] = true
+			}
+		}
+		m.LeakChecked = true
+		m.LeakedUUIDs = findLeakedUUIDs(m.Response, "", own, p.registry)
+	}
+
+	// Presence and conformity stay gated on inj.Recite, which is the right
+	// gate for them: buildInjection returns non-nil whenever any qualifying
+	// turn is visible (it always stamps them inline so they stay warm in KV),
+	// but only Recite says the model was ASKED to repeat this turn. Scoring a
+	// turn nobody asked about would count "the model did not volunteer a
+	// list" as a presence miss.
 	if inj != nil && inj.Recite && m.Error == nil && !m.IsEmpty {
 		m.ConvIdx = sessionIdx
 		m.ExpectedUUIDs = append([]string(nil), inj.ReciteUUIDs...)
@@ -788,14 +818,6 @@ func (p *replayPoster) do(
 		for i, u := range inj.ReciteUUIDs {
 			m.UUIDFound[i] = strings.Contains(m.Response, u)
 		}
-		// Scored against what THIS request sent, not against a session-wide
-		// assignment: own is exactly the markers in the prompt, so a marker
-		// the response produced from anywhere else is the leak.
-		own := make(map[string]bool, len(inj.StampByHash))
-		for _, st := range inj.StampByHash {
-			own[st.UUID] = true
-		}
-		m.LeakedUUIDs = findLeakedUUIDs(m.Response, "", own, p.registry)
 		m.ExactMatch = firstLineConformity(m.Response, inj.ReciteUUIDs)
 	}
 	return m

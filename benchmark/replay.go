@@ -394,6 +394,17 @@ func recordReplayRequest(
 		}
 	}
 	uuidLeakedCount := len(metrics.LeakedUUIDs)
+	if metrics.LeakChecked {
+		// Counted separately from valReqs: contamination is scored on every
+		// completed request, presence only on those asked to recite, and
+		// reporting one count against the other's denominator is what made
+		// an 18%-uncovered run read as fully checked.
+		st.valLeakCheckedReqs.Add(1)
+		if uuidLeakedCount > 0 {
+			st.valCrossContamUUIDs.Add(int64(uuidLeakedCount))
+			st.valCrossContamReqs.Add(1)
+		}
+	}
 	if uuidExpectedCount > 0 {
 		st.valReqs.Add(1)
 		st.valUUIDChecks.Add(int64(uuidExpectedCount))
@@ -404,10 +415,6 @@ func recordReplayRequest(
 		if missCount := uuidExpectedCount - uuidFoundCount; missCount > 0 {
 			st.valPresenceMissUUIDs.Add(int64(missCount))
 			st.valPresenceMissReqs.Add(1)
-		}
-		if uuidLeakedCount > 0 {
-			st.valCrossContamUUIDs.Add(int64(uuidLeakedCount))
-			st.valCrossContamReqs.Add(1)
 		}
 	}
 

@@ -2,7 +2,9 @@ package benchmark
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -1092,6 +1094,7 @@ type autoState struct {
 	valExactMatchReqs    atomic.Int64 // requests whose first line was the exact ordered UUID list (output conformity)
 	valPresenceMissUUIDs atomic.Int64 // per-UUID PRESENCE_MISS count (expected UUID absent)
 	valCrossContamUUIDs  atomic.Int64 // per-UUID CROSS_CONTAMINATION count (other-conversation UUID present)
+	valLeakCheckedReqs   atomic.Int64 // responses actually scanned for contamination — the denominator that zero belongs to
 	valPresenceMissReqs  atomic.Int64 // requests with >=1 PRESENCE_MISS
 	valCrossContamReqs   atomic.Int64 // requests with >=1 CROSS_CONTAMINATION
 
@@ -1199,6 +1202,9 @@ type autoBenchmarkResult struct {
 	valExactMatchReqs    int64
 	valPresenceMissUUIDs int64
 	valCrossContamUUIDs  int64
+	valLeakCheckedReqs   int64
+	valWindowSessions    int
+	valWindowMarkers     int
 	valPresenceMissReqs  int64
 	valCrossContamReqs   int64
 }
@@ -1379,7 +1385,16 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		fmt.Printf("   UUID correctness (presence)          : %d/%d\n", res.valUUIDFound, res.valUUIDChecks)
 		fmt.Printf("   Output conformity (first-line exact) : %d/%d\n", res.valExactMatchReqs, res.valReqs)
 		fmt.Printf("   PRESENCE_MISS (expected UUID absent) : %d across %d requests\n", res.valPresenceMissUUIDs, res.valPresenceMissReqs)
+		// Both denominators, because they are different populations: presence
+		// is scored only where a recite was asked, contamination on every
+		// completed response. The window is printed with the count because a
+		// bare zero invites "no session ever saw another's content", and what
+		// was actually checked is "no session saw another's content among
+		// those live at the same moment" — markers stop being recognisable
+		// once every session holding them has finished.
+		fmt.Printf("   Responses scanned for leaks          : %d\n", res.valLeakCheckedReqs)
 		fmt.Printf("   CROSS_CONTAMINATION (other-conv)     : %d across %d requests\n", res.valCrossContamUUIDs, res.valCrossContamReqs)
+		fmt.Printf("   Detection window (peak concurrent)   : %d session(s), %d marker(s)\n", res.valWindowSessions, res.valWindowMarkers)
 	}
 	fmt.Println(strings.Repeat("=", 62))
 }
@@ -2787,6 +2802,10 @@ func runSingleModelBenchmark(
 	res.valExactMatchReqs = st.valExactMatchReqs.Load()
 	res.valPresenceMissUUIDs = st.valPresenceMissUUIDs.Load()
 	res.valCrossContamUUIDs = st.valCrossContamUUIDs.Load()
+	res.valLeakCheckedReqs = st.valLeakCheckedReqs.Load()
+	if cfg.uuidRegistry != nil {
+		_, res.valWindowMarkers, res.valWindowSessions = cfg.uuidRegistry.Stats()
+	}
 	res.valPresenceMissReqs = st.valPresenceMissReqs.Load()
 	res.valCrossContamReqs = st.valCrossContamReqs.Load()
 
@@ -3032,6 +3051,19 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		// was answering a question the scoring no longer asks.
 		if cfg.ReplayInjectUUIDs {
 			cfg.uuidRegistry = newUUIDRegistry()
+			// Seed 0 means "pick one", not "use zero". Markers are derived
+			// from the block hash, so a fixed seed makes them identical in
+			// every run over the same corpus — and two runs against one fleet
+			// (an A/B pair, say) would then mint the same markers, hiding a
+			// genuine leak between them as each session's own. Drawn once and
+			// printed, so a run stays reproducible by passing it back.
+			if cfg.ReplayUUIDSeed == 0 {
+				var b [8]byte
+				if _, err := crand.Read(b[:]); err != nil {
+					return fmt.Errorf("draw --replay-uuid-seed: %w", err)
+				}
+				cfg.ReplayUUIDSeed = int64(binary.LittleEndian.Uint64(b[:]) >> 1)
+			}
 			fmt.Printf("UUID validation enabled: markers derived per block hash, seed=%d, recite-every-request=%v\n",
 				cfg.ReplayUUIDSeed, cfg.ReplayReciteEveryRequest)
 		}

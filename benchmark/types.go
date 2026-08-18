@@ -51,6 +51,11 @@ type RequestMetrics struct {
 	ConvIdx       int      // session index within cfg.replayUUIDSets (== seriesNum-1)
 	ExpectedUUIDs []string // this session's own N-UUID list, in order
 	UUIDFound     []bool   // parallel to ExpectedUUIDs: whether each was found in Response or thinking
-	LeakedUUIDs   []string // "uuid(series=N)" entries for any OTHER session's UUID found here
-	ExactMatch    bool     // first line of Response is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
+	// LeakChecked records that this request's response WAS scanned for
+	// contamination, which is a different population from the recite-scored
+	// requests below: a zero contamination count is only meaningful against
+	// the number of responses actually looked at.
+	LeakChecked bool
+	LeakedUUIDs []string // "uuid(series=N)" entries for any OTHER session's UUID found here
+	ExactMatch  bool     // first line of Response is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
 }
