@@ -102,12 +102,26 @@ func replayReciteWindowInstruction(labels []string) string {
 	if len(labels) == 0 {
 		return ""
 	}
-	tagged := make([]string, len(labels))
-	for i, l := range labels {
-		tagged[i] = "[" + l + "]"
-	}
-	return "\n\nSomewhere above, several ids are tagged like [turn-N id: ...]. On the FIRST line output ONLY the id values for these tags, " +
-		"in this exact order, comma-separated and nothing else: " + strings.Join(tagged, ", ") + ". Then continue normally."
+	// The turn names are listed WITHOUT brackets, and the ask is phrased around
+	// the guid rather than the tag.
+	//
+	// The previous wording ended with the bracketed tags themselves —
+	// "...comma-separated and nothing else: [turn-1], [turn-50], ..." — and a
+	// trailing list immediately after "output only" reads as the thing to
+	// output. Measured against a real session, four responses in eight copied
+	// that list back verbatim and scored zero, which the summary then reported
+	// as PRESENCE_MISS: a prompt defect arriving as a cache-coherency figure.
+	//
+	// Naming what a guid looks like, showing one worked example, and saying
+	// outright that the turn names are not the answer removes every reading in
+	// which echoing the list is correct.
+	return "\n\nSome messages above end with a tag of the form [turn-N id: GUID], where GUID is a " +
+		"36-character identifier like 550e8400-e29b-41d4-a716-446655440000. On the FIRST line of your " +
+		"reply output ONLY those GUID values, comma-separated, for these turns in this order: " +
+		strings.Join(labels, ", ") + ". Output the GUID values themselves — never the turn names, " +
+		"and never the square brackets. For example, if a message ends with " +
+		"[turn-7 id: 550e8400-e29b-41d4-a716-446655440000] then for turn-7 you output " +
+		"550e8400-e29b-41d4-a716-446655440000. Then continue normally."
 }
 
 // ---- how many ids this request's own output budget can carry ----
