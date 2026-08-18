@@ -645,7 +645,7 @@ func runRouterReplaySession(
 	// cross-contamination is scored against. See replay_uuid_registry.go.
 	var su *sessionUUIDs
 	if cfg.Verify {
-		if su = buildSessionUUIDs(sess, cfg.Seed); su != nil {
+		if su = buildSessionUUIDs(sess, passStamp); su != nil {
 			cfg.uuidRegistry.Acquire(su.uuids, seriesNum)
 			defer cfg.uuidRegistry.Release(su.uuids)
 		}
@@ -805,7 +805,6 @@ func runRouterReplayInstance(
 		// passed in per request rather than cached here.
 		if cfg.Verify {
 			poster.uuidEnabled = true
-			poster.uuidSeed = cfg.Seed
 			poster.registry = cfg.uuidRegistry
 			poster.reciteEveryRequest = cfg.VerifyReciteEvery
 		}

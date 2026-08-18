@@ -91,8 +91,6 @@ type replayPoster struct {
 	// poster's session": the caller passes the session's own view in per
 	// request, so nothing session-specific is ever cached here.
 	uuidEnabled bool
-	// uuidSeed seeds the hash-to-marker derivation (see uuidForHash).
-	uuidSeed int64
 	// registry is the live marker set, shared by every poster in the run. It
 	// answers "is this UUID one of ours, right now" for leak scoring, and its
 	// refcounts are what make a block shared by concurrent sessions visible

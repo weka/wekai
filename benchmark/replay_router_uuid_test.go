@@ -86,7 +86,7 @@ func TestBuildSessionUUIDsIdentifiesQualifyingTurns(t *testing.T) {
 			},
 		}},
 	}
-	su := buildSessionUUIDs(sess, 1)
+	su := buildSessionUUIDs(sess, "stamp-1")
 	if su == nil {
 		t.Fatal("buildSessionUUIDs returned nil for a session with qualifying turns")
 	}
@@ -110,7 +110,7 @@ func TestBuildSessionUUIDsNilWithoutQualifyingTurns(t *testing.T) {
 	sess := RouterReplaySession{Instances: []RouterReplayInstance{{
 		Requests: []RouterReplayRequest{{Messages: []RouterReplayMessage{assistantText("a1", 10)}}},
 	}}}
-	if su := buildSessionUUIDs(sess, 1); su != nil {
+	if su := buildSessionUUIDs(sess, "stamp-1"); su != nil {
 		t.Errorf("got %d turns for a session with no qualifying turn, want nil", len(su.uuids))
 	}
 }
@@ -131,8 +131,8 @@ func TestMarkerIsHashDerivedNotSessionDerived(t *testing.T) {
 	}
 	// The shared block sits at a DIFFERENT turn index in each session, so a
 	// marker keyed by position rather than by content would diverge here.
-	a := buildSessionUUIDs(mk("a", userText("shared", 10), userText("a-only", 10)), 9)
-	b := buildSessionUUIDs(mk("b", userText("b-only", 10), userText("shared", 10)), 9)
+	a := buildSessionUUIDs(mk("a", userText("shared", 10), userText("a-only", 10)), "stamp-9")
+	b := buildSessionUUIDs(mk("b", userText("b-only", 10), userText("shared", 10)), "stamp-9")
 
 	if a.uuids[a.hashToTurn["shared"]] != b.uuids[b.hashToTurn["shared"]] {
 		t.Errorf("shared block stamped differently per session: %q vs %q — the prefix the two "+
@@ -144,21 +144,21 @@ func TestMarkerIsHashDerivedNotSessionDerived(t *testing.T) {
 	}
 }
 
-// TestUUIDForHashShapeAndSeed: markers must be recognisable on the way back
-// out of a response (uuidRe) and must vary with the seed, or two runs
-// sharing a corpus could not be told apart.
-func TestUUIDForHashShapeAndSeed(t *testing.T) {
-	u := uuidForHash("block-a", 42)
+// TestUUIDForHashShapeAndStamp: markers must be recognisable on the way back
+// out of a response (uuidRe) and must vary with the pass stamp, or two runs
+// over one corpus — or two passes within one run — could not be told apart.
+func TestUUIDForHashShapeAndStamp(t *testing.T) {
+	u := uuidForHash("block-a", "stamp-42")
 	if !uuidRe.MatchString(u) {
 		t.Fatalf("uuidForHash produced %q, which the response scanner would never match", u)
 	}
-	if u != uuidForHash("block-a", 42) {
+	if u != uuidForHash("block-a", "stamp-42") {
 		t.Error("uuidForHash is not deterministic")
 	}
-	if u == uuidForHash("block-a", 43) {
-		t.Error("uuidForHash ignores the seed; two runs over one corpus would mint identical markers")
+	if u == uuidForHash("block-a", "stamp-43") {
+		t.Error("uuidForHash ignores the stamp; two runs over one corpus would mint identical markers")
 	}
-	if u == uuidForHash("block-b", 42) {
+	if u == uuidForHash("block-b", "stamp-42") {
 		t.Error("uuidForHash ignores the hash")
 	}
 }
@@ -170,8 +170,8 @@ func TestUUIDForHashShapeAndSeed(t *testing.T) {
 // others still running.
 func TestUUIDRegistryHoldsWhileAnySessionDoes(t *testing.T) {
 	r := newUUIDRegistry()
-	shared := uuidForHash("shared", 1)
-	aOnly := uuidForHash("a-only", 1)
+	shared := uuidForHash("shared", "stamp-1")
+	aOnly := uuidForHash("a-only", "stamp-1")
 
 	r.Acquire([]string{shared, aOnly}, 1)
 	r.Acquire([]string{shared}, 2)
@@ -206,7 +206,7 @@ func TestUUIDRegistryHoldsWhileAnySessionDoes(t *testing.T) {
 // leaves the entry stranded and the live set never shrinks.
 func TestUUIDRegistryAcquireIsIdempotentPerCall(t *testing.T) {
 	r := newUUIDRegistry()
-	u := uuidForHash("h", 1)
+	u := uuidForHash("h", "stamp-1")
 	r.Acquire([]string{u, u, u}, 1)
 	if e := r.lookup(u); e == nil || e.n.Load() != 1 {
 		t.Fatalf("refcount = %v after acquiring the same marker three times in one call, want 1", e)
@@ -235,18 +235,17 @@ func equalStrSlices(a, b []string) bool {
 	return true
 }
 
-func newFixturePoster(nTurns int, seed int64, reciteEveryRequest bool) (*replayPoster, *sessionUUIDs) {
+func newFixturePoster(nTurns int, stamp string, reciteEveryRequest bool) (*replayPoster, *sessionUUIDs) {
 	su := &sessionUUIDs{hashToTurn: map[string]int{}}
 	for i := 0; i < nTurns; i++ {
 		h := fmt.Sprintf("h%d", i)
 		su.hashToTurn[h] = i
-		su.uuids = append(su.uuids, uuidForHash(h, seed))
+		su.uuids = append(su.uuids, uuidForHash(h, stamp))
 	}
 	reg := newUUIDRegistry()
 	reg.Acquire(su.uuids, 1)
 	return &replayPoster{
 		uuidEnabled:        true,
-		uuidSeed:           seed,
 		registry:           reg,
 		reciteEveryRequest: reciteEveryRequest,
 	}, su
@@ -270,7 +269,7 @@ func visibleTurnsRequest(n int) RouterReplayRequest {
 // Exercises the edge cases at turns 1, 2, 3 explicitly (D1/D2/D3 in the
 // plan) plus the steady-state 4-cap and window-sliding behavior beyond it.
 func TestBuildInjectionWindowSelection(t *testing.T) {
-	p, su := newFixturePoster(6, 1, true)
+	p, su := newFixturePoster(6, "fixture", true)
 
 	cases := []struct {
 		turn       int      // 1-based "current turn" being requested
@@ -340,26 +339,26 @@ func TestBuildInjectionWindowSelection(t *testing.T) {
 // turn at all.
 func TestBuildInjectionNilCases(t *testing.T) {
 	t.Run("uuidEnabled false", func(t *testing.T) {
-		p, su := newFixturePoster(3, 1, true)
+		p, su := newFixturePoster(3, "fixture", true)
 		p.uuidEnabled = false
 		if got := p.buildInjection(visibleTurnsRequest(2), su, false); got != nil {
 			t.Errorf("buildInjection = %v, want nil (disabled)", got)
 		}
 	})
 	t.Run("no session view", func(t *testing.T) {
-		p, _ := newFixturePoster(3, 1, true)
+		p, _ := newFixturePoster(3, "fixture", true)
 		if got := p.buildInjection(visibleTurnsRequest(2), nil, false); got != nil {
 			t.Errorf("buildInjection = %v, want nil (session has no markers)", got)
 		}
 	})
 	t.Run("zero-turn session", func(t *testing.T) {
-		p, su := newFixturePoster(0, 1, true)
+		p, su := newFixturePoster(0, "fixture", true)
 		if got := p.buildInjection(visibleTurnsRequest(0), su, false); got != nil {
 			t.Errorf("buildInjection = %v, want nil (no turns)", got)
 		}
 	})
 	t.Run("no qualifying turn visible in this request", func(t *testing.T) {
-		p, su := newFixturePoster(3, 1, true)
+		p, su := newFixturePoster(3, "fixture", true)
 		req := RouterReplayRequest{Messages: []RouterReplayMessage{assistantText("unrelated", 30)}}
 		if got := p.buildInjection(req, su, false); got != nil {
 			t.Errorf("buildInjection = %v, want nil (nothing visible)", got)
@@ -372,12 +371,12 @@ func TestBuildInjectionNilCases(t *testing.T) {
 func TestBuildInjectionRecite(t *testing.T) {
 	req := visibleTurnsRequest(2)
 
-	pAlways, suA := newFixturePoster(3, 1, true)
+	pAlways, suA := newFixturePoster(3, "fixture", true)
 	if inj := pAlways.buildInjection(req, suA, false); inj == nil || !inj.Recite {
 		t.Error("reciteEveryRequest=true, isLastRequest=false: expected Recite=true")
 	}
 
-	pFinalOnly, suF := newFixturePoster(3, 1, false)
+	pFinalOnly, suF := newFixturePoster(3, "fixture", false)
 	if inj := pFinalOnly.buildInjection(req, suF, false); inj == nil || inj.Recite {
 		t.Error("reciteEveryRequest=false, isLastRequest=false: expected Recite=false")
 	}
@@ -572,9 +571,9 @@ func TestCacheFidelitySharedBlockUnaffectedByInjection(t *testing.T) {
 // hold legitimately, and neither is flagged for reciting it.
 func TestFindLeakedUUIDsRouterPath(t *testing.T) {
 	reg := newUUIDRegistry()
-	mine := uuidForHash("mine", 1)
-	theirs := uuidForHash("theirs", 1)
-	shared := uuidForHash("shared", 1)
+	mine := uuidForHash("mine", "stamp-1")
+	theirs := uuidForHash("theirs", "stamp-1")
+	shared := uuidForHash("shared", "stamp-1")
 	reg.Acquire([]string{mine, shared}, 1)
 	reg.Acquire([]string{theirs, shared}, 2)
 
@@ -628,8 +627,8 @@ func TestFindLeakedUUIDsRouterPath(t *testing.T) {
 	})
 	t.Run("multiple leaks in scan order", func(t *testing.T) {
 		reg3 := newUUIDRegistry()
-		a := uuidForHash("a", 1)
-		b := uuidForHash("b", 1)
+		a := uuidForHash("a", "stamp-1")
+		b := uuidForHash("b", "stamp-1")
 		reg3.Acquire([]string{a}, 4)
 		reg3.Acquire([]string{b}, 5)
 		got := findLeakedUUIDs(b+" then "+a, "", nil, reg3)
@@ -766,5 +765,71 @@ func TestMaxTokensFloorAppliedInWireBuilders(t *testing.T) {
 	}
 	if got, want := plainParsed["max_tokens"].(float64), float64(5); got != want {
 		t.Errorf("anthropic max_tokens (no injection) = %v, want %v (unfloored)", got, want)
+	}
+}
+
+// TestMarkersDifferPerPass covers --replay-reuse-sessions: the same session
+// replayed a second time must mint different markers.
+//
+// A pass carries its own stamp so its content lands in a disjoint keyspace and
+// cannot trivially hit the previous pass's cache entries. Keying markers on the
+// RUN stamp instead of the PASS stamp would leave them identical across passes
+// while the content around them changed — and two live passes of one session
+// would then present as a single block shared by two sessions, which is exactly
+// the case the scoring treats as legitimate. A real leak between passes would
+// be counted as each pass holding its own marker.
+func TestMarkersDifferPerPass(t *testing.T) {
+	sess := RouterReplaySession{Instances: []RouterReplayInstance{{
+		Requests: []RouterReplayRequest{{Messages: []RouterReplayMessage{userText("turn-a", 10)}}},
+	}}}
+
+	// The stamps runRouterReplaySession derives: the run's own for pass 0, and
+	// a suffixed one for each pass after it.
+	const runID = "3fa1c2d4-0000-4000-8000-000000000000"
+	p0 := buildSessionUUIDs(sess, runID)
+	p1 := buildSessionUUIDs(sess, runID+"-p2")
+
+	if p0.uuids[0] == p1.uuids[0] {
+		t.Errorf("pass 1 and pass 2 of the same session minted the same marker %q — two live passes "+
+			"would read as one block shared by two sessions, and a leak between them would be "+
+			"scored as each holding its own", p0.uuids[0])
+	}
+
+	// Same pass, same marker: this is the property that keeps a block two
+	// sessions shared in the capture colliding on the server's prefix cache.
+	if again := buildSessionUUIDs(sess, runID); again.uuids[0] != p0.uuids[0] {
+		t.Errorf("same pass produced different markers on two builds (%q vs %q) — sharing within a "+
+			"pass would break and every session would look unique to the cache",
+			p0.uuids[0], again.uuids[0])
+	}
+}
+
+// TestRunIDIsAFunctionOfTheSeed: one printed number has to reproduce a run, and
+// a run with no seed given has to be distinct from every other.
+func TestRunIDIsAFunctionOfTheSeed(t *testing.T) {
+	if runIDFromSeed(7) != runIDFromSeed(7) {
+		t.Error("runIDFromSeed is not deterministic; --seed could not reproduce a run")
+	}
+	if runIDFromSeed(7) == runIDFromSeed(8) {
+		t.Error("runIDFromSeed ignores the seed; every run would share content and start warm")
+	}
+	if !uuidRe.MatchString(runIDFromSeed(7)) {
+		t.Errorf("run id %q is not UUID-shaped; every consumer of RUN_GUID has always seen one",
+			runIDFromSeed(7))
+	}
+	a, err := resolveRunSeed(0)
+	if err != nil {
+		t.Fatalf("resolveRunSeed: %v", err)
+	}
+	b, _ := resolveRunSeed(0)
+	if a == b {
+		t.Error("an unseeded run drew the same seed twice; two runs would share prefixes and the " +
+			"second's cache hit rate would measure the first's leftovers")
+	}
+	if a < 0 || b < 0 {
+		t.Errorf("drew a negative seed (%d, %d); it is printed for a human to paste back into --seed", a, b)
+	}
+	if got, err := resolveRunSeed(42); err != nil || got != 42 {
+		t.Errorf("resolveRunSeed(42) = %d, %v; an explicit seed must be used verbatim", got, err)
 	}
 }

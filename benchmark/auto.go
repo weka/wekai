@@ -2,9 +2,7 @@ package benchmark
 
 import (
 	"context"
-	crand "crypto/rand"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -1859,7 +1857,6 @@ func runSingleModelBenchmark(
 			// cached on the poster.
 			if cfg.Verify {
 				pp.uuidEnabled = true
-				pp.uuidSeed = cfg.Seed
 				pp.registry = cfg.uuidRegistry
 				pp.reciteEveryRequest = cfg.VerifyReciteEvery
 			}
@@ -3011,7 +3008,9 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		fmt.Printf("Documentation loaded (%d bytes). Starting auto benchmark...\n\n", len(fullDocs))
 	} else {
 		if !cfg.ReplayNoStamp && cfg.RunID == "" {
-			cfg.RunID = uuid.New().String()
+			if err := applyRunSeed(&cfg); err != nil {
+				return err
+			}
 		}
 		fmt.Printf("Replay mode: dataset=%s replay-series=%d run-id=%s. Loading dataset...\n",
 			cfg.FromDataset, cfg.ReplaySeries, cfg.RunID)
@@ -3028,7 +3027,9 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 	// model's runSingleModelBenchmark via its own stream over the file.
 	if cfg.RouterReplayFile != "" {
 		if !cfg.ReplayNoStamp && cfg.RunID == "" {
-			cfg.RunID = uuid.New().String()
+			if err := applyRunSeed(&cfg); err != nil {
+				return err
+			}
 		}
 		hdr, err := readRouterReplayHeader(cfg.RouterReplayFile)
 		if err != nil {
@@ -3051,25 +3052,13 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		// was answering a question the scoring no longer asks.
 		if cfg.Verify {
 			cfg.uuidRegistry = newUUIDRegistry()
-			// Seed 0 means "pick one", not "use zero". Markers are derived
-			// from the block hash, so a fixed seed makes them identical in
-			// every run over the same corpus — and two runs against one fleet
-			// (an A/B pair, say) would then mint the same markers, hiding a
-			// genuine leak between them as each session's own. Drawn once and
-			// printed, so a run stays reproducible by passing it back.
-			if cfg.Seed == 0 {
-				var b [8]byte
-				if _, err := crand.Read(b[:]); err != nil {
-					return fmt.Errorf("draw --seed: %w", err)
-				}
-				cfg.Seed = int64(binary.LittleEndian.Uint64(b[:]) >> 1)
-			}
 			recite := "last"
 			if cfg.VerifyReciteEvery {
 				recite = "every"
 			}
-			fmt.Printf("Coherency verification enabled: markers derived per block hash, seed=%d, recite=%s\n",
-				cfg.Seed, recite)
+			// The seed is not repeated here: it is printed once with the run
+			// stamp it produced, and markers derive from that stamp.
+			fmt.Printf("Coherency verification enabled: markers derived per block hash, recite=%s\n", recite)
 		}
 	}
 

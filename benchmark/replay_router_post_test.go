@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -796,7 +798,7 @@ func TestUUIDScoringGatedOnRecite(t *testing.T) {
 		t.Fatalf("newReplayPoster: %v", err)
 	}
 	// Wire up UUID injection exactly as runRouterReplaySession does (see
-	// replay_router.go): the poster holds only the seed and the registry,
+	// replay_router.go): the poster holds only the registry,
 	// and the session's own view is passed per request. reciteEveryRequest
 	// is false so only the FINAL request of an instance's list carries the
 	// recite ask.
@@ -805,7 +807,7 @@ func TestUUIDScoringGatedOnRecite(t *testing.T) {
 	p.reciteEveryRequest = false
 	su := &sessionUUIDs{
 		hashToTurn: map[string]int{"h1": 0, "h2": 1},
-		uuids:      []string{uuidForHash("h1", 7), uuidForHash("h2", 7)},
+		uuids:      []string{uuidForHash("h1", "stamp-7"), uuidForHash("h2", "stamp-7")},
 	}
 	p.registry.Acquire(su.uuids, 1)
 
@@ -934,19 +936,19 @@ func TestConsumePlainMergesThinking(t *testing.T) {
 func TestCrossContaminationDetectedEndToEnd(t *testing.T) {
 	docs := strings.Repeat("contamination-docs ", 100)
 
-	const seed = 4242
+	const stamp = "run-stamp-A"
 	// Two sessions with disjoint content, plus one block they genuinely
 	// share — the case that used to require a corpus-wide pass to recognise.
 	mine := buildSessionUUIDs(RouterReplaySession{Instances: []RouterReplayInstance{{
 		Requests: []RouterReplayRequest{{Messages: []RouterReplayMessage{
 			userText("s2-own", 40), userText("both-carry", 40),
 		}}},
-	}}}, seed)
+	}}}, stamp)
 	theirs := buildSessionUUIDs(RouterReplaySession{Instances: []RouterReplayInstance{{
 		Requests: []RouterReplayRequest{{Messages: []RouterReplayMessage{
 			userText("s1-own", 40), userText("both-carry", 40),
 		}}},
-	}}}, seed)
+	}}}, stamp)
 
 	foreign := theirs.uuids[theirs.hashToTurn["s1-own"]]
 	own := mine.uuids[mine.hashToTurn["s2-own"]]
@@ -978,7 +980,6 @@ func TestCrossContaminationDetectedEndToEnd(t *testing.T) {
 			t.Fatalf("newReplayPoster: %v", err)
 		}
 		p.uuidEnabled = true
-		p.uuidSeed = seed
 		p.reciteEveryRequest = true
 		p.registry = newUUIDRegistry()
 		// Both sessions live, exactly as two concurrent series would be.
@@ -1078,12 +1079,12 @@ func TestCrossContaminationDetectedEndToEnd(t *testing.T) {
 // from a clean fleet in the output and is exactly the failure this feature
 // exists to rule out.
 func TestSessionRegistersItsMarkersAndDetectsLeaks(t *testing.T) {
-	const seed = 31337
+	const stamp = "run-stamp-B"
 
 	// Another session, already running, whose marker the server will leak.
 	other := buildSessionUUIDs(RouterReplaySession{Instances: []RouterReplayInstance{{
 		Requests: []RouterReplayRequest{{Messages: []RouterReplayMessage{userText("other-own", 40)}}},
-	}}}, seed)
+	}}}, stamp)
 	foreign := other.uuids[other.hashToTurn["other-own"]]
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1104,7 +1105,6 @@ func TestSessionRegistersItsMarkersAndDetectsLeaks(t *testing.T) {
 	cfg := AutoBenchmarkConfig{
 		Model:             fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL),
 		Verify:            true,
-		Seed:              seed,
 		VerifyReciteEvery: true,
 		ReplayNoStamp:     true,
 		uuidRegistry:      reg,
@@ -1158,5 +1158,85 @@ func TestSessionRegistersItsMarkersAndDetectsLeaks(t *testing.T) {
 	if live != len(other.uuids) {
 		t.Errorf("live markers = %d, want %d (only the still-running other session): the finished "+
 			"session did not release, so the live set grows without bound", live, len(other.uuids))
+	}
+}
+
+// TestPassStampReachesTheMarkers drives runRouterReplaySession twice over one
+// session — pass 0, then pass 1 — and reads the markers off the wire.
+//
+// Asserted here rather than on buildSessionUUIDs because the defect this
+// guards is in the wiring: buildSessionUUIDs keyed on the run stamp behaves
+// perfectly, and every direct test of it still passes. Only the caller knows
+// which stamp is the pass's, and mutating that call site to pass cfg.RunID was
+// invisible to the whole suite until this existed.
+func TestPassStampReachesTheMarkers(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		fmt.Fprint(w, `{"id":"c","object":"chat.completion","model":"test-model",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}`)
+	}))
+	defer ts.Close()
+
+	cfg := AutoBenchmarkConfig{
+		Model:             fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL),
+		Verify:            true,
+		VerifyReciteEvery: true,
+		RunID:             "3fa1c2d4-0000-4000-8000-000000000000",
+		uuidRegistry:      newUUIDRegistry(),
+	}
+	sess := RouterReplaySession{
+		SessionID: "s1",
+		Instances: []RouterReplayInstance{{
+			InstanceID: "i1",
+			Requests: []RouterReplayRequest{{
+				RequestID: 1, OutputTokens: 50,
+				Messages: []RouterReplayMessage{userText("turn-a", 40)},
+			}},
+		}},
+	}
+
+	markersOf := func(pass int) []string {
+		mu.Lock()
+		bodies = nil
+		mu.Unlock()
+		s := sess
+		s.pass = pass
+		st := &autoState{
+			stream: newCompletionStream(200), gate: newConcurrencyGate(4, false),
+			datasetTracker: newActiveDatasetTracker(), ttft: newTTFTWindow(30 * time.Second),
+			skipClk: newSkipClock(false), lag: &pacingLag{}, estimator: newCacheEstimator(0),
+		}
+		runRouterReplaySession(context.Background(), cfg, st, nil, s, 1,
+			endpointPicker{}, 30*time.Second, strings.Repeat("pass-docs ", 50),
+			newConcurrencyGate(4, false))
+		mu.Lock()
+		defer mu.Unlock()
+		var out []string
+		for _, b := range bodies {
+			for _, m := range regexp.MustCompile(`\[turn-\d+ id: ([0-9a-f-]{36})\]`).FindAllStringSubmatch(b, -1) {
+				out = append(out, m[1])
+			}
+		}
+		return out
+	}
+
+	p0, p1 := markersOf(0), markersOf(1)
+	if len(p0) == 0 || len(p1) == 0 {
+		t.Fatalf("no inline markers on the wire (pass0=%d pass1=%d); the test cannot see what it asserts",
+			len(p0), len(p1))
+	}
+	if p0[0] == p1[0] {
+		t.Errorf("pass 0 and pass 1 sent the same marker %q. Each pass stamps its content differently "+
+			"so it lands in a disjoint keyspace; markers that do not follow make two live passes of "+
+			"one session look like a single shared block, and a leak between them is scored as each "+
+			"holding its own", p0[0])
 	}
 }

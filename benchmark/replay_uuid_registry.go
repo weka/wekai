@@ -2,8 +2,6 @@ package benchmark
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
-	"fmt"
 	"sync"
 	"sync/atomic"
 )
@@ -165,26 +163,28 @@ func (r *uuidRegistry) Stats() (live, peak, peakSessions int) {
 	return len(r.m), r.peak, r.peakSessions
 }
 
-// uuidForHash derives a stable UUID-shaped marker from a block hash.
+// uuidForHash derives a stable marker from a block hash and the stamp of the
+// pass that is replaying it.
 //
-// Deterministic in (seed, hash) alone: the same block yields the same marker
-// in every session, on every pass over the corpus, and in every run sharing
-// a seed. That is what keeps cross-session prefix sharing intact — the
-// property the corpus-wide session counting used to buy — and it also makes
-// the live set bounded by the number of distinct blocks rather than growing
-// with elapsed time or with corpus re-reads under --replay-reuse-sessions.
+// Deterministic in (stamp, hash) alone, so within one pass the same block
+// yields the same marker in every session that carries it — which is what
+// keeps cross-session prefix sharing intact, the property the corpus-wide
+// session counting used to buy.
 //
-// Formatted canonically (8-4-4-4-12) so it matches uuidRe on the way back
-// out of a response, with the version and variant nibbles set so it is a
-// well-formed v4-shaped value rather than arbitrary hex.
-func uuidForHash(hash string, seed int64) string {
-	var pre [8]byte
-	binary.LittleEndian.PutUint64(pre[:], uint64(seed))
-	sum := sha256.Sum256(append(pre[:], hash...))
-	b := sum[:16]
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+// The stamp is the PASS stamp, not the run stamp, and the difference matters
+// under --replay-reuse-sessions. A second pass over the corpus deliberately
+// carries a different stamp so its content lands in a disjoint keyspace; keyed
+// on the run stamp the markers would not follow, and the same session replayed
+// twice would mint identical markers in both passes. Two live passes of one
+// session would then look like a shared block rather than two distinct
+// sessions, and a genuine leak between them would be scored as each holding
+// its own.
+//
+// It also bounds the live set by distinct blocks per pass rather than letting
+// it grow with elapsed time.
+func uuidForHash(hash, stamp string) string {
+	sum := sha256.Sum256([]byte(stamp + "\x00" + hash))
+	return formatUUID(sum[:16])
 }
 
 // sessionUUIDs is one session's view of the stamping scheme, built when the
@@ -211,7 +211,7 @@ type sessionUUIDs struct {
 // two sessions share perturbs neither session's prefix relative to the other
 // and cannot be mistaken for a leak — both hold it legitimately, and the
 // registry records the shared hold.
-func buildSessionUUIDs(sess RouterReplaySession, seed int64) *sessionUUIDs {
+func buildSessionUUIDs(sess RouterReplaySession, stamp string) *sessionUUIDs {
 	su := &sessionUUIDs{hashToTurn: map[string]int{}}
 	for _, inst := range sess.Instances {
 		for _, req := range inst.Requests {
@@ -223,7 +223,7 @@ func buildSessionUUIDs(sess RouterReplaySession, seed int64) *sessionUUIDs {
 					continue
 				}
 				su.hashToTurn[m.Hash] = len(su.uuids)
-				su.uuids = append(su.uuids, uuidForHash(m.Hash, seed))
+				su.uuids = append(su.uuids, uuidForHash(m.Hash, stamp))
 			}
 		}
 	}
