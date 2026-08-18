@@ -1097,6 +1097,7 @@ type autoState struct {
 	valPresenceMissUUIDs atomic.Int64 // per-UUID PRESENCE_MISS count (expected UUID absent)
 	valCrossContamUUIDs  atomic.Int64 // per-UUID CROSS_CONTAMINATION count (other-conversation UUID present)
 	valLeakCheckedReqs   atomic.Int64 // responses actually scanned for contamination — the denominator that zero belongs to
+	valBudgetShortReqs   atomic.Int64 // requests whose captured output budget could not carry one id, so presence was never asked
 	valPresenceMissReqs  atomic.Int64 // requests with >=1 PRESENCE_MISS
 	valCrossContamReqs   atomic.Int64 // requests with >=1 CROSS_CONTAMINATION
 
@@ -1205,6 +1206,7 @@ type autoBenchmarkResult struct {
 	valPresenceMissUUIDs int64
 	valCrossContamUUIDs  int64
 	valLeakCheckedReqs   int64
+	valBudgetShortReqs   int64
 	valWindowSessions    int
 	valWindowMarkers     int
 	valPresenceMissReqs  int64
@@ -1394,6 +1396,10 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		// was actually checked is "no session saw another's content among
 		// those live at the same moment" — markers stop being recognisable
 		// once every session holding them has finished.
+		// Printed even at zero: an absent line would leave a reader to assume
+		// every request was asked, and the excluded population is exactly what
+		// makes a presence ratio mean less than it appears to.
+		fmt.Printf("   Not asked (output budget too small)  : %d\n", res.valBudgetShortReqs)
 		fmt.Printf("   Responses scanned for leaks          : %d\n", res.valLeakCheckedReqs)
 		fmt.Printf("   CROSS_CONTAMINATION (other-conv)     : %d across %d requests\n", res.valCrossContamUUIDs, res.valCrossContamReqs)
 		fmt.Printf("   Detection window (peak concurrent)   : %d session(s), %d marker(s)\n", res.valWindowSessions, res.valWindowMarkers)
@@ -2804,6 +2810,7 @@ func runSingleModelBenchmark(
 	res.valPresenceMissUUIDs = st.valPresenceMissUUIDs.Load()
 	res.valCrossContamUUIDs = st.valCrossContamUUIDs.Load()
 	res.valLeakCheckedReqs = st.valLeakCheckedReqs.Load()
+	res.valBudgetShortReqs = st.valBudgetShortReqs.Load()
 	if cfg.uuidRegistry != nil {
 		_, res.valWindowMarkers, res.valWindowSessions = cfg.uuidRegistry.Stats()
 	}

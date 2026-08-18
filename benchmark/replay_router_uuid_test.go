@@ -254,23 +254,28 @@ func newFixturePoster(nTurns int, stamp string) (*replayPoster, *sessionUUIDs) {
 // qualifying-turn hashes h0..h(n-1) (in order), simulating a growing
 // conversation history at turn n.
 func visibleTurnsRequest(n int) RouterReplayRequest {
+	return visibleTurnsRequestBudget(n, 1000) // room for the full window
+}
+
+// visibleTurnsRequestBudget carries an explicit captured output budget, which
+// is what now decides how many ids the request can be asked for.
+func visibleTurnsRequestBudget(n, outputTokens int) RouterReplayRequest {
 	msgs := make([]RouterReplayMessage, 0, n)
 	for i := 0; i < n; i++ {
 		msgs = append(msgs, userText(fmt.Sprintf("h%d", i), 50))
 	}
-	return RouterReplayRequest{Messages: msgs}
+	return RouterReplayRequest{Messages: msgs, OutputTokens: outputTokens}
 }
 
-// TestBuildInjectionWindowSelection verifies buildInjection's recite window:
-// first (visible) turn + up to 3 most-recent turns EXCLUDING the current
-// (highest-index visible) turn, deduplicated, capped at 4 — and that
-// StampByHash always covers EVERY visible turn, not just the window.
-// Exercises the edge cases at turns 1, 2, 3 explicitly (D1/D2/D3 in the
-// plan) plus the steady-state 4-cap and window-sliding behavior beyond it.
+// TestBuildInjectionWindowSelection verifies the recite window: the first
+// visible turn, plus as many of the most-recent turns EXCLUDING the current
+// one as the request's own captured output budget allows, up to
+// reciteMaxRecent — and that StampByHash always covers EVERY visible turn,
+// not just the window, so an unrecited turn still keeps its identity in KV.
 func TestBuildInjectionWindowSelection(t *testing.T) {
-	p, su := newFixturePoster(6, "fixture")
+	p, su := newFixturePoster(14, "fixture")
 
-	cases := []struct {
+	for _, c := range []struct {
 		turn       int      // 1-based "current turn" being requested
 		wantLabels []string // expected inj.ReciteLabels
 	}{
@@ -278,10 +283,12 @@ func TestBuildInjectionWindowSelection(t *testing.T) {
 		{2, []string{"turn-1"}},
 		{3, []string{"turn-1", "turn-2"}},
 		{4, []string{"turn-1", "turn-2", "turn-3"}},
-		{5, []string{"turn-1", "turn-2", "turn-3", "turn-4"}},
-		{6, []string{"turn-1", "turn-3", "turn-4", "turn-5"}},
-	}
-	for _, c := range cases {
+		{6, []string{"turn-1", "turn-2", "turn-3", "turn-4", "turn-5"}},
+		// Past the cap the first turn stays pinned and the oldest middle
+		// turns fall out, so coverage keeps sliding forward.
+		{13, []string{"turn-1", "turn-3", "turn-4", "turn-5", "turn-6", "turn-7",
+			"turn-8", "turn-9", "turn-10", "turn-11", "turn-12"}},
+	} {
 		t.Run(fmt.Sprintf("turn-%d", c.turn), func(t *testing.T) {
 			req := visibleTurnsRequest(c.turn)
 			inj := p.buildInjection(req, su)
@@ -291,13 +298,12 @@ func TestBuildInjectionWindowSelection(t *testing.T) {
 			if !equalStrSlices(inj.ReciteLabels, c.wantLabels) {
 				t.Errorf("ReciteLabels = %v, want %v", inj.ReciteLabels, c.wantLabels)
 			}
-			if len(inj.ReciteLabels) > 4 {
-				t.Errorf("ReciteLabels len = %d, want <= 4", len(inj.ReciteLabels))
+			if len(inj.ReciteLabels) > reciteMaxRecent+1 {
+				t.Errorf("ReciteLabels len = %d, want <= %d", len(inj.ReciteLabels), reciteMaxRecent+1)
 			}
 			if len(inj.ReciteUUIDs) != len(inj.ReciteLabels) {
-				t.Fatalf("ReciteUUIDs len = %d, want %d (matching ReciteLabels)", len(inj.ReciteUUIDs), len(inj.ReciteLabels))
+				t.Fatalf("ReciteUUIDs len = %d, want %d", len(inj.ReciteUUIDs), len(inj.ReciteLabels))
 			}
-			// Every UUID in the window must be one this session carries.
 			own := map[string]bool{}
 			for _, u := range su.uuids {
 				own[u] = true
@@ -307,34 +313,75 @@ func TestBuildInjectionWindowSelection(t *testing.T) {
 					t.Errorf("ReciteUUIDs[%d] = %q is not a marker this session carries", i, u)
 				}
 			}
-			// StampByHash must cover EVERY visible turn (h0..h(turn-1)), not
-			// just the recite window — this is what keeps every turn's
-			// marker warm in KV regardless of whether it's being recited
-			// this request.
 			if len(inj.StampByHash) != c.turn {
-				t.Errorf("StampByHash covers %d turns, want %d (every visible turn)", len(inj.StampByHash), c.turn)
-			}
-			for i := 0; i < c.turn; i++ {
-				h := fmt.Sprintf("h%d", i)
-				stamp, ok := inj.StampByHash[h]
-				if !ok {
-					t.Errorf("StampByHash missing visible turn hash %q", h)
-					continue
-				}
-				if stamp.Idx != i {
-					t.Errorf("StampByHash[%q].Idx = %d, want %d", h, stamp.Idx, i)
-				}
-				if stamp.Label != fmt.Sprintf("turn-%d", i+1) {
-					t.Errorf("StampByHash[%q].Label = %q, want turn-%d", h, stamp.Label, i+1)
-				}
+				t.Errorf("StampByHash covers %d turns, want all %d visible — an unrecited turn must "+
+					"still carry its marker so it stays identifiable in KV", len(inj.StampByHash), c.turn)
 			}
 		})
 	}
 }
 
-// TestBuildInjectionNilCases verifies buildInjection degrades to "no
-// injection" (nil) rather than panicking: disabled, session index out of
-// range, session with zero turns, and a request with no visible qualifying
+// TestBuildInjectionWindowFollowsTheCapturedBudget is the point of the
+// rewrite: the ask shrinks to fit the budget the capture recorded, instead of
+// the budget being raised to fit the ask.
+func TestBuildInjectionWindowFollowsTheCapturedBudget(t *testing.T) {
+	p, su := newFixturePoster(14, "fixture")
+
+	for _, c := range []struct {
+		name       string
+		out        int
+		wantLabels []string
+		wantShort  bool
+	}{
+		{"no room for even one id", reciteReserveTokens + reciteTokensPerID - 1, nil, true},
+		{"room for exactly one", reciteReserveTokens + reciteTokensPerID, []string{"turn-1"}, false},
+		{"room for two", reciteReserveTokens + 2*reciteTokensPerID, []string{"turn-1", "turn-11"}, false},
+		{"room for three", reciteReserveTokens + 3*reciteTokensPerID, []string{"turn-1", "turn-10", "turn-11"}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			inj := p.buildInjection(visibleTurnsRequestBudget(12, c.out), su)
+			if inj == nil {
+				t.Fatal("buildInjection returned nil; the inline markers must be sent regardless")
+			}
+			if inj.BudgetShort != c.wantShort {
+				t.Errorf("BudgetShort = %v, want %v", inj.BudgetShort, c.wantShort)
+			}
+			if !equalStrSlices(inj.ReciteLabels, c.wantLabels) {
+				t.Errorf("ReciteLabels = %v, want %v", inj.ReciteLabels, c.wantLabels)
+			}
+			if c.wantShort && len(inj.StampByHash) == 0 {
+				t.Error("a budget-short request dropped its inline markers; the turn would lose its " +
+					"identity for every later request that could afford to ask about it")
+			}
+		})
+	}
+}
+
+// TestReciteCapacityNeverRaisesTheBudget: the estimate must be a function of
+// the captured budget alone. A replay that edits max_tokens to fit its own
+// instrumentation is measuring a workload nobody captured.
+func TestReciteCapacityNeverRaisesTheBudget(t *testing.T) {
+	if got := reciteCapacity(0); got != 0 {
+		t.Errorf("reciteCapacity(0) = %d, want 0", got)
+	}
+	if got := reciteCapacity(reciteReserveTokens); got != 0 {
+		t.Errorf("reciteCapacity(reserve) = %d, want 0: the reserve is what the prose needs before "+
+			"any id fits", got)
+	}
+	if got := reciteCapacity(1 << 20); got != reciteMaxRecent+1 {
+		t.Errorf("reciteCapacity(huge) = %d, want %d — the ask stays bounded on a deep session",
+			got, reciteMaxRecent+1)
+	}
+	prev := 0
+	for b := 0; b < 5000; b += 7 {
+		if got := reciteCapacity(b); got < prev {
+			t.Fatalf("reciteCapacity is not monotonic: %d tokens gave %d after %d", b, got, prev)
+		} else {
+			prev = got
+		}
+	}
+}
+
 // turn at all.
 func TestBuildInjectionNilCases(t *testing.T) {
 	t.Run("uuidEnabled false", func(t *testing.T) {
@@ -641,107 +688,6 @@ func TestFirstLineConformity(t *testing.T) {
 	}
 }
 
-// TestApplyReciteFloor verifies the max_tokens recite-floor helper: raises
-// a too-small budget to replayReciteFloorTokens(numUUIDs) only when recite
-// is requested; leaves larger budgets and non-recite calls untouched.
-func TestApplyReciteFloor(t *testing.T) {
-	cases := []struct {
-		name     string
-		tokens   int
-		recite   bool
-		numUUIDs int
-	}{
-		{"below floor, recite -> raised", 5, true, 2},
-		{"at floor, recite -> unchanged", replayReciteFloorTokens(2), true, 2},
-		{"above floor, recite -> unchanged", 100000, true, 2},
-		{"below floor, no recite -> unchanged", 5, false, 2},
-		{"below floor, more uuids (capped at 4), recite -> raised higher", 5, true, 4},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			floor := replayReciteFloorTokens(c.numUUIDs)
-			want := c.tokens
-			if c.recite && c.tokens < floor {
-				want = floor
-			}
-			if got := applyReciteFloor(c.tokens, c.recite, c.numUUIDs); got != want {
-				t.Errorf("applyReciteFloor(%d, %v, %d) = %d, want %d", c.tokens, c.recite, c.numUUIDs, got, want)
-			}
-		})
-	}
-}
-
-// TestReciteFloorScalesWithN verifies the recite floor grows with numUUIDs
-// up to the window cap (4) — more UUIDs to recite on the first line needs a
-// bigger budget — but is now BOUNDED, unlike the retired per-session-N
-// scheme where a long session's floor grew without bound.
-func TestReciteFloorScalesWithN(t *testing.T) {
-	small := replayReciteFloorTokens(1)
-	large := replayReciteFloorTokens(4)
-	if large <= small {
-		t.Errorf("replayReciteFloorTokens(4) = %d, want > replayReciteFloorTokens(1) = %d", large, small)
-	}
-}
-
-// TestMaxTokensFloorAppliedInWireBuilders verifies the floor is actually
-// wired into both body builders' emitted max_tokens when a recite
-// injection is present and the original/recorded budget is tiny — the
-// scenario a real tool-call-only turn would hit. numUUIDs is now
-// len(inj.ReciteUUIDs) (the window, capped at 4), not the old per-session N.
-func TestMaxTokensFloorAppliedInWireBuilders(t *testing.T) {
-	docs := strings.Repeat("floor-docs ", 100)
-	req := RouterReplayRequest{
-		InputTokens:  500,
-		OutputTokens: 5, // tiny recorded budget -- would truncate the recite line
-		Messages:     []RouterReplayMessage{userText("msg1", 100)},
-	}
-	reciteUUIDs := []string{"uuid-floor-0", "uuid-floor-1"}
-	inj := &uuidInjection{
-		StampByHash:  map[string]turnStamp{"msg1": {Idx: 0, UUID: reciteUUIDs[0], Label: "turn-1"}},
-		ReciteLabels: []string{"turn-1"},
-		ReciteUUIDs:  reciteUUIDs,
-	}
-	wantFloor := float64(replayReciteFloorTokens(len(reciteUUIDs)))
-
-	anthBody, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, 0, inj)
-	if err != nil {
-		t.Fatalf("anthropic build: %v", err)
-	}
-	var anthParsed map[string]interface{}
-	if err := json.Unmarshal(anthBody, &anthParsed); err != nil {
-		t.Fatalf("anthropic unmarshal: %v", err)
-	}
-	if got := anthParsed["max_tokens"].(float64); got != wantFloor {
-		t.Errorf("anthropic max_tokens = %v, want %v (floor)", got, wantFloor)
-	}
-
-	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, 0, inj)
-	if err != nil {
-		t.Fatalf("openai build: %v", err)
-	}
-	var openaiParsed map[string]interface{}
-	if err := json.Unmarshal(openaiBody, &openaiParsed); err != nil {
-		t.Fatalf("openai unmarshal: %v", err)
-	}
-	if got := openaiParsed["max_tokens"].(float64); got != wantFloor {
-		t.Errorf("openai max_tokens = %v, want %v (floor)", got, wantFloor)
-	}
-
-	// Without injection (nil), the tiny recorded output_tokens is honored
-	// as before -- the floor must never apply when there's no recite ask.
-	plainBody, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, 0, nil)
-	if err != nil {
-		t.Fatalf("anthropic build (no injection): %v", err)
-	}
-	var plainParsed map[string]interface{}
-	if err := json.Unmarshal(plainBody, &plainParsed); err != nil {
-		t.Fatalf("anthropic unmarshal (no injection): %v", err)
-	}
-	if got, want := plainParsed["max_tokens"].(float64), float64(5); got != want {
-		t.Errorf("anthropic max_tokens (no injection) = %v, want %v (unfloored)", got, want)
-	}
-}
-
 // TestMarkersDifferPerPass covers --replay-reuse-sessions: the same session
 // replayed a second time must mint different markers.
 //
@@ -787,9 +733,12 @@ func TestRunIDIsAFunctionOfTheSeed(t *testing.T) {
 	if runIDFromSeed(7) == runIDFromSeed(8) {
 		t.Error("runIDFromSeed ignores the seed; every run would share content and start warm")
 	}
-	if !uuidRe.MatchString(runIDFromSeed(7)) {
-		t.Errorf("run id %q is not UUID-shaped; every consumer of RUN_GUID has always seen one",
-			runIDFromSeed(7))
+	// Deliberately NOT UUID-shaped. The stamp sits above every marker in the
+	// prompt, so a UUID-shaped one is a plausible wrong answer to "output the
+	// id for this tag" — and it could be picked up by the contamination scan.
+	if uuidRe.MatchString(runIDFromSeed(7)) {
+		t.Errorf("run id %q is UUID-shaped: it is the first UUID in every prompt, and a model asked "+
+			"for an id has every reason to reach for it", runIDFromSeed(7))
 	}
 	a, err := resolveRunSeed(0)
 	if err != nil {

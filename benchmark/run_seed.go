@@ -4,6 +4,7 @@ import (
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"os"
 )
@@ -39,15 +40,20 @@ func resolveRunSeed(seed int64) (int64, error) {
 	return int64(binary.LittleEndian.Uint64(b[:]) >> 1), nil
 }
 
-// runIDFromSeed derives the run stamp. UUID-shaped because that is what every
-// consumer of RUN_GUID has always seen — logs, capture files, report headers —
-// and a stamp that suddenly looked like something else would read as a
-// different kind of value rather than the same one made reproducible.
+// runIDFromSeed derives the run stamp, deliberately NOT UUID-shaped.
+//
+// The stamp is prepended to every prompt as <ignore>RUN_GUID: ...</ignore>,
+// and --verify asks the model to repeat "the id" for a tagged turn. A
+// UUID-shaped stamp sitting above every marker is a plausible wrong answer to
+// that question — it is the first UUID in the context, and a model asked for
+// "the first id" has every reason to reach for it. A plain hex digest cannot
+// be confused with a marker, and cannot be matched by uuidRe either, so it can
+// never be picked up by the contamination scan.
 func runIDFromSeed(seed int64) string {
 	var s [8]byte
 	binary.LittleEndian.PutUint64(s[:], uint64(seed))
 	sum := sha256.Sum256(append([]byte("wekai-run-id:"), s[:]...))
-	return formatUUID(sum[:16])
+	return "run" + hex.EncodeToString(sum[:12])
 }
 
 // formatUUID renders 16 bytes canonically, with the version and variant

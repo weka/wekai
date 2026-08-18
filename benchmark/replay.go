@@ -394,6 +394,9 @@ func recordReplayRequest(
 		}
 	}
 	uuidLeakedCount := len(metrics.LeakedUUIDs)
+	if metrics.ReciteBudgetShort {
+		st.valBudgetShortReqs.Add(1)
+	}
 	if metrics.LeakChecked {
 		// Counted separately from valReqs: contamination is scored on every
 		// completed request, presence only on those asked to recite, and

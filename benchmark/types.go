@@ -56,6 +56,11 @@ type RequestMetrics struct {
 	// requests below: a zero contamination count is only meaningful against
 	// the number of responses actually looked at.
 	LeakChecked bool
-	LeakedUUIDs []string // "uuid(series=N)" entries for any OTHER session's UUID found here
-	ExactMatch  bool     // first line of Response is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
+	// ReciteBudgetShort marks a request whose captured output budget could not
+	// carry even one id, so presence was never asked and must not be scored.
+	// Counted and reported separately: an unanswerable question recorded as a
+	// miss would read as a coherency failure.
+	ReciteBudgetShort bool
+	LeakedUUIDs       []string // "uuid(series=N)" entries for any OTHER session's UUID found here
+	ExactMatch        bool     // first line of Response is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
 }

@@ -40,10 +40,7 @@ package benchmark
 // cover every visible turn, not just the recited window).
 
 import (
-	"fmt"
-	"os"
 	"strings"
-	"sync"
 )
 
 // turnStamp is the per-user-turn UUID marker injected inline into that
@@ -67,6 +64,12 @@ type uuidInjection struct {
 	// KV as later requests repeat that history in full, not just the turns
 	// named in the recite window below.
 	StampByHash map[string]turnStamp
+	// BudgetShort marks a request whose captured output budget cannot carry
+	// even one id (see reciteCapacity). It is asked nothing and scored on
+	// nothing: a question the response had no room to answer must not be
+	// recorded as a wrong answer, and the count of these is reported so the
+	// validated population is never mistaken for the whole run.
+	BudgetShort bool
 	// ReciteLabels is the ordered window of turn labels ("turn-N") the
 	// instruction names — first (visible) turn, then up to 3 most-recent
 	// turns EXCLUDING the current turn, deduplicated, capped at 4.
@@ -107,63 +110,45 @@ func replayReciteWindowInstruction(labels []string) string {
 		"in this exact order, comma-separated and nothing else: " + strings.Join(tagged, ", ") + ". Then continue normally."
 }
 
-// ---- max_tokens recite floor ----
+// ---- how many ids this request's own output budget can carry ----
 
-// replayReciteFloorMultiplier mirrors the cache-coherency eval's default
-// --max-output-multiplier (see computeMaxOutputTokens): the recite floor is
-// sized at multiplier x the expected N-UUID first-line list size, giving
-// the model headroom to emit the full list without truncation.
-const replayReciteFloorMultiplier = 3.0
+// reciteReserveTokens is what the response needs for everything that is not
+// the id list: any reasoning the model emits before answering, and the prose
+// it continues with afterwards.
+const reciteReserveTokens = 100
 
-// replayReciteFloorTokens returns the minimum max_tokens budget to enforce
-// on a request that carries an injection — every request carrying a
-// qualifying turn asks for a recite — sized
-// to fit the FIRST-LINE numUUIDs-UUID comma-joined list this feature asks
-// for (reuses the cache-coherency eval's computeMaxOutputTokens sizing:
-// numUUIDs*36 chars + separating commas, /4 for an approximate token count,
-// x replayReciteFloorMultiplier). numUUIDs is now len(inj.ReciteUUIDs) — the
-// current request's recite WINDOW, capped at 4 (see uuidInjection) — so the
-// floor itself is now bounded and constant regardless of session length,
-// unlike the retired per-session-N scheme where a long session's floor grew
-// without bound. The tradeoff: for a request whose recorded output budget
-// is tiny (a handful of tokens, e.g. a pure tool-call turn), this constant
-// floor is a much LARGER ratio of the original budget than an N-scaled
-// floor would have been at N=2 — i.e. the recite ask now perturbs a small
-// turn's output-size profile proportionally more. Accepted: correctness
-// (not truncating the recite line into a false PRESENCE_MISS) takes
-// priority over preserving the exact captured output-size ratio.
+// reciteTokensPerID is a deliberately generous per-id estimate. A hyphenated
+// UUID splits into roughly sixteen BPE pieces plus its separator, and being
+// wrong in the cheap direction costs one fewer id in the window while being
+// wrong in the expensive direction truncates the list mid-way and reports a
+// PRESENCE_MISS that describes the budget rather than the fleet.
+const reciteTokensPerID = 20
+
+// reciteMaxRecent caps how many recent turns join the first one, so the ask
+// stays bounded on a session hundreds of turns deep.
+const reciteMaxRecent = 10
+
+// reciteCapacity answers how many ids this request can be asked for, given the
+// output budget the CAPTURE recorded for it.
 //
-// A router-replay request's max_tokens is normally sized off the ORIGINAL
-// capture's output_tokens (see pickMaxTokens) — which for a tool-call-only
-// turn can be a handful of tokens, nowhere near enough to also emit the
-// first-line UUID list. Without this floor, a tiny budget truncates that
-// first line, which would misread as PRESENCE_MISS/NOT_EXACT (coherency
-// failure) when it's actually just an output-size artifact.
-func replayReciteFloorTokens(numUUIDs int) int {
-	return computeMaxOutputTokens(numUUIDs, replayReciteFloorMultiplier)
-}
-
-var reciteFloorWarnOnce sync.Once
-
-// applyReciteFloor raises maxTokens to replayReciteFloorTokens(numUUIDs)
-// when recite is requested and the original budget falls short, warning
-// once per process (mirrors the dataset path's reciteTruncWarned one-shot
-// pattern, but this is a single global warning rather than per-conversation
-// since the router path computes one floor value per call, not a per-
-// conversation truncation computation).
-func applyReciteFloor(maxTokens int, recite bool, numUUIDs int) int {
-	if !recite {
-		return maxTokens
+// The budget is never raised to fit the ask. A replay benchmark that edits
+// max_tokens is no longer replaying: the output-size profile is part of the
+// workload under test, and a request whose captured budget was a handful of
+// tokens — a tool-call turn, say — is exactly the kind of traffic whose shape
+// matters. The previous design raised such budgets to a floor and warned about
+// it, which traded a false PRESENCE_MISS for a real distortion of the thing
+// being measured.
+//
+// Capacity 0 means this request cannot answer a recite at all. It is then not
+// asked, not scored, and counted as excluded rather than as a miss — an
+// unanswerable question must not be recorded as a wrong answer.
+func reciteCapacity(maxTokens int) int {
+	n := (maxTokens - reciteReserveTokens) / reciteTokensPerID
+	if n < 0 {
+		return 0
 	}
-	floor := replayReciteFloorTokens(numUUIDs)
-	if maxTokens >= floor {
-		return maxTokens
+	if n > reciteMaxRecent+1 {
+		return reciteMaxRecent + 1
 	}
-	reciteFloorWarnOnce.Do(func() {
-		fmt.Fprintf(os.Stderr,
-			"[router-replay] WARNING: max_tokens raised to the UUID-recite floor (%d) for one or more requests — "+
-				"a tiny captured output budget would otherwise truncate the first-line recite list into a false PRESENCE_MISS, not real corruption\n",
-			floor)
-	})
-	return floor
+	return n
 }

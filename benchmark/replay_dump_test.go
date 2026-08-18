@@ -55,7 +55,7 @@ func TestDumpCapturesTheWireNotTheParse(t *testing.T) {
 	p.dumper = dumper
 
 	req := RouterReplayRequest{
-		Stream: true, OutputTokens: 50,
+		Stream: true, OutputTokens: 400, // room for the recite ask
 		Messages: []RouterReplayMessage{userText("turn-a", 40)},
 	}
 	m := p.do(context.Background(), req, strings.Repeat("dump-docs ", 50), 7, "s1", "inst-1", 3,

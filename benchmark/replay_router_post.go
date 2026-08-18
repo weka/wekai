@@ -138,27 +138,45 @@ func (p *replayPoster) buildInjection(req RouterReplayRequest, su *sessionUUIDs)
 		return nil
 	}
 
-	// Window: first visible turn, plus up to 3 most-recent turns EXCLUDING
-	// the current turn (visible's last entry — the highest turn index
-	// present, since turns only ever get appended to a growing history).
+	// The window is sized by THIS request's own captured output budget — see
+	// reciteCapacity. Three cases, and the first is the one that matters:
+	//
+	//   capacity 0  the response cannot carry even one id. No ask is made, no
+	//               scoring happens, and the request is counted as excluded.
+	//   capacity 1  the first turn's id alone. The oldest marker is the one a
+	//               fleet is likeliest to have lost, so a single-id budget is
+	//               spent on the strongest probe available.
+	//   capacity n  the first turn, plus the n-1 most recent EXCLUDING the
+	//               current one, up to reciteMaxRecent.
+	capacity := reciteCapacity(pickMaxTokens(req, p.outputRatio))
+	if capacity < 1 {
+		// Still returned, with no recite ask: the inline markers stay in the
+		// prompt so the turn keeps its identity in KV for later requests that
+		// CAN afford to ask about it.
+		return &uuidInjection{StampByHash: stampByHash, BudgetShort: true}
+	}
+
 	first := visible[0]
-	var recentCandidates []int
-	if len(visible) > 1 {
-		recentCandidates = visible[:len(visible)-1]
-	}
-	recent := recentCandidates
-	if len(recent) > 3 {
-		recent = recent[len(recent)-3:]
-	}
 	window := []int{first}
-	for _, t := range recent {
-		if t == first {
-			continue
+	if capacity > 1 {
+		// Everything visible except the current turn is a candidate; the most
+		// recent of those fill whatever the budget has left.
+		var recent []int
+		if len(visible) > 1 {
+			recent = visible[:len(visible)-1]
 		}
-		window = append(window, t)
-	}
-	if len(window) > 4 {
-		window = window[:4]
+		room := capacity - 1
+		if room > reciteMaxRecent {
+			room = reciteMaxRecent
+		}
+		if len(recent) > room {
+			recent = recent[len(recent)-room:]
+		}
+		for _, t := range recent {
+			if t != first {
+				window = append(window, t)
+			}
+		}
 	}
 
 	labels := make([]string, len(window))
@@ -804,6 +822,9 @@ func (p *replayPoster) do(
 		}
 		m.LeakChecked = true
 		m.LeakedUUIDs = findLeakedUUIDs(m.Response, "", own, p.registry)
+		// Contamination is unaffected by the output budget: a leaked marker
+		// arrives whether or not anything was asked for.
+		m.ReciteBudgetShort = inj != nil && inj.BudgetShort
 	}
 
 	// Presence and conformity stay gated on inj.Recite, which is the right
@@ -812,7 +833,7 @@ func (p *replayPoster) do(
 	// but only Recite says the model was ASKED to repeat this turn. Scoring a
 	// turn nobody asked about would count "the model did not volunteer a
 	// list" as a presence miss.
-	if inj != nil && m.Error == nil && !m.IsEmpty {
+	if inj != nil && !inj.BudgetShort && m.Error == nil && !m.IsEmpty {
 		m.ConvIdx = sessionIdx
 		m.ExpectedUUIDs = append([]string(nil), inj.ReciteUUIDs...)
 		m.UUIDFound = make([]bool, len(inj.ReciteUUIDs))

@@ -47,14 +47,12 @@ const verboseOutputInstruction = "Provide a thorough, detailed response and keep
 // leaving the body byte-for-byte identical to before this feature existed.
 func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
 	var stampByHash map[string]turnStamp
-	injNumUUIDs := 0
 	if inj != nil {
 		stampByHash = inj.StampByHash
-		injNumUUIDs = len(inj.ReciteUUIDs)
 	}
 	body := map[string]interface{}{
 		"model":      modelName,
-		"max_tokens": applyReciteFloor(pickMaxTokens(req, outputRatio), inj != nil, injNumUUIDs),
+		"max_tokens": pickMaxTokens(req, outputRatio),
 		"stream":     req.Stream,
 	}
 	if req.Temperature != nil {
@@ -564,14 +562,12 @@ func buildOpenAITools(spec *RouterReplayToolsSpec, docs string, charsPerToken fl
 // router path — see replay_router_uuid.go); nil means "no injection".
 func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
 	var stampByHash map[string]turnStamp
-	injNumUUIDs := 0
 	if inj != nil {
 		stampByHash = inj.StampByHash
-		injNumUUIDs = len(inj.ReciteUUIDs)
 	}
 	body := map[string]interface{}{
 		"model":      modelName,
-		"max_tokens": applyReciteFloor(pickMaxTokens(req, outputRatio), inj != nil, injNumUUIDs),
+		"max_tokens": pickMaxTokens(req, outputRatio),
 		"stream":     req.Stream,
 	}
 	if req.Temperature != nil {
