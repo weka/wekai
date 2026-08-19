@@ -184,6 +184,9 @@ type AutoBenchmarkConfig struct {
 	// replay_uuid_registry.go for why none is needed and what the registry's
 	// detection window is.
 	uuidRegistry *uuidRegistry
+	// VerifyContinueOnContamination keeps the run going after a leaked
+	// marker. Off by default: see the evaluator's contamination check.
+	VerifyContinueOnContamination bool
 	// DumpDir/DumpLimit drive the verbatim exchange capture; see
 	// replay_dump.go. dumper is built once and shared by every poster.
 	DumpDir   string
@@ -959,6 +962,7 @@ const (
 	termReasonReplayDone                                 // replay queue drained, all series done
 	termReasonReplayLowConcurrency                       // replay queue drained and active workers fell below target concurrency
 	termReasonReplayUnderfilled                          // the corpus ran out, so admitted slots could not be filled
+	termReasonContamination                              // --verify found a leaked marker and the run did not opt out of stopping
 )
 
 func (r autoTermReason) String() string {
@@ -981,6 +985,8 @@ func (r autoTermReason) String() string {
 		return "Corpus exhausted: admitted slots could not be filled, so offered load had fallen below the governor's session count"
 	case termReasonReplayLowConcurrency:
 		return "Replay stopped: active workers fell below target concurrency"
+	case termReasonContamination:
+		return "Cross-contamination detected (--verify); stopped so the evidence stays fresh"
 	}
 	return "Unknown"
 }
@@ -1104,8 +1110,11 @@ type autoState struct {
 	valEchoedTagsReqs    atomic.Int64 // responses that repeated turn names instead of guids — an ASK defect
 	valNoIDsReqs         atomic.Int64 // responses containing no guid at all — an ASK defect
 	valGarbageReqs       atomic.Int64 // responses carrying decode-level corruption (U+FFFD, NUL, stray control chars)
-	valPresenceMissReqs  atomic.Int64 // requests with >=1 PRESENCE_MISS
-	valCrossContamReqs   atomic.Int64 // requests with >=1 CROSS_CONTAMINATION
+	// contaminationStop is armed by the first leaked marker unless the run
+	// opted out; the evaluator turns it into a termination.
+	contaminationStop   atomic.Bool
+	valPresenceMissReqs atomic.Int64 // requests with >=1 PRESENCE_MISS
+	valCrossContamReqs  atomic.Int64 // requests with >=1 CROSS_CONTAMINATION
 
 	// Persistent early-sample buffers — never trimmed, survive stream eviction.
 	printMu sync.Mutex // serialises --print-responses output across concurrent series
@@ -1934,6 +1943,7 @@ func runSingleModelBenchmark(
 			if cfg.Verify {
 				pp.uuidEnabled = true
 				pp.registry = cfg.uuidRegistry
+				pp.continueOnContamination = cfg.VerifyContinueOnContamination
 			}
 			pp.dumper = cfg.dumper
 			posters[i] = pp
@@ -2506,6 +2516,19 @@ func runSingleModelBenchmark(
 
 		// Always push display updates, even during warmup.
 		updateSnap(st)
+
+		// A leaked marker stops the run by default. Placed first: nothing
+		// else the evaluator does matters more than freezing the fleet in the
+		// state that just produced cross-session content, and every further
+		// request churns the caches the investigation needs intact.
+		if st.contaminationStop.Load() && benchCtx.Err() == nil {
+			termReason = termReasonContamination
+			select {
+			case termChan <- termReason:
+			default:
+			}
+			return true
+		}
 
 		// Fail-fast: abort once TOTAL errors reach the configured ceiling.
 		// Unlike consecutiveFailures (reset on success), totalErrors is

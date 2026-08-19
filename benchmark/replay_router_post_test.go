@@ -885,8 +885,8 @@ func TestCrossContaminationDetectedEndToEnd(t *testing.T) {
 		p.uuidEnabled = true
 		p.registry = newUUIDRegistry()
 		// Both sessions live, exactly as two concurrent series would be.
-		p.registry.Acquire(theirs.uuids, 1)
-		p.registry.Acquire(mine.uuids, 2)
+		p.registry.Acquire(theirs.uuids, uuidHolder{Series: 1})
+		p.registry.Acquire(mine.uuids, uuidHolder{Series: 2})
 		return p
 	}
 
@@ -1003,7 +1003,7 @@ func TestSessionRegistersItsMarkersAndDetectsLeaks(t *testing.T) {
 	defer ts.Close()
 
 	reg := newUUIDRegistry()
-	reg.Acquire(other.uuids, 99) // the other session is live
+	reg.Acquire(other.uuids, uuidHolder{Series: 99}) // the other session is live
 	cfg := AutoBenchmarkConfig{
 		Model:         fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL),
 		Verify:        true,

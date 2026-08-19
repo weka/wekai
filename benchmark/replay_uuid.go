@@ -71,9 +71,9 @@ func findLeakedUUIDs(resp, thinking string, own map[string]bool, reg *uuidRegist
 			continue
 		}
 		if e.n.Load() > 1 {
-			leaked = append(leaked, fmt.Sprintf("%s(series=%d,shared)", u, e.series))
+			leaked = append(leaked, fmt.Sprintf("%s(series=%d,shared)", u, e.holder.Series))
 		} else {
-			leaked = append(leaked, fmt.Sprintf("%s(series=%d)", u, e.series))
+			leaked = append(leaked, fmt.Sprintf("%s(series=%d)", u, e.holder.Series))
 		}
 	}
 	return leaked

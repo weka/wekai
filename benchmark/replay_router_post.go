@@ -20,6 +20,8 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -94,6 +96,9 @@ type replayPoster struct {
 	// dumper writes the verbatim exchange when --dump-dir is set; nil
 	// otherwise, and nil is the whole of the feature's cost when off.
 	dumper *requestDumper
+	// continueOnContamination mirrors --verify-continue-on-contamination:
+	// false (the default) stops the run on the first leaked marker.
+	continueOnContamination bool
 	// registry is the live marker set, shared by every poster in the run. It
 	// answers "is this UUID one of ours, right now" for leak scoring, and its
 	// refcounts are what make a block shared by concurrent sessions visible
@@ -822,7 +827,18 @@ func (p *replayPoster) do(
 		}
 		m.LeakChecked = true
 		m.LeakedUUIDs = findLeakedUUIDs(m.Response, "", own, p.registry)
-		m.ResponseGarbage = responseIsGarbage(m.Response)
+		if g := classifyGarbage(m.Response); g.bad() {
+			m.ResponseGarbage = true
+			// Printed as it happens, not just counted: 338 in a summary is a
+			// number, one line per event with the bytes in context is
+			// something the detector can be tuned against.
+			fmt.Fprintf(os.Stderr,
+				"[verify] GARBAGE series=%d turn=%d session=%s instance=%s: %d\u00d7U+FFFD %d\u00d7NUL %d\u00d7ctrl at rune %d, context %s\n",
+				seriesNum, turnIdx, sessionID, instanceID, g.Replacement, g.Nul, g.Control, g.FirstOffset, g.Excerpt)
+		}
+		if len(m.LeakedUUIDs) > 0 {
+			p.reportContamination(m.LeakedUUIDs, inj, su, seriesNum, sessionID, instanceID, turnIdx, st)
+		}
 		// Contamination is unaffected by the output budget: a leaked marker
 		// arrives whether or not anything was asked for.
 		m.ReciteBudgetShort = inj != nil && inj.BudgetShort
@@ -1318,4 +1334,77 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// reportContamination prints everything known about a leaked marker, then —
+// unless the run opted out — arms the stop.
+//
+// Printed in full in BOTH modes, because the event is rare enough to be
+// precious: the eleven-hour run that motivated this saw exactly one in 65771
+// scanned responses, and its summary line said nothing but "1". Everything a
+// person needs to chase it is known right here — the marker, both sessions,
+// and the file indices that replay exactly this pair — and by the time the
+// summary prints, the holder may have retired and the registry forgotten it.
+func (p *replayPoster) reportContamination(leaked []string, inj *uuidInjection, su *sessionUUIDs,
+	seriesNum int, sessionID, instanceID string, turnIdx int, st *autoState) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n[verify] CROSS_CONTAMINATION detected (%d marker(s))\n", len(leaked))
+	repro := map[int]bool{}
+	for _, entry := range leaked {
+		u := entry
+		if i := strings.IndexByte(u, '('); i > 0 {
+			u = u[:i]
+		}
+		fmt.Fprintf(&b, "  leaked marker : %s\n", u)
+		if e := p.registry.lookup(u); e != nil {
+			fmt.Fprintf(&b, "    owner       : series=%d session=%s file-index=%d pass=%d live-holders=%d\n",
+				e.holder.Series, e.holder.SessionID, e.holder.FileIdx, e.holder.Pass, e.n.Load())
+			repro[e.holder.FileIdx] = true
+		} else {
+			fmt.Fprintf(&b, "    owner       : (already retired from the registry)\n")
+		}
+	}
+	fmt.Fprintf(&b, "  this request  : series=%d session=%s file-index=%d pass=%d instance=%s turn=%d\n",
+		seriesNum, sessionID, suFileIdx(su), suPass(su), instanceID, turnIdx)
+	if inj != nil {
+		fmt.Fprintf(&b, "  expected here : %d recite id(s), %d marker(s) in this prompt\n",
+			len(inj.ReciteUUIDs), len(inj.StampByHash))
+	}
+	if su != nil {
+		repro[su.fileIdx] = true
+	}
+	idxs := make([]int, 0, len(repro))
+	for i := range repro {
+		idxs = append(idxs, i)
+	}
+	sort.Ints(idxs)
+	parts := make([]string, len(idxs))
+	for i, v := range idxs {
+		parts[i] = strconv.Itoa(v)
+	}
+	fmt.Fprintf(&b, "  reproduce     : --verify --replay-series-indices=%s --series=%d\n",
+		strings.Join(parts, ","), len(idxs))
+	if p.continueOnContamination {
+		fmt.Fprintf(&b, "  action        : continuing (--verify-continue-on-contamination)\n")
+	} else {
+		fmt.Fprintf(&b, "  action        : stopping the run — pass --verify-continue-on-contamination to keep going\n")
+		st.contaminationStop.Store(true)
+	}
+	fmt.Fprint(os.Stderr, b.String())
+}
+
+// suFileIdx / suPass tolerate a nil view: a request with no qualifying turn
+// still leak-scans, and a leak there must not panic the report.
+func suFileIdx(su *sessionUUIDs) int {
+	if su == nil {
+		return -1
+	}
+	return su.fileIdx
+}
+
+func suPass(su *sessionUUIDs) int {
+	if su == nil {
+		return 0
+	}
+	return su.pass
 }

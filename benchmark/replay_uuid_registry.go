@@ -59,10 +59,24 @@ type uuidEntry struct {
 	// common case — a session acquiring a marker another session already
 	// registered — needs only a read lock.
 	n atomic.Int64
-	// series is the first series number to register it, used only to label a
-	// leak. Shared markers name their first holder plus a shared flag rather
-	// than pretending to a single owner.
-	series int
+	// holder identifies the FIRST session to register the marker. A leak
+	// report has to hand back something a person can act on — which session
+	// to re-run, by which file index — and a bare series number is not that.
+	// Shared markers name their first holder plus a shared flag rather than
+	// pretending to a single owner.
+	holder uuidHolder
+}
+
+// uuidHolder is what a contamination report needs to know about a marker's
+// owner: enough to name it, and enough to reproduce the pairing.
+type uuidHolder struct {
+	Series    int
+	SessionID string
+	// FileIdx is the session's 0-based line in the replay file — the value
+	// --replay-series-indices takes, so the repro command can be printed
+	// rather than reverse-engineered.
+	FileIdx int
+	Pass    int
 }
 
 func newUUIDRegistry() *uuidRegistry {
@@ -71,7 +85,7 @@ func newUUIDRegistry() *uuidRegistry {
 
 // Acquire registers every marker in uuids as live, held by series. Safe to
 // call with duplicates; each distinct marker is counted once per call.
-func (r *uuidRegistry) Acquire(uuids []string, series int) {
+func (r *uuidRegistry) Acquire(uuids []string, h uuidHolder) {
 	if r == nil || len(uuids) == 0 {
 		return
 	}
@@ -108,7 +122,7 @@ func (r *uuidRegistry) Acquire(uuids []string, series int) {
 			e.n.Add(1)
 			continue
 		}
-		e := &uuidEntry{series: series}
+		e := &uuidEntry{holder: h}
 		e.n.Store(1)
 		r.m[u] = e
 	}
@@ -200,6 +214,11 @@ type sessionUUIDs struct {
 	hashToTurn map[string]int
 	// uuids is indexed by turn, parallel to hashToTurn's values.
 	uuids []string
+	// The session's own identity, carried so a contamination report can name
+	// both sides of the pair without any caller threading extra context.
+	sessionID string
+	fileIdx   int
+	pass      int
 }
 
 // buildSessionUUIDs walks one session and returns its turn view, or nil if
@@ -212,7 +231,7 @@ type sessionUUIDs struct {
 // and cannot be mistaken for a leak — both hold it legitimately, and the
 // registry records the shared hold.
 func buildSessionUUIDs(sess RouterReplaySession, stamp string) *sessionUUIDs {
-	su := &sessionUUIDs{hashToTurn: map[string]int{}}
+	su := &sessionUUIDs{hashToTurn: map[string]int{}, sessionID: sess.SessionID, fileIdx: sess.fileIdx, pass: sess.pass}
 	for _, inst := range sess.Instances {
 		for _, req := range inst.Requests {
 			for _, m := range req.Messages {

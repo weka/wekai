@@ -1,6 +1,9 @@
 package benchmark
 
-import "regexp"
+import (
+	"fmt"
+	"regexp"
+)
 
 // Why a marker was not recited.
 //
@@ -97,6 +100,61 @@ func indexOf(haystack, needle string) int {
 	return -1
 }
 
+// garbageReport breaks decode-level corruption down far enough to act on.
+//
+// A bare count of 338 garbage responses says only "something is wrong
+// somewhere"; tuning the detector — or blaming the right layer — needs to know
+// WHICH corruption, WHERE in the response, and what the bytes around it were.
+// U+FFFD means the wire bytes were not valid UTF-8 (the decoder put it there);
+// a NUL or stray C0 control survived decoding intact, which points further up
+// the stack than the transport.
+type garbageReport struct {
+	Replacement int // U+FFFD runes
+	Nul         int // 0x00 bytes
+	Control     int // other C0 controls, excluding \t \n \r
+	FirstOffset int // rune offset of the first bad rune
+	// Excerpt is the printable neighbourhood of the first bad rune, so the
+	// on-screen line shows the corruption in context instead of a number.
+	Excerpt string
+}
+
+func (g garbageReport) bad() bool { return g.Replacement+g.Nul+g.Control > 0 }
+
+// classifyGarbage scans once and reports every kind. The detector stays as
+// narrow as responseIsGarbage always was — these three signals need no
+// cooperation from the model and have no innocent cause — it just stops
+// discarding the details.
+func classifyGarbage(resp string) garbageReport {
+	g := garbageReport{FirstOffset: -1}
+	runes := []rune(resp)
+	for i, r := range runes {
+		bad := false
+		switch {
+		case r == '\uFFFD':
+			g.Replacement++
+			bad = true
+		case r == 0:
+			g.Nul++
+			bad = true
+		case r < 0x20 && r != '\n' && r != '\t' && r != '\r':
+			g.Control++
+			bad = true
+		}
+		if bad && g.FirstOffset < 0 {
+			g.FirstOffset = i
+			lo, hi := i-24, i+24
+			if lo < 0 {
+				lo = 0
+			}
+			if hi > len(runes) {
+				hi = len(runes)
+			}
+			g.Excerpt = fmt.Sprintf("%q", string(runes[lo:hi]))
+		}
+	}
+	return g
+}
+
 // responseIsGarbage reports decode-level corruption in a response: replacement
 // characters, NUL bytes, or C0 control characters other than tab/newline/CR.
 //
@@ -111,15 +169,5 @@ func indexOf(haystack, needle string) int {
 // the corpus itself), and a "garbage" counter that fires on innocent causes
 // gets ignored — this one firing at all is worth reading the capture.
 func responseIsGarbage(resp string) bool {
-	for _, r := range resp {
-		switch {
-		case r == '\uFFFD':
-			return true
-		case r == 0:
-			return true
-		case r < 0x20 && r != '\n' && r != '\t' && r != '\r':
-			return true
-		}
-	}
-	return false
+	return classifyGarbage(resp).bad()
 }

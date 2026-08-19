@@ -74,7 +74,11 @@ type RouterReplaySession struct {
 	SessionID string `json:"session_id"`
 	// pass is which time through the corpus this session was handed out on,
 	// 0-based. Not from the file — set by the producer on wraparound.
-	pass      int
+	pass int
+	// fileIdx is this session's 0-based line index in the replay file — the
+	// value --replay-series-indices selects by. Carried so a contamination
+	// report can hand back the exact indices that reproduce the pair.
+	fileIdx   int
 	StartTs   string                 `json:"start_ts"`
 	Instances []RouterReplayInstance `json:"instances"`
 }
@@ -312,6 +316,7 @@ func (s *routerReplayStream) produce() {
 				var sess RouterReplaySession
 				if jerr := json.Unmarshal(line, &sess); jerr == nil {
 					sess.pass = int(s.pass.Load())
+					sess.fileIdx = currentIdx
 					// Backpressure: blocks when ch is full, so the next
 					// file read happens only after a worker pulls.
 					// Respect ctx so Close() can unblock us when the
@@ -646,7 +651,9 @@ func runRouterReplaySession(
 	var su *sessionUUIDs
 	if cfg.Verify {
 		if su = buildSessionUUIDs(sess, passStamp); su != nil {
-			cfg.uuidRegistry.Acquire(su.uuids, seriesNum)
+			cfg.uuidRegistry.Acquire(su.uuids, uuidHolder{
+				Series: seriesNum, SessionID: sess.SessionID, FileIdx: sess.fileIdx, Pass: sess.pass,
+			})
 			defer cfg.uuidRegistry.Release(su.uuids)
 		}
 	}
@@ -807,6 +814,7 @@ func runRouterReplayInstance(
 		if cfg.Verify {
 			poster.uuidEnabled = true
 			poster.registry = cfg.uuidRegistry
+			poster.continueOnContamination = cfg.VerifyContinueOnContamination
 		}
 	}
 	if err != nil {

@@ -51,7 +51,7 @@ func TestDumpCapturesTheWireNotTheParse(t *testing.T) {
 	}
 	p.uuidEnabled = true
 	p.registry = newUUIDRegistry()
-	p.registry.Acquire(su.uuids, 1)
+	p.registry.Acquire(su.uuids, uuidHolder{Series: 1})
 	p.dumper = dumper
 
 	req := RouterReplayRequest{

@@ -173,14 +173,14 @@ func TestUUIDRegistryHoldsWhileAnySessionDoes(t *testing.T) {
 	shared := uuidForHash("shared", "stamp-1")
 	aOnly := uuidForHash("a-only", "stamp-1")
 
-	r.Acquire([]string{shared, aOnly}, 1)
-	r.Acquire([]string{shared}, 2)
+	r.Acquire([]string{shared, aOnly}, uuidHolder{Series: 1})
+	r.Acquire([]string{shared}, uuidHolder{Series: 2})
 
 	if e := r.lookup(shared); e == nil || e.n.Load() != 2 {
 		t.Fatalf("shared marker refcount = %v, want 2", e)
 	}
-	if e := r.lookup(shared); e.series != 1 {
-		t.Errorf("shared marker labelled series %d, want its first holder (1)", e.series)
+	if e := r.lookup(shared); e.holder.Series != 1 {
+		t.Errorf("shared marker labelled series %d, want its first holder (1)", e.holder.Series)
 	}
 
 	r.Release([]string{shared, aOnly}) // session 1 finishes
@@ -207,7 +207,7 @@ func TestUUIDRegistryHoldsWhileAnySessionDoes(t *testing.T) {
 func TestUUIDRegistryAcquireIsIdempotentPerCall(t *testing.T) {
 	r := newUUIDRegistry()
 	u := uuidForHash("h", "stamp-1")
-	r.Acquire([]string{u, u, u}, 1)
+	r.Acquire([]string{u, u, u}, uuidHolder{Series: 1})
 	if e := r.lookup(u); e == nil || e.n.Load() != 1 {
 		t.Fatalf("refcount = %v after acquiring the same marker three times in one call, want 1", e)
 	}
@@ -243,7 +243,7 @@ func newFixturePoster(nTurns int, stamp string) (*replayPoster, *sessionUUIDs) {
 		su.uuids = append(su.uuids, uuidForHash(h, stamp))
 	}
 	reg := newUUIDRegistry()
-	reg.Acquire(su.uuids, 1)
+	reg.Acquire(su.uuids, uuidHolder{Series: 1})
 	return &replayPoster{
 		uuidEnabled: true,
 		registry:    reg,
@@ -596,8 +596,8 @@ func TestFindLeakedUUIDsRouterPath(t *testing.T) {
 	mine := uuidForHash("mine", "stamp-1")
 	theirs := uuidForHash("theirs", "stamp-1")
 	shared := uuidForHash("shared", "stamp-1")
-	reg.Acquire([]string{mine, shared}, 1)
-	reg.Acquire([]string{theirs, shared}, 2)
+	reg.Acquire([]string{mine, shared}, uuidHolder{Series: 1})
+	reg.Acquire([]string{theirs, shared}, uuidHolder{Series: 2})
 
 	own := map[string]bool{mine: true, shared: true}
 
@@ -642,7 +642,7 @@ func TestFindLeakedUUIDsRouterPath(t *testing.T) {
 	})
 	t.Run("thinking is scanned too", func(t *testing.T) {
 		reg2 := newUUIDRegistry()
-		reg2.Acquire([]string{theirs}, 3)
+		reg2.Acquire([]string{theirs}, uuidHolder{Series: 3})
 		if got := findLeakedUUIDs("clean", "leaked "+theirs, own, reg2); len(got) != 1 {
 			t.Errorf("findLeakedUUIDs = %v, want the leak found in the thinking blob", got)
 		}
@@ -651,8 +651,8 @@ func TestFindLeakedUUIDsRouterPath(t *testing.T) {
 		reg3 := newUUIDRegistry()
 		a := uuidForHash("a", "stamp-1")
 		b := uuidForHash("b", "stamp-1")
-		reg3.Acquire([]string{a}, 4)
-		reg3.Acquire([]string{b}, 5)
+		reg3.Acquire([]string{a}, uuidHolder{Series: 4})
+		reg3.Acquire([]string{b}, uuidHolder{Series: 5})
 		got := findLeakedUUIDs(b+" then "+a, "", nil, reg3)
 		if len(got) != 2 || got[0] != b+"(series=5)" || got[1] != a+"(series=4)" {
 			t.Errorf("findLeakedUUIDs = %v, want scan order [%s(series=5) %s(series=4)]", got, b, a)
