@@ -36,6 +36,26 @@ import (
 // this instruction is injected to make the cap load-bearing.
 const verboseOutputInstruction = "Provide a thorough, detailed response and keep elaborating rather than stopping early."
 
+// replayLengthAsk names the CURRENT request's output budget to the model, in
+// words. The generic keep-elaborating instruction holds ~50% conformity on
+// large budgets and stronger generic wording measured WORSE — a model has no
+// way to know how much elaboration is wanted, so it guesses. The budget is
+// known per request, and the only cache-safe place for per-request text is
+// the tail, after the shared history: a varying instruction in the system
+// slot would fork every request's prefix at the top and destroy the replay's
+// sharing structure.
+//
+// Below ~16 tokens no ask is made: "write about 6 words" reads as a trick,
+// and tiny budgets conform by clamping anyway.
+func replayLengthAsk(maxTokens int) string {
+	if maxTokens < 16 {
+		return ""
+	}
+	words := maxTokens * 3 / 4
+	return fmt.Sprintf("\n\nWrite a response of at least %d words. Keep elaborating with relevant"+
+		" detail until you reach that length — do not stop short of it.", words)
+}
+
 // buildAnthropicMessagesBody reconstructs the body of a POST /v1/messages
 // request that matches the original capture's shape and size as closely
 // as possible. Returns the marshaled JSON bytes and the canonical text
@@ -95,8 +115,13 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 	if len(req.Messages) > 0 {
 		msgs = buildMessages(req.Messages, docs, charsPerToken, stampByHash)
 	}
+	tail := ""
 	if inj != nil {
-		msgs = appendTailMessageAnthropic(msgs, replayReciteWindowInstruction(inj.ReciteLabels))
+		tail = replayReciteWindowInstruction(inj.ReciteLabels)
+	}
+	tail += replayLengthAsk(pickMaxTokens(req, outputRatio))
+	if tail != "" {
+		msgs = appendTailMessageAnthropic(msgs, tail)
 	}
 	if len(msgs) > 0 {
 		body["messages"] = msgs
@@ -634,8 +659,13 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		messages = append(messages, openaiMsgs...)
 	}
 
+	tailAsk := ""
 	if inj != nil {
-		messages = appendTailMessageOpenAI(messages, replayReciteWindowInstruction(inj.ReciteLabels))
+		tailAsk = replayReciteWindowInstruction(inj.ReciteLabels)
+	}
+	tailAsk += replayLengthAsk(pickMaxTokens(req, outputRatio))
+	if tailAsk != "" {
+		messages = appendTailMessageOpenAI(messages, tailAsk)
 	}
 
 	body["messages"] = messages

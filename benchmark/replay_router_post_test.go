@@ -480,10 +480,11 @@ func TestOpenAIReplayToolTranslation(t *testing.T) {
 	}
 
 	messages := parsed["messages"].([]interface{})
-	// +1: the keep-generating instruction rides in every mode, prepended
-	// before the conversation.
-	if len(messages) != 2 {
-		t.Fatalf("expected 2 messages (length instruction + assistant), got %d", len(messages))
+	// +2: the keep-generating system instruction is prepended, and the
+	// per-request length ask rides in the tail (this fixture's budget clears
+	// the 16-token floor).
+	if len(messages) != 3 {
+		t.Fatalf("expected 3 messages (instruction + assistant + length tail), got %d", len(messages))
 	}
 	msg := messages[1].(map[string]interface{})
 	if msg["role"] != "assistant" {
