@@ -86,3 +86,33 @@ func TestProgressLineVerifySegment(t *testing.T) {
 		}
 	})
 }
+
+// TestClassifyGarbagePositions pins the situating fields, with fixtures shaped
+// like the two events observed live: babble immediately after a literal EOS
+// marker, and a repeating �\t cycle running to the end of the budget.
+func TestClassifyGarbagePositions(t *testing.T) {
+	t.Run("literal EOS marker located before the garbage", func(t *testing.T) {
+		g := classifyGarbage("aaa-a42<｜end▁of▁sentence｜>7€\uFFFD#@/ uncertain")
+		if g.EOSByte < 0 || g.EOSMarker != "<｜end▁of▁sentence｜>" {
+			t.Fatalf("EOS marker not found: %+v", g)
+		}
+		if g.EOSByte > g.FirstByte {
+			t.Errorf("EOS at byte %d should precede the first bad rune at byte %d", g.EOSByte, g.FirstByte)
+		}
+	})
+	t.Run("tail babble runs to the end", func(t *testing.T) {
+		g := classifyGarbage("coherent prose then \uFFFD\t\uFFFD\t\uFFFD\t")
+		if !g.tailBabble() {
+			t.Errorf("garbage to the end of the response must read as tail babble: %+v", g)
+		}
+	})
+	t.Run("clean text after the last bad rune is counted", func(t *testing.T) {
+		g := classifyGarbage("x\uFFFDy" + strings.Repeat("clean ", 20))
+		if g.tailBabble() {
+			t.Errorf("120 clean runes after the corruption is not a tail: %+v", g)
+		}
+		if g.CleanAfter < 100 {
+			t.Errorf("CleanAfter = %d, want the full clean tail counted", g.CleanAfter)
+		}
+	})
+}

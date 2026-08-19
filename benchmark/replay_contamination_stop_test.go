@@ -146,7 +146,7 @@ func TestGarbagePrintsAsItHappens(t *testing.T) {
 		fmt.Fprintf(w, `{"id":"c","object":"chat.completion","model":"m",
 			"choices":[{"index":0,"message":{"role":"assistant","content":%q},"finish_reason":"stop"}],
 			"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
-			"the whale \ufffd\ufffd surfaced")
+			su.uuids[0]+" is the id; the whale \ufffd\ufffd surfaced")
 	}))
 	defer ts.Close()
 
@@ -164,7 +164,10 @@ func TestGarbagePrintsAsItHappens(t *testing.T) {
 			t.Fatal("a response carrying U+FFFD was not flagged as garbage")
 		}
 	})
-	for _, want := range []string{"GARBAGE", "2\u00d7U+FFFD", "turn=3", "whale"} {
+	for _, want := range []string{"GARBAGE", "2\u00d7U+FFFD", "turn=3", "whale",
+		// The situating fields: did the answer arrive before the noise, and
+		// what does the noise look like relative to the response's end.
+		"guids-before-garbage=1/1", "clean-after=", "verdict:"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("garbage line is missing %q:\n%s", want, out)
 		}

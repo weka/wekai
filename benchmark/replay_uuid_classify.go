@@ -3,6 +3,7 @@ package benchmark
 import (
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 // Why a marker was not recited.
@@ -113,10 +114,30 @@ type garbageReport struct {
 	Nul         int // 0x00 bytes
 	Control     int // other C0 controls, excluding \t \n \r
 	FirstOffset int // rune offset of the first bad rune
+	LastOffset  int // rune offset of the last bad rune
+	TotalRunes  int // response length, so the offsets read as positions
+	FirstByte   int // byte offset of the first bad rune, for substring-position comparisons
+	// EOSByte/EOSMarker locate a literal stop-token in the text, if one is
+	// visible — see eosMarkers. -1 when none is.
+	EOSByte   int
+	EOSMarker string
+	// CleanAfter is how many runes of clean text follow the LAST bad rune.
+	// This is the discriminator that matters under ignore_eos: a model
+	// generating past its natural stop babbles to the END of its budget, so
+	// tail garbage with nothing clean after it is the harness's own doing,
+	// while corruption with real prose resuming after it cannot be explained
+	// that way and points at the serving stack.
+	CleanAfter int
 	// Excerpt is the printable neighbourhood of the first bad rune, so the
 	// on-screen line shows the corruption in context instead of a number.
 	Excerpt string
 }
+
+// tailBabble reports whether the garbage runs to (nearly) the end of the
+// response — the shape generation-past-EOS produces. The 24-rune allowance
+// covers a trailing quote or newline the decoder emitted after the last bad
+// rune.
+func (g garbageReport) tailBabble() bool { return g.bad() && g.CleanAfter <= 24 }
 
 func (g garbageReport) bad() bool { return g.Replacement+g.Nul+g.Control > 0 }
 
@@ -125,8 +146,10 @@ func (g garbageReport) bad() bool { return g.Replacement+g.Nul+g.Control > 0 }
 // cooperation from the model and have no innocent cause — it just stops
 // discarding the details.
 func classifyGarbage(resp string) garbageReport {
-	g := garbageReport{FirstOffset: -1}
+	g := garbageReport{FirstOffset: -1, LastOffset: -1, FirstByte: -1, EOSByte: -1}
 	runes := []rune(resp)
+	g.TotalRunes = len(runes)
+	byteIdx := 0
 	for i, r := range runes {
 		bad := false
 		switch {
@@ -140,19 +163,55 @@ func classifyGarbage(resp string) garbageReport {
 			g.Control++
 			bad = true
 		}
-		if bad && g.FirstOffset < 0 {
-			g.FirstOffset = i
-			lo, hi := i-24, i+24
-			if lo < 0 {
-				lo = 0
+		if bad {
+			g.LastOffset = i
+			if g.FirstOffset < 0 {
+				g.FirstOffset = i
+				g.FirstByte = byteIdx
+				lo, hi := i-24, i+24
+				if lo < 0 {
+					lo = 0
+				}
+				if hi > len(runes) {
+					hi = len(runes)
+				}
+				g.Excerpt = fmt.Sprintf("%q", string(runes[lo:hi]))
 			}
-			if hi > len(runes) {
-				hi = len(runes)
-			}
-			g.Excerpt = fmt.Sprintf("%q", string(runes[lo:hi]))
 		}
+		byteIdx += len(string(r))
+	}
+	if g.LastOffset >= 0 {
+		g.CleanAfter = g.TotalRunes - g.LastOffset - 1
+	}
+	if pos, marker := eosMarker(resp); pos >= 0 {
+		g.EOSByte, g.EOSMarker = pos, marker
 	}
 	return g
+}
+
+// eosMarkers are stop tokens that decode to a visible literal when generation
+// is forced past them. Under ignore_eos the engine samples the stop token,
+// declines to stop, and the decoder renders it into the text — observed
+// verbatim with DeepSeek's <｜end▁of▁sentence｜> immediately preceding the
+// babble. Its position is the natural end of the response, which no client-side
+// heuristic could otherwise locate.
+var eosMarkers = []string{
+	"<｜end▁of▁sentence｜>", // DeepSeek
+	"<|end▁of▁sentence|>", // DeepSeek, ASCII-pipe variant
+	"<|endoftext|>",       // GPT family
+	"<|eot_id|>",          // Llama 3
+	"<|im_end|>",          // ChatML
+	"</s>",                // Llama 2 / Mistral
+}
+
+func eosMarker(resp string) (int, string) {
+	best, which := -1, ""
+	for _, m := range eosMarkers {
+		if i := strings.Index(resp, m); i >= 0 && (best < 0 || i < best) {
+			best, which = i, m
+		}
+	}
+	return best, which
 }
 
 // responseIsGarbage reports decode-level corruption in a response: replacement

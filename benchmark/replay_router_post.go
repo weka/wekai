@@ -829,12 +829,35 @@ func (p *replayPoster) do(
 		m.LeakedUUIDs = findLeakedUUIDs(m.Response, "", own, p.registry)
 		if g := classifyGarbage(m.Response); g.bad() {
 			m.ResponseGarbage = true
-			// Printed as it happens, not just counted: 338 in a summary is a
-			// number, one line per event with the bytes in context is
-			// something the detector can be tuned against.
+			// Printed as it happens, not just counted — and situated, because
+			// under ignore_eos most garbage is the harness's own doing. The
+			// engine samples the stop token, is told not to stop, and babbles
+			// to the end of the budget; that babble is expected and says
+			// nothing about the fleet. What CAN'T be explained that way is
+			// corruption with clean prose resuming after it, so the verdict
+			// separates the two, and the guid positions say whether the
+			// answer was already complete before the noise began.
+			guidsBefore, guidsAsked := 0, 0
+			if inj != nil {
+				guidsAsked = len(inj.ReciteUUIDs)
+				for _, u := range inj.ReciteUUIDs {
+					if i := strings.Index(m.Response, u); i >= 0 && i+len(u) <= g.FirstByte {
+						guidsBefore++
+					}
+				}
+			}
+			verdict := "MID-RESPONSE (clean text resumes after — not explainable by ignore_eos)"
+			switch {
+			case g.EOSByte >= 0 && g.EOSByte <= g.FirstByte:
+				verdict = fmt.Sprintf("post-EOS (literal %q at byte %d precedes the garbage; ignore_eos continuation)", g.EOSMarker, g.EOSByte)
+			case g.tailBabble():
+				verdict = "tail babble to end of budget (no visible EOS marker; consistent with generation past natural stop)"
+			}
 			fmt.Fprintf(os.Stderr,
-				"[verify] GARBAGE series=%d turn=%d session=%s instance=%s: %d\u00d7U+FFFD %d\u00d7NUL %d\u00d7ctrl at rune %d, context %s\n",
-				seriesNum, turnIdx, sessionID, instanceID, g.Replacement, g.Nul, g.Control, g.FirstOffset, g.Excerpt)
+				"[verify] GARBAGE series=%d turn=%d session=%s instance=%s: %d\u00d7U+FFFD %d\u00d7NUL %d\u00d7ctrl runes %d..%d of %d, clean-after=%d, guids-before-garbage=%d/%d, context %s\n"+
+					"[verify]   verdict: %s\n",
+				seriesNum, turnIdx, sessionID, instanceID, g.Replacement, g.Nul, g.Control,
+				g.FirstOffset, g.LastOffset, g.TotalRunes, g.CleanAfter, guidsBefore, guidsAsked, g.Excerpt, verdict)
 		}
 		if len(m.LeakedUUIDs) > 0 {
 			p.reportContamination(m.LeakedUUIDs, inj, su, seriesNum, sessionID, instanceID, turnIdx, st)
