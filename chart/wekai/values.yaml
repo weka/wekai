@@ -31,6 +31,24 @@ model: ""
 duration: "8h"
 
 # Advanced/optional replay knobs — sane defaults, rarely need changing.
+# ── Coherency verification (--verify) ────────────────────────────────────────
+# Injects one deterministic marker per user turn, asks responses to recite a
+# window of them, and scans every response for a marker it never sent. The run
+# STOPS on the first cross-contamination event (opt out below). Verify runs
+# drop vLLM's ignore_eos so responses are genuine text: output conformity dips
+# to ~90% (reported as outconf= on the progress line) instead of ignore_eos's
+# padded 100%.
+verify:
+  enabled: false
+  # forceEos keeps ignore_eos on even under verify — deterministic output
+  # volume at the cost of padding every response past its natural stop with
+  # the degenerate text the coherency check exists to notice.
+  forceEos: false
+  # continueOnContamination keeps the run going after a leaked marker instead
+  # of stopping. Either way the event prints in full with a copy-pastable
+  # repro (--replay-series-indices of both sessions involved).
+  continueOnContamination: false
+
 replay:
   replayFile: /wekai/replay.jsonl  # path baked into the image by the Dockerfile
   replayRoles: ""          # comma-separated instance roles to replay (empty = all)

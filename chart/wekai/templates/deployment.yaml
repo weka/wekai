@@ -41,6 +41,15 @@ spec:
                 {{- if .Values.duration }}
                 --timeout={{ .Values.duration }} \
                 {{- end }}
+                {{- if .Values.verify.enabled }}
+                --verify \
+                {{- if .Values.verify.forceEos }}
+                --verify-force-eos \
+                {{- end }}
+                {{- if .Values.verify.continueOnContamination }}
+                --verify-continue-on-contamination \
+                {{- end }}
+                {{- end }}
                 {{- if .Values.replay.replayRoles }}
                 --router-replay-roles={{ .Values.replay.replayRoles }} \
                 {{- end }}

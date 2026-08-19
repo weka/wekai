@@ -622,6 +622,9 @@ func TestRenderedArgvHasNoBrokenContinuations(t *testing.T) {
 		{"realtime with cap", []string{"--set", "replay.realtime=true", "--set", "replay.concurrencyCap=512"}},
 		{"realtime with metrics urls", []string{"--set", "replay.realtime=true", "--set", "replay.vllmMetricsUrls={http://r:29000}"}},
 		{"dry run", []string{"--set", "replay.dryRun=true"}},
+		{"verify", []string{"--set", "verify.enabled=true"}},
+		{"verify with overrides", []string{"--set", "verify.enabled=true",
+			"--set", "verify.forceEos=true", "--set", "verify.continueOnContamination=true"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			lines := strings.Split(render(t, tc.args...), "\n")
@@ -719,5 +722,31 @@ func TestDefaultRealtimeRenderEmitsOnlyFlagsThatShippedWithIt(t *testing.T) {
 	}
 	if !seen["--replay-realtime"] {
 		t.Error("premise check: the realtime render is missing --replay-realtime")
+	}
+}
+
+// TestVerifyFlagsRenderOnlyWhenEnabled: verify.forceEos and
+// verify.continueOnContamination are sub-options of verify.enabled — rendered
+// alone they would either fail the binary's startup validation
+// (--verify-force-eos without --verify) or silently change nothing, and a
+// chart must produce neither a crashing pod nor a value that lies about
+// having an effect.
+func TestVerifyFlagsRenderOnlyWhenEnabled(t *testing.T) {
+	out := render(t, "--set", "endpoint=http://x:8000")
+	if strings.Contains(out, "--verify") {
+		t.Error("verify flags rendered with verify.enabled=false")
+	}
+	out = render(t, "--set", "endpoint=http://x:8000", "--set", "verify.forceEos=true",
+		"--set", "verify.continueOnContamination=true")
+	if strings.Contains(out, "--verify") {
+		t.Error("verify sub-options rendered without verify.enabled; --verify-force-eos alone " +
+			"fails the binary's startup validation")
+	}
+	out = render(t, "--set", "endpoint=http://x:8000", "--set", "verify.enabled=true")
+	if !strings.Contains(out, "--verify \\") && !strings.Contains(out, "--verify \\\n") && !strings.Contains(out, "--verify ") {
+		t.Errorf("verify.enabled=true did not render --verify:\n%s", out)
+	}
+	if strings.Contains(out, "--verify-force-eos") {
+		t.Error("forceEos rendered without being set")
 	}
 }
