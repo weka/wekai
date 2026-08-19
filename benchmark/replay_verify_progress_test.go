@@ -61,10 +61,34 @@ func TestProgressLineVerifySegment(t *testing.T) {
 		s := base()
 		s.verifyOn = true
 		s.verifyChecks, s.verifyFound = 100, 90
-		s.verifyLeaked, s.verifyGarbage, s.verifyAbsent = 1, 2, 3
+		s.verifyLeaked, s.verifyAbsent = 1, 3
+		s.verifyGarbage = 7
+		s.verifyGarbagePostEOS, s.verifyGarbageTail, s.verifyGarbageBabble, s.verifyGarbageMid = 3, 1, 1, 2
 		line := renderModelOneLiner(s)
+		if !strings.Contains(line, "gbg(eos=3 tail=1 babble=1 mid=2)") {
+			t.Errorf("want the garbage classes inline in:\n%s", line)
+		}
 		if !strings.Contains(line, "BAD(leak=1 garbage=2 lost=3)") {
-			t.Errorf("want BAD(leak=1 garbage=2 lost=3) in:\n%s", line)
+			t.Errorf("BAD must carry only the UNEXPLAINED garbage (mid=2), not the ignore_eos "+
+				"classes:\n%s", line)
+		}
+	})
+
+	t.Run("harness-explained garbage alone does not raise BAD", func(t *testing.T) {
+		// A fleet whose only garbage is the model being forced past its stop
+		// is behaving; the classes show it, and BAD stays silent so a clean
+		// run under ignore_eos still reads clean at a glance.
+		s := base()
+		s.verifyOn = true
+		s.verifyChecks, s.verifyFound = 100, 100
+		s.verifyGarbage = 5
+		s.verifyGarbagePostEOS = 5
+		line := renderModelOneLiner(s)
+		if !strings.Contains(line, "gbg(eos=5 tail=0 babble=0 mid=0)") {
+			t.Errorf("classes missing:\n%s", line)
+		}
+		if strings.Contains(line, "BAD(") {
+			t.Errorf("BAD raised for garbage the run's own setting explains:\n%s", line)
 		}
 	})
 

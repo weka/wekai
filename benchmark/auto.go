@@ -1253,34 +1253,41 @@ type displaySnapshot struct {
 	// --verify live counters for the progress line. verifyOn distinguishes
 	// "verification disabled" from "enabled but nothing scored yet", which
 	// would otherwise both render as nothing.
-	verifyOn          bool
-	verifyChecks      int64
-	verifyFound       int64
-	verifyLeaked      int64
-	verifyGarbage     int64
-	verifyAbsent      int64 // all-time local hit rate (non-cold / total non-error)
-	reqPerSec         float64
-	inputTokPerSec    float64
-	outputTokPerSec   float64
-	allTimePeakRPS    float64
-	allTimePeakConc   int
-	allTimePeakSeries int
-	ttftP50           time.Duration
-	ttftP95           time.Duration
-	ttftCutoff        time.Duration // degradation cutoff = earlyColdBaseline * factor
-	ttftDegradedCount int64         // requests disqualified by TTFT cutoff
-	totalCompleted    int64
-	totalErrors       int64
-	totalRetries429   int64
-	totalRetryWait    time.Duration
-	elapsed           time.Duration
-	cacheWarning      bool
-	bothDone          bool
-	termReason        string // non-empty when model benchmark has finished
-	gateActive        int
-	gateColdWaiting   int
-	gateNormalWait    int
-	gateHotActive     int // active slots in the hot-pool gate (non-zero only with hot-series-concurrency)
+	verifyOn      bool
+	verifyChecks  int64
+	verifyFound   int64
+	verifyLeaked  int64
+	verifyGarbage int64
+	verifyAbsent  int64
+	// Garbage by class, so a running comparison across fleets does not need
+	// the summary or a scroll through per-event lines. Only mid-response is
+	// an alarm; the others are the run's own ignore_eos at work.
+	verifyGarbagePostEOS int64
+	verifyGarbageTail    int64
+	verifyGarbageBabble  int64
+	verifyGarbageMid     int64
+	reqPerSec            float64
+	inputTokPerSec       float64
+	outputTokPerSec      float64
+	allTimePeakRPS       float64
+	allTimePeakConc      int
+	allTimePeakSeries    int
+	ttftP50              time.Duration
+	ttftP95              time.Duration
+	ttftCutoff           time.Duration // degradation cutoff = earlyColdBaseline * factor
+	ttftDegradedCount    int64         // requests disqualified by TTFT cutoff
+	totalCompleted       int64
+	totalErrors          int64
+	totalRetries429      int64
+	totalRetryWait       time.Duration
+	elapsed              time.Duration
+	cacheWarning         bool
+	bothDone             bool
+	termReason           string // non-empty when model benchmark has finished
+	gateActive           int
+	gateColdWaiting      int
+	gateNormalWait       int
+	gateHotActive        int // active slots in the hot-pool gate (non-zero only with hot-series-concurrency)
 	// gateDispatched is requests whose HTTP exchange is actually open. gateActive
 	// counts gate slots, which are held from before the body is built until after
 	// the response is consumed, so the difference is the client's own prep and
@@ -1541,9 +1548,18 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 			rate = 100 * float64(snap.verifyFound) / float64(snap.verifyChecks)
 		}
 		verifyInfo = fmt.Sprintf(" guid=%.1f%%", rate)
-		if snap.verifyLeaked > 0 || snap.verifyGarbage > 0 || snap.verifyAbsent > 0 {
+		// Garbage renders as its classes, not its total. The total mixes the
+		// run's own ignore_eos babble with real corruption, and a line meant
+		// for at-a-glance cross-run comparison must not require mental
+		// subtraction: eos/tail/babble track the model being forced past its
+		// stop; mid is the only one that belongs in BAD.
+		if snap.verifyGarbage > 0 {
+			verifyInfo += fmt.Sprintf(" gbg(eos=%d tail=%d babble=%d mid=%d)",
+				snap.verifyGarbagePostEOS, snap.verifyGarbageTail, snap.verifyGarbageBabble, snap.verifyGarbageMid)
+		}
+		if snap.verifyLeaked > 0 || snap.verifyGarbageMid > 0 || snap.verifyAbsent > 0 {
 			verifyInfo += fmt.Sprintf(" BAD(leak=%d garbage=%d lost=%d)",
-				snap.verifyLeaked, snap.verifyGarbage, snap.verifyAbsent)
+				snap.verifyLeaked, snap.verifyGarbageMid, snap.verifyAbsent)
 		}
 	}
 	if snap.termReason != "" {
@@ -1843,6 +1859,10 @@ func runSingleModelBenchmark(
 			snap.verifyLeaked = st.valCrossContamUUIDs.Load()
 			snap.verifyGarbage = st.valGarbageReqs.Load()
 			snap.verifyAbsent = st.valMissAbsent.Load()
+			snap.verifyGarbagePostEOS = st.valGarbagePostEOS.Load()
+			snap.verifyGarbageTail = st.valGarbageTail.Load()
+			snap.verifyGarbageBabble = st.valGarbageGuidBabble.Load()
+			snap.verifyGarbageMid = st.valGarbageMidResponse.Load()
 		}
 		display.updateSnapshot(snap)
 		sendSnap(snap)
@@ -2999,6 +3019,10 @@ func runSingleModelBenchmark(
 			finalSnap.verifyLeaked = st.valCrossContamUUIDs.Load()
 			finalSnap.verifyGarbage = st.valGarbageReqs.Load()
 			finalSnap.verifyAbsent = st.valMissAbsent.Load()
+			finalSnap.verifyGarbagePostEOS = st.valGarbagePostEOS.Load()
+			finalSnap.verifyGarbageTail = st.valGarbageTail.Load()
+			finalSnap.verifyGarbageBabble = st.valGarbageGuidBabble.Load()
+			finalSnap.verifyGarbageMid = st.valGarbageMidResponse.Load()
 		}
 		// Populate token totals on the DONE snap (previously left zero, which
 		// showed up as in=0 warm=0 out=0 on the final rendered line).
