@@ -69,7 +69,7 @@ func TestProgressLineVerifySegment(t *testing.T) {
 			t.Errorf("want the garbage classes inline in:\n%s", line)
 		}
 		// tail+babble+mid = 1+1+2: everything except the proven post-EOS class.
-		if !strings.Contains(line, "BAD(leak=1 gbg-noneos=4 lost=3)") {
+		if !strings.Contains(line, "BAD(leak=1 garbage=4 lost=3)") {
 			t.Errorf("BAD must carry all garbage except the proven post-EOS class:\n%s", line)
 		}
 	})
@@ -102,7 +102,7 @@ func TestProgressLineVerifySegment(t *testing.T) {
 		s.verifyGarbage = 3
 		s.verifyGarbageTail = 3
 		line := renderModelOneLiner(s)
-		if !strings.Contains(line, "BAD(leak=0 gbg-noneos=3 lost=0)") {
+		if !strings.Contains(line, "BAD(leak=0 garbage=3 lost=0)") {
 			t.Errorf("tail garbage must count as BAD:\n%s", line)
 		}
 	})

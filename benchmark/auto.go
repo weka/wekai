@@ -1579,13 +1579,16 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 			verifyInfo += fmt.Sprintf(" gbg(eos=%d tail=%d babble=%d mid=%d)",
 				snap.verifyGarbagePostEOS, snap.verifyGarbageTail, snap.verifyGarbageBabble, snap.verifyGarbageMid)
 		}
-		gbgNonEOS := snap.verifyGarbage - snap.verifyGarbagePostEOS
-		if snap.verifyLeaked > 0 || gbgNonEOS > 0 || snap.verifyAbsent > 0 {
-			// gbg-noneos = tail+babble+mid, everything the gbg(...) block
-			// shows except eos — named so the arithmetic is checkable on the
-			// line itself.
-			verifyInfo += fmt.Sprintf(" BAD(leak=%d gbg-noneos=%d lost=%d)",
-				snap.verifyLeaked, gbgNonEOS, snap.verifyAbsent)
+		badGarbage := snap.verifyGarbage - snap.verifyGarbagePostEOS
+		if snap.verifyLeaked > 0 || badGarbage > 0 || snap.verifyAbsent > 0 {
+			// garbage here excludes the proven post-EOS class — the one with
+			// an explanation. The plain name is safe because a default verify
+			// run has no ignore_eos and so CANNOT produce that class: the
+			// number equals total garbage. Only under --verify-force-eos can
+			// the two diverge, and there the gbg(...) block beside it shows
+			// the eos count the arithmetic excludes.
+			verifyInfo += fmt.Sprintf(" BAD(leak=%d garbage=%d lost=%d)",
+				snap.verifyLeaked, badGarbage, snap.verifyAbsent)
 		}
 	}
 	if snap.termReason != "" {
