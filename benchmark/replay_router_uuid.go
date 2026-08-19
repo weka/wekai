@@ -152,7 +152,17 @@ const reciteTokensPerID = 20
 
 // reciteMaxRecent caps how many recent turns join the first one, so the ask
 // stays bounded on a session hundreds of turns deep.
-const reciteMaxRecent = 10
+//
+// 39 (a 40-id window with the pinned first turn) rather than the earlier 10:
+// every recited id is a probe into a distinct region of the KV prefix, so a
+// wider window covers four times the places corruption could surface per
+// response. The budget arithmetic keeps it honest — at ~20 tokens per id a
+// full window only happens on requests whose captured output budget clears
+// ~900 tokens, and anything smaller degrades to what fits rather than
+// forcing the ask. The cost is model effort: recalling 40 ids is harder than
+// 10, so presence dips on weaker models raise the ask-quality counters, and
+// those say prompt, not fleet, by design.
+const reciteMaxRecent = 39
 
 // reciteCapacity answers how many ids this request can be asked for, given the
 // output budget the CAPTURE recorded for it.

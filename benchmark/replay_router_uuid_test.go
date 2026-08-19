@@ -273,7 +273,7 @@ func visibleTurnsRequestBudget(n, outputTokens int) RouterReplayRequest {
 // reciteMaxRecent — and that StampByHash always covers EVERY visible turn,
 // not just the window, so an unrecited turn still keeps its identity in KV.
 func TestBuildInjectionWindowSelection(t *testing.T) {
-	p, su := newFixturePoster(14, "fixture")
+	p, su := newFixturePoster(44, "fixture")
 
 	for _, c := range []struct {
 		turn       int      // 1-based "current turn" being requested
@@ -284,10 +284,19 @@ func TestBuildInjectionWindowSelection(t *testing.T) {
 		{3, []string{"turn-1", "turn-2"}},
 		{4, []string{"turn-1", "turn-2", "turn-3"}},
 		{6, []string{"turn-1", "turn-2", "turn-3", "turn-4", "turn-5"}},
+		// Below the cap everything visible except the current turn is asked.
+		{13, []string{"turn-1", "turn-2", "turn-3", "turn-4", "turn-5", "turn-6",
+			"turn-7", "turn-8", "turn-9", "turn-10", "turn-11", "turn-12"}},
 		// Past the cap the first turn stays pinned and the oldest middle
-		// turns fall out, so coverage keeps sliding forward.
-		{13, []string{"turn-1", "turn-3", "turn-4", "turn-5", "turn-6", "turn-7",
-			"turn-8", "turn-9", "turn-10", "turn-11", "turn-12"}},
+		// turns fall out, so coverage keeps sliding forward: at turn 43 the
+		// 39 most recent (turns 4..42) join the pinned turn-1.
+		{43, func() []string {
+			w := []string{"turn-1"}
+			for i := 4; i <= 42; i++ {
+				w = append(w, fmt.Sprintf("turn-%d", i))
+			}
+			return w
+		}()},
 	} {
 		t.Run(fmt.Sprintf("turn-%d", c.turn), func(t *testing.T) {
 			req := visibleTurnsRequest(c.turn)
