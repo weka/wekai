@@ -118,10 +118,15 @@ type garbageReport struct {
 	TotalRunes  int // response length, so the offsets read as positions
 	FirstByte   int // byte offset of the first bad rune, for substring-position comparisons
 	LastByte    int // byte offset just past the last bad rune, where the tail begins
-	// EOSByte/EOSMarker locate a literal stop-token in the text, if one is
-	// visible — see eosMarkers. -1 when none is.
+	// EOSByte/EOSMarker locate the FIRST literal stop-token in the text, if
+	// any is visible — see eosMarkers. -1 when none is. EOSCount is how many
+	// appear in total: under ignore_eos a model can stop, be forced onward,
+	// and stop again, so one response may carry several — and an excerpt
+	// around the garbage can show a LATER one than the verdict names, which
+	// reads as a contradiction unless the count says otherwise.
 	EOSByte   int
 	EOSMarker string
+	EOSCount  int
 	// CleanAfter is how many runes of clean text follow the LAST bad rune.
 	// This is the discriminator that matters under ignore_eos: a model
 	// generating past its natural stop babbles to the END of its budget, so
@@ -187,6 +192,9 @@ func classifyGarbage(resp string) garbageReport {
 	}
 	if pos, marker := eosMarker(resp); pos >= 0 {
 		g.EOSByte, g.EOSMarker = pos, marker
+		for _, m := range eosMarkers {
+			g.EOSCount += strings.Count(resp, m)
+		}
 	}
 	return g
 }

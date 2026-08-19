@@ -100,6 +100,18 @@ func TestClassifyGarbagePositions(t *testing.T) {
 			t.Errorf("EOS at byte %d should precede the first bad rune at byte %d", g.EOSByte, g.FirstByte)
 		}
 	})
+	t.Run("repeated stop attempts are counted", func(t *testing.T) {
+		// The observed shape: answer, EOS, forced continuation, EOS again,
+		// garbage. The verdict names the first; the count explains why the
+		// excerpt can show a different one.
+		g := classifyGarbage("guid<｜end▁of▁sentence｜>中文继续<｜end▁of▁sentence｜>\uFFFD more")
+		if g.EOSCount != 2 {
+			t.Errorf("EOSCount = %d, want 2", g.EOSCount)
+		}
+		if g.EOSByte != 4 {
+			t.Errorf("EOSByte = %d, want the FIRST marker's position (4)", g.EOSByte)
+		}
+	})
 	t.Run("tail babble runs to the end", func(t *testing.T) {
 		g := classifyGarbage("coherent prose then \uFFFD\t\uFFFD\t\uFFFD\t")
 		if !g.tailBabble() {

@@ -850,7 +850,7 @@ func (p *replayPoster) do(
 			m.GarbageVerdict = "mid_response"
 			switch {
 			case g.EOSByte >= 0 && g.EOSByte <= g.FirstByte:
-				verdict = fmt.Sprintf("post-EOS (literal %q at byte %d precedes the garbage; ignore_eos continuation)", g.EOSMarker, g.EOSByte)
+				verdict = fmt.Sprintf("post-EOS (%d stop attempt(s), first %q at byte %d; ignore_eos continuation)", g.EOSCount, g.EOSMarker, g.EOSByte)
 				m.GarbageVerdict = "post_eos"
 			case g.tailBabble():
 				verdict = "tail babble to end of budget (no visible EOS marker; consistent with generation past natural stop)"
