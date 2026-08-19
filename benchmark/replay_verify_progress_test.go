@@ -68,15 +68,17 @@ func TestProgressLineVerifySegment(t *testing.T) {
 		if !strings.Contains(line, "gbg(eos=3 tail=1 babble=1 mid=2)") {
 			t.Errorf("want the garbage classes inline in:\n%s", line)
 		}
-		if !strings.Contains(line, "BAD(leak=1 gbg-mid=2 lost=3)") {
-			t.Errorf("BAD must repeat gbg's mid term under the same name, not the total:\n%s", line)
+		// tail+babble+mid = 1+1+2: everything except the proven post-EOS class.
+		if !strings.Contains(line, "BAD(leak=1 gbg-noneos=4 lost=3)") {
+			t.Errorf("BAD must carry all garbage except the proven post-EOS class:\n%s", line)
 		}
 	})
 
-	t.Run("harness-explained garbage alone does not raise BAD", func(t *testing.T) {
-		// A fleet whose only garbage is the model being forced past its stop
-		// is behaving; the classes show it, and BAD stays silent so a clean
-		// run under ignore_eos still reads clean at a glance.
+	t.Run("proven post-EOS garbage alone does not raise BAD", func(t *testing.T) {
+		// Only the class with proof is excluded: a visible stop token before
+		// the corruption shows the model had finished and ignore_eos pushed
+		// it onward. A run whose only garbage is that stays clean at a
+		// glance.
 		s := base()
 		s.verifyOn = true
 		s.verifyChecks, s.verifyFound = 100, 100
@@ -87,7 +89,21 @@ func TestProgressLineVerifySegment(t *testing.T) {
 			t.Errorf("classes missing:\n%s", line)
 		}
 		if strings.Contains(line, "BAD(") {
-			t.Errorf("BAD raised for garbage the run's own setting explains:\n%s", line)
+			t.Errorf("BAD raised for provably post-EOS garbage:\n%s", line)
+		}
+	})
+
+	t.Run("unproven tail garbage raises BAD", func(t *testing.T) {
+		// tail merely RESEMBLES the post-EOS event; without the marker there
+		// is no proof, and corruption without an explanation is bad.
+		s := base()
+		s.verifyOn = true
+		s.verifyChecks, s.verifyFound = 100, 100
+		s.verifyGarbage = 3
+		s.verifyGarbageTail = 3
+		line := renderModelOneLiner(s)
+		if !strings.Contains(line, "BAD(leak=0 gbg-noneos=3 lost=0)") {
+			t.Errorf("tail garbage must count as BAD:\n%s", line)
 		}
 	})
 

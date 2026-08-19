@@ -846,14 +846,14 @@ func (p *replayPoster) do(
 					}
 				}
 			}
-			verdict := "MID-RESPONSE (clean, non-babble text resumes after — not explainable by ignore_eos)"
+			verdict := "MID-RESPONSE (ordinary text resumes after the corruption)"
 			m.GarbageVerdict = "mid_response"
 			switch {
 			case g.EOSByte >= 0 && g.EOSByte <= g.FirstByte:
 				verdict = fmt.Sprintf("post-EOS (%d stop attempt(s), first %q at byte %d; ignore_eos continuation)", g.EOSCount, g.EOSMarker, g.EOSByte)
 				m.GarbageVerdict = "post_eos"
 			case g.tailBabble():
-				verdict = "tail babble to end of budget (no visible EOS marker; consistent with generation past natural stop)"
+				verdict = "tail garbage to end of budget (no visible stop token — resembles post-stop babble but carries no proof)"
 				m.GarbageVerdict = "tail_babble"
 			default:
 				// "Clean text after" only means DECODABLE text after. A model
@@ -862,7 +862,7 @@ func (p *replayPoster) do(
 				// recombined uuid fragments earning the MID-RESPONSE verdict.
 				// Novel guid-density in the tail reclassifies it.
 				if tg, tn, dense := tailGuidBabble(m.Response[g.LastByte:], own); dense {
-					verdict = fmt.Sprintf("post-stop guid babble (tail holds %d guid-shaped strings, %d novel recombinations; consistent with ignore_eos continuation)", tg, tn)
+					verdict = fmt.Sprintf("guid-babble tail (%d guid-shaped strings, %d novel recombinations; no visible stop token — invention, not content)", tg, tn)
 					m.GarbageVerdict = "guid_babble"
 				}
 			}

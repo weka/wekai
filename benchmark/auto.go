@@ -1444,17 +1444,16 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		// ratio above is describing the instruction, not the fleet.
 		fmt.Printf("   Ask quality: responses echoing tags  : %d\n", res.valEchoedTagsReqs)
 		fmt.Printf("   Ask quality: responses with no ids   : %d\n", res.valNoIDsReqs)
-		// The classes matter more than the total: the first three are the
-		// run's own ignore_eos setting at work — the model forced past its
-		// stop — and only mid-response is corruption that setting cannot
-		// explain. A total that summed them was read as an alarm 338 strong
-		// when nearly all of it was the harness's own doing.
+		// Only post-EOS has an explanation: the stop token is visible, so the
+		// garbage is provably the model forced past its finish. tail and
+		// babble resemble that event but carry no proof, and mid does not
+		// even resemble it — all three are bad, in different ways.
 		fmt.Printf("   Garbage responses (decode corruption): %d\n", res.valGarbageReqs)
 		if res.valGarbageReqs > 0 {
-			fmt.Printf("     post-EOS (stop token visible)      : %d\n", res.valGarbagePostEOS)
-			fmt.Printf("     tail babble to end of budget       : %d\n", res.valGarbageTail)
-			fmt.Printf("     post-stop guid babble              : %d\n", res.valGarbageGuidBabble)
-			fmt.Printf("     MID-RESPONSE (unexplained)         : %d\n", res.valGarbageMidResponse)
+			fmt.Printf("     post-EOS (proven: stop token seen) : %d\n", res.valGarbagePostEOS)
+			fmt.Printf("     tail garbage (no proof)            : %d\n", res.valGarbageTail)
+			fmt.Printf("     guid-babble tail (no proof)        : %d\n", res.valGarbageGuidBabble)
+			fmt.Printf("     mid-response                       : %d\n", res.valGarbageMidResponse)
 		}
 		// Both denominators, because they are different populations: presence
 		// is scored only where a recite was asked, contamination on every
@@ -1548,22 +1547,22 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 			rate = 100 * float64(snap.verifyFound) / float64(snap.verifyChecks)
 		}
 		verifyInfo = fmt.Sprintf(" guid=%.1f%%", rate)
-		// Garbage renders as its classes, not its total. The total mixes the
-		// run's own ignore_eos babble with real corruption, and a line meant
-		// for at-a-glance cross-run comparison must not require mental
-		// subtraction: eos/tail/babble track the model being forced past its
-		// stop; mid is the only one that belongs in BAD.
+		// Garbage renders as its classes. Only post-EOS is excluded from BAD:
+		// a literal stop token before the corruption is proof the model had
+		// finished and ignore_eos pushed it onward. tail and babble merely
+		// SHAPE like that event — no marker means no proof, and corruption
+		// without an explanation is bad whatever it resembles.
 		if snap.verifyGarbage > 0 {
 			verifyInfo += fmt.Sprintf(" gbg(eos=%d tail=%d babble=%d mid=%d)",
 				snap.verifyGarbagePostEOS, snap.verifyGarbageTail, snap.verifyGarbageBabble, snap.verifyGarbageMid)
 		}
-		if snap.verifyLeaked > 0 || snap.verifyGarbageMid > 0 || snap.verifyAbsent > 0 {
-			// gbg-mid, not "garbage": it is the SAME number as gbg(...)'s mid
-			// term, repeated here because BAD is the at-a-glance aggregate —
-			// and a different name for the same count read as a different
-			// count.
-			verifyInfo += fmt.Sprintf(" BAD(leak=%d gbg-mid=%d lost=%d)",
-				snap.verifyLeaked, snap.verifyGarbageMid, snap.verifyAbsent)
+		gbgNonEOS := snap.verifyGarbage - snap.verifyGarbagePostEOS
+		if snap.verifyLeaked > 0 || gbgNonEOS > 0 || snap.verifyAbsent > 0 {
+			// gbg-noneos = tail+babble+mid, everything the gbg(...) block
+			// shows except eos — named so the arithmetic is checkable on the
+			// line itself.
+			verifyInfo += fmt.Sprintf(" BAD(leak=%d gbg-noneos=%d lost=%d)",
+				snap.verifyLeaked, gbgNonEOS, snap.verifyAbsent)
 		}
 	}
 	if snap.termReason != "" {
