@@ -1558,7 +1558,11 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 				snap.verifyGarbagePostEOS, snap.verifyGarbageTail, snap.verifyGarbageBabble, snap.verifyGarbageMid)
 		}
 		if snap.verifyLeaked > 0 || snap.verifyGarbageMid > 0 || snap.verifyAbsent > 0 {
-			verifyInfo += fmt.Sprintf(" BAD(leak=%d garbage=%d lost=%d)",
+			// gbg-mid, not "garbage": it is the SAME number as gbg(...)'s mid
+			// term, repeated here because BAD is the at-a-glance aggregate —
+			// and a different name for the same count read as a different
+			// count.
+			verifyInfo += fmt.Sprintf(" BAD(leak=%d gbg-mid=%d lost=%d)",
 				snap.verifyLeaked, snap.verifyGarbageMid, snap.verifyAbsent)
 		}
 	}

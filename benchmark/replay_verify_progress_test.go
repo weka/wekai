@@ -68,9 +68,8 @@ func TestProgressLineVerifySegment(t *testing.T) {
 		if !strings.Contains(line, "gbg(eos=3 tail=1 babble=1 mid=2)") {
 			t.Errorf("want the garbage classes inline in:\n%s", line)
 		}
-		if !strings.Contains(line, "BAD(leak=1 garbage=2 lost=3)") {
-			t.Errorf("BAD must carry only the UNEXPLAINED garbage (mid=2), not the ignore_eos "+
-				"classes:\n%s", line)
+		if !strings.Contains(line, "BAD(leak=1 gbg-mid=2 lost=3)") {
+			t.Errorf("BAD must repeat gbg's mid term under the same name, not the total:\n%s", line)
 		}
 	})
 
