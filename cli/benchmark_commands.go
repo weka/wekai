@@ -291,8 +291,7 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		RouterReplayRoles:             c.RouterReplayRoles,
 		ReplayOutputRatio:             c.ReplayOutputRatio,
 		// Force-output (short continue-generating instruction + vLLM
-		// ignore_eos) is the default; --replay-natural-output opts out.
-		ReplayForceOutput:  !c.ReplayNaturalOutput,
+		ForceOutputRatio:   c.ForceOutputRatio,
 		DryRun:             c.DryRun,
 		DryRunColdTPS:      c.DryRunColdTPS,
 		DryRunWarmTPS:      c.DryRunWarmTPS,
@@ -307,6 +306,9 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 
 	if err := c.validateVerify(); err != nil {
 		return err
+	}
+	if c.ForceOutputRatio < 0 {
+		return fmt.Errorf("--force-output-ratio must be >= 0 (0 = engine-enforced via ignore_eos)")
 	}
 	if c.DryRun && c.RouterReplayFile == "" {
 		return fmt.Errorf("--dry-run requires --router-replay-file")

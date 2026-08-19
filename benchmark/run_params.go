@@ -60,7 +60,7 @@ type runParamsRecord struct {
 	RouterReplayFile  string  `json:"router_replay_file,omitempty"`
 	RouterReplayRoles string  `json:"router_replay_roles,omitempty"`
 	ReplayOutputRatio float64 `json:"replay_output_ratio,omitempty"`
-	ReplayForceOutput bool    `json:"replay_force_output,omitempty"`
+	ForceOutputRatio  float64 `json:"force_output_ratio,omitempty"`
 	FromDataset       string  `json:"from_dataset,omitempty"`
 	ReplaySeries      int     `json:"replay_series,omitempty"`
 
@@ -103,7 +103,7 @@ func buildRunParams(cfg AutoBenchmarkConfig, now time.Time) runParamsRecord {
 		RouterReplayFile:  cfg.RouterReplayFile,
 		RouterReplayRoles: cfg.RouterReplayRoles,
 		ReplayOutputRatio: cfg.ReplayOutputRatio,
-		ReplayForceOutput: cfg.ReplayForceOutput,
+		ForceOutputRatio:  cfg.ForceOutputRatio,
 		FromDataset:       cfg.FromDataset,
 		ReplaySeries:      cfg.ReplaySeries,
 

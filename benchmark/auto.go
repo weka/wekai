@@ -236,14 +236,16 @@ type AutoBenchmarkConfig struct {
 	// model stops almost immediately on replay — a ~500:1 input:output run).
 	// 0 = off (original precedence: output_tokens, then max_tokens, then 1).
 	ReplayOutputRatio float64
-	// ReplayForceOutput, when true (the default), forces the model to fill
-	// its max_tokens budget instead of stopping early: a short continue-
-	// generating instruction is appended (system block/message) AND, on the
-	// OpenAI/vLLM wire path, "ignore_eos": true is set on the request body.
-	// Without this, a retargeted --replay-output-ratio cap is a no-op — the
-	// model just stops at its natural response length. Disabled by
-	// --replay-natural-output (CLI layer sets ReplayForceOutput = !ReplayNaturalOutput).
-	ReplayForceOutput bool
+	// ForceOutputRatio selects HOW the captured output profile is enforced.
+	// 0 (the default): the engine enforces it — "ignore_eos": true on the
+	// vLLM wire path, so the budget is filled deterministically. Above 0:
+	// the PROMPT enforces it — no ignore_eos; each request's tail asks for
+	// ratio x the captured length in words, and max_tokens cuts the
+	// overshoot. Measured at 300 requests: ratio 2 holds 90.5% conformity
+	// against the engine's 100%, and is the tuned value — see
+	// replayLengthAsk for the curve. Either way the same instruction text
+	// rides in the prompt, so settings differ only by engine enforcement.
+	ForceOutputRatio float64
 
 	// Dry-run mode (router replay only): skip HTTP, drive with synthetic timing.
 	DryRun          bool
@@ -2003,7 +2005,7 @@ func runSingleModelBenchmark(
 			pp.outputRatio = cfg.ReplayOutputRatio
 			pp.limitContext = cfg.LimitContext
 			pp.replayCharsPerToken = cfg.ReplayCharsPerToken
-			pp.forceOutput = cfg.ReplayForceOutput
+			pp.forceRatio = cfg.ForceOutputRatio
 			// UUID cache-coherency injection (--verify). Same
 			// global/read-only refs set on the per-instance poster in
 			// replay_router.go — every poster in the run, per-instance or

@@ -64,12 +64,12 @@ type replayPoster struct {
 		outputTPS int
 	}
 
-	// outputRatio and forceOutput implement --replay-output-ratio /
-	// --replay-natural-output. Set directly on the poster after construction
+	// outputRatio and forceRatio implement --replay-output-ratio /
+	// --force-output-ratio. Set directly on the poster after construction
 	// (see runRouterReplayInstance) rather than threaded through
 	// newReplayPoster, to avoid touching its many existing call sites.
 	outputRatio float64
-	forceOutput bool
+	forceRatio  float64
 	// limitContext: skip requests whose capture-recorded prompt tokens exceed it
 	// (chars~=tokens*4 convention). 0 = off.
 	limitContext int
@@ -82,7 +82,7 @@ type replayPoster struct {
 
 	// UUID cache-coherency injection (--verify, router path —
 	// see replay_router_uuid.go). Set directly on the poster after
-	// construction, same rationale as outputRatio/forceOutput above.
+	// construction, same rationale as outputRatio/forceRatio above.
 	// uuidEnabled gates everything: false leaves do()/dryDo() byte-for-byte
 	// identical to before this feature existed.
 	//
@@ -582,9 +582,9 @@ func (p *replayPoster) do(
 	var err error
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken, inj)
+		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceRatio, p.replayCharsPerToken, inj)
 	default:
-		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken, inj)
+		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceRatio, p.replayCharsPerToken, inj)
 	}
 	// --limit-context uses the capture's production-measured token counts
 	// (usage.input_tokens + cache read/creation), not a chars heuristic:
@@ -1267,9 +1267,9 @@ func (p *replayPoster) dryDo(
 	var canonical string
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken, inj)
+		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceRatio, p.replayCharsPerToken, inj)
 	default:
-		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceOutput, p.replayCharsPerToken, inj)
+		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceRatio, p.replayCharsPerToken, inj)
 	}
 	var ratio float64
 	if p.estimator != nil {

@@ -28,12 +28,11 @@ import (
 	"strings"
 )
 
-// verboseOutputInstruction is appended as a system block/message when
-// force-output is in effect (the default; disabled by
-// --replay-natural-output). Retargeting max_tokens upward (e.g. via
-// --replay-output-ratio) is a no-op unless the model is actually nudged to
-// keep generating instead of stopping at its natural response length, so
-// this instruction is injected to make the cap load-bearing.
+// verboseOutputInstruction is appended as a system block/message in every
+// replay mode. Retargeting max_tokens upward (e.g. via --replay-output-ratio)
+// is a no-op unless the model is actually nudged to keep generating instead
+// of stopping at its natural response length, so this instruction is injected
+// to make the cap load-bearing.
 const verboseOutputInstruction = "Provide a thorough, detailed response and keep elaborating rather than stopping early."
 
 // replayLengthAsk names the CURRENT request's output budget to the model, in
@@ -45,21 +44,25 @@ const verboseOutputInstruction = "Provide a thorough, detailed response and keep
 // slot would fork every request's prefix at the top and destroy the replay's
 // sharing structure.
 //
-// The ask names TWICE the captured length (1 token ~ 0.75 English words, so
-// words = 1.5x tokens ~ 2x the true size). Overshooting is free — the server
-// clamps at max_tokens — and this model, like every variant measured, delivers
-// a consistent fraction of whatever figure it is given. The curve measured at
-// 300 requests: asking the exact length yields 84.8% conformity, twice yields
-// 90.5%, four times drops to 72.6% — a number too far past plausible gets
-// discounted the same way "write infinitely" does. Two is the peak.
+// The ask names ratio x the captured length (1 token ~ 0.75 English words,
+// so words = 0.75 x tokens x ratio). Overshooting is free — the server clamps
+// at max_tokens — and the model delivers a consistent fraction of whatever
+// figure it is given. The curve measured at 300 requests: ratio 1 (the exact
+// length) yields 84.8% conformity, ratio 2 yields 90.5%, ratio 4 drops to
+// 72.6% — a number too far past plausible gets discounted the same way
+// "write infinitely" does. Two is the peak, and the default the engine-forced
+// mode also sends so every setting emits byte-identical prompts.
 //
 // Below ~16 tokens no ask is made: "write about 6 words" reads as a trick,
 // and tiny budgets conform by clamping anyway.
-func replayLengthAsk(maxTokens int) string {
+func replayLengthAsk(maxTokens int, ratio float64) string {
 	if maxTokens < 16 {
 		return ""
 	}
-	words := maxTokens * 3 / 2
+	if ratio <= 0 {
+		ratio = 2
+	}
+	words := int(float64(maxTokens) * 0.75 * ratio)
 	return fmt.Sprintf("\n\nWrite a response of at least %d words. Keep elaborating with relevant"+
 		" detail until you reach that length — do not stop short of it.", words)
 }
@@ -73,7 +76,7 @@ func replayLengthAsk(maxTokens int) string {
 // inj carries the UUID cache-coherency injection (--verify,
 // router path — see replay_router_uuid.go); nil means "no injection",
 // leaving the body byte-for-byte identical to before this feature existed.
-func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
+func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceRatio float64, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
 	var stampByHash map[string]turnStamp
 	if inj != nil {
 		stampByHash = inj.StampByHash
@@ -127,7 +130,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 	if inj != nil {
 		tail = replayReciteWindowInstruction(inj.ReciteLabels)
 	}
-	tail += replayLengthAsk(pickMaxTokens(req, outputRatio))
+	tail += replayLengthAsk(pickMaxTokens(req, outputRatio), forceRatio)
 	if tail != "" {
 		msgs = appendTailMessageAnthropic(msgs, tail)
 	}
@@ -592,7 +595,7 @@ func buildOpenAITools(spec *RouterReplayToolsSpec, docs string, charsPerToken fl
 //
 // inj carries the UUID cache-coherency injection (--verify,
 // router path — see replay_router_uuid.go); nil means "no injection".
-func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceOutput bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
+func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceRatio float64, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
 	var stampByHash map[string]turnStamp
 	if inj != nil {
 		stampByHash = inj.StampByHash
@@ -639,20 +642,19 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		messages = append([]map[string]interface{}{stamp}, messages...)
 	}
 
-	// The keep-generating instruction rides in BOTH modes, so force and
-	// natural runs send byte-identical prompts and differ only by ignore_eos —
-	// which is exactly the comparison --replay-natural-output exists for: can
-	// the instruction alone hold output at the captured budget, with
-	// max_tokens as the cut, once the engine stops enforcing it.
+	// The keep-generating instruction rides at EVERY ratio, so engine-forced
+	// (ratio 0) and prompt-forced (ratio > 0) runs send byte-identical
+	// prompts and differ only by ignore_eos — the clean A/B for whether
+	// prompting alone can hold output at the captured budget.
 	messages = append(messages, map[string]interface{}{
 		"role":    "system",
 		"content": verboseOutputInstruction,
 	})
-	if forceOutput {
-		// vLLM ignores the stop token, so the (possibly retargeted) budget is
-		// filled deterministically. Applies to both --replay-output-ratio
-		// (cap = input*ratio) and the recorded-output path (cap = recorded
-		// output_tokens).
+	if forceRatio == 0 {
+		// Engine-forced (the default): vLLM ignores the stop token, so the
+		// (possibly retargeted) budget is filled deterministically. A ratio
+		// above zero hands the job to the prompt instead — measured at 90.5%
+		// conformity at ratio 2, against 100% here.
 		body["ignore_eos"] = true
 	}
 
@@ -671,7 +673,7 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 	if inj != nil {
 		tailAsk = replayReciteWindowInstruction(inj.ReciteLabels)
 	}
-	tailAsk += replayLengthAsk(pickMaxTokens(req, outputRatio))
+	tailAsk += replayLengthAsk(pickMaxTokens(req, outputRatio), forceRatio)
 	if tailAsk != "" {
 		messages = appendTailMessageOpenAI(messages, tailAsk)
 	}

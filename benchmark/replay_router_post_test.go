@@ -469,7 +469,7 @@ func TestOpenAIReplayToolTranslation(t *testing.T) {
 		},
 	}
 
-	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, 0, nil)
+	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, 2, 0, nil)
 	if err != nil {
 		t.Fatalf("buildOpenAIChatCompletionsBody: %v", err)
 	}
@@ -532,7 +532,7 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 				{Role: "user", Hash: "h1", Bytes: 50, BlockTypes: []string{"text"}},
 			},
 		}
-		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "run-42", 0, false, 0, nil)
+		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "run-42", 0, 2, 0, nil)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
@@ -561,7 +561,7 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 				{Role: "user", Hash: "h1", Bytes: 50, BlockTypes: []string{"text"}},
 			},
 		}
-		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, 0, nil)
+		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, 2, 0, nil)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
@@ -589,7 +589,7 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 				{Role: "user", Hash: "h1", Bytes: 50, BlockTypes: []string{"text"}},
 			},
 		}
-		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, 0, nil)
+		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, 2, 0, nil)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
@@ -615,7 +615,7 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 			Stream:       true,
 			OutputTokens: 100,
 		}
-		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, 0, nil)
+		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, 2, 0, nil)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
