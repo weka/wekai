@@ -80,12 +80,11 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 		systemArr = append([]map[string]interface{}{stamp}, systemArr...)
 	}
 
-	if forceOutput {
-		systemArr = append(systemArr, map[string]interface{}{
-			"type": "text",
-			"text": verboseOutputInstruction,
-		})
-	}
+	// Both modes carry the instruction — see the openai path's comment.
+	systemArr = append(systemArr, map[string]interface{}{
+		"type": "text",
+		"text": verboseOutputInstruction,
+	})
 	if len(systemArr) > 0 {
 		body["system"] = systemArr
 	}
@@ -607,18 +606,20 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		messages = append([]map[string]interface{}{stamp}, messages...)
 	}
 
+	// The keep-generating instruction rides in BOTH modes, so force and
+	// natural runs send byte-identical prompts and differ only by ignore_eos —
+	// which is exactly the comparison --replay-natural-output exists for: can
+	// the instruction alone hold output at the captured budget, with
+	// max_tokens as the cut, once the engine stops enforcing it.
+	messages = append(messages, map[string]interface{}{
+		"role":    "system",
+		"content": verboseOutputInstruction,
+	})
 	if forceOutput {
-		// Force the model to generate up to max_tokens: append a short
-		// continue-generating instruction as a system message AND set vLLM's
-		// ignore_eos (ignore the stop token) so the (possibly retargeted)
-		// output budget is actually filled — deterministic output length
-		// instead of the model stopping early. Applies to both
-		// --replay-output-ratio (cap = input*ratio) and the recorded-output
-		// path (cap = recorded output_tokens).
-		messages = append(messages, map[string]interface{}{
-			"role":    "system",
-			"content": verboseOutputInstruction,
-		})
+		// vLLM ignores the stop token, so the (possibly retargeted) budget is
+		// filled deterministically. Applies to both --replay-output-ratio
+		// (cap = input*ratio) and the recorded-output path (cap = recorded
+		// output_tokens).
 		body["ignore_eos"] = true
 	}
 

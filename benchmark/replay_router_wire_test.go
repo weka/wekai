@@ -38,8 +38,8 @@ func TestBuildAnthropicMessagesBodyRunGUIDStamp(t *testing.T) {
 	if !ok {
 		t.Fatal("system is not an array")
 	}
-	if len(sys) != 3 {
-		t.Fatalf("expected 3 system blocks with runID, got %d", len(sys))
+	if len(sys) != 4 {
+		t.Fatalf("expected 4 system blocks (runID + 2 + length instruction), got %d", len(sys))
 	}
 	sys0 := sys[0].(map[string]interface{})
 	if sys0["type"] != "text" {
@@ -64,8 +64,8 @@ func TestBuildAnthropicMessagesBodyRunGUIDStamp(t *testing.T) {
 	if !ok {
 		t.Fatal("system is not an array (empty runID)")
 	}
-	if len(sys) != 2 {
-		t.Fatalf("expected 2 system blocks with empty runID, got %d", len(sys))
+	if len(sys) != 3 {
+		t.Fatalf("expected 3 system blocks with empty runID (2 + length instruction), got %d", len(sys))
 	}
 	sys0Text, _ := sys[0].(map[string]interface{})["text"].(string)
 	if sys0Text == "<ignore>RUN_GUID: test-run-id</ignore>" {
@@ -85,8 +85,8 @@ func TestBuildAnthropicMessagesBodyRunGUIDStamp(t *testing.T) {
 	if !ok {
 		t.Fatal("system is not an array (0 system blocks)")
 	}
-	if len(sys) != 1 {
-		t.Fatalf("expected 1 system block (stamp only) with 0 system blocks, got %d", len(sys))
+	if len(sys) != 2 {
+		t.Fatalf("expected 2 system blocks (stamp + length instruction) with 0 captured blocks, got %d", len(sys))
 	}
 	sys0 = sys[0].(map[string]interface{})
 	if sys0["text"] != "<ignore>RUN_GUID: test-run-id</ignore>" {
@@ -274,12 +274,16 @@ func TestBuildAnthropicMessagesBodyForceOutput(t *testing.T) {
 	}
 
 	// --- force-output off (--replay-natural-output) ---
+	// The instruction rides in BOTH modes so the two send byte-identical
+	// prompts and differ only by ignore_eos: --replay-natural-output measures
+	// whether the instruction alone can hold output at the captured budget.
 	body, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, 0, nil)
 	if err != nil {
 		t.Fatalf("build (force-output off): %v", err)
 	}
-	if strings.Contains(string(body), verboseOutputInstruction) {
-		t.Error("continue-generating instruction present in body when forceOutput=false")
+	if !strings.Contains(string(body), verboseOutputInstruction) {
+		t.Error("continue-generating instruction missing when forceOutput=false; natural mode " +
+			"would then measure a model with no length nudge at all")
 	}
 
 	// --- force-output on (default) ---
@@ -327,7 +331,8 @@ func TestBuildOpenAIChatCompletionsBodyForceOutput(t *testing.T) {
 		},
 	}
 
-	// force-output off: neither ignore_eos nor the instruction in the body.
+	// force-output off: no ignore_eos, but the instruction still rides — the
+	// modes differ ONLY by engine enforcement.
 	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, 0, nil)
 	if err != nil {
 		t.Fatalf("build (force-output off): %v", err)
@@ -339,8 +344,8 @@ func TestBuildOpenAIChatCompletionsBodyForceOutput(t *testing.T) {
 	if _, ok := off["ignore_eos"]; ok {
 		t.Error("ignore_eos present in body when forceOutput=false")
 	}
-	if strings.Contains(string(body), verboseOutputInstruction) {
-		t.Error("continue-generating instruction present in body when forceOutput=false")
+	if !strings.Contains(string(body), verboseOutputInstruction) {
+		t.Error("continue-generating instruction missing when forceOutput=false")
 	}
 
 	// force-output on (default): ignore_eos=true AND the instruction is present.

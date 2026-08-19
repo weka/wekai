@@ -480,10 +480,12 @@ func TestOpenAIReplayToolTranslation(t *testing.T) {
 	}
 
 	messages := parsed["messages"].([]interface{})
-	if len(messages) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(messages))
+	// +1: the keep-generating instruction rides in every mode, prepended
+	// before the conversation.
+	if len(messages) != 2 {
+		t.Fatalf("expected 2 messages (length instruction + assistant), got %d", len(messages))
 	}
-	msg := messages[0].(map[string]interface{})
+	msg := messages[1].(map[string]interface{})
 	if msg["role"] != "assistant" {
 		t.Errorf("role = %q, want assistant", msg["role"])
 	}
@@ -538,8 +540,8 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 			t.Fatalf("unmarshal: %v", err)
 		}
 		msgs := parsed["messages"].([]interface{})
-		if len(msgs) != 2 {
-			t.Fatalf("expected 2 messages (stamp + user), got %d", len(msgs))
+		if len(msgs) != 3 {
+			t.Fatalf("expected 3 messages (stamp + user + length instruction), got %d", len(msgs))
 		}
 		msg0 := msgs[0].(map[string]interface{})
 		if msg0["role"] != "system" {
@@ -621,8 +623,8 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 			t.Fatalf("unmarshal: %v", err)
 		}
 		msgs := parsed["messages"].([]interface{})
-		if len(msgs) != 0 {
-			t.Errorf("expected 0 messages, got %d", len(msgs))
+		if len(msgs) != 1 {
+			t.Errorf("expected 1 message (the length instruction), got %d", len(msgs))
 		}
 	})
 }
