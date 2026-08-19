@@ -797,7 +797,7 @@ func runRouterReplayInstance(
 	poster, err := newReplayPoster(cfg.Model, config.GetAPIKeys(), "", replayRunID, cfg.DryRun, cfg.DryRunColdTPS, cfg.DryRunWarmTPS, cfg.DryRunOutputTPS, st.estimator, &st.dispatched)
 	if err == nil {
 		poster.outputRatio = cfg.ReplayOutputRatio
-		poster.forceRatio = cfg.ForceOutputRatio
+		poster.forceVolume = cfg.forceVolume()
 		// Same wiring as the multi-endpoint picker path (auto.go): without
 		// these, --limit-context and --replay-chars-per-token are silent
 		// no-ops in the single-endpoint case — which was every golden run

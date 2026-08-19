@@ -291,7 +291,7 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		RouterReplayRoles:             c.RouterReplayRoles,
 		ReplayOutputRatio:             c.ReplayOutputRatio,
 		// Force-output (short continue-generating instruction + vLLM
-		ForceOutputRatio:   c.ForceOutputRatio,
+		VerifyForceEOS:     c.VerifyForceEOS,
 		DryRun:             c.DryRun,
 		DryRunColdTPS:      c.DryRunColdTPS,
 		DryRunWarmTPS:      c.DryRunWarmTPS,
@@ -307,8 +307,8 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 	if err := c.validateVerify(); err != nil {
 		return err
 	}
-	if c.ForceOutputRatio < 0 {
-		return fmt.Errorf("--force-output-ratio must be >= 0 (0 = engine-enforced via ignore_eos)")
+	if err := c.validateVerifyForceEOS(); err != nil {
+		return err
 	}
 	if c.DryRun && c.RouterReplayFile == "" {
 		return fmt.Errorf("--dry-run requires --router-replay-file")
@@ -739,6 +739,17 @@ func (c *BenchmarkAutoOptions) validateVerify() error {
 			return fmt.Errorf("--verify is not supported with --docs-dir (synthetic mode): prompts " +
 				"are generated per request, so a marker has nothing stable to attach to")
 		}
+	}
+	return nil
+}
+
+// validateVerifyForceEOS refuses --verify-force-eos outside --verify: there it
+// would be a no-op masquerading as a choice, since a regular run already
+// forces output volume.
+func (c *BenchmarkAutoOptions) validateVerifyForceEOS() error {
+	if c.VerifyForceEOS && !c.Verify {
+		return fmt.Errorf("--verify-force-eos only applies with --verify; a regular benchmark " +
+			"already runs with ignore_eos on")
 	}
 	return nil
 }

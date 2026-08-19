@@ -236,16 +236,9 @@ type AutoBenchmarkConfig struct {
 	// model stops almost immediately on replay — a ~500:1 input:output run).
 	// 0 = off (original precedence: output_tokens, then max_tokens, then 1).
 	ReplayOutputRatio float64
-	// ForceOutputRatio selects HOW the captured output profile is enforced.
-	// 0 (the default): the engine enforces it — "ignore_eos": true on the
-	// vLLM wire path, so the budget is filled deterministically. Above 0:
-	// the PROMPT enforces it — no ignore_eos; each request's tail asks for
-	// ratio x the captured length in words, and max_tokens cuts the
-	// overshoot. Measured at 300 requests: ratio 2 holds 90.5% conformity
-	// against the engine's 100%, and is the tuned value — see
-	// replayLengthAsk for the curve. Either way the same instruction text
-	// rides in the prompt, so settings differ only by engine enforcement.
-	ForceOutputRatio float64
+	// VerifyForceEOS keeps ignore_eos on under --verify. See forceVolume for
+	// the rule it feeds.
+	VerifyForceEOS bool
 
 	// Dry-run mode (router replay only): skip HTTP, drive with synthetic timing.
 	DryRun          bool
@@ -1423,10 +1416,10 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		formatKiloInt(res.totalCachedTokens), formatKiloInt(serverUncached), cachedPct)
 	fmt.Printf(" Output tokens      : %s\n", formatKiloInt(res.totalOutput))
 	if res.outTargetSum > 0 {
-		// actual vs the budgets the run put on the wire. Under ignore_eos this
-		// is ~100% by construction and serves as the baseline; under
-		// --replay-natural-output it scores how well prompts alone reproduce
-		// the captured output profile.
+		// actual vs the budgets the run put on the wire. With ignore_eos on
+		// (regular runs, or --verify-force-eos) this is ~100% by
+		// construction; under --verify it scores how well the per-request
+		// length ask alone reproduces the captured output profile.
 		fmt.Printf(" Output conformity  : %s of %s requested (%s)\n",
 			formatKiloInt(res.outActualSum), formatKiloInt(res.outTargetSum), pctOf(res.outActualSum, res.outTargetSum))
 	}
@@ -1564,9 +1557,8 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 	// the prompt, and belong in the summary where their caveats are printed
 	// next to them.
 	// outconf: how faithfully the run reproduced the captured output sizes.
-	// Under ignore_eos ~100% by construction — the baseline; under
-	// --replay-natural-output it is the score for prompt-based length
-	// control.
+	// With ignore_eos on (regular runs) ~100% by construction; under
+	// --verify it is the score for prompt-based length control.
 	outConf := ""
 	if snap.outTargetSum > 0 {
 		outConf = fmt.Sprintf(" outconf=%.1f%%", 100*float64(snap.outActualSum)/float64(snap.outTargetSum))
@@ -2005,7 +1997,7 @@ func runSingleModelBenchmark(
 			pp.outputRatio = cfg.ReplayOutputRatio
 			pp.limitContext = cfg.LimitContext
 			pp.replayCharsPerToken = cfg.ReplayCharsPerToken
-			pp.forceRatio = cfg.ForceOutputRatio
+			pp.forceVolume = cfg.forceVolume()
 			// UUID cache-coherency injection (--verify). Same
 			// global/read-only refs set on the per-instance poster in
 			// replay_router.go — every poster in the run, per-instance or
@@ -3363,6 +3355,26 @@ func maxInt(a, b int) int {
 	}
 	return b
 }
+
+// forceVolume decides whether the engine enforces the output profile
+// (vLLM's ignore_eos).
+//
+// A regular benchmark run keeps it ON: the tool's primary job is load with a
+// deterministic output volume, and what the padded tokens say is irrelevant
+// to throughput. --verify turns it OFF, because forcing generation past the
+// stop token pads every response with degenerate text — the babble, the
+// guid-shaped invention, the repeated stop attempts — which is exactly the
+// noise a coherency check exists to notice, not to manufacture. The built-in
+// per-request length ask holds ~90% output conformity in that mode.
+// --verify-force-eos overrides for verify runs where deterministic volume
+// matters more than genuine output.
+func (cfg *AutoBenchmarkConfig) forceVolume() bool {
+	return !cfg.Verify || cfg.VerifyForceEOS
+}
+
+// ForceVolumeForTest exposes the mode-to-mechanism rule to the CLI package's
+// tests, which own the flag surface that feeds it.
+func (cfg AutoBenchmarkConfig) ForceVolumeForTest() bool { return cfg.forceVolume() }
 
 // pctOf renders a ratio for the summary. "n/a" rather than 100% when nothing
 // was measured: a run that asked no questions has no hit rate, and printing a

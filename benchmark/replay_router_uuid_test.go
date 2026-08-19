@@ -436,9 +436,9 @@ func TestWireInjectionDeterminism(t *testing.T) {
 			var body []byte
 			var err error
 			if kind == "openai" {
-				body, _, err = buildOpenAIChatCompletionsBody(r, docs, "model", "", 0, 2, 0, inj)
+				body, _, err = buildOpenAIChatCompletionsBody(r, docs, "model", "", 0, false, 0, inj)
 			} else {
-				body, _, err = buildAnthropicMessagesBody(r, docs, "model", "", 0, 2, 0, inj)
+				body, _, err = buildAnthropicMessagesBody(r, docs, "model", "", 0, false, 0, inj)
 			}
 			if err != nil {
 				t.Fatalf("%s build: %v", kind, err)
@@ -513,7 +513,7 @@ func TestInlineMarkerAppendedToTurnMessage(t *testing.T) {
 	}
 	wantMarker := "\n\n[turn-4 id: abc-uuid]"
 
-	body, canonical, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, 2, 0, inj)
+	body, canonical, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, 0, inj)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -559,12 +559,12 @@ func TestCacheFidelitySharedBlockUnaffectedByInjection(t *testing.T) {
 		},
 	}
 
-	bodyNoInj, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, 2, 0, nil)
+	bodyNoInj, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, 0, nil)
 	if err != nil {
 		t.Fatalf("build (no injection): %v", err)
 	}
 	inj := &uuidInjection{StampByHash: map[string]turnStamp{"own-msg": {Idx: 0, UUID: "own-uuid", Label: "turn-1"}}}
-	bodyWithInj, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, 2, 0, inj)
+	bodyWithInj, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, 0, inj)
 	if err != nil {
 		t.Fatalf("build (with injection): %v", err)
 	}

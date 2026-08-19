@@ -3,6 +3,8 @@ package cli
 import (
 	"strings"
 	"testing"
+
+	"github.com/weka/wekai/benchmark"
 )
 
 // TestVerifyRejectsUnsupportedModes: --verify silently doing nothing would
@@ -55,5 +57,35 @@ func TestVerifyReciteChoiceMapping(t *testing.T) {
 		if got := choice != "last"; got != wantEvery {
 			t.Errorf("--verify-recite=%s maps to reciteEvery=%v, want %v", choice, got, wantEvery)
 		}
+	}
+}
+
+// TestVerifyImpliesNaturalOutput pins the mode-to-mechanism rule: a regular
+// run forces output volume (ignore_eos), a verify run does not — forcing pads
+// every response past its natural stop with the degenerate text a coherency
+// check exists to notice, not to manufacture — and --verify-force-eos puts it
+// back for verify runs that want deterministic volume anyway.
+func TestVerifyImpliesNaturalOutput(t *testing.T) {
+	if !(benchmark.AutoBenchmarkConfig{}).ForceVolumeForTest() {
+		t.Error("a regular benchmark run must force output volume; deterministic load is the tool's primary job")
+	}
+	if (benchmark.AutoBenchmarkConfig{Verify: true}).ForceVolumeForTest() {
+		t.Error("--verify must drop ignore_eos by default; forced babble corrupts the signals it scores")
+	}
+	if !(benchmark.AutoBenchmarkConfig{Verify: true, VerifyForceEOS: true}).ForceVolumeForTest() {
+		t.Error("--verify-force-eos must restore engine enforcement under --verify")
+	}
+}
+
+// TestVerifyForceEOSRequiresVerify: outside verify the flag is a no-op
+// masquerading as a choice, so it is refused rather than ignored.
+func TestVerifyForceEOSRequiresVerify(t *testing.T) {
+	o := BenchmarkAutoOptions{VerifyForceEOS: true}
+	if err := o.validateVerifyForceEOS(); err == nil {
+		t.Error("--verify-force-eos without --verify accepted; it would silently do nothing")
+	}
+	o = BenchmarkAutoOptions{Verify: true, VerifyForceEOS: true, RouterReplayFile: "r.jsonl"}
+	if err := o.validateVerifyForceEOS(); err != nil {
+		t.Errorf("valid combination rejected: %v", err)
 	}
 }

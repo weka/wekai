@@ -44,25 +44,23 @@ const verboseOutputInstruction = "Provide a thorough, detailed response and keep
 // slot would fork every request's prefix at the top and destroy the replay's
 // sharing structure.
 //
-// The ask names ratio x the captured length (1 token ~ 0.75 English words,
-// so words = 0.75 x tokens x ratio). Overshooting is free — the server clamps
-// at max_tokens — and the model delivers a consistent fraction of whatever
-// figure it is given. The curve measured at 300 requests: ratio 1 (the exact
-// length) yields 84.8% conformity, ratio 2 yields 90.5%, ratio 4 drops to
-// 72.6% — a number too far past plausible gets discounted the same way
-// "write infinitely" does. Two is the peak, and the default the engine-forced
-// mode also sends so every setting emits byte-identical prompts.
+// The ask names TWICE the captured length (1 token ~ 0.75 English words, so
+// words = 1.5 x tokens ~ 2x the true size). Overshooting is free — the server
+// clamps at max_tokens — and the model delivers a consistent fraction of
+// whatever figure it is given. The curve measured at 300 requests: asking the
+// exact length yields 84.8% conformity, twice yields 90.5%, four times drops
+// to 72.6% — a number too far past plausible gets discounted the same way
+// "write infinitely" does. Two is the peak, hard-coded rather than exposed:
+// it compensates for how models discount length asks, which is not a property
+// an operator tunes per run.
 //
 // Below ~16 tokens no ask is made: "write about 6 words" reads as a trick,
 // and tiny budgets conform by clamping anyway.
-func replayLengthAsk(maxTokens int, ratio float64) string {
+func replayLengthAsk(maxTokens int) string {
 	if maxTokens < 16 {
 		return ""
 	}
-	if ratio <= 0 {
-		ratio = 2
-	}
-	words := int(float64(maxTokens) * 0.75 * ratio)
+	words := maxTokens * 3 / 2
 	return fmt.Sprintf("\n\nWrite a response of at least %d words. Keep elaborating with relevant"+
 		" detail until you reach that length — do not stop short of it.", words)
 }
@@ -76,7 +74,7 @@ func replayLengthAsk(maxTokens int, ratio float64) string {
 // inj carries the UUID cache-coherency injection (--verify,
 // router path — see replay_router_uuid.go); nil means "no injection",
 // leaving the body byte-for-byte identical to before this feature existed.
-func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceRatio float64, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
+func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceVolume bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
 	var stampByHash map[string]turnStamp
 	if inj != nil {
 		stampByHash = inj.StampByHash
@@ -130,7 +128,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 	if inj != nil {
 		tail = replayReciteWindowInstruction(inj.ReciteLabels)
 	}
-	tail += replayLengthAsk(pickMaxTokens(req, outputRatio), forceRatio)
+	tail += replayLengthAsk(pickMaxTokens(req, outputRatio))
 	if tail != "" {
 		msgs = appendTailMessageAnthropic(msgs, tail)
 	}
@@ -595,7 +593,7 @@ func buildOpenAITools(spec *RouterReplayToolsSpec, docs string, charsPerToken fl
 //
 // inj carries the UUID cache-coherency injection (--verify,
 // router path — see replay_router_uuid.go); nil means "no injection".
-func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceRatio float64, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
+func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceVolume bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
 	var stampByHash map[string]turnStamp
 	if inj != nil {
 		stampByHash = inj.StampByHash
@@ -642,19 +640,20 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		messages = append([]map[string]interface{}{stamp}, messages...)
 	}
 
-	// The keep-generating instruction rides at EVERY ratio, so engine-forced
-	// (ratio 0) and prompt-forced (ratio > 0) runs send byte-identical
-	// prompts and differ only by ignore_eos — the clean A/B for whether
-	// prompting alone can hold output at the captured budget.
+	// The keep-generating instruction rides in both modes, so forced and
+	// unforced runs send byte-identical prompts and differ only by
+	// ignore_eos — the clean A/B for whether prompting alone can hold output
+	// at the captured budget.
 	messages = append(messages, map[string]interface{}{
 		"role":    "system",
 		"content": verboseOutputInstruction,
 	})
-	if forceRatio == 0 {
-		// Engine-forced (the default): vLLM ignores the stop token, so the
-		// (possibly retargeted) budget is filled deterministically. A ratio
-		// above zero hands the job to the prompt instead — measured at 90.5%
-		// conformity at ratio 2, against 100% here.
+	if forceVolume {
+		// --force-output-volume: vLLM ignores the stop token, so the
+		// (possibly retargeted) budget is filled deterministically — 100%
+		// conformity, at the cost of padding every response past its natural
+		// end with degenerate output. The default leaves the prompt in
+		// charge: ~90% conformity, genuine text throughout.
 		body["ignore_eos"] = true
 	}
 
@@ -673,7 +672,7 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 	if inj != nil {
 		tailAsk = replayReciteWindowInstruction(inj.ReciteLabels)
 	}
-	tailAsk += replayLengthAsk(pickMaxTokens(req, outputRatio), forceRatio)
+	tailAsk += replayLengthAsk(pickMaxTokens(req, outputRatio))
 	if tailAsk != "" {
 		messages = appendTailMessageOpenAI(messages, tailAsk)
 	}
