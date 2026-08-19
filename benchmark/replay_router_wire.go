@@ -45,13 +45,21 @@ const verboseOutputInstruction = "Provide a thorough, detailed response and keep
 // slot would fork every request's prefix at the top and destroy the replay's
 // sharing structure.
 //
+// The ask names TWICE the captured length (1 token ~ 0.75 English words, so
+// words = 1.5x tokens ~ 2x the true size). Overshooting is free — the server
+// clamps at max_tokens — and this model, like every variant measured, delivers
+// a consistent fraction of whatever figure it is given. The curve measured at
+// 300 requests: asking the exact length yields 84.8% conformity, twice yields
+// 90.5%, four times drops to 72.6% — a number too far past plausible gets
+// discounted the same way "write infinitely" does. Two is the peak.
+//
 // Below ~16 tokens no ask is made: "write about 6 words" reads as a trick,
 // and tiny budgets conform by clamping anyway.
 func replayLengthAsk(maxTokens int) string {
 	if maxTokens < 16 {
 		return ""
 	}
-	words := maxTokens * 3 / 4
+	words := maxTokens * 3 / 2
 	return fmt.Sprintf("\n\nWrite a response of at least %d words. Keep elaborating with relevant"+
 		" detail until you reach that length — do not stop short of it.", words)
 }
