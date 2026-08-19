@@ -397,6 +397,10 @@ func recordReplayRequest(
 	if metrics.ReciteBudgetShort {
 		st.valBudgetShortReqs.Add(1)
 	}
+	if metrics.OutputTarget > 0 && metrics.Error == nil && !metrics.Skipped {
+		st.outTargetSum.Add(int64(metrics.OutputTarget))
+		st.outActualSum.Add(int64(metrics.UsageData.OutputTokens.Count))
+	}
 	if metrics.ResponseGarbage {
 		st.valGarbageReqs.Add(1)
 		switch metrics.GarbageVerdict {

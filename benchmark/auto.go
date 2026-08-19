@@ -1113,7 +1113,13 @@ type autoState struct {
 	valGarbagePostEOS     atomic.Int64 // a literal stop token precedes the corruption — ignore_eos continuation
 	valGarbageTail        atomic.Int64 // corruption runs to the end of the budget, no visible marker
 	valGarbageGuidBabble  atomic.Int64 // the tail after corruption is invented uuid shapes
-	valGarbageMidResponse atomic.Int64 // none of the above — the class ignore_eos cannot explain
+	valGarbageMidResponse atomic.Int64
+	// Output-profile conformity: the wire budgets and what actually came
+	// back, summed over completed replay requests. actual/target is ~100%
+	// under ignore_eos by construction; when prompt-based length control
+	// replaces it, this ratio is the score.
+	outTargetSum atomic.Int64
+	outActualSum atomic.Int64 // none of the above — the class ignore_eos cannot explain
 	// contaminationStop is armed by the first leaked marker unless the run
 	// opted out; the evaluator turns it into a termination.
 	contaminationStop   atomic.Bool
@@ -1235,6 +1241,8 @@ type autoBenchmarkResult struct {
 	valGarbageTail        int64
 	valGarbageGuidBabble  int64
 	valGarbageMidResponse int64
+	outTargetSum          int64
+	outActualSum          int64
 	valWindowSessions     int
 	valWindowMarkers      int
 	valPresenceMissReqs   int64
@@ -1266,28 +1274,33 @@ type displaySnapshot struct {
 	verifyGarbageTail    int64
 	verifyGarbageBabble  int64
 	verifyGarbageMid     int64
-	reqPerSec            float64
-	inputTokPerSec       float64
-	outputTokPerSec      float64
-	allTimePeakRPS       float64
-	allTimePeakConc      int
-	allTimePeakSeries    int
-	ttftP50              time.Duration
-	ttftP95              time.Duration
-	ttftCutoff           time.Duration // degradation cutoff = earlyColdBaseline * factor
-	ttftDegradedCount    int64         // requests disqualified by TTFT cutoff
-	totalCompleted       int64
-	totalErrors          int64
-	totalRetries429      int64
-	totalRetryWait       time.Duration
-	elapsed              time.Duration
-	cacheWarning         bool
-	bothDone             bool
-	termReason           string // non-empty when model benchmark has finished
-	gateActive           int
-	gateColdWaiting      int
-	gateNormalWait       int
-	gateHotActive        int // active slots in the hot-pool gate (non-zero only with hot-series-concurrency)
+	// Output-profile conformity, replay mode: actual vs requested output
+	// tokens. Rendered whenever a target exists — it is a replay property,
+	// not a verify one.
+	outTargetSum      int64
+	outActualSum      int64
+	reqPerSec         float64
+	inputTokPerSec    float64
+	outputTokPerSec   float64
+	allTimePeakRPS    float64
+	allTimePeakConc   int
+	allTimePeakSeries int
+	ttftP50           time.Duration
+	ttftP95           time.Duration
+	ttftCutoff        time.Duration // degradation cutoff = earlyColdBaseline * factor
+	ttftDegradedCount int64         // requests disqualified by TTFT cutoff
+	totalCompleted    int64
+	totalErrors       int64
+	totalRetries429   int64
+	totalRetryWait    time.Duration
+	elapsed           time.Duration
+	cacheWarning      bool
+	bothDone          bool
+	termReason        string // non-empty when model benchmark has finished
+	gateActive        int
+	gateColdWaiting   int
+	gateNormalWait    int
+	gateHotActive     int // active slots in the hot-pool gate (non-zero only with hot-series-concurrency)
 	// gateDispatched is requests whose HTTP exchange is actually open. gateActive
 	// counts gate slots, which are held from before the body is built until after
 	// the response is consumed, so the difference is the client's own prep and
@@ -1407,6 +1420,14 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 	fmt.Printf(" Server cache       : cached=%s  uncached=%s  (%.1f%% cached)\n",
 		formatKiloInt(res.totalCachedTokens), formatKiloInt(serverUncached), cachedPct)
 	fmt.Printf(" Output tokens      : %s\n", formatKiloInt(res.totalOutput))
+	if res.outTargetSum > 0 {
+		// actual vs the budgets the run put on the wire. Under ignore_eos this
+		// is ~100% by construction and serves as the baseline; under
+		// --replay-natural-output it scores how well prompts alone reproduce
+		// the captured output profile.
+		fmt.Printf(" Output conformity  : %s of %s requested (%s)\n",
+			formatKiloInt(res.outActualSum), formatKiloInt(res.outTargetSum), pctOf(res.outActualSum, res.outTargetSum))
+	}
 	fmt.Println(strings.Repeat("-", 62))
 	fmt.Printf(" TTFT p50           : %s\n", formatDur(res.ttftP50))
 	fmt.Printf(" TTFT p95           : %s\n", formatDur(res.ttftP95))
@@ -1540,6 +1561,14 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 	// ask-quality counters stay off the line — they describe the model and
 	// the prompt, and belong in the summary where their caveats are printed
 	// next to them.
+	// outconf: how faithfully the run reproduced the captured output sizes.
+	// Under ignore_eos ~100% by construction — the baseline; under
+	// --replay-natural-output it is the score for prompt-based length
+	// control.
+	outConf := ""
+	if snap.outTargetSum > 0 {
+		outConf = fmt.Sprintf(" outconf=%.1f%%", 100*float64(snap.outActualSum)/float64(snap.outTargetSum))
+	}
 	verifyInfo := ""
 	if snap.verifyOn {
 		rate := 100.0
@@ -1570,20 +1599,20 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 		if snap.gateHotActive > 0 {
 			hotInfo = fmt.Sprintf(" hot=%d", snap.gateHotActive)
 		}
-		return fmt.Sprintf("DONE(%s) %sseries=%d conc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d%s in=%s warm=%s scached=%s out=%s",
+		return fmt.Sprintf("DONE(%s) %sseries=%d conc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d%s in=%s warm=%s scached=%s out=%s%s",
 			snap.termReason, replayPrefix, snap.series, snap.concurrency, snap.gateDispatched, snap.gateActive, hotInfo,
 			formatFloat(snap.reqPerSec), snap.cacheHitRate*100, snap.globalLocalCacheRate*100, ttftStr, snap.totalCompleted, snap.totalErrors, verifyInfo,
-			formatKiloInt(snap.totalInput), formatKiloInt(snap.totalInputWarm), formatKiloInt(snap.totalCached), formatKiloInt(snap.totalOutput))
+			formatKiloInt(snap.totalInput), formatKiloInt(snap.totalInputWarm), formatKiloInt(snap.totalCached), formatKiloInt(snap.totalOutput), outConf)
 	}
 	hotInfo := ""
 	if snap.gateHotActive > 0 {
 		hotInfo = fmt.Sprintf(" hot=%d", snap.gateHotActive)
 	}
-	return fmt.Sprintf("%sseries=%d conc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d%s elapsed=%s in=%s warm=%s scached=%s out=%s",
+	return fmt.Sprintf("%sseries=%d conc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d%s elapsed=%s in=%s warm=%s scached=%s out=%s%s",
 		replayPrefix, snap.series, snap.concurrency, snap.gateDispatched, snap.gateActive, hotInfo,
 		formatFloat(snap.reqPerSec), snap.cacheHitRate*100, snap.globalLocalCacheRate*100, ttftStr, snap.totalCompleted, snap.totalErrors, verifyInfo,
 		formatDuration(snap.elapsed),
-		formatKiloInt(snap.totalInput), formatKiloInt(snap.totalInputWarm), formatKiloInt(snap.totalCached), formatKiloInt(snap.totalOutput))
+		formatKiloInt(snap.totalInput), formatKiloInt(snap.totalInputWarm), formatKiloInt(snap.totalCached), formatKiloInt(snap.totalOutput), outConf)
 }
 
 // runMultiModelDisplay drives the live display for one or more models.
@@ -1867,6 +1896,8 @@ func runSingleModelBenchmark(
 			snap.verifyGarbageBabble = st.valGarbageGuidBabble.Load()
 			snap.verifyGarbageMid = st.valGarbageMidResponse.Load()
 		}
+		snap.outTargetSum = st.outTargetSum.Load()
+		snap.outActualSum = st.outActualSum.Load()
 		display.updateSnapshot(snap)
 		sendSnap(snap)
 	}
@@ -2951,6 +2982,8 @@ func runSingleModelBenchmark(
 	res.valGarbageTail = st.valGarbageTail.Load()
 	res.valGarbageGuidBabble = st.valGarbageGuidBabble.Load()
 	res.valGarbageMidResponse = st.valGarbageMidResponse.Load()
+	res.outTargetSum = st.outTargetSum.Load()
+	res.outActualSum = st.outActualSum.Load()
 	if cfg.uuidRegistry != nil {
 		_, res.valWindowMarkers, res.valWindowSessions = cfg.uuidRegistry.Stats()
 	}
@@ -3027,6 +3060,8 @@ func runSingleModelBenchmark(
 			finalSnap.verifyGarbageBabble = st.valGarbageGuidBabble.Load()
 			finalSnap.verifyGarbageMid = st.valGarbageMidResponse.Load()
 		}
+		finalSnap.outTargetSum = st.outTargetSum.Load()
+		finalSnap.outActualSum = st.outActualSum.Load()
 		// Populate token totals on the DONE snap (previously left zero, which
 		// showed up as in=0 warm=0 out=0 on the final rendered line).
 		finalSnap.totalInput = res.totalInputCold + res.totalInputWarm

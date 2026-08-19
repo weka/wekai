@@ -575,6 +575,7 @@ func (p *replayPoster) do(
 
 	sessionIdx := seriesNum - 1
 	inj := p.buildInjection(req, su)
+	outputTarget := pickMaxTokens(req, p.outputRatio)
 
 	var bodyBytes []byte
 	var canonical string
@@ -699,10 +700,11 @@ func (p *replayPoster) do(
 	defer resp.Body.Close()
 
 	m := RequestMetrics{
-		RequestNum: int(st.totalCompleted.Load()) + 1,
-		SeriesNum:  seriesNum,
-		CycleNum:   turnIdx,
-		SeriesGUID: sessionID + ":" + instanceID,
+		RequestNum:   int(st.totalCompleted.Load()) + 1,
+		SeriesNum:    seriesNum,
+		CycleNum:     turnIdx,
+		SeriesGUID:   sessionID + ":" + instanceID,
+		OutputTarget: outputTarget,
 	}
 
 	if resp.StatusCode/100 != 2 {

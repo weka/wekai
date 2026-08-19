@@ -195,3 +195,17 @@ func TestTailGuidBabble(t *testing.T) {
 		}
 	})
 }
+
+// TestProgressLineOutputConformity: outconf is a replay property, independent
+// of --verify — it renders whenever the run put output budgets on the wire,
+// and stays absent otherwise rather than reading 0% on synthetic runs.
+func TestProgressLineOutputConformity(t *testing.T) {
+	s := &displaySnapshot{series: 1, concurrency: 1}
+	if line := renderModelOneLiner(s); strings.Contains(line, "outconf=") {
+		t.Errorf("outconf rendered with no targets on the wire:\n%s", line)
+	}
+	s.outTargetSum, s.outActualSum = 1000, 973
+	if line := renderModelOneLiner(s); !strings.Contains(line, "outconf=97.3%") {
+		t.Errorf("want outconf=97.3%% in:\n%s", line)
+	}
+}

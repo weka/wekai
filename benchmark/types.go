@@ -43,7 +43,13 @@ type RequestMetrics struct {
 	// number; TotalResponseTime INCLUDES RetryWait, because that is how long
 	// the caller really waited.
 	Retries429 int
-	RetryWait  time.Duration
+	// OutputTarget is the max_tokens this request carried on the wire — in
+	// replay mode, the captured output budget. Actual output over this,
+	// aggregated, is the run's output-profile conformity: ~100% under
+	// ignore_eos by construction, and the score to beat when prompt-based
+	// length control replaces it.
+	OutputTarget int
+	RetryWait    time.Duration
 
 	// UUID validation (router-replay --verify only). All nil/zero
 	// when the feature is off (default) or on the synthetic path, which never
