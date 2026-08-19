@@ -1423,8 +1423,8 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		// correctness (per-stamp presence, Contains anywhere in the response)
 		// and output conformity (first line is exactly the ordered,
 		// comma-joined UUID list — see firstLineConformity).
-		fmt.Printf("   UUID correctness (presence)          : %d/%d\n", res.valUUIDFound, res.valUUIDChecks)
-		fmt.Printf("   Output conformity (leads with list)  : %d/%d\n", res.valExactMatchReqs, res.valReqs)
+		fmt.Printf("   UUID correctness (presence)          : %d/%d (%s)\n", res.valUUIDFound, res.valUUIDChecks, pctOf(res.valUUIDFound, res.valUUIDChecks))
+		fmt.Printf("   Output conformity (leads with list)  : %d/%d (%s)\n", res.valExactMatchReqs, res.valReqs, pctOf(res.valExactMatchReqs, res.valReqs))
 		fmt.Printf("   PRESENCE_MISS (expected UUID absent) : %d across %d requests\n", res.valPresenceMissUUIDs, res.valPresenceMissReqs)
 		// Attributed, because the raw count sums unrelated causes. A
 		// substitution proves the tagged content was there to read and the
@@ -3298,4 +3298,15 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// pctOf renders a ratio for the summary. "n/a" rather than 100% when nothing
+// was measured: a run that asked no questions has no hit rate, and printing a
+// perfect score for it invites exactly the cross-run comparison this line
+// exists to serve.
+func pctOf(num, den int64) string {
+	if den == 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.1f%%", 100*float64(num)/float64(den))
 }
