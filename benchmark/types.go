@@ -72,6 +72,12 @@ type RequestMetrics struct {
 	// stray control characters — decode-level corruption from the serving
 	// stack, which no amount of model non-compliance can produce.
 	ResponseGarbage bool
-	LeakedUUIDs     []string // "uuid(series=N)" entries for any OTHER session's UUID found here
-	ExactMatch      bool     // first line of Response is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
+	// GarbageVerdict classifies the corruption's situation: "post_eos" (a
+	// literal stop token precedes it), "tail_babble" (runs to the end of the
+	// budget), "guid_babble" (the tail is invented uuid shapes), or
+	// "mid_response" (none of the above — the only class the harness's own
+	// ignore_eos setting cannot explain).
+	GarbageVerdict string
+	LeakedUUIDs    []string // "uuid(series=N)" entries for any OTHER session's UUID found here
+	ExactMatch     bool     // first line of Response is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
 }

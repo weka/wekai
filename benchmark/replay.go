@@ -399,6 +399,16 @@ func recordReplayRequest(
 	}
 	if metrics.ResponseGarbage {
 		st.valGarbageReqs.Add(1)
+		switch metrics.GarbageVerdict {
+		case "post_eos":
+			st.valGarbagePostEOS.Add(1)
+		case "tail_babble":
+			st.valGarbageTail.Add(1)
+		case "guid_babble":
+			st.valGarbageGuidBabble.Add(1)
+		default:
+			st.valGarbageMidResponse.Add(1)
+		}
 	}
 	if metrics.LeakChecked {
 		// Counted separately from valReqs: contamination is scored on every

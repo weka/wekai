@@ -1097,19 +1097,23 @@ type autoState struct {
 	// UUID validation (replay --verify only). All zero when the
 	// feature is off — recordReplayRequest only touches these when
 	// metrics.ExpectedUUIDs is non-empty.
-	valReqs              atomic.Int64 // requests that carried >=1 expected UUID (i.e. validation ran)
-	valUUIDChecks        atomic.Int64 // total per-UUID presence checks made
-	valUUIDFound         atomic.Int64 // per-UUID presence checks that found the UUID
-	valExactMatchReqs    atomic.Int64 // requests whose first line was the exact ordered UUID list (output conformity)
-	valPresenceMissUUIDs atomic.Int64 // per-UUID PRESENCE_MISS count (expected UUID absent)
-	valCrossContamUUIDs  atomic.Int64 // per-UUID CROSS_CONTAMINATION count (other-conversation UUID present)
-	valLeakCheckedReqs   atomic.Int64 // responses actually scanned for contamination — the denominator that zero belongs to
-	valBudgetShortReqs   atomic.Int64 // requests whose captured output budget could not carry one id, so presence was never asked
-	valMissSubstituted   atomic.Int64 // misses where the response carried another marker from this same prompt
-	valMissAbsent        atomic.Int64 // misses with no such evidence either way
-	valEchoedTagsReqs    atomic.Int64 // responses that repeated turn names instead of guids — an ASK defect
-	valNoIDsReqs         atomic.Int64 // responses containing no guid at all — an ASK defect
-	valGarbageReqs       atomic.Int64 // responses carrying decode-level corruption (U+FFFD, NUL, stray control chars)
+	valReqs               atomic.Int64 // requests that carried >=1 expected UUID (i.e. validation ran)
+	valUUIDChecks         atomic.Int64 // total per-UUID presence checks made
+	valUUIDFound          atomic.Int64 // per-UUID presence checks that found the UUID
+	valExactMatchReqs     atomic.Int64 // requests whose first line was the exact ordered UUID list (output conformity)
+	valPresenceMissUUIDs  atomic.Int64 // per-UUID PRESENCE_MISS count (expected UUID absent)
+	valCrossContamUUIDs   atomic.Int64 // per-UUID CROSS_CONTAMINATION count (other-conversation UUID present)
+	valLeakCheckedReqs    atomic.Int64 // responses actually scanned for contamination — the denominator that zero belongs to
+	valBudgetShortReqs    atomic.Int64 // requests whose captured output budget could not carry one id, so presence was never asked
+	valMissSubstituted    atomic.Int64 // misses where the response carried another marker from this same prompt
+	valMissAbsent         atomic.Int64 // misses with no such evidence either way
+	valEchoedTagsReqs     atomic.Int64 // responses that repeated turn names instead of guids — an ASK defect
+	valNoIDsReqs          atomic.Int64 // responses containing no guid at all — an ASK defect
+	valGarbageReqs        atomic.Int64 // responses carrying decode-level corruption (U+FFFD, NUL, stray control chars)
+	valGarbagePostEOS     atomic.Int64 // a literal stop token precedes the corruption — ignore_eos continuation
+	valGarbageTail        atomic.Int64 // corruption runs to the end of the budget, no visible marker
+	valGarbageGuidBabble  atomic.Int64 // the tail after corruption is invented uuid shapes
+	valGarbageMidResponse atomic.Int64 // none of the above — the class ignore_eos cannot explain
 	// contaminationStop is armed by the first leaked marker unless the run
 	// opted out; the evaluator turns it into a termination.
 	contaminationStop   atomic.Bool
@@ -1214,23 +1218,27 @@ type autoBenchmarkResult struct {
 
 	// UUID validation (replay --verify only); all zero when the
 	// feature is off. See autoState's val* atomics for field meanings.
-	valReqs              int64
-	valUUIDChecks        int64
-	valUUIDFound         int64
-	valExactMatchReqs    int64
-	valPresenceMissUUIDs int64
-	valCrossContamUUIDs  int64
-	valLeakCheckedReqs   int64
-	valBudgetShortReqs   int64
-	valMissSubstituted   int64
-	valMissAbsent        int64
-	valEchoedTagsReqs    int64
-	valNoIDsReqs         int64
-	valGarbageReqs       int64
-	valWindowSessions    int
-	valWindowMarkers     int
-	valPresenceMissReqs  int64
-	valCrossContamReqs   int64
+	valReqs               int64
+	valUUIDChecks         int64
+	valUUIDFound          int64
+	valExactMatchReqs     int64
+	valPresenceMissUUIDs  int64
+	valCrossContamUUIDs   int64
+	valLeakCheckedReqs    int64
+	valBudgetShortReqs    int64
+	valMissSubstituted    int64
+	valMissAbsent         int64
+	valEchoedTagsReqs     int64
+	valNoIDsReqs          int64
+	valGarbageReqs        int64
+	valGarbagePostEOS     int64
+	valGarbageTail        int64
+	valGarbageGuidBabble  int64
+	valGarbageMidResponse int64
+	valWindowSessions     int
+	valWindowMarkers      int
+	valPresenceMissReqs   int64
+	valCrossContamReqs    int64
 }
 
 // displaySnapshot is an atomic snapshot of state for the display goroutine.
@@ -1429,7 +1437,18 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		// ratio above is describing the instruction, not the fleet.
 		fmt.Printf("   Ask quality: responses echoing tags  : %d\n", res.valEchoedTagsReqs)
 		fmt.Printf("   Ask quality: responses with no ids   : %d\n", res.valNoIDsReqs)
+		// The classes matter more than the total: the first three are the
+		// run's own ignore_eos setting at work — the model forced past its
+		// stop — and only mid-response is corruption that setting cannot
+		// explain. A total that summed them was read as an alarm 338 strong
+		// when nearly all of it was the harness's own doing.
 		fmt.Printf("   Garbage responses (decode corruption): %d\n", res.valGarbageReqs)
+		if res.valGarbageReqs > 0 {
+			fmt.Printf("     post-EOS (stop token visible)      : %d\n", res.valGarbagePostEOS)
+			fmt.Printf("     tail babble to end of budget       : %d\n", res.valGarbageTail)
+			fmt.Printf("     post-stop guid babble              : %d\n", res.valGarbageGuidBabble)
+			fmt.Printf("     MID-RESPONSE (unexplained)         : %d\n", res.valGarbageMidResponse)
+		}
 		// Both denominators, because they are different populations: presence
 		// is scored only where a recite was asked, contamination on every
 		// completed response. The window is printed with the count because a
@@ -2905,6 +2924,10 @@ func runSingleModelBenchmark(
 	res.valEchoedTagsReqs = st.valEchoedTagsReqs.Load()
 	res.valNoIDsReqs = st.valNoIDsReqs.Load()
 	res.valGarbageReqs = st.valGarbageReqs.Load()
+	res.valGarbagePostEOS = st.valGarbagePostEOS.Load()
+	res.valGarbageTail = st.valGarbageTail.Load()
+	res.valGarbageGuidBabble = st.valGarbageGuidBabble.Load()
+	res.valGarbageMidResponse = st.valGarbageMidResponse.Load()
 	if cfg.uuidRegistry != nil {
 		_, res.valWindowMarkers, res.valWindowSessions = cfg.uuidRegistry.Stats()
 	}

@@ -846,12 +846,25 @@ func (p *replayPoster) do(
 					}
 				}
 			}
-			verdict := "MID-RESPONSE (clean text resumes after — not explainable by ignore_eos)"
+			verdict := "MID-RESPONSE (clean, non-babble text resumes after — not explainable by ignore_eos)"
+			m.GarbageVerdict = "mid_response"
 			switch {
 			case g.EOSByte >= 0 && g.EOSByte <= g.FirstByte:
 				verdict = fmt.Sprintf("post-EOS (literal %q at byte %d precedes the garbage; ignore_eos continuation)", g.EOSMarker, g.EOSByte)
+				m.GarbageVerdict = "post_eos"
 			case g.tailBabble():
 				verdict = "tail babble to end of budget (no visible EOS marker; consistent with generation past natural stop)"
+				m.GarbageVerdict = "tail_babble"
+			default:
+				// "Clean text after" only means DECODABLE text after. A model
+				// whose context is full of markers babbles in guid shapes,
+				// which are valid UTF-8 — observed live as a 4102-rune tail of
+				// recombined uuid fragments earning the MID-RESPONSE verdict.
+				// Novel guid-density in the tail reclassifies it.
+				if tg, tn, dense := tailGuidBabble(m.Response[g.LastByte:], own); dense {
+					verdict = fmt.Sprintf("post-stop guid babble (tail holds %d guid-shaped strings, %d novel recombinations; consistent with ignore_eos continuation)", tg, tn)
+					m.GarbageVerdict = "guid_babble"
+				}
 			}
 			fmt.Fprintf(os.Stderr,
 				"[verify] GARBAGE series=%d turn=%d session=%s instance=%s: %d\u00d7U+FFFD %d\u00d7NUL %d\u00d7ctrl runes %d..%d of %d, clean-after=%d, guids-before-garbage=%d/%d, context %s\n"+
@@ -900,7 +913,7 @@ func (p *replayPoster) do(
 			ExactMatch: m.ExactMatch, LeakChecked: m.LeakChecked,
 			MissSubstituted: m.MissSubstituted, MissAbsent: m.MissAbsent,
 			ReciteEchoedTags: m.ReciteEchoedTags, ReciteNoIDs: m.ReciteNoIDs,
-			BudgetShort: m.ReciteBudgetShort, Garbage: m.ResponseGarbage,
+			BudgetShort: m.ReciteBudgetShort, Garbage: m.ResponseGarbage, GarbageVerdict: m.GarbageVerdict,
 			Error: errString(m.Error),
 		}, bodyBytes, respCapture.Bytes(), mergedResponse(m.Response, respCapture.Bytes()))
 	}

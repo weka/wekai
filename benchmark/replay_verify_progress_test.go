@@ -116,3 +116,31 @@ func TestClassifyGarbagePositions(t *testing.T) {
 		}
 	})
 }
+
+// TestTailGuidBabble pins the reclassifier against the shape observed live: a
+// 4102-rune tail of recombined uuid fragments that earned MID-RESPONSE — the
+// verdict reserved for corruption the harness's own ignore_eos cannot explain
+// — because invented guids are valid UTF-8 and read as "clean text resumed".
+func TestTailGuidBabble(t *testing.T) {
+	own := map[string]bool{"11111111-1111-4111-8111-111111111111": true}
+
+	t.Run("novel guid spam is babble", func(t *testing.T) {
+		tail := "8b7a4f2e-9c3d-4f5a-8b2c-1e6d9f0a3b5c 8b7a4f2e-9c3d-4f5a-8b2c-1e6d9f0a3b5d 8b7a4f2e-9c3d-4f5a-8b2c-1e6d9f0a3b5e"
+		if _, _, dense := tailGuidBabble(tail, own); !dense {
+			t.Error("a tail that is nothing but invented uuid shapes must classify as babble")
+		}
+	})
+	t.Run("prose is not babble", func(t *testing.T) {
+		if _, _, dense := tailGuidBabble("and the whale surfaced once more, spouting into the dawn, while the crew watched in silence from the rigging above", own); dense {
+			t.Error("plain prose misclassified as guid babble")
+		}
+	})
+	t.Run("legitimate recall of own markers is not babble", func(t *testing.T) {
+		// Every id real, none invented: novelty is the discriminator, so a
+		// correct recitation must never land in the babble bucket.
+		tail := "11111111-1111-4111-8111-111111111111 11111111-1111-4111-8111-111111111111 11111111-1111-4111-8111-111111111111"
+		if _, novel, dense := tailGuidBabble(tail, own); dense || novel != 0 {
+			t.Errorf("own-marker recall classified as babble (novel=%d dense=%v)", novel, dense)
+		}
+	})
+}

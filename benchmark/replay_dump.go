@@ -86,12 +86,13 @@ type dumpMeta struct {
 	// result. Without it a reader has to re-derive from the bytes what the
 	// summary already worked out — which is exactly the re-derivation this
 	// capture exists to spare them.
-	MissSubstituted  int  `json:"miss_substituted,omitempty"`
-	MissAbsent       int  `json:"miss_absent,omitempty"`
-	ReciteEchoedTags bool `json:"recite_echoed_tags,omitempty"`
-	ReciteNoIDs      bool `json:"recite_no_ids,omitempty"`
-	BudgetShort      bool `json:"recite_budget_short,omitempty"`
-	Garbage          bool `json:"response_garbage,omitempty"`
+	MissSubstituted  int    `json:"miss_substituted,omitempty"`
+	MissAbsent       int    `json:"miss_absent,omitempty"`
+	ReciteEchoedTags bool   `json:"recite_echoed_tags,omitempty"`
+	ReciteNoIDs      bool   `json:"recite_no_ids,omitempty"`
+	BudgetShort      bool   `json:"recite_budget_short,omitempty"`
+	Garbage          bool   `json:"response_garbage,omitempty"`
+	GarbageVerdict   string `json:"garbage_verdict,omitempty"`
 }
 
 // dump writes one exchange: the request, the raw response, the readable

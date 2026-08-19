@@ -117,6 +117,7 @@ type garbageReport struct {
 	LastOffset  int // rune offset of the last bad rune
 	TotalRunes  int // response length, so the offsets read as positions
 	FirstByte   int // byte offset of the first bad rune, for substring-position comparisons
+	LastByte    int // byte offset just past the last bad rune, where the tail begins
 	// EOSByte/EOSMarker locate a literal stop-token in the text, if one is
 	// visible — see eosMarkers. -1 when none is.
 	EOSByte   int
@@ -165,6 +166,7 @@ func classifyGarbage(resp string) garbageReport {
 		}
 		if bad {
 			g.LastOffset = i
+			g.LastByte = byteIdx + len(string(r))
 			if g.FirstOffset < 0 {
 				g.FirstOffset = i
 				g.FirstByte = byteIdx
@@ -229,4 +231,32 @@ func eosMarker(resp string) (int, string) {
 // gets ignored — this one firing at all is worth reading the capture.
 func responseIsGarbage(resp string) bool {
 	return classifyGarbage(resp).bad()
+}
+
+// tailGuidBabble examines the text after the last bad rune for the babble
+// mode observed live: a model whose context holds dozens of [turn-N id: ...]
+// markers, forced past its stop by ignore_eos, babbles in GUID SHAPES —
+// recombined fragments of markers it saw, valid UTF-8 throughout. That tail
+// reads as "clean text resumed" to a decodability test and earned the one
+// verdict reserved for corruption that generation-past-stop cannot explain.
+// Density of guid-shaped strings separates the two: prose does not contain
+// runs of uuid-shaped tokens, and recall does not contain NOVEL ones — a
+// recombination is a string no session ever minted, so novelty against the
+// request's own markers is what proves the tail is invention rather than
+// content.
+func tailGuidBabble(tail string, own map[string]bool) (guids, novel int, dense bool) {
+	matches := uuidRe.FindAllString(tail, -1)
+	guids = len(matches)
+	covered := 0
+	for _, m := range matches {
+		covered += len(m)
+		if !own[m] {
+			novel++
+		}
+	}
+	// Three or more guid-shaped strings occupying a third of the tail is not
+	// prose; requiring at least one novel one keeps a legitimate full recall
+	// (every id real, none invented) out of the babble bucket.
+	dense = guids >= 3 && novel >= 1 && len(tail) > 0 && float64(covered)/float64(len(tail)) >= 0.3
+	return guids, novel, dense
 }
