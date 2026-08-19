@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,10 +17,10 @@ import (
 // then on. Anything else falls back to passive health — served, with health
 // inferred from real traffic rather than from probes it would always fail.
 func TestVLLMIsDiscoveredAndOthersFallBackToPassive(t *testing.T) {
-	var probes int
+	var probes atomic.Int64
 	vllm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" {
-			probes++
+			probes.Add(1)
 			// A vLLM instance is identified by its own metric names, whatever
 			// request format it is fronted with.
 			fmt.Fprint(w, "# HELP vllm:num_requests_running\nvllm:num_requests_running 3\n")
@@ -39,10 +40,10 @@ func TestVLLMIsDiscoveredAndOthersFallBackToPassive(t *testing.T) {
 
 	// A hosted API: no /v1/models, no /health. Probing it forever would be the
 	// benchmark sampler's retry-forever bug, one layer down.
-	var hostedProbes int
+	var hostedProbes atomic.Int64
 	hosted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" || r.URL.Path == "/v1/models" || r.URL.Path == "/health" {
-			hostedProbes++
+			hostedProbes.Add(1)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -86,13 +87,29 @@ func TestVLLMIsDiscoveredAndOthersFallBackToPassive(t *testing.T) {
 
 	// The discovery probe runs ONCE per endpoint. A retry loop against an
 	// endpoint that will never answer is the shape being avoided.
-	before := hostedProbes
-	time.Sleep(200 * time.Millisecond)
-	if hostedProbes > before {
-		t.Errorf("hosted endpoint was probed %d more times after discovery; "+
-			"a failed probe must be latched, not retried", hostedProbes-before)
+	//
+	// Discovery is asynchronous, and the request served above orders nothing
+	// about it: on a slow runner the single discovery sequence can still be
+	// in flight here, its remaining probes landing during any fixed sleep and
+	// misreading as retries. So the assertion is stability, which subsumes
+	// the old take-a-baseline-and-sleep form: a latched probe goes quiet
+	// within a few health intervals and stays quiet; a retry loop fires every
+	// interval and can never hold still.
+	deadline := time.Now().Add(2 * time.Second)
+	stableFor, last := 0, hostedProbes.Load()
+	for time.Now().Before(deadline) && stableFor < 4 {
+		time.Sleep(50 * time.Millisecond)
+		if cur := hostedProbes.Load(); cur == last {
+			stableFor++
+		} else {
+			stableFor, last = 0, cur
+		}
 	}
-	if probes != 1 {
-		t.Errorf("vLLM /metrics was probed %d times by DISCOVERY, want exactly 1", probes)
+	if stableFor < 4 {
+		t.Errorf("hosted endpoint was still being probed after 2s (%d probes and counting); "+
+			"a failed probe must be latched, not retried", hostedProbes.Load())
+	}
+	if got := probes.Load(); got != 1 {
+		t.Errorf("vLLM /metrics was probed %d times by DISCOVERY, want exactly 1", got)
 	}
 }
