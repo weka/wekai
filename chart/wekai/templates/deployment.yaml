@@ -56,6 +56,13 @@ spec:
                 {{- if .Values.replay.replaySeries }}
                 --replay-series={{ .Values.replay.replaySeries | int64 }} \
                 {{- end }}
+                {{- /* Guarded rather than always rendered: 0 is off, so an
+                       unset value has nothing to say, and a flag on every
+                       deploy would make the chart exit on an unknown flag
+                       against any image older than it. */}}
+                {{- if .Values.replay.maxRequestsPerSession }}
+                --replay-max-requests-per-session={{ .Values.replay.maxRequestsPerSession | int64 }} \
+                {{- end }}
                 {{- if .Values.replay.realtime }}
                 {{- /* Real-time replay grows the session count itself, so --series
                      must NOT be passed: it pins max-series too, and the run

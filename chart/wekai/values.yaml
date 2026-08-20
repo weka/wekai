@@ -53,6 +53,23 @@ replay:
   replayFile: /wekai/replay.jsonl  # path baked into the image by the Dockerfile
   replayRoles: ""          # comma-separated instance roles to replay (empty = all)
   replaySeries: 0          # cap on sessions replayed — subset selection (0 = all in the file)
+  # Replay only the first N requests of each session, in capture order, and drop
+  # the rest (0 = off). A capture's sessions are wildly uneven: on the July
+  # corpus the median holds 17 requests and one holds 26,253, 42% of the first
+  # 256 sessions by itself. Uncapped, a run spends most of its time inside a
+  # handful of sessions and measures the fleet on their shape rather than the
+  # workload's — and those same sessions occupy a slot, and stay resident, for
+  # the whole run.
+  #
+  # The cap is almost entirely a tax on those outliers, since the median session
+  # is far below any value worth setting: at 100 it truncates 51 of the first 256
+  # sessions and leaves 15.5% of the requests. Truncation is chronological across
+  # the whole session, so it can only ever remove a sub-agent entirely, never
+  # orphan a live one.
+  #
+  # A capped run is NOT comparable with an uncapped one. The run reports how many
+  # sessions it shortened and how many requests it dropped.
+  maxRequestsPerSession: 0
   series: 256              # parallel series workers replaying sessions (--series; 0 = binary default ramp)
 
   # ── Real-time replay and session admission ────────────────────────────────

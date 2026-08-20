@@ -775,3 +775,25 @@ func TestReuseSessionsRendersOnlyWhenTurnedOff(t *testing.T) {
 		t.Error("replay.reuseSessions=false rendered the bare flag, which means ON")
 	}
 }
+
+// The per-session request cap renders only when set, and reaches both replay
+// modes.
+//
+// Guarded because 0 is off: an unset value has nothing to say, and a flag on
+// every deploy would make the chart exit on an unknown flag against any image
+// older than it. Outside the realtime branch because an uneven corpus skews a
+// fixed --series run exactly as much — a handful of sessions holding most of
+// the requests hold most of the slots too.
+func TestMaxRequestsPerSessionRendersOnlyWhenSet(t *testing.T) {
+	if out := render(t, "--set", "replay.enabled=true"); strings.Contains(out, "--replay-max-requests-per-session") {
+		t.Error("the default render carries the cap; 0 means off, and rendering it anyway breaks " +
+			"deploys against any image predating the flag")
+	}
+	for _, mode := range []string{"replay.realtime=false", "replay.realtime=true"} {
+		out := render(t, "--set", "replay.enabled=true", "--set", mode,
+			"--set", "replay.maxRequestsPerSession=100")
+		if !strings.Contains(out, "--replay-max-requests-per-session=100") {
+			t.Errorf("%s: the cap did not render; an uneven corpus skews both replay modes", mode)
+		}
+	}
+}
