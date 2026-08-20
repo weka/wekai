@@ -272,7 +272,7 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		ReplayCharsPerToken:           c.ReplayCharsPerToken,
 		VLLMMetricsURLs:               c.VLLMMetricsURLs,
 		TTFTLimitStat:                 c.TTFTLimitStat,
-		ReplayReuseSessions:           c.ReplayReuseSessions,
+		ReplayReuseSessions:           c.ReuseSessions(),
 		ReplayAllowUnderfill:          c.ReplayAllowUnderfill,
 		ReplayRealtime:                c.ReplayRealtime,
 		AdmitEvery:                    c.AdmitEvery,
@@ -297,7 +297,7 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		DryRunWarmTPS:      c.DryRunWarmTPS,
 		DryRunOutputTPS:    c.DryRunOutputTPS,
 		CacheSimChunkBytes: c.CacheSimChunkBytes,
-		FIFOGateOrder:      c.RandomGateOrder == "false",
+		FIFOGateOrder:      c.FIFOGateOrder(),
 	}
 
 	if c.FromDataset != "" && c.RouterReplayFile != "" {

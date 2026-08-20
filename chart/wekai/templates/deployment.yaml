@@ -80,14 +80,28 @@ spec:
                 {{- if .Values.replay.skipIdle }}
                 --replay-skip-idle \
                 {{- end }}
-                {{- if .Values.replay.reuseSessions }}
-                --replay-reuse-sessions \
-                {{- end }}
                 {{- if .Values.replay.allowUnderfill }}
                 --replay-allow-underfill \
                 {{- end }}
                 {{- else if .Values.replay.series }}
                 --series={{ .Values.replay.series | int64 }} \
+                {{- end }}
+                {{- /* Cycling the corpus is the BINARY's default, so true renders
+                     nothing: the flag appears only to turn it off. That keeps
+                     the chart deployable against an image older than the flag
+                     — which would exit on an unknown flag — while still letting
+                     a deployment opt out, which a bare presence switch could
+                     never express. Rendered outside the realtime branch because
+                     a fixed --series run is exactly where cycling matters: a
+                     session count above the corpus size leaves the surplus slots
+                     empty from the first minute.
+
+                     kindIs "bool" and not a bare `not`, because a values file
+                     may null the key out and Go templates treat nil as falsy —
+                     which would render =false for a deployment that never asked
+                     to turn anything off. */}}
+                {{- if and (kindIs "bool" .Values.replay.reuseSessions) (not .Values.replay.reuseSessions) }}
+                --replay-reuse-sessions=false \
                 {{- end }}
                 {{- range .Values.replay.vllmMetricsUrls }}
                 --vllm-metrics-url={{ . }} \

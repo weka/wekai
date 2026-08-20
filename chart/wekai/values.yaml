@@ -97,8 +97,11 @@ replay:
   # contributes nothing to fidelity either.
   allowUnderfill: false
   # Replay the corpus again from the top instead of draining, so a run can
-  # outlast its dataset. 5,441 sessions at this workload's turnover is about
-  # 3.3 hours, so an 8-hour arm needs this.
+  # outlast its dataset. ON by default, because both ways a run ends up short of
+  # its corpus produce a number that reads as the fleet's: a long arm drains it
+  # (5,441 sessions at this workload's turnover is about 3.3 hours, so an 8-hour
+  # arm needs this), and a session count above the corpus size leaves the
+  # surplus slots empty from the first minute.
   #
   # Each pass gets its OWN content stamp, uniformly across the whole pass:
   # within a pass, sessions that shared a prompt in the capture still share it,
@@ -106,7 +109,11 @@ replay:
   # disjoint, so pass two cannot hit pass one's entries. A cache figure spanning
   # several passes is NOT comparable to a single-pass one — the run reports
   # corpus_pass so this is visible rather than inferred.
-  reuseSessions: false
+  #
+  # Set false to sweep the corpus once and stop at the end of it. That is also
+  # the only thing that ends a run with no timeout, so a false here and no
+  # timeout anywhere is how a job is meant to finish on its own.
+  reuseSessions: true
   # admitEvery is how fast the count climbs under realtime: one session, then
   # one more this often while the fleet keeps up. Concurrency is then whatever
   # the fleet's latency implies rather than a number set here. Ignored unless

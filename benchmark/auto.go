@@ -3237,6 +3237,35 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 			hdr.Summary.Sessions, hdr.Summary.Instances, hdr.Summary.Requests,
 			hdr.Summary.FanOutTurns, hdr.Summary.MaxFanOutInOneTurn)
 
+		// Both of these are properties of the run, not of a model, and every
+		// model streams the same file — so they belong here, where the header is
+		// read once, rather than in the per-model path that would print them
+		// once per model interleaved with each other's output.
+		sessions := effectiveSessionCount(hdr.Summary.Sessions,
+			len(cfg.RouterReplaySeriesIndices), cfg.ReplaySeries, cfg.ReplayReuseSessions)
+		// A fleet bigger than the capture is the ordinary reason to ask for more
+		// session slots than the corpus holds, and with cycling turned off the
+		// surplus slots pull once, find the stream drained and exit. The run
+		// still prints the slot count it was asked for while a fraction of it is
+		// running, so say it up front rather than leaving it to be read out of a
+		// throughput number hours later.
+		if !cfg.ReplayReuseSessions && cfg.MaxSeries > sessions {
+			fmt.Fprintf(os.Stderr, "[auto] %d session slots over a %d-session corpus with "+
+				"--replay-reuse-sessions=false: %d of them will never hold a session, so the offered "+
+				"load is not the %d this run reports. Drop the flag to replay the corpus again "+
+				"instead of draining it.\n",
+				cfg.MaxSeries, sessions, cfg.MaxSeries-sessions, cfg.MaxSeries)
+		}
+		// Cycling is the default, and it removes the terminator a replay run
+		// used to have: the corpus never drains, so nothing ends the run on its
+		// own. Worth one line, because the alternative is finding out by having
+		// a run still going the next morning.
+		if cfg.ReplayReuseSessions && cfg.Timeout == 0 && cfg.Total == 0 {
+			fmt.Fprintf(os.Stderr, "[auto] cycling the corpus with no --timeout and no --total: "+
+				"this run ends when you stop it. Pass one of those, or "+
+				"--replay-reuse-sessions=false to stop at the end of the corpus.\n")
+		}
+
 		// One registry for the whole run, built before any per-model
 		// goroutine spawns so every model shares the identical live marker
 		// set (same sharing rationale as replayConversations above).

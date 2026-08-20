@@ -750,3 +750,28 @@ func TestVerifyFlagsRenderOnlyWhenEnabled(t *testing.T) {
 		t.Error("forceEos rendered without being set")
 	}
 }
+
+// Cycling the corpus is the binary's default, so the chart renders the flag
+// only to turn it OFF.
+//
+// The asymmetry is the point. A bare presence switch can express "on" and
+// nothing else, which is useless once "on" is what you get anyway; and a flag
+// rendered on every deploy makes the chart exit on an unknown flag against any
+// image older than it. Rendering only the override gives a deployment a way to
+// opt out without costing the chart its deployability.
+func TestReuseSessionsRendersOnlyWhenTurnedOff(t *testing.T) {
+	if out := render(t, "--set", "replay.enabled=true"); strings.Contains(out, "--replay-reuse-sessions") {
+		t.Error("the default render carries --replay-reuse-sessions; cycling is the binary's default, " +
+			"so rendering it says nothing and breaks deploys against any image predating the flag")
+	}
+	out := render(t, "--set", "replay.enabled=true", "--set", "replay.reuseSessions=false")
+	if !strings.Contains(out, "--replay-reuse-sessions=false") {
+		t.Error("replay.reuseSessions=false rendered no flag; a deployment that wants a single sweep " +
+			"of the corpus has no other way to ask for one")
+	}
+	// A value, not a presence switch: the bare form would read as "on" and turn
+	// the opt-out into its opposite.
+	if strings.Contains(out, "--replay-reuse-sessions \\") {
+		t.Error("replay.reuseSessions=false rendered the bare flag, which means ON")
+	}
+}
