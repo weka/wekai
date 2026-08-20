@@ -414,6 +414,14 @@ func recordReplayRequest(
 			st.valGarbageMidResponse.Add(1)
 		}
 	}
+	// The same two facts, kept in this series' own order rather than summed
+	// into the run's totals: corruption twice in a row, and a miss nothing
+	// after it recovers from, are shapes a per-request count cannot hold.
+	// This runs on the series' goroutine, which issues its turns in sequence,
+	// so the order observed here is the order they were served in.
+	st.valSeries.observe(metrics.SeriesGUID, metrics.SeriesNum, metrics.CycleNum,
+		metrics.GarbageChecked, metrics.ResponseGarbage,
+		uuidExpectedCount > 0, uuidFoundCount < uuidExpectedCount)
 	if metrics.LeakChecked {
 		// Counted separately from valReqs: contamination is scored on every
 		// completed request, presence only on those asked to recite, and

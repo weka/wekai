@@ -829,16 +829,17 @@ func (p *replayPoster) do(
 		}
 		m.LeakChecked = true
 		m.LeakedUUIDs = findLeakedUUIDs(m.Response, "", own, p.registry)
+		m.GarbageChecked = true
 		if g := classifyGarbage(m.Response); g.bad() {
 			m.ResponseGarbage = true
-			// Printed as it happens, not just counted — and situated, because
-			// under ignore_eos most garbage is the harness's own doing. The
-			// engine samples the stop token, is told not to stop, and babbles
-			// to the end of the budget; that babble is expected and says
-			// nothing about the fleet. What CAN'T be explained that way is
-			// corruption with clean prose resuming after it, so the verdict
-			// separates the two, and the guid positions say whether the
-			// answer was already complete before the noise began.
+			// Printed as it happens, not just counted, and situated: WHERE the
+			// corruption sits is most of what separates its causes. A verify
+			// run keeps ignore_eos OFF (see forceVolume), so none of this is
+			// the harness forcing generation past the model's stop token —
+			// the post-EOS class survives only for --verify-force-eos, where
+			// that babble is expected and says nothing about the fleet. The
+			// guid positions say whether the answer was already complete
+			// before the noise began.
 			guidsBefore, guidsAsked := 0, 0
 			if inj != nil {
 				guidsAsked = len(inj.ReciteUUIDs)
@@ -855,7 +856,7 @@ func (p *replayPoster) do(
 				verdict = fmt.Sprintf("post-EOS (%d stop attempt(s), first %q at byte %d; ignore_eos continuation)", g.EOSCount, g.EOSMarker, g.EOSByte)
 				m.GarbageVerdict = "post_eos"
 			case g.tailBabble():
-				verdict = "tail garbage to end of budget (no visible stop token — resembles post-stop babble but carries no proof)"
+				verdict = "tail garbage (corruption runs to the end of the response — nothing clean resumed before the budget ran out)"
 				m.GarbageVerdict = "tail_babble"
 			default:
 				// "Clean text after" only means DECODABLE text after. A model
@@ -864,7 +865,7 @@ func (p *replayPoster) do(
 				// recombined uuid fragments earning the MID-RESPONSE verdict.
 				// Novel guid-density in the tail reclassifies it.
 				if tg, tn, dense := tailGuidBabble(m.Response[g.LastByte:], own); dense {
-					verdict = fmt.Sprintf("guid-babble tail (%d guid-shaped strings, %d novel recombinations; no visible stop token — invention, not content)", tg, tn)
+					verdict = fmt.Sprintf("guid-babble tail (%d guid-shaped strings, %d novel recombinations — invention, not content)", tg, tn)
 					m.GarbageVerdict = "guid_babble"
 				}
 			}

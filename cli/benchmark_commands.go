@@ -287,6 +287,8 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		VerifyContinueOnContamination: c.VerifyContinueOnContamination,
 		DumpDir:                       c.DumpDir,
 		DumpLimit:                     c.DumpLimit,
+		DumpGarbage:                   flagOn(c.DumpGarbage),
+		DumpGarbageDir:                c.DumpGarbageDir,
 		Seed:                          c.Seed,
 		RouterReplayFile:              c.RouterReplayFile,
 		RouterReplayRoles:             c.RouterReplayRoles,
@@ -309,6 +311,9 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		return err
 	}
 	if err := c.validateVerifyForceEOS(); err != nil {
+		return err
+	}
+	if err := c.validateDumpGarbage(); err != nil {
 		return err
 	}
 	if c.DryRun && c.RouterReplayFile == "" {
@@ -740,6 +745,21 @@ func (c *BenchmarkAutoOptions) validateVerify() error {
 			return fmt.Errorf("--verify is not supported with --docs-dir (synthetic mode): prompts " +
 				"are generated per request, so a marker has nothing stable to attach to")
 		}
+	}
+	return nil
+}
+
+// validateDumpGarbage refuses --dump-garbage-dir outside --verify, where the
+// capture can never fire: responses are scanned for corruption only under
+// coherency verification, so the directory would stay empty for the whole run
+// and read as a fleet that produced no garbage.
+//
+// Only the explicit directory is refused. --dump-garbage is ON by default, so
+// erroring on it would reject every non-verify run in the tool.
+func (c *BenchmarkAutoOptions) validateDumpGarbage() error {
+	if c.DumpGarbageDir != "" && !c.Verify {
+		return fmt.Errorf("--dump-garbage-dir requires --verify: responses are only scanned for " +
+			"corruption during coherency verification, so nothing would ever be written there")
 	}
 	return nil
 }

@@ -74,6 +74,12 @@ type RequestMetrics struct {
 	MissAbsent       int
 	ReciteEchoedTags bool
 	ReciteNoIDs      bool
+	// GarbageChecked records that this response WAS scanned for corruption,
+	// which is what makes "no garbage" different from "never looked". It is
+	// also the population the per-series garbage run is measured over: an
+	// errored or empty request is no evidence either way, so it must neither
+	// break a run of corrupt responses nor join one.
+	GarbageChecked bool
 	// ResponseGarbage: the response carried replacement characters, NULs or
 	// stray control characters — decode-level corruption from the serving
 	// stack, which no amount of model non-compliance can produce.

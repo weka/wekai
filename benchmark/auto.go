@@ -196,7 +196,13 @@ type AutoBenchmarkConfig struct {
 	// replay_dump.go. dumper is built once and shared by every poster.
 	DumpDir   string
 	DumpLimit int
-	dumper    *requestDumper
+	// DumpGarbage keeps the default-on garbage-only capture (--verify runs
+	// only); DumpGarbageDir names its directory instead of an mktemp one.
+	// --dump-dir supersedes both: it already writes every exchange, garbage
+	// among them, and two captures of the same bytes help nobody.
+	DumpGarbage    bool
+	DumpGarbageDir string
+	dumper         *requestDumper
 
 	// RunID is populated internally by RunAutoBenchmark at the start of each
 	// run. It's the UUID injected into every conversation's system prompt
@@ -1137,6 +1143,10 @@ type autoState struct {
 	valGarbageTail        atomic.Int64 // corruption runs to the end of the budget, no visible marker
 	valGarbageGuidBabble  atomic.Int64 // the tail after corruption is invented uuid shapes
 	valGarbageMidResponse atomic.Int64
+	// valSeries holds the two signals that live between requests rather than
+	// in one — back-to-back garbage and a miss the series never recovers
+	// from. See replay_verify_series.go. Zero value is ready to use.
+	valSeries seriesVerifyHistory
 	// Output-profile conformity: the wire budgets and what actually came
 	// back, summed over completed replay requests. actual/target is ~100%
 	// under ignore_eos by construction; when prompt-based length control
@@ -1264,6 +1274,7 @@ type autoBenchmarkResult struct {
 	valGarbageTail        int64
 	valGarbageGuidBabble  int64
 	valGarbageMidResponse int64
+	valSeries             seriesVerifyTotals
 	outTargetSum          int64
 	outActualSum          int64
 	valWindowSessions     int
@@ -1469,7 +1480,7 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 	if cfg.Verify {
 		fmt.Println(strings.Repeat("-", 62))
 		fmt.Println(" UUID validation (replay)")
-		fmt.Printf("   Requests validated                  : %d\n", res.valReqs)
+		fmt.Printf("   Requests validated                   : %d\n", res.valReqs)
 		// Two tests, mirroring the cache-coherency eval CLI's layout: UUID
 		// correctness (per-stamp presence, Contains anywhere in the response)
 		// and output conformity (first line is exactly the ordered,
@@ -1488,16 +1499,42 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		// ratio above is describing the instruction, not the fleet.
 		fmt.Printf("   Ask quality: responses echoing tags  : %d\n", res.valEchoedTagsReqs)
 		fmt.Printf("   Ask quality: responses with no ids   : %d\n", res.valNoIDsReqs)
-		// Only post-EOS has an explanation: the stop token is visible, so the
-		// garbage is provably the model forced past its finish. tail and
-		// babble resemble that event but carry no proof, and mid does not
-		// even resemble it — all three are bad, in different ways.
+		// A verify run keeps ignore_eos OFF (see forceVolume), so nothing here
+		// can be the one innocent thing garbage sometimes is: a model forced
+		// to keep generating past its own stop token. The classes say WHERE
+		// the corruption sat, which is what separates their causes, and the
+		// post-EOS class is printed only if it happened at all — that takes
+		// --verify-force-eos, and in any other run its zero was a line about
+		// a mode the run was not in.
 		fmt.Printf("   Garbage responses (decode corruption): %d\n", res.valGarbageReqs)
 		if res.valGarbageReqs > 0 {
-			fmt.Printf("     post-EOS (proven: stop token seen) : %d\n", res.valGarbagePostEOS)
-			fmt.Printf("     tail garbage (no proof)            : %d\n", res.valGarbageTail)
-			fmt.Printf("     guid-babble tail (no proof)        : %d\n", res.valGarbageGuidBabble)
+			if res.valGarbagePostEOS > 0 {
+				fmt.Printf("     post-EOS (ignore_eos continuation) : %d\n", res.valGarbagePostEOS)
+			}
+			fmt.Printf("     tail garbage (runs to end)         : %d\n", res.valGarbageTail)
+			fmt.Printf("     guid-babble tail                   : %d\n", res.valGarbageGuidBabble)
 			fmt.Printf("     mid-response                       : %d\n", res.valGarbageMidResponse)
+		}
+		// Two shapes that exist only BETWEEN requests, printed beside the
+		// per-request counts because the counts cannot hold them: 40 corrupt
+		// responses one per session and 40 arriving in pairs are the same
+		// number and two different fleets. Independent faults land adjacent
+		// at the square of their rate, while a corrupted prefix stays
+		// corrupted until the session ends — so consecutive garbage in one
+		// series is the shape KV corruption makes and a flaky decode does
+		// not. The same argument holds for a miss nothing later in the series
+		// recovers from: a model that declines one request answers the next,
+		// and a session that lost its context does not get it back.
+		fmt.Printf("   Series with back-to-back garbage     : %d of %d that produced any, %d scanned\n",
+			res.valSeries.garbageRunSeries, res.valSeries.garbageSeries, res.valSeries.classifiedSeries)
+		fmt.Printf("   Series never recovering from a miss  : %d of %d that missed, %d scored\n",
+			res.valSeries.missToEndSeries, res.valSeries.missSeries, res.valSeries.scoredSeries)
+		// Named, not just counted. The count says the fleet has the fault; these
+		// say which conversation to open, and the first two fields are the same
+		// s/t coordinates the per-request error lines carry, so a run can be
+		// grepped straight out of the log or the request-data JSONL.
+		if runs := formatMissRuns(res.valSeries.missToEnd, maxReportedMissRuns); runs != "" {
+			fmt.Printf("     series:turn:length                 : %s\n", runs)
 		}
 		// Both denominators, because they are different populations: presence
 		// is scored only where a recite was asked, contamination on every
@@ -1513,13 +1550,20 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		fmt.Printf("   Responses scanned for leaks          : %d\n", res.valLeakCheckedReqs)
 		fmt.Printf("   CROSS_CONTAMINATION (other-conv)     : %d across %d requests\n", res.valCrossContamUUIDs, res.valCrossContamReqs)
 		fmt.Printf("   Detection window (peak concurrent)   : %d session(s), %d marker(s)\n", res.valWindowSessions, res.valWindowMarkers)
-		if dir, n := cfg.dumper.Written(); dir != "" {
+		if dir, n, garbageOnly := cfg.dumper.Written(); dir != "" {
 			// Absolute, so the line is copy-pastable from any shell regardless
 			// of where the run was started.
 			if abs, err := filepath.Abs(dir); err == nil {
 				dir = abs
 			}
-			fmt.Printf("   Captured exchanges                   : %d in %s\n", n, dir)
+			// Named for what is IN it. The garbage-only capture holds a
+			// fraction of the run's exchanges by design, and a reader who
+			// takes it for the full one reads its count as a request total.
+			label := "Captured exchanges"
+			if garbageOnly {
+				label = "Captured garbage exchanges"
+			}
+			fmt.Printf("   %-37s: %d in %s\n", label, n, dir)
 		}
 	}
 	fmt.Println(strings.Repeat("=", 62))
@@ -1598,14 +1642,20 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 			rate = 100 * float64(snap.verifyFound) / float64(snap.verifyChecks)
 		}
 		verifyInfo = fmt.Sprintf(" guid=%.1f%%", rate)
-		// Garbage renders as its classes. Only post-EOS is excluded from BAD:
-		// a literal stop token before the corruption is proof the model had
-		// finished and ignore_eos pushed it onward. tail and babble merely
-		// SHAPE like that event — no marker means no proof, and corruption
-		// without an explanation is bad whatever it resembles.
+		// Garbage renders as its classes. post-EOS is the only one excluded
+		// from BAD — a literal stop token before the corruption is the model
+		// having finished and ignore_eos pushing it onward — and it takes
+		// width on the line only in a run that can produce it. A default
+		// verify run has ignore_eos off, where eos=0 is a fact about the
+		// mode rather than about the fleet, and the classes that move are
+		// what the line has room for.
 		if snap.verifyGarbage > 0 {
-			verifyInfo += fmt.Sprintf(" gbg(eos=%d tail=%d babble=%d mid=%d)",
-				snap.verifyGarbagePostEOS, snap.verifyGarbageTail, snap.verifyGarbageBabble, snap.verifyGarbageMid)
+			eos := ""
+			if snap.verifyGarbagePostEOS > 0 {
+				eos = fmt.Sprintf("eos=%d ", snap.verifyGarbagePostEOS)
+			}
+			verifyInfo += fmt.Sprintf(" gbg(%stail=%d babble=%d mid=%d)",
+				eos, snap.verifyGarbageTail, snap.verifyGarbageBabble, snap.verifyGarbageMid)
 		}
 		badGarbage := snap.verifyGarbage - snap.verifyGarbagePostEOS
 		if snap.verifyLeaked > 0 || badGarbage > 0 || snap.verifyAbsent > 0 {
@@ -3003,6 +3053,7 @@ func runSingleModelBenchmark(
 	res.valGarbageTail = st.valGarbageTail.Load()
 	res.valGarbageGuidBabble = st.valGarbageGuidBabble.Load()
 	res.valGarbageMidResponse = st.valGarbageMidResponse.Load()
+	res.valSeries = st.valSeries.totals()
 	res.outTargetSum = st.outTargetSum.Load()
 	res.outActualSum = st.outActualSum.Load()
 	if cfg.uuidRegistry != nil {
@@ -3303,13 +3354,31 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 		// block hashes it already carries, when it is dispatched — see
 		// replay_uuid_registry.go for why the corpus-wide pass this replaced
 		// was answering a question the scoring no longer asks.
-		if cfg.DumpDir != "" {
-			d, err := newRequestDumper(cfg.DumpDir, cfg.DumpLimit)
+		// --dump-dir wins where both apply: it is the wider capture, and it
+		// already contains every exchange the garbage-only one would have
+		// taken (each .meta.json carries the verdict, so they stay findable).
+		switch {
+		case cfg.DumpDir != "":
+			d, err := newRequestDumper(dumpAll, cfg.DumpDir, cfg.DumpLimit)
 			if err != nil {
 				return err
 			}
 			cfg.dumper = d
 			fmt.Printf("Dumping verbatim exchanges to %s (limit %d)\n", cfg.DumpDir, cfg.DumpLimit)
+		case cfg.Verify && cfg.DumpGarbage:
+			// On by default, because a corrupt response is the one verdict
+			// that cannot be reconstructed once the run is over, and it is
+			// rare enough to keep whole. The directory is only created if
+			// something goes wrong (see ensureDir), so a clean run pays
+			// nothing and leaves nothing behind.
+			d, err := newRequestDumper(dumpGarbage, cfg.DumpGarbageDir, cfg.DumpLimit)
+			if err != nil {
+				return err
+			}
+			cfg.dumper = d
+			if cfg.DumpGarbageDir != "" {
+				fmt.Printf("Dumping garbage exchanges to %s (limit %d)\n", cfg.DumpGarbageDir, cfg.DumpLimit)
+			}
 		}
 		if cfg.Verify {
 			cfg.uuidRegistry = newUUIDRegistry()

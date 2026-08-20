@@ -26,36 +26,102 @@ import (
 // under one name. A disagreement between the three is then readable rather
 // than inferred.
 type requestDumper struct {
-	dir   string
+	mode  dumpMode
 	limit int64
 	n     atomic.Int64
 	warn  sync.Once
+
+	// dirMu guards the destination, which a default-on capture only resolves
+	// when it first has something to write. See ensureDir.
+	dirMu  sync.Mutex
+	dir    string
+	dirErr error
 }
 
-// Written reports how many exchanges landed on disk, and where — the summary
-// prints this so a reader can go from a number straight to the bytes behind it.
-func (d *requestDumper) Written() (dir string, n int64) {
+// dumpMode selects which exchanges reach the disk.
+type dumpMode int
+
+const (
+	dumpOff dumpMode = iota
+	// dumpAll writes every exchange (--dump-dir). It answers questions about
+	// the run as a whole and costs a few hundred KB per request, so it is
+	// something a reader asks for deliberately.
+	dumpAll
+	// dumpGarbage writes only the exchanges whose response carried
+	// decode-level corruption, and is ON by default under --verify.
+	//
+	// Garbage is the one verdict that cannot be re-derived after the fact. A
+	// count says two responses were corrupt; it cannot say what was in the
+	// prompt that produced them, whether the corruption sat mid-answer or ran
+	// to the end of the budget, or whether the same session produced the next
+	// one. By the time a reader knows they want that, the run is over and the
+	// bytes are gone — and a corrupt response is rare enough that keeping
+	// every one of them costs nothing next to re-running the arm.
+	dumpGarbage
+)
+
+// Written reports how many exchanges landed on disk, where, and whether the
+// capture was the garbage-only one — the summary prints this so a reader can
+// go from a number straight to the bytes behind it.
+//
+// A dumper that resolves its directory on demand reports none until it has
+// written something, which is the honest answer: nothing exists yet.
+func (d *requestDumper) Written() (dir string, n int64, garbageOnly bool) {
 	if d == nil {
-		return "", 0
+		return "", 0, false
 	}
 	n = d.n.Load()
 	if n > d.limit {
 		n = d.limit
 	}
-	return d.dir, n
+	d.dirMu.Lock()
+	dir = d.dir
+	d.dirMu.Unlock()
+	return dir, n, d.mode == dumpGarbage
 }
 
-func newRequestDumper(dir string, limit int) (*requestDumper, error) {
-	if dir == "" {
+// newRequestDumper builds the capture for one run. An empty dir under
+// dumpGarbage means "make one when there is something to put in it"; under
+// dumpAll it means the flag was not given, so there is no capture at all.
+func newRequestDumper(mode dumpMode, dir string, limit int) (*requestDumper, error) {
+	if mode == dumpOff || (mode == dumpAll && dir == "") {
 		return nil, nil
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("create dump dir: %w", err)
+	if dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create dump dir: %w", err)
+		}
 	}
 	if limit <= 0 {
 		limit = defaultDumpLimit
 	}
-	return &requestDumper{dir: dir, limit: int64(limit)}, nil
+	return &requestDumper{mode: mode, dir: dir, limit: int64(limit)}, nil
+}
+
+// ensureDir resolves the destination, creating a fresh mktemp directory the
+// first time one is needed and announcing it on stderr.
+//
+// Deferring it is what makes the garbage capture safe to leave on: a run that
+// produces no garbage creates no directory, so the default never litters
+// /tmp with empty evidence of nothing having gone wrong. The announcement is
+// on stderr beside the [verify] GARBAGE line it belongs to, so the path is in
+// front of whoever is watching the run rather than only in the summary hours
+// later.
+func (d *requestDumper) ensureDir() string {
+	d.dirMu.Lock()
+	defer d.dirMu.Unlock()
+	if d.dir != "" || d.dirErr != nil {
+		return d.dir
+	}
+	dir, err := os.MkdirTemp("", "wekai-garbage-")
+	if err != nil {
+		d.dirErr = err
+		fmt.Fprintf(os.Stderr, "[dump] cannot create a capture directory: %v (capture disabled)\n", err)
+		return ""
+	}
+	d.dir = dir
+	fmt.Fprintf(os.Stderr, "[dump] capturing garbage exchanges to %s (--dump-garbage-dir to choose one)\n", dir)
+	return dir
 }
 
 // defaultDumpLimit bounds the capture because a replay prompt averages several
@@ -103,15 +169,27 @@ func (d *requestDumper) dump(meta dumpMeta, request, response, merged []byte) {
 	if d == nil {
 		return
 	}
+	// The filter precedes the counter, so the limit bounds what is WRITTEN.
+	// Counting the exchanges it skips would let a clean stretch of the run
+	// exhaust a garbage capture's budget before the first corrupt response
+	// ever arrived.
+	if d.mode == dumpGarbage && !meta.Garbage {
+		return
+	}
 	if d.n.Add(1) > d.limit {
 		d.warn.Do(func() {
+			dir, _, _ := d.Written()
 			fmt.Fprintf(os.Stderr,
 				"[dump] reached --dump-limit=%d exchanges; no further requests are being written to %s\n",
-				d.limit, d.dir)
+				d.limit, dir)
 		})
 		return
 	}
-	base := filepath.Join(d.dir, fmt.Sprintf("s%03d-%s-t%03d", meta.Series, sanitizeName(meta.Instance), meta.Turn))
+	dir := d.ensureDir()
+	if dir == "" {
+		return
+	}
+	base := filepath.Join(dir, fmt.Sprintf("s%03d-%s-t%03d", meta.Series, sanitizeName(meta.Instance), meta.Turn))
 	write := func(suffix string, b []byte) {
 		if err := os.WriteFile(base+suffix, b, 0o644); err != nil {
 			d.warn.Do(func() {
