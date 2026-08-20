@@ -16,6 +16,22 @@ import (
 	"github.com/weka/wekai/llm"
 )
 
+// newTestAutoState mirrors the fields runAutoBenchmark builds that the replay
+// dispatch path dereferences — see the autoState literal in auto.go. gateLimit
+// sizes the concurrency gate, which has to be at least the number of requests a
+// test wants in flight at once.
+func newTestAutoState(gateLimit int) *autoState {
+	return &autoState{
+		stream:         newCompletionStream(200),
+		gate:           newConcurrencyGate(gateLimit, false),
+		datasetTracker: newActiveDatasetTracker(),
+		ttft:           newTTFTWindow(30 * time.Second),
+		skipClk:        newSkipClock(false),
+		lag:            &pacingLag{},
+		estimator:      newCacheEstimator(0),
+	}
+}
+
 // TestReplayEndpointResolution covers the attempt-then-fallback contract:
 // bare-root bases fall back to /v1 on 404 and latch that form; /v1 bases
 // work on the first attempt with no doubled probe; non-404 errors never
@@ -1026,17 +1042,7 @@ func TestSessionRegistersItsMarkersAndDetectsLeaks(t *testing.T) {
 		}},
 	}
 
-	// Mirrors the fields runAutoBenchmark builds that the replay dispatch
-	// path dereferences — see the autoState literal in auto.go.
-	st := &autoState{
-		stream:         newCompletionStream(200),
-		gate:           newConcurrencyGate(4, false),
-		datasetTracker: newActiveDatasetTracker(),
-		ttft:           newTTFTWindow(30 * time.Second),
-		skipClk:        newSkipClock(false),
-		lag:            &pacingLag{},
-		estimator:      newCacheEstimator(0),
-	}
+	st := newTestAutoState(4)
 	runRouterReplaySession(context.Background(), cfg, st, nil, sess, 1,
 		endpointPicker{}, 30*time.Second,
 		strings.Repeat("session-docs ", 100), newConcurrencyGate(4, false))
@@ -1112,11 +1118,7 @@ func TestPassStampReachesTheMarkers(t *testing.T) {
 		mu.Unlock()
 		s := sess
 		s.pass = pass
-		st := &autoState{
-			stream: newCompletionStream(200), gate: newConcurrencyGate(4, false),
-			datasetTracker: newActiveDatasetTracker(), ttft: newTTFTWindow(30 * time.Second),
-			skipClk: newSkipClock(false), lag: &pacingLag{}, estimator: newCacheEstimator(0),
-		}
+		st := newTestAutoState(4)
 		runRouterReplaySession(context.Background(), cfg, st, nil, s, 1,
 			endpointPicker{}, 30*time.Second, strings.Repeat("pass-docs ", 50),
 			newConcurrencyGate(4, false))

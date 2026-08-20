@@ -160,8 +160,15 @@ type RouterReplayMessage struct {
 // routerReplayStream reads a replay-v3 JSONL file line-by-line and serves
 // sessions through a bounded channel. The producer goroutine reads exactly
 // one session ahead of what consumers have pulled (channel cap = small),
-// so memory stays bounded by chan_capacity * max_session_size — no matter
-// how big the file gets.
+// so the READ side stays bounded by chan_capacity * max_session_size — no
+// matter how big the file gets.
+//
+// What that bound does not cover is the sessions already handed out: a worker
+// holds its whole parsed session for as long as the session runs, so a run's
+// resident set is session_slots * mean_session_size, and the sessions that stay
+// resident longest are the largest ones — a capture's size distribution is long
+// tailed, and a session is big because it has many turns to replay. At a few
+// thousand slots that is the corpus itself, in parsed form.
 //
 // Only Pull, Total, and Remaining are externally visible; the producer
 // goroutine is internal.
@@ -210,6 +217,29 @@ func readRouterReplayHeader(path string) (RouterReplayHeader, error) {
 	return hdr, nil
 }
 
+// effectiveSessionCount is how many sessions a run will dispatch, given a corpus
+// of corpusSessions, an index filter selecting filtered of them (0 = no filter),
+// and a --replay-series cap.
+//
+// One owner, because it is both what the progress display divides by and what a
+// pre-flight check compares a run's session slots against, and those two
+// answering differently is how a run reports past 100% or warns about a corpus
+// it is not actually going to use.
+//
+// A cap below the corpus bounds the run. A cap ABOVE it only means something
+// under reuse, where the producer goes round again instead of draining: then the
+// cap, not the corpus, is the number of sessions the run sees.
+func effectiveSessionCount(corpusSessions, filtered, sessionLimit int, reuse bool) int {
+	total := corpusSessions
+	if filtered > 0 {
+		total = filtered
+	}
+	if sessionLimit > 0 && (reuse || sessionLimit < total) {
+		total = sessionLimit
+	}
+	return total
+}
+
 // openRouterReplayStream parses the header line, then starts a producer
 // goroutine that streams subsequent lines through ch (cap defines how
 // many sessions can be buffered ahead of consumers). sessionLimit > 0
@@ -247,18 +277,7 @@ func openRouterReplayStream(path string, chanCap, sessionLimit int, allowedIndic
 		chanCap = 4
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	total := hdr.Summary.Sessions
-	if sessionLimit > 0 && sessionLimit < total {
-		total = sessionLimit
-	}
-	// When an index filter is active, total is the number of matching indices
-	// (capped by sessionLimit if set) — this is what the progress display uses.
-	if len(allowedIndices) > 0 {
-		total = len(allowedIndices)
-		if sessionLimit > 0 && sessionLimit < total {
-			total = sessionLimit
-		}
-	}
+	total := effectiveSessionCount(hdr.Summary.Sessions, len(allowedIndices), sessionLimit, reuse)
 	s := &routerReplayStream{
 		header:         hdr,
 		f:              f,
@@ -286,7 +305,8 @@ func openRouterReplayStream(path string, chanCap, sessionLimit int, allowedIndic
 func (s *routerReplayStream) produce() {
 	defer close(s.done)
 	defer close(s.ch)
-	lineIdx := 0 // 0-based index of the current session line (header already consumed)
+	lineIdx := 0  // 0-based index of the current session line (header already consumed)
+	thisPass := 0 // sessions emitted on the current lap through the corpus
 	for {
 		if s.ctx.Err() != nil {
 			return
@@ -295,10 +315,18 @@ func (s *routerReplayStream) produce() {
 			// session cap reached — stop reading further lines.
 			return
 		}
-		// When filtering by index: stop once we've read past the highest
-		// allowed index (no point scanning the rest of the file).
-		if s.allowedIndices != nil && s.produced.Load() >= int64(len(s.allowedIndices)) {
-			return
+		// When filtering by index: stop once this lap has emitted every allowed
+		// index (no point scanning the rest of the file). Counted per lap and
+		// not per run, because under reuse the filter chooses WHICH sessions
+		// repeat — a run cycling a slice of the corpus is the ordinary way to
+		// hold a working set smaller than the file — and a run-wide count would
+		// end the stream after one lap.
+		if s.allowedIndices != nil && thisPass >= len(s.allowedIndices) {
+			if !s.advancePass(thisPass) {
+				return
+			}
+			lineIdx, thisPass = 0, 0
+			continue
 		}
 		line, err := s.br.ReadBytes('\n')
 		if len(line) > 0 {
@@ -315,6 +343,7 @@ func (s *routerReplayStream) produce() {
 				}
 				var sess RouterReplaySession
 				if jerr := json.Unmarshal(line, &sess); jerr == nil {
+					thisPass++
 					sess.pass = int(s.pass.Load())
 					sess.fileIdx = currentIdx
 					// Backpressure: blocks when ch is full, so the next
@@ -331,25 +360,49 @@ func (s *routerReplayStream) produce() {
 			}
 		}
 		if err != nil {
-			if !s.reuse {
+			if !s.advancePass(thisPass) {
 				return
 			}
-			// Another pass. Rewind, re-consume the header, and bump the stamp
-			// generation. Sessions are independent, so replaying them is
-			// legitimate — what must NOT be reused is their content keyspace,
-			// and that is what the per-pass stamp separates.
-			if _, serr := s.f.Seek(0, io.SeekStart); serr != nil {
-				return
-			}
-			s.br.Reset(s.f)
-			if _, herr := s.br.ReadBytes('\n'); herr != nil {
-				return
-			}
-			s.pass.Add(1)
-			lineIdx = 0
+			lineIdx, thisPass = 0, 0
 			continue
 		}
 	}
+}
+
+// advancePass starts another lap over the corpus, reporting whether the producer
+// should keep going. emitted is how many sessions the lap that just ended
+// produced.
+//
+// Both ways a lap can end — the file running out, and an index filter having
+// seen every index it selects — go through here, so every condition on starting
+// another one is decided in a single place rather than depending on which path
+// noticed the lap was over.
+func (s *routerReplayStream) advancePass(emitted int) bool {
+	if !s.reuse {
+		return false
+	}
+	// A lap that emitted nothing will emit nothing next time either — an empty
+	// corpus, or one whose every line failed to parse. Going round again on it
+	// is an unbounded loop over a file with no sessions in it: a pinned core,
+	// and a run that never starts and, because the stream never reports itself
+	// drained, never ends.
+	if emitted == 0 {
+		fmt.Fprintf(os.Stderr, "[router-replay] no sessions parsed from %s; stopping instead of "+
+			"replaying an empty corpus\n", s.f.Name())
+		return false
+	}
+	// Rewind, re-consume the header, and bump the stamp generation. Sessions are
+	// independent, so replaying them is legitimate — what must NOT be reused is
+	// their content keyspace, and that is what the per-pass stamp separates.
+	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
+		return false
+	}
+	s.br.Reset(s.f)
+	if _, err := s.br.ReadBytes('\n'); err != nil {
+		return false
+	}
+	s.pass.Add(1)
+	return true
 }
 
 // Pull blocks until a session is available, the stream is done, or ctx is
@@ -384,9 +437,19 @@ func (s *routerReplayStream) Total() int { return s.total }
 // "remaining" for the consumer's purposes).
 func (s *routerReplayStream) Remaining() int {
 	if s.reuse {
-		// Never drains: the corpus is replayed again rather than exhausted, so
-		// the underfill abort has nothing to fire on.
-		return s.total
+		select {
+		case <-s.done:
+			// The producer stopped anyway — a --replay-series cap reached, or a
+			// corpus that yielded nothing. From here the stream drains like any
+			// other, and it has to say so: the drain watcher and the evaluator
+			// both decide a run is finished by asking this, so a stream that
+			// always answers "more" leaves every worker idle while the run
+			// ticks on to its timeout.
+		default:
+			// Still cycling: the corpus is replayed again rather than
+			// exhausted, so the underfill abort has nothing to fire on.
+			return s.total
+		}
 	}
 	r := s.total - int(s.idx.Load())
 	if r < 0 {
