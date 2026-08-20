@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,8 +23,8 @@ import (
 // histogram's _count is the missing figure: how many requests entered the retry
 // path, and how many the waiting actually rescued.
 
-func post(srv *httptest.Server) (*http.Response, error) {
-	return http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
+func post(fx *retryFixture) (*http.Response, error) {
+	return http.Post(fx.srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
 }
 
 func waitStats(t *testing.T, reason, outcome string) (count uint64, sum float64) {
@@ -65,16 +64,17 @@ func TestRetryWaitCountsRequestsNotAttempts(t *testing.T) {
 	// satisfied, and this test would fail for a reason it is not about. Where
 	// the budget's edge is under test the fixture says so — see
 	// TestRetryWaitSeparatesRescuedFromExpired.
-	srv, clk := retryHarness(t, sel, time.Hour, nil)
+	fx := retryHarness(t, sel, time.Hour, nil)
 
 	done := make(chan struct{})
-	go drive(clk, done)
-	resp, err := post(srv)
+	go drive(fx.clk, done)
+	resp, err := post(fx)
 	close(done)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
 	resp.Body.Close()
+	fx.settled()
 
 	countAfter, sumAfter := waitStats(t, reason, "satisfied")
 	if got := countAfter - countBefore; got != 1 {
@@ -100,16 +100,17 @@ func TestRetryWaitSeparatesRescuedFromExpired(t *testing.T) {
 
 	sel := &refusingSelector{err: policy.ErrAllBackendsSaturated}
 	sel.remaining.Store(1 << 30) // never recovers
-	srv, clk := retryHarness(t, sel, 2*time.Second, nil)
+	fx := retryHarness(t, sel, 2*time.Second, nil)
 
 	done := make(chan struct{})
-	go drive(clk, done)
-	resp, err := post(srv)
+	go drive(fx.clk, done)
+	resp, err := post(fx)
 	close(done)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
 	resp.Body.Close()
+	fx.settled()
 
 	satisfiedAfter, _ := waitStats(t, reason, "satisfied")
 	expiredAfter, _ := waitStats(t, reason, "expired")
@@ -136,13 +137,14 @@ func TestRetryWaitIgnoresRequestsThatNeverWaited(t *testing.T) {
 
 	sel := &refusingSelector{err: policy.ErrAllBackendsSaturated}
 	sel.remaining.Store(0) // refuses nothing
-	srv, _ := retryHarness(t, sel, 10*time.Second, nil)
+	fx := retryHarness(t, sel, 10*time.Second, nil)
 
-	resp, err := post(srv)
+	resp, err := post(fx)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
 	resp.Body.Close()
+	fx.settled()
 
 	var after uint64
 	for _, r := range metrics.CapacityRetryReasons {
@@ -185,7 +187,7 @@ func TestRetryWaitExcludesTheServiceTimeOfTheAttemptThatSucceeded(t *testing.T) 
 		serviceBegan atomic.Int64
 	)
 	done := make(chan struct{})
-	srv, c := retryHarness(t, sel, budget, func(w http.ResponseWriter, r *http.Request) {
+	fx := retryHarness(t, sel, budget, func(w http.ResponseWriter, r *http.Request) {
 		// The driver stops before the service leg, so this handler is the only
 		// writer of the clock while it runs. That gives the span under test an
 		// exact ceiling rather than one that moves with how often the driver
@@ -196,16 +198,17 @@ func TestRetryWaitExcludesTheServiceTimeOfTheAttemptThatSucceeded(t *testing.T) 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"c","object":"chat.completion","choices":[]}`))
 	})
-	clk = c
+	clk = fx.clk
 	start := clk.Now()
 
 	go drive(clk, done)
-	resp, err := post(srv)
+	resp, err := post(fx)
 	stop.Do(func() { close(done) })
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
 	resp.Body.Close()
+	fx.settled()
 
 	countAfter, sumAfter := waitStats(t, reason, "satisfied")
 	if countAfter-countBefore != 1 {

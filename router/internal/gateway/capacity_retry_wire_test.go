@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -50,7 +51,30 @@ func (s *refusingSelector) Select(_ context.Context, cands []*registry.Backend, 
 
 const chatBody = `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
 
-func retryHarness(t *testing.T, sel proxy.Selector, limit time.Duration, upstream http.HandlerFunc) (*httptest.Server, *clock.Fake) {
+// retryFixture is a gateway under test, the fake clock its retry loop waits on,
+// and a barrier that a metrics assertion has to cross first.
+type retryFixture struct {
+	srv      *httptest.Server
+	clk      *clock.Fake
+	handlers sync.WaitGroup
+}
+
+// settled blocks until every request served so far has RETURNED from the
+// gateway, not merely been answered.
+//
+// The two are not the same instant. The proxy writes the response from inside
+// the retry loop, and only once that loop returns does it settle its histogram
+// — so a test reading a metric the moment http.Post returns is racing the tail
+// of the handler it just triggered. It is a race the test usually wins on one
+// core and loses on several, which makes it a CI failure rather than a local
+// one: about 1 run in 80 at GOMAXPROCS=2, on whichever commit happened to be
+// building.
+//
+// Every assertion about a metric this package records therefore has to cross
+// this barrier, and assertions about the RESPONSE do not.
+func (f *retryFixture) settled() { f.handlers.Wait() }
+
+func retryHarness(t *testing.T, sel proxy.Selector, limit time.Duration, upstream http.HandlerFunc) *retryFixture {
 	t.Helper()
 	if upstream == nil {
 		upstream = func(w http.ResponseWriter, r *http.Request) {
@@ -75,9 +99,17 @@ func retryHarness(t *testing.T, sel proxy.Selector, limit time.Duration, upstrea
 	}, stubRouter{Target{Name: "default", Registry: reg, Selector: sel}},
 		proxy.New(proxy.Config{MaxAttempts: 2, StreamBufferBytes: 64 << 10}), openai.New())
 
-	srv := httptest.NewServer(gw)
-	t.Cleanup(srv.Close)
-	return srv, clk
+	fx := &retryFixture{clk: clk}
+	// Add runs before the gateway writes a single byte, so a caller that reaches
+	// settled() by way of a returned response is guaranteed to see the counter
+	// already raised.
+	fx.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fx.handlers.Add(1)
+		defer fx.handlers.Done()
+		gw.ServeHTTP(w, r)
+	}))
+	t.Cleanup(fx.srv.Close)
+	return fx
 }
 
 // drive advances the fake clock while the handler is parked in clock.After.
@@ -107,11 +139,11 @@ func TestCapacityRefusalIsWaitedOutAndReDecided(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			sel := &refusingSelector{err: tc.err}
 			sel.remaining.Store(3) // frees up on the fourth decision
-			srv, clk := retryHarness(t, sel, 10*time.Second, nil)
+			fx := retryHarness(t, sel, 10*time.Second, nil)
 
 			done := make(chan struct{})
-			go drive(clk, done)
-			resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
+			go drive(fx.clk, done)
+			resp, err := http.Post(fx.srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
 			close(done)
 			if err != nil {
 				t.Fatalf("post: %v", err)
@@ -133,11 +165,11 @@ func TestCapacityRefusalIsWaitedOutAndReDecided(t *testing.T) {
 func TestCapacityRefusalGivesUpAtTheLimit(t *testing.T) {
 	sel := &refusingSelector{err: policy.ErrAllBackendsSaturated}
 	sel.remaining.Store(1 << 30) // never recovers
-	srv, clk := retryHarness(t, sel, 2*time.Second, nil)
+	fx := retryHarness(t, sel, 2*time.Second, nil)
 
 	done := make(chan struct{})
-	go drive(clk, done)
-	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
+	go drive(fx.clk, done)
+	resp, err := http.Post(fx.srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
 	close(done)
 	if err != nil {
 		t.Fatalf("post: %v", err)
@@ -151,9 +183,9 @@ func TestCapacityRefusalGivesUpAtTheLimit(t *testing.T) {
 func TestRetryLimitOffAnswersImmediately(t *testing.T) {
 	sel := &refusingSelector{err: policy.ErrAllBackendsSaturated}
 	sel.remaining.Store(1 << 30)
-	srv, _ := retryHarness(t, sel, 0, nil) // the shipped default
+	fx := retryHarness(t, sel, 0, nil) // the shipped default
 
-	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
+	resp, err := http.Post(fx.srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
@@ -172,7 +204,7 @@ func TestRetryLimitOffAnswersImmediately(t *testing.T) {
 func TestFailuresAreNotWaitedOut(t *testing.T) {
 	sel := &refusingSelector{err: policy.ErrAllBackendsSaturated}
 	sel.remaining.Store(0) // never refuses; the UPSTREAM is what fails
-	srv, _ := retryHarness(t, sel, time.Hour, func(w http.ResponseWriter, r *http.Request) {
+	fx := retryHarness(t, sel, time.Hour, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 	})
 
@@ -180,7 +212,7 @@ func TestFailuresAreNotWaitedOut(t *testing.T) {
 	// advance and the request would hang until the test binary's own deadline.
 	answered := make(chan int, 1)
 	go func() {
-		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
+		resp, err := http.Post(fx.srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
 		if err != nil {
 			answered <- 0
 			return
