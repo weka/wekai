@@ -943,6 +943,29 @@ func (g *concurrencyGate) GateStats() (active, coldWaiting, normalWaiting int) {
 	return g.active, len(g.coldWaiters), len(g.waiters)
 }
 
+// errorAbortEarned reports whether the run's error counters have already
+// crossed a configured ceiling. The evaluator calls it before every other gate.
+//
+// The two ceilings answer different questions. MaxTotalErrors is monotonic, so
+// it catches a single intermittent error even when surrounded by successes;
+// MaxConsecutiveFailures resets on any success, so transient blips do not
+// accumulate and its default of 512 lets a temporarily overloaded fleet
+// recover first.
+//
+// It deliberately cannot see totalCompleted, which is what the evaluator's
+// warmup gate counts. That gate is StartSeries*2 completions — thousands of
+// requests at a few thousand sessions — and a ceiling of 512 that cannot be
+// reached until 16,000 requests have landed is not the ceiling it says it is.
+// A fleet failing every request is at its most obviously broken during the
+// ramp, which is exactly the window the gate covers.
+func (st *autoState) errorAbortEarned(cfg AutoBenchmarkConfig) bool {
+	if cfg.MaxTotalErrors > 0 && st.totalErrors.Load() >= int64(cfg.MaxTotalErrors) {
+		return true
+	}
+	return cfg.MaxConsecutiveFailures > 0 &&
+		st.consecutiveFailures.Load() >= int64(cfg.MaxConsecutiveFailures)
+}
+
 // autoTermReason describes why the auto benchmark terminated.
 
 type autoTermReason int
@@ -2600,13 +2623,9 @@ func runSingleModelBenchmark(
 			return true
 		}
 
-		// Fail-fast: abort once TOTAL errors reach the configured ceiling.
-		// Unlike consecutiveFailures (reset on success), totalErrors is
-		// monotonic, so this catches a single intermittent error even when
-		// surrounded by successes. Placed before warmup/replay gates so it
-		// fires ASAP. Does not touch the LLM server — it stays up for replay.
-		if cfg.MaxTotalErrors > 0 && benchCtx.Err() == nil &&
-			st.totalErrors.Load() >= int64(cfg.MaxTotalErrors) {
+		// Both error ceilings, ahead of every gate below. Does not touch the LLM
+		// server — it stays up for replay.
+		if st.errorAbortEarned(cfg) && benchCtx.Err() == nil {
 			termReason = termReasonError
 			select {
 			case termChan <- termReason:
@@ -2695,19 +2714,6 @@ func runSingleModelBenchmark(
 				}
 				st.mu.Unlock()
 			}
-		}
-
-		// Simple abort: N consecutive failures. Counter is reset on any success
-		// so transient blips don't accumulate. Default 512 is high enough that
-		// a temporarily overloaded server recovers before we bail.
-		if cfg.MaxConsecutiveFailures > 0 && benchCtx.Err() == nil &&
-			st.consecutiveFailures.Load() >= int64(cfg.MaxConsecutiveFailures) {
-			termReason = termReasonError
-			select {
-			case termChan <- termReason:
-			default:
-			}
-			return true
 		}
 
 		st.mu.Lock()
