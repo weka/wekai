@@ -1,22 +1,19 @@
 package benchmark
 
 import (
-	"bufio"
 	"encoding/json"
-	"os"
 	"strings"
 	"testing"
 )
 
-// TestOpenAIVsAnthropicBodySize measures the token-count gap between the two
-// wire builders before and after the tools-array fix.
-//
-// Part (a): synthetic fixtures.
-// Part (b): real replay file (skipped if absent).
+// TestOpenAIVsAnthropicBodySize pins the token-count gap between the two wire
+// builders. The two dialects have to put a request of the same shape on the
+// wire at the same size, or an arm run against an OpenAI endpoint is not
+// carrying the load an Anthropic one carries and the two results are not
+// comparable — and the tools array, which is most of a tools-heavy request, is
+// where that last diverged.
 func TestOpenAIVsAnthropicBodySize(t *testing.T) {
 	docs := embeddedBenchDoc // deterministic corpus; same as production path
-
-	// ---- (a) synthetic fixtures ----
 
 	toolsSpec := &RouterReplayToolsSpec{
 		Count: 8,
@@ -102,61 +99,6 @@ func TestOpenAIVsAnthropicBodySize(t *testing.T) {
 	if ratio > 1.15 {
 		t.Errorf("OpenAI/Anthropic size ratio %.3f > 1.15 — tools array is unexpectedly large", ratio)
 	}
-
-	// ---- (b) real replay file ----
-	replayPath := os.ExpandEnv("$HOME/.wekai/router/capture/replays/replay-20-may-2027-20h-weka-v2.jsonl")
-	f, err := os.Open(replayPath)
-	if err != nil {
-		t.Logf("real replay file not found (%v); skipping part (b)", err)
-		return
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 128*1024*1024), 128*1024*1024)
-
-	// Line 1: header (consume but ignore for our purposes).
-	if !scanner.Scan() {
-		t.Log("replay file is empty; skipping part (b)")
-		return
-	}
-
-	var totalAnthTok, totalOpenaiTok int
-	sessCount := 0
-	const maxSessions = 300
-
-	for sessCount < maxSessions && scanner.Scan() {
-		line := scanner.Bytes()
-		var sess RouterReplaySession
-		if err := json.Unmarshal(line, &sess); err != nil {
-			continue
-		}
-		sessCount++
-		for _, inst := range sess.Instances {
-			for _, r := range inst.Requests {
-				ab, _, err := buildAnthropicMessagesBody(r, docs, "model-a", "", 0, false, 0, nil)
-				if err != nil {
-					continue
-				}
-				ob, _, err := buildOpenAIChatCompletionsBody(r, docs, "model-a", "", 0, false, 0, nil)
-				if err != nil {
-					continue
-				}
-				totalAnthTok += len(ab) / 4
-				totalOpenaiTok += len(ob) / 4
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		t.Logf("scanner error: %v", err)
-	}
-
-	realRatio := float64(0)
-	if totalAnthTok > 0 {
-		realRatio = float64(totalOpenaiTok) / float64(totalAnthTok)
-	}
-	t.Logf("REAL FILE (%d sessions) — Anthropic tokens(est): %d  OpenAI tokens(est): %d  ratio: %.3f",
-		sessCount, totalAnthTok, totalOpenaiTok, realRatio)
 }
 
 // TestOpenAIToolUseConversion verifies that tool_use/tool_result blocks are
