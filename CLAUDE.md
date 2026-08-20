@@ -56,6 +56,26 @@ place by narrating what the code used to do or which bug was fixed.
 That belongs in the commit message, where `git log` and `git blame` put it in
 front of whoever needs it.
 
+## Verify Before You Commit (MANDATORY)
+
+Run `task verify` — gofmt, `go vet`, and the whole suite under `-race`, exactly
+what CI gates on — and only commit once it passes. Do it before every commit
+that could change its result, and again between commits when you are landing a
+series: a green tree at the end of five commits says nothing about whether
+commits two through four build, and `git bisect` is worth nothing on a history
+that does not.
+
+A commit that cannot change the result does not need it. Editing this file,
+a README, or a comment touches nothing gofmt, vet, or a test can see. Judge it
+by what the diff can reach, not by how small it feels — a one-line change to a
+struct tag or a default is exactly the kind that reaches everything.
+
+`go test ./...` is not a substitute. It omits `-race`, and the races it omits
+are the ones that pass locally and fail in CI, on whichever commit happened to
+be building. If the suite is too slow to run at every commit, that is a bug in
+the suite: find the test that is eating the time and fix it, rather than
+skipping the check that would have caught the problem.
+
 ## Build & Test
 
 - Binary is named `wekai` (main package at the repo root, so plain `go install github.com/weka/wekai@<vX>` works); module stays
