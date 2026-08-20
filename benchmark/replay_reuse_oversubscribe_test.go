@@ -147,7 +147,7 @@ func runOversubscribed(t *testing.T, sessions, slots int, reuse bool) (*blocking
 	bf := newBlockingFleet()
 	defer bf.close()
 
-	stream, err := openRouterReplayStream(path, 8, 0, nil, reuse)
+	stream, err := openRouterReplayStream(path, routerReplayStreamOpts{ChanCap: 8, Reuse: reuse})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func TestCyclingKeepsEachPassInItsOwnKeyspace(t *testing.T) {
 // marker holders) collides between laps.
 func TestEveryLapGetsFreshSeriesNumbers(t *testing.T) {
 	path := oversubscribeCorpus(t, 3)
-	st, err := openRouterReplayStream(path, 1, 0, nil, true)
+	st, err := openRouterReplayStream(path, routerReplayStreamOpts{ChanCap: 1, Reuse: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestEveryLapGetsFreshSeriesNumbers(t *testing.T) {
 // while the run ticks on to its timeout.
 func TestCappedReuseStopsAndReportsDrained(t *testing.T) {
 	path := oversubscribeCorpus(t, 3)
-	st, err := openRouterReplayStream(path, 1, 5, nil, true)
+	st, err := openRouterReplayStream(path, routerReplayStreamOpts{ChanCap: 1, SessionLimit: 5, Reuse: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,7 @@ func TestCappedReuseStopsAndReportsDrained(t *testing.T) {
 // underfill abort has nothing to fire on.
 func TestUncappedReuseNeverReportsDrained(t *testing.T) {
 	path := oversubscribeCorpus(t, 2)
-	st, err := openRouterReplayStream(path, 1, 0, nil, true)
+	st, err := openRouterReplayStream(path, routerReplayStreamOpts{ChanCap: 1, Reuse: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +328,8 @@ func TestUncappedReuseNeverReportsDrained(t *testing.T) {
 // how many laps there are.
 func TestIndexFilteredReuseKeepsCycling(t *testing.T) {
 	path := oversubscribeCorpus(t, 4)
-	st, err := openRouterReplayStream(path, 1, 0, map[int]bool{1: true, 3: true}, true)
+	st, err := openRouterReplayStream(path, routerReplayStreamOpts{ChanCap: 1,
+		AllowedIndices: map[int]bool{1: true, 3: true}, Reuse: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +367,7 @@ func TestReuseOnAnEmptyCorpusStops(t *testing.T) {
 	if err := os.WriteFile(path, append(hdr, '\n'), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	st, err := openRouterReplayStream(path, 1, 0, nil, true)
+	st, err := openRouterReplayStream(path, routerReplayStreamOpts{ChanCap: 1, Reuse: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -50,7 +50,7 @@ func writeReplayFile(t *testing.T, sessions int) string {
 
 func TestReuseReplaysTheCorpusAgain(t *testing.T) {
 	path := writeReplayFile(t, 3)
-	st, err := openRouterReplayStream(path, 1, 0, nil, true)
+	st, err := openRouterReplayStream(path, routerReplayStreamOpts{ChanCap: 1, Reuse: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestReuseReplaysTheCorpusAgain(t *testing.T) {
 
 func TestWithoutReuseTheStreamStillDrains(t *testing.T) {
 	path := writeReplayFile(t, 2)
-	st, err := openRouterReplayStream(path, 1, 0, nil, false)
+	st, err := openRouterReplayStream(path, routerReplayStreamOpts{ChanCap: 1, Reuse: false})
 	if err != nil {
 		t.Fatal(err)
 	}

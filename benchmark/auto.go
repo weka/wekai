@@ -82,7 +82,12 @@ type AutoBenchmarkConfig struct {
 	// knobs are ignored in this mode.
 	FromDataset  string // short name, e.g. "hermes-lambda"
 	ReplaySeries int    // number of conversations to replay (0 = whole dataset)
-	LimitContext int    // --limit-context: skip requests over N tokens (~N*4 chars); 0=off
+	// ReplayMaxRequestsPerSession truncates each replayed session to its first
+	// N requests in capture order (0 = off). A capture's sessions are wildly
+	// uneven, so a run over one spends most of its time on a handful of them;
+	// capping normalizes the corpus to the shape of its own median.
+	ReplayMaxRequestsPerSession int
+	LimitContext                int // --limit-context: skip requests over N tokens (~N*4 chars); 0=off
 	// ReplayCharsPerToken: --replay-chars-per-token. When > 0, synthesized
 	// replay content is sized off each block's captured Tokens count
 	// (tokens * ReplayCharsPerToken chars) instead of its captured Bytes
@@ -2066,7 +2071,13 @@ func runSingleModelBenchmark(
 	// concurrently both open the file; that's fine, each gets its own
 	// independent producer.)
 	if cfg.RouterReplayFile != "" {
-		stream, err := openRouterReplayStream(cfg.RouterReplayFile, 8, cfg.ReplaySeries, cfg.RouterReplaySeriesIndices, cfg.ReplayReuseSessions)
+		stream, err := openRouterReplayStream(cfg.RouterReplayFile, routerReplayStreamOpts{
+			ChanCap:               8,
+			SessionLimit:          cfg.ReplaySeries,
+			AllowedIndices:        cfg.RouterReplaySeriesIndices,
+			Reuse:                 cfg.ReplayReuseSessions,
+			MaxRequestsPerSession: cfg.ReplayMaxRequestsPerSession,
+		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[auto][%s] open router-replay file: %v\n",
 				shortModelName(cfg.Model), err)
@@ -2958,6 +2969,13 @@ func runSingleModelBenchmark(
 
 	res.elapsed = time.Since(startTime)
 	res.totalCompleted = st.totalCompleted.Load()
+	if st.routerReplay != nil {
+		if sessions, requests := st.routerReplay.Truncated(); sessions > 0 {
+			fmt.Fprintf(os.Stderr, "[auto][%s] --replay-max-requests-per-session shortened %d session(s), "+
+				"dropping %d request(s) they would otherwise have sent\n",
+				shortModelName(cfg.Model), sessions, requests)
+		}
+	}
 	res.totalErrors = st.totalErrors.Load()
 	res.totalRetries429 = st.totalRetries429.Load()
 	res.totalRetryWait = time.Duration(st.totalRetryWaitNs.Load())
@@ -3261,6 +3279,11 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 				"load is not the %d this run reports. Drop the flag to replay the corpus again "+
 				"instead of draining it.\n",
 				cfg.MaxSeries, sessions, cfg.MaxSeries-sessions, cfg.MaxSeries)
+		}
+		if cfg.ReplayMaxRequestsPerSession > 0 {
+			fmt.Fprintf(os.Stderr, "[auto] truncating each session to its first %d requests: this run "+
+				"replays a normalized corpus, and its totals are not comparable with an uncapped run's.\n",
+				cfg.ReplayMaxRequestsPerSession)
 		}
 		// Cycling is the default, and it removes the terminator a replay run
 		// used to have: the corpus never drains, so nothing ends the run on its

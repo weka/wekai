@@ -187,9 +187,16 @@ type routerReplayStream struct {
 	reuse          bool
 	pass           atomic.Int64
 	allowedIndices map[int]bool // nil = allow all; non-nil = only emit sessions at these 0-based line indices
-	done           chan struct{}
-	ctx            context.Context
-	cancel         context.CancelFunc
+	// maxRequests > 0 truncates every session to its first N requests in
+	// capture order. Counters are reported so a run says how much of the
+	// corpus it actually replayed — a truncated run is not comparable with an
+	// untruncated one, and nothing else in the output would show it.
+	maxRequests       int
+	truncatedSessions atomic.Int64
+	droppedRequests   atomic.Int64
+	done              chan struct{}
+	ctx               context.Context
+	cancel            context.CancelFunc
 }
 
 // readRouterReplayHeader reads only line 1 (the header) and closes the
@@ -240,17 +247,32 @@ func effectiveSessionCount(corpusSessions, filtered, sessionLimit int, reuse boo
 	return total
 }
 
+// routerReplayStreamOpts configures a stream. A struct rather than positional
+// arguments because most of these are interchangeable ints at a call site.
+type routerReplayStreamOpts struct {
+	// ChanCap is how many sessions may be buffered ahead of consumers.
+	ChanCap int
+	// SessionLimit > 0 caps the producer to that many sessions, counted from
+	// the beginning of the file and across laps under Reuse.
+	SessionLimit int
+	// AllowedIndices, when non-nil, restricts the producer to sessions at the
+	// given 0-based line indices (after the header); others are read and
+	// discarded. SessionLimit still applies independently.
+	AllowedIndices map[int]bool
+	// Reuse replays the corpus again from the top instead of draining.
+	Reuse bool
+	// MaxRequestsPerSession > 0 truncates each session to its first N requests
+	// in capture order. Applied here, in the producer, rather than at dispatch:
+	// the requests it drops become garbage before the session reaches a worker,
+	// and a worker holds its whole session for as long as the session runs.
+	MaxRequestsPerSession int
+}
+
 // openRouterReplayStream parses the header line, then starts a producer
-// goroutine that streams subsequent lines through ch (cap defines how
-// many sessions can be buffered ahead of consumers). sessionLimit > 0
-// caps the producer to that many sessions (useful for bounded runs that
-// shouldn't continue past the first N sessions in the file).
-// allowedIndices, when non-nil, restricts the producer to only emit
-// sessions at the given 0-based line indices (after the header line);
-// sessions at other positions are read and discarded. sessionLimit is
-// applied independently and still stops the producer after N sessions
-// from the beginning of the file regardless of allowedIndices.
-func openRouterReplayStream(path string, chanCap, sessionLimit int, allowedIndices map[int]bool, reuse bool) (*routerReplayStream, error) {
+// goroutine that streams subsequent lines through a bounded channel.
+func openRouterReplayStream(path string, opts routerReplayStreamOpts) (*routerReplayStream, error) {
+	chanCap, sessionLimit := opts.ChanCap, opts.SessionLimit
+	allowedIndices, reuse := opts.AllowedIndices, opts.Reuse
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -287,6 +309,7 @@ func openRouterReplayStream(path string, chanCap, sessionLimit int, allowedIndic
 		limit:          sessionLimit,
 		allowedIndices: allowedIndices,
 		reuse:          reuse,
+		maxRequests:    opts.MaxRequestsPerSession,
 		done:           make(chan struct{}),
 		ctx:            ctx,
 		cancel:         cancel,
@@ -343,6 +366,10 @@ func (s *routerReplayStream) produce() {
 				}
 				var sess RouterReplaySession
 				if jerr := json.Unmarshal(line, &sess); jerr == nil {
+					if dropped := truncateSessionRequests(&sess, s.maxRequests); dropped > 0 {
+						s.truncatedSessions.Add(1)
+						s.droppedRequests.Add(int64(dropped))
+					}
 					thisPass++
 					sess.pass = int(s.pass.Load())
 					sess.fileIdx = currentIdx
@@ -427,6 +454,12 @@ func (s *routerReplayStream) Pull(ctx context.Context) (RouterReplaySession, int
 // different from a single-pass run, so it has to be visible rather than
 // inferred from the session count exceeding the corpus size.
 func (s *routerReplayStream) Pass() int { return int(s.pass.Load()) }
+
+// Truncated is how many sessions --replay-max-requests-per-session shortened,
+// and how many requests it dropped doing so. Both are zero when the cap is off.
+func (s *routerReplayStream) Truncated() (sessions, requests int64) {
+	return s.truncatedSessions.Load(), s.droppedRequests.Load()
+}
 
 // Total returns the session count from the header summary. May be 0 if the
 // producer didn't populate it.
