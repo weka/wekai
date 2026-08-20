@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/weka/wekai/router/internal/dialect/openai"
 	"github.com/weka/wekai/router/internal/gateway"
@@ -37,6 +39,8 @@ type harness struct {
 	gw      *gateway.Server
 	reg     *registry.Registry
 	workers []*mockvllm.Worker
+	// handlers counts requests still inside the gateway. See settled().
+	handlers sync.WaitGroup
 }
 
 // harnessConfig spans what the tests configure across three now-separate
@@ -112,7 +116,13 @@ func newHarness(t *testing.T, nWorkers int, mutate func(*harnessConfig)) *harnes
 		RebalanceRatio:  cfg.RebalanceRatio,
 	})), px, d)
 	h.gw = gw
-	h.srv = httptest.NewServer(gw)
+	// Add runs before the gateway writes a byte, so a caller reaching settled()
+	// by way of a returned response always sees the counter already raised.
+	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.handlers.Add(1)
+		defer h.handlers.Done()
+		gw.ServeHTTP(w, r)
+	}))
 	h.probes = httptest.NewServer(gw.ProbeHandler())
 	t.Cleanup(h.probes.Close)
 	t.Cleanup(h.srv.Close)
@@ -142,6 +152,12 @@ func mustTable(t *testing.T, reg *registry.Registry, flow *affinity.Policy) *rou
 	}
 	return tbl
 }
+
+// settled blocks until every request this harness has served has RETURNED from
+// the gateway, not merely been answered. The proxy records a response's metrics
+// after the body has gone to the client, so a metric read the moment a post
+// returns is racing the tail of the handler it triggered.
+func (h *harness) settled() { h.handlers.Wait() }
 
 func (h *harness) post(t *testing.T, path, body string, hdr map[string]string) *http.Response {
 	t.Helper()
@@ -1152,19 +1168,43 @@ func TestConcurrencyCapShedsWith503(t *testing.T) {
 // correspond to anything the worker actually did.
 func TestObservedCacheFractionIsRecorded(t *testing.T) {
 	h := newHarness(t, 1, nil)
-	before := testutil.CollectAndCount(metrics.CacheObservedFraction)
-	_ = before
+	countBefore, sumBefore := observedFractionStats(t)
 
 	h.workers[0].SetScript(mockvllm.Script{PromptTokens: 1000, CachedTokens: 750})
 	resp := h.post(t, "/v1/chat/completions", `{"model":"m","messages":[]}`, nil)
 	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+	h.settled()
 
-	got := testutil.ToFloat64(metrics.CacheObservedFractionSumForTest())
-	if got <= 0 {
-		t.Errorf("router_cache_observed_fraction was never observed; " +
-			"prediction accuracy remains unmeasurable")
+	countAfter, sumAfter := observedFractionStats(t)
+	if countAfter <= countBefore {
+		t.Fatalf("router_cache_observed_fraction did not move; prediction accuracy remains "+
+			"unmeasurable (count %d -> %d)", countBefore, countAfter)
 	}
+	// A fraction is never negative, so any observation another test's in-flight
+	// request contributes can only add. 750/1000 must therefore still be in
+	// here, whatever else landed alongside it.
+	if got := sumAfter - sumBefore; got < 0.7 {
+		t.Errorf("observed fractions summed to %.3f, want at least the 0.75 this request reported: "+
+			"the worker said 750 of 1000 prompt tokens were cached", got)
+	}
+}
+
+// observedFractionStats reads the histogram itself rather than the last-value
+// shadow gauge beside it.
+//
+// The gauge holds the most recent observation PROCESS-WIDE, so any other
+// request finishing anywhere in the binary overwrites it — and most mock
+// scripts report no cached tokens, so the value it lands on is 0. Asserting on
+// it made this test a race against every other test's leftover traffic, which
+// is why it failed in CI and never alone.
+func observedFractionStats(t *testing.T) (count uint64, sum float64) {
+	t.Helper()
+	var pb dto.Metric
+	if err := metrics.CacheObservedFraction.(prometheus.Metric).Write(&pb); err != nil {
+		t.Fatalf("read histogram: %v", err)
+	}
+	return pb.GetHistogram().GetSampleCount(), pb.GetHistogram().GetSampleSum()
 }
 
 // TestMaxNodeConcurrencyRejects429WhenAllBackendsAtCap is anton's exact
