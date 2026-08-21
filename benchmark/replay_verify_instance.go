@@ -8,7 +8,15 @@ import (
 	"sync"
 )
 
-// Verify signals that only exist ACROSS the requests of one series.
+// Verify signals that only exist ACROSS the requests of one agent instance.
+//
+// The unit is the INSTANCE, not the session and not the run's --series count.
+// An instance is one agent — the main one, or a sub-agent it spawned — and it
+// is what owns a conversation prefix: a fan-out gives each sub-agent its own
+// context, so a marker one of them loses says nothing about its siblings.
+// A session in the July corpus holds 4.3 instances on average, so these counts
+// run well ABOVE the session count a run was asked for, and a 256-session run
+// reporting 686 of them is not a contradiction.
 //
 // Every other number in the verify section is a property of a single response:
 // this one was corrupt, that one did not recite its marker. Read that way, a
@@ -35,25 +43,24 @@ import (
 // empty or skipped request is no evidence either way, so it neither joins a
 // run of corrupt responses nor breaks one — treating it as clean would let
 // one 429 in the middle hide the very continuity these signals exist to see.
-type seriesVerifyHistory struct {
+type instanceVerifyHistory struct {
 	mu sync.Mutex
-	// Keyed by DISPATCH, not by conversation: the series number joined to the
-	// GUID. Under --replay-reuse-sessions the corpus is replayed in laps, and
+	// Keyed by DISPATCH: the session's series number joined to the
+	// session:instance GUID, so one entry is one agent on one lap. Under --replay-reuse-sessions the corpus is replayed in laps, and
 	// every lap hands out the same session with the same SeriesGUID — so a
 	// GUID-keyed history folds all of a session's laps together, and one lap
 	// reciting correctly erases the lap before it that never recovered. The
 	// series number is the pull counter, unique per dispatch, so joining it to
 	// the GUID keeps each lap of each instance its own conversation.
-	byDispatch map[string]*seriesVerifyState
+	byDispatch map[string]*instanceVerifyState
 }
 
-// seriesVerifyState is one series' running history. Keyed by SeriesGUID
-// (session:instance), which is the unit that owns a conversation prefix: a
-// session's sub-agents fan out with their own context, so a marker lost by one
-// says nothing about its siblings.
-type seriesVerifyState struct {
-	// seriesNum is the run's own index for this series — the same s%d the
-	// per-request error lines carry, so a reported run can be grepped for.
+// instanceVerifyState is one instance's running history on one lap.
+type instanceVerifyState struct {
+	// seriesNum is the SESSION's dispatch index — the same s%d the per-request
+	// error lines carry, so a reported run can be grepped for. Shared by every
+	// instance of that session, so two entries reporting the same number are
+	// two agents of one conversation rather than a duplicate.
 	seriesNum   int
 	classified  int  // responses scanned for corruption
 	garbageReqs int  // of those, ones that carried it
@@ -76,19 +83,19 @@ type seriesVerifyState struct {
 // request order — an instance issues its turns strictly in sequence, and that
 // is the ordering both signals are built on. The lock guards the map against
 // other series, not against this series' own ordering.
-func (h *seriesVerifyHistory) observe(guid string, seriesNum, turn int, classified, garbage, asked, missed bool) {
+func (h *instanceVerifyHistory) observe(guid string, seriesNum, turn int, classified, garbage, asked, missed bool) {
 	if guid == "" || (!classified && !asked) {
 		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.byDispatch == nil {
-		h.byDispatch = make(map[string]*seriesVerifyState)
+		h.byDispatch = make(map[string]*instanceVerifyState)
 	}
 	key := strconv.Itoa(seriesNum) + "|" + guid
 	s := h.byDispatch[key]
 	if s == nil {
-		s = &seriesVerifyState{seriesNum: seriesNum}
+		s = &instanceVerifyState{seriesNum: seriesNum}
 		h.byDispatch[key] = s
 	}
 	if classified {
@@ -117,22 +124,23 @@ func (h *seriesVerifyHistory) observe(guid string, seriesNum, turn int, classifi
 	}
 }
 
-// seriesVerifyTotals is the run-level view, with the denominators each count
+// instanceVerifyTotals is the run-level view, with the denominators each count
 // belongs to: "3 series went bad" means nothing without how many were watched,
 // and the two counts are watched over different populations.
-type seriesVerifyTotals struct {
-	classifiedSeries int64 // series with >=1 response scanned for corruption
-	garbageSeries    int64 // of those, ones that produced any garbage at all
-	garbageRunSeries int64 // of those, ones that produced it twice in a row
-	askedSeries      int64 // series with >=1 response asked to recite
-	missSeries       int64 // of those, ones that missed at least once
-	missToEndSeries  int64 // of those, ones that never recited correctly again
+type instanceVerifyTotals struct {
+	classifiedInstances int64 // instances with >=1 response scanned for corruption
+	garbageInstances    int64 // of those, ones that produced any garbage at all
+	garbageRunInstances int64 // of those, ones that produced it twice in a row
+	askedInstances      int64 // series with >=1 response asked to recite
+	missInstances       int64 // of those, ones that missed at least once
+	missToEndInstances  int64 // of those, ones that never recited correctly again
 	// missToEnd names them, sorted by series. A count says the fault exists;
 	// these say which conversation to open.
 	missToEnd []seriesMissRun
 }
 
-// seriesMissRun locates one series' unrecovered tail of misses.
+// seriesMissRun locates one instance's unrecovered tail of misses, by the
+// SESSION series number it belongs to.
 type seriesMissRun struct {
 	Series int // the run's series index, as in the s%d of an error line
 	Turn   int // the turn its first unrecovered miss landed on, as in t%d
@@ -171,25 +179,25 @@ func formatMissRuns(runs []seriesMissRun, limit int) string {
 	return out
 }
 
-func (h *seriesVerifyHistory) totals() seriesVerifyTotals {
-	var t seriesVerifyTotals
+func (h *instanceVerifyHistory) totals() instanceVerifyTotals {
+	var t instanceVerifyTotals
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, s := range h.byDispatch {
 		if s.classified > 0 {
-			t.classifiedSeries++
+			t.classifiedInstances++
 		}
 		if s.garbageReqs > 0 {
-			t.garbageSeries++
+			t.garbageInstances++
 		}
 		if s.garbageRun {
-			t.garbageRunSeries++
+			t.garbageRunInstances++
 		}
 		if s.asked > 0 {
-			t.askedSeries++
+			t.askedInstances++
 		}
 		if s.misses > 0 {
-			t.missSeries++
+			t.missInstances++
 		}
 		// misses == missTail says no correct recite followed the first miss;
 		// missTail >= 2 says there were later requests to get it right in.
@@ -197,7 +205,7 @@ func (h *seriesVerifyHistory) totals() seriesVerifyTotals {
 		// to miss would qualify, which is a statement about where the session
 		// ended rather than about anything failing to recover.
 		if s.misses > 0 && s.misses == s.missTail && s.missTail >= 2 {
-			t.missToEndSeries++
+			t.missToEndInstances++
 			t.missToEnd = append(t.missToEnd, seriesMissRun{
 				Series: s.seriesNum, Turn: s.missTailTurn, Length: s.missTail,
 			})

@@ -17,9 +17,9 @@ type seriesTurn struct {
 
 // foldSeries numbers the series in first-seen order and the turns within each
 // series from 1, which is what the recorder does with SeriesNum and CycleNum.
-func foldSeries(t *testing.T, turns ...seriesTurn) seriesVerifyTotals {
+func foldSeries(t *testing.T, turns ...seriesTurn) instanceVerifyTotals {
 	t.Helper()
-	var h seriesVerifyHistory
+	var h instanceVerifyHistory
 	seriesOf := map[string]int{}
 	turnOf := map[string]int{}
 	for _, tn := range turns {
@@ -54,28 +54,28 @@ func seriesFailed(guid string) seriesTurn { return seriesTurn{guid: guid} }
 func TestSeriesGarbageRun(t *testing.T) {
 	t.Run("two in a row is a run", func(t *testing.T) {
 		got := foldSeries(t, seriesClean("a"), seriesCorrupt("a"), seriesCorrupt("a"), seriesClean("a"))
-		if got.garbageRunSeries != 1 {
-			t.Errorf("garbageRunSeries = %d, want 1", got.garbageRunSeries)
+		if got.garbageRunInstances != 1 {
+			t.Errorf("garbageRunInstances = %d, want 1", got.garbageRunInstances)
 		}
-		if got.garbageSeries != 1 || got.classifiedSeries != 1 {
-			t.Errorf("denominators = %d of %d, want 1 of 1", got.garbageSeries, got.classifiedSeries)
+		if got.garbageInstances != 1 || got.classifiedInstances != 1 {
+			t.Errorf("denominators = %d of %d, want 1 of 1", got.garbageInstances, got.classifiedInstances)
 		}
 	})
 
 	t.Run("a clean response between them is not", func(t *testing.T) {
 		got := foldSeries(t, seriesCorrupt("a"), seriesClean("a"), seriesCorrupt("a"))
-		if got.garbageRunSeries != 0 {
+		if got.garbageRunInstances != 0 {
 			t.Error("two corrupt responses with a good one between them are not a run: the series " +
 				"recovered, which is exactly what a persistent fault does not do")
 		}
-		if got.garbageSeries != 1 {
-			t.Errorf("garbageSeries = %d, want the series still counted as having produced garbage", got.garbageSeries)
+		if got.garbageInstances != 1 {
+			t.Errorf("garbageInstances = %d, want the series still counted as having produced garbage", got.garbageInstances)
 		}
 	})
 
 	t.Run("a failed request between them breaks nothing", func(t *testing.T) {
 		got := foldSeries(t, seriesCorrupt("a"), seriesFailed("a"), seriesCorrupt("a"))
-		if got.garbageRunSeries != 1 {
+		if got.garbageRunInstances != 1 {
 			t.Error("a request that never produced a response is no evidence of recovery; treating " +
 				"it as clean lets one 429 hide the continuity this signal exists to see")
 		}
@@ -83,12 +83,12 @@ func TestSeriesGarbageRun(t *testing.T) {
 
 	t.Run("different series do not chain into each other", func(t *testing.T) {
 		got := foldSeries(t, seriesCorrupt("a"), seriesCorrupt("b"), seriesCorrupt("c"))
-		if got.garbageRunSeries != 0 {
-			t.Errorf("garbageRunSeries = %d; one corrupt response each in three series is not a run "+
-				"in any of them", got.garbageRunSeries)
+		if got.garbageRunInstances != 0 {
+			t.Errorf("garbageRunInstances = %d; one corrupt response each in three series is not a run "+
+				"in any of them", got.garbageRunInstances)
 		}
-		if got.garbageSeries != 3 {
-			t.Errorf("garbageSeries = %d, want 3", got.garbageSeries)
+		if got.garbageInstances != 3 {
+			t.Errorf("garbageInstances = %d, want 3", got.garbageInstances)
 		}
 	})
 }
@@ -99,28 +99,28 @@ func TestSeriesGarbageRun(t *testing.T) {
 func TestSeriesMissToEnd(t *testing.T) {
 	t.Run("never reciting again after the first miss", func(t *testing.T) {
 		got := foldSeries(t, seriesClean("a"), seriesMissed("a"), seriesMissed("a"), seriesMissed("a"))
-		if got.missToEndSeries != 1 {
-			t.Errorf("missToEndSeries = %d, want 1", got.missToEndSeries)
+		if got.missToEndInstances != 1 {
+			t.Errorf("missToEndInstances = %d, want 1", got.missToEndInstances)
 		}
-		if got.missSeries != 1 || got.askedSeries != 1 {
-			t.Errorf("denominators = %d of %d, want 1 of 1", got.missSeries, got.askedSeries)
+		if got.missInstances != 1 || got.askedInstances != 1 {
+			t.Errorf("denominators = %d of %d, want 1 of 1", got.missInstances, got.askedInstances)
 		}
 	})
 
 	t.Run("a later correct recite is a recovery", func(t *testing.T) {
 		got := foldSeries(t, seriesMissed("a"), seriesMissed("a"), seriesClean("a"), seriesMissed("a"), seriesClean("a"))
-		if got.missToEndSeries != 0 {
+		if got.missToEndInstances != 0 {
 			t.Error("the series recited correctly after missing, so it did not lose its context; " +
 				"counting it would put ordinary model non-compliance in a cache-corruption row")
 		}
-		if got.missSeries != 1 {
-			t.Errorf("missSeries = %d, want the series still counted as having missed", got.missSeries)
+		if got.missInstances != 1 {
+			t.Errorf("missInstances = %d, want the series still counted as having missed", got.missInstances)
 		}
 	})
 
 	t.Run("one miss on the last request is where it ended, not a failure to recover", func(t *testing.T) {
 		got := foldSeries(t, seriesClean("a"), seriesClean("a"), seriesMissed("a"))
-		if got.missToEndSeries != 0 {
+		if got.missToEndInstances != 0 {
 			t.Error("a single trailing miss says only that the session stopped there; with no later " +
 				"request there was never an opportunity to recover, and counting it would make this " +
 				"row a statistic about where sessions end")
@@ -129,11 +129,11 @@ func TestSeriesMissToEnd(t *testing.T) {
 
 	t.Run("a series that never missed is not in the numerator or its denominator", func(t *testing.T) {
 		got := foldSeries(t, seriesClean("a"), seriesClean("a"))
-		if got.missToEndSeries != 0 || got.missSeries != 0 {
-			t.Errorf("missToEnd=%d miss=%d, want 0 0", got.missToEndSeries, got.missSeries)
+		if got.missToEndInstances != 0 || got.missInstances != 0 {
+			t.Errorf("missToEnd=%d miss=%d, want 0 0", got.missToEndInstances, got.missInstances)
 		}
-		if got.askedSeries != 1 {
-			t.Errorf("askedSeries = %d, want the clean series counted as watched", got.askedSeries)
+		if got.askedInstances != 1 {
+			t.Errorf("askedInstances = %d, want the clean series counted as watched", got.askedInstances)
 		}
 	})
 
@@ -143,11 +143,11 @@ func TestSeriesMissToEnd(t *testing.T) {
 			seriesMissed("b"), seriesClean("b"), // b does
 			seriesClean("c"), seriesMissed("c"), seriesMissed("c"), // c goes bad and stays bad
 		)
-		if got.missToEndSeries != 2 {
-			t.Errorf("missToEndSeries = %d, want 2 (a and c)", got.missToEndSeries)
+		if got.missToEndInstances != 2 {
+			t.Errorf("missToEndInstances = %d, want 2 (a and c)", got.missToEndInstances)
 		}
-		if got.missSeries != 3 || got.askedSeries != 3 {
-			t.Errorf("denominators = %d of %d, want 3 of 3", got.missSeries, got.askedSeries)
+		if got.missInstances != 3 || got.askedInstances != 3 {
+			t.Errorf("denominators = %d of %d, want 3 of 3", got.missInstances, got.askedInstances)
 		}
 	})
 }
@@ -157,7 +157,7 @@ func TestSeriesMissToEnd(t *testing.T) {
 // manufacture runs out of unrelated requests.
 func TestSeriesVerifyIgnoresUnidentifiedRequests(t *testing.T) {
 	got := foldSeries(t, seriesCorrupt(""), seriesCorrupt(""), seriesMissed(""), seriesMissed(""))
-	if got.classifiedSeries != 0 || got.askedSeries != 0 {
+	if got.classifiedInstances != 0 || got.askedInstances != 0 {
 		t.Errorf("unidentified requests entered the series population: %+v", got)
 	}
 }
@@ -256,7 +256,7 @@ func TestMissRunListSaysWhatItLeftOut(t *testing.T) {
 // one history lets a later lap's correct recite erase an earlier lap that never
 // recovered — the signal reads 0 on a fleet that failed every time.
 func TestSeriesLapsAreCountedSeparately(t *testing.T) {
-	var h seriesVerifyHistory
+	var h instanceVerifyHistory
 	// Two laps of one session, same GUID, different series numbers. Lap 1 stops
 	// reciting for good; lap 2 is clean.
 	for _, turn := range []struct {
@@ -269,14 +269,53 @@ func TestSeriesLapsAreCountedSeparately(t *testing.T) {
 		h.observe("sess:inst", turn.series, turn.turn, true, false, true, turn.missed)
 	}
 	got := h.totals()
-	if got.missToEndSeries != 1 {
-		t.Fatalf("missToEndSeries = %d, want 1: lap 1 never recovered, and lap 2 reciting correctly "+
-			"is a different conversation rather than a recovery", got.missToEndSeries)
+	if got.missToEndInstances != 1 {
+		t.Fatalf("missToEndInstances = %d, want 1: lap 1 never recovered, and lap 2 reciting correctly "+
+			"is a different conversation rather than a recovery", got.missToEndInstances)
 	}
-	if got.askedSeries != 2 {
-		t.Errorf("askedSeries = %d, want 2: two laps are two conversations", got.askedSeries)
+	if got.askedInstances != 2 {
+		t.Errorf("askedInstances = %d, want 2: two laps are two conversations", got.askedInstances)
 	}
 	if s := got.missToEnd[0].String(); s != "1:2:2" {
 		t.Errorf("run = %s, want 1:2:2", s)
+	}
+}
+
+// The unit is the AGENT, not the session, and that is why these counts exceed
+// the session count a run was given: one session that fans out to three
+// sub-agents contributes four.
+//
+// The confusion this pins is a real one — a 256-session run reported 686
+// instances scanned, which reads as impossible until you know a session holds
+// 4.3 agents on average in this corpus.
+func TestInstancesOfOneSessionAreCountedSeparately(t *testing.T) {
+	var h instanceVerifyHistory
+	// One session (series 7), a main agent and two sub-agents. Only the second
+	// sub-agent loses its context.
+	for _, inst := range []struct {
+		guid   string
+		missed bool
+	}{
+		{"sess-a:main", false},
+		{"sess-a:sub-1", false},
+		{"sess-a:sub-2", true},
+	} {
+		h.observe(inst.guid, 7, 1, true, false, true, false)
+		h.observe(inst.guid, 7, 2, true, false, true, inst.missed)
+		h.observe(inst.guid, 7, 3, true, false, true, inst.missed)
+	}
+	got := h.totals()
+	if got.askedInstances != 3 {
+		t.Errorf("askedInstances = %d, want 3: one session's agents each own their own prefix, so "+
+			"each is its own conversation here", got.askedInstances)
+	}
+	if got.missToEndInstances != 1 {
+		t.Fatalf("missToEndInstances = %d, want 1: only one sub-agent lost its context, and its "+
+			"siblings' health says nothing about it", got.missToEndInstances)
+	}
+	// The reported series number is the SESSION's, shared by every agent in it,
+	// so it stays greppable against the s%d of a per-request error line.
+	if s := got.missToEnd[0].String(); s != "7:2:2" {
+		t.Errorf("run = %s, want 7:2:2 — session 7's failing agent stopped reciting on turn 2", s)
 	}
 }

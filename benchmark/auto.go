@@ -1143,10 +1143,10 @@ type autoState struct {
 	valGarbageTail        atomic.Int64 // corruption runs to the end of the budget, no visible marker
 	valGarbageGuidBabble  atomic.Int64 // the tail after corruption is invented uuid shapes
 	valGarbageMidResponse atomic.Int64
-	// valSeries holds the two signals that live between requests rather than
+	// valInstances holds the two signals that live between requests rather than
 	// in one — back-to-back garbage and a miss the series never recovers
 	// from. See replay_verify_series.go. Zero value is ready to use.
-	valSeries seriesVerifyHistory
+	valInstances instanceVerifyHistory
 	// Output-profile conformity: the wire budgets and what actually came
 	// back, summed over completed replay requests. actual/target is ~100%
 	// under ignore_eos by construction; when prompt-based length control
@@ -1274,7 +1274,7 @@ type autoBenchmarkResult struct {
 	valGarbageTail        int64
 	valGarbageGuidBabble  int64
 	valGarbageMidResponse int64
-	valSeries             seriesVerifyTotals
+	valInstances          instanceVerifyTotals
 	outTargetSum          int64
 	outActualSum          int64
 	valWindowSessions     int
@@ -1484,6 +1484,11 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		// none of them mean anything without it.
 		fmt.Println("   Each user turn carries a [ref-id: <uuid>] marker and the request asks the model")
 		fmt.Println("   to recite the ids in scope; responses are matched for those ids by substring.")
+		// Named because the alternative is the reader doing this subtraction and
+		// getting it wrong: a 256-session run reporting 686 instances looks like
+		// a bug until you know a session fans out.
+		fmt.Println("   The two instance counts below are per AGENT — main and sub-agents each own")
+		fmt.Println("   their own prefix — so they run above the session count the run was given.")
 		fmt.Printf("   Requests validated                   : %d\n", res.valReqs)
 		// Two tests, mirroring the cache-coherency eval CLI's layout: UUID
 		// correctness (per-stamp presence, Contains anywhere in the response)
@@ -1529,19 +1534,19 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		// not. The same argument holds for a miss nothing later in the series
 		// recovers from: a model that declines one request answers the next,
 		// and a session that lost its context does not get it back.
-		fmt.Printf("   Series with back-to-back garbage     : %d of %d that produced any, %d scanned\n",
-			res.valSeries.garbageRunSeries, res.valSeries.garbageSeries, res.valSeries.classifiedSeries)
+		fmt.Printf("   Instances with back-to-back garbage  : %d of %d that produced any, %d scanned\n",
+			res.valInstances.garbageRunInstances, res.valInstances.garbageInstances, res.valInstances.classifiedInstances)
 		// "asked to recite" and not "scored": the denominator is the series that
 		// carried a marker the model was told to repeat, which is a population
 		// a reader cannot infer and is far smaller than the request count. A
 		// bare "scored" says neither what was measured nor over what.
-		fmt.Printf("   Series never recovering from a miss  : %d of %d that missed, %d asked to recite\n",
-			res.valSeries.missToEndSeries, res.valSeries.missSeries, res.valSeries.askedSeries)
+		fmt.Printf("   Instances never recovering a miss    : %d of %d that missed, %d asked to recite\n",
+			res.valInstances.missToEndInstances, res.valInstances.missInstances, res.valInstances.askedInstances)
 		// Named, not just counted. The count says the fleet has the fault; these
 		// say which conversation to open, and the first two fields are the same
 		// s/t coordinates the per-request error lines carry, so a run can be
 		// grepped straight out of the log or the request-data JSONL.
-		if runs := formatMissRuns(res.valSeries.missToEnd, maxReportedMissRuns); runs != "" {
+		if runs := formatMissRuns(res.valInstances.missToEnd, maxReportedMissRuns); runs != "" {
 			fmt.Printf("     series:turn:length                 : %s\n", runs)
 		}
 		// Both denominators, because they are different populations: presence
@@ -3061,7 +3066,7 @@ func runSingleModelBenchmark(
 	res.valGarbageTail = st.valGarbageTail.Load()
 	res.valGarbageGuidBabble = st.valGarbageGuidBabble.Load()
 	res.valGarbageMidResponse = st.valGarbageMidResponse.Load()
-	res.valSeries = st.valSeries.totals()
+	res.valInstances = st.valInstances.totals()
 	res.outTargetSum = st.outTargetSum.Load()
 	res.outActualSum = st.outActualSum.Load()
 	if cfg.uuidRegistry != nil {

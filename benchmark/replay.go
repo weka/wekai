@@ -419,7 +419,7 @@ func recordReplayRequest(
 	// after it recovers from, are shapes a per-request count cannot hold.
 	// This runs on the series' goroutine, which issues its turns in sequence,
 	// so the order observed here is the order they were served in.
-	st.valSeries.observe(metrics.SeriesGUID, metrics.SeriesNum, metrics.CycleNum,
+	st.valInstances.observe(metrics.SeriesGUID, metrics.SeriesNum, metrics.CycleNum,
 		metrics.GarbageChecked, metrics.ResponseGarbage,
 		uuidExpectedCount > 0, uuidFoundCount < uuidExpectedCount)
 	if metrics.LeakChecked {
