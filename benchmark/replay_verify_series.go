@@ -60,9 +60,9 @@ type seriesVerifyState struct {
 	prevGarbage bool // was the previous classified response corrupt
 	garbageRun  bool // two classified responses in a row were
 
-	scored   int // responses that were asked to recite
-	misses   int // of those, ones missing at least one expected marker
-	missTail int // consecutive misses ending at the latest scored response
+	asked    int // responses that were asked to recite their markers
+	misses   int // of those, ones missing at least one marker they were asked for
+	missTail int // consecutive misses ending at the latest response asked
 	// missTailTurn is the turn the current unbroken tail of misses began on,
 	// reset with the tail. Held because "2 of 97 series never recovered" says
 	// a fleet has the fault but not where to look for it, and the turn a
@@ -76,8 +76,8 @@ type seriesVerifyState struct {
 // request order — an instance issues its turns strictly in sequence, and that
 // is the ordering both signals are built on. The lock guards the map against
 // other series, not against this series' own ordering.
-func (h *seriesVerifyHistory) observe(guid string, seriesNum, turn int, classified, garbage, scored, missed bool) {
-	if guid == "" || (!classified && !scored) {
+func (h *seriesVerifyHistory) observe(guid string, seriesNum, turn int, classified, garbage, asked, missed bool) {
+	if guid == "" || (!classified && !asked) {
 		return
 	}
 	h.mu.Lock()
@@ -101,8 +101,8 @@ func (h *seriesVerifyHistory) observe(guid string, seriesNum, turn int, classifi
 		}
 		s.prevGarbage = garbage
 	}
-	if scored {
-		s.scored++
+	if asked {
+		s.asked++
 		if missed {
 			if s.missTail == 0 {
 				s.missTailTurn = turn
@@ -124,7 +124,7 @@ type seriesVerifyTotals struct {
 	classifiedSeries int64 // series with >=1 response scanned for corruption
 	garbageSeries    int64 // of those, ones that produced any garbage at all
 	garbageRunSeries int64 // of those, ones that produced it twice in a row
-	scoredSeries     int64 // series with >=1 response asked to recite
+	askedSeries      int64 // series with >=1 response asked to recite
 	missSeries       int64 // of those, ones that missed at least once
 	missToEndSeries  int64 // of those, ones that never recited correctly again
 	// missToEnd names them, sorted by series. A count says the fault exists;
@@ -185,8 +185,8 @@ func (h *seriesVerifyHistory) totals() seriesVerifyTotals {
 		if s.garbageRun {
 			t.garbageRunSeries++
 		}
-		if s.scored > 0 {
-			t.scoredSeries++
+		if s.asked > 0 {
+			t.askedSeries++
 		}
 		if s.misses > 0 {
 			t.missSeries++

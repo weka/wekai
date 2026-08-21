@@ -102,8 +102,8 @@ func TestSeriesMissToEnd(t *testing.T) {
 		if got.missToEndSeries != 1 {
 			t.Errorf("missToEndSeries = %d, want 1", got.missToEndSeries)
 		}
-		if got.missSeries != 1 || got.scoredSeries != 1 {
-			t.Errorf("denominators = %d of %d, want 1 of 1", got.missSeries, got.scoredSeries)
+		if got.missSeries != 1 || got.askedSeries != 1 {
+			t.Errorf("denominators = %d of %d, want 1 of 1", got.missSeries, got.askedSeries)
 		}
 	})
 
@@ -132,8 +132,8 @@ func TestSeriesMissToEnd(t *testing.T) {
 		if got.missToEndSeries != 0 || got.missSeries != 0 {
 			t.Errorf("missToEnd=%d miss=%d, want 0 0", got.missToEndSeries, got.missSeries)
 		}
-		if got.scoredSeries != 1 {
-			t.Errorf("scoredSeries = %d, want the clean series counted as watched", got.scoredSeries)
+		if got.askedSeries != 1 {
+			t.Errorf("askedSeries = %d, want the clean series counted as watched", got.askedSeries)
 		}
 	})
 
@@ -146,8 +146,8 @@ func TestSeriesMissToEnd(t *testing.T) {
 		if got.missToEndSeries != 2 {
 			t.Errorf("missToEndSeries = %d, want 2 (a and c)", got.missToEndSeries)
 		}
-		if got.missSeries != 3 || got.scoredSeries != 3 {
-			t.Errorf("denominators = %d of %d, want 3 of 3", got.missSeries, got.scoredSeries)
+		if got.missSeries != 3 || got.askedSeries != 3 {
+			t.Errorf("denominators = %d of %d, want 3 of 3", got.missSeries, got.askedSeries)
 		}
 	})
 }
@@ -157,7 +157,7 @@ func TestSeriesMissToEnd(t *testing.T) {
 // manufacture runs out of unrelated requests.
 func TestSeriesVerifyIgnoresUnidentifiedRequests(t *testing.T) {
 	got := foldSeries(t, seriesCorrupt(""), seriesCorrupt(""), seriesMissed(""), seriesMissed(""))
-	if got.classifiedSeries != 0 || got.scoredSeries != 0 {
+	if got.classifiedSeries != 0 || got.askedSeries != 0 {
 		t.Errorf("unidentified requests entered the series population: %+v", got)
 	}
 }
@@ -273,8 +273,8 @@ func TestSeriesLapsAreCountedSeparately(t *testing.T) {
 		t.Fatalf("missToEndSeries = %d, want 1: lap 1 never recovered, and lap 2 reciting correctly "+
 			"is a different conversation rather than a recovery", got.missToEndSeries)
 	}
-	if got.scoredSeries != 2 {
-		t.Errorf("scoredSeries = %d, want 2: two laps are two conversations", got.scoredSeries)
+	if got.askedSeries != 2 {
+		t.Errorf("askedSeries = %d, want 2: two laps are two conversations", got.askedSeries)
 	}
 	if s := got.missToEnd[0].String(); s != "1:2:2" {
 		t.Errorf("run = %s, want 1:2:2", s)

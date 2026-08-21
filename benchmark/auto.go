@@ -1480,6 +1480,10 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 	if cfg.Verify {
 		fmt.Println(strings.Repeat("-", 62))
 		fmt.Println(" UUID validation (replay)")
+		// The mechanism, once, because every count below is a count of it and
+		// none of them mean anything without it.
+		fmt.Println("   Each user turn carries a [ref-id: <uuid>] marker and the request asks the model")
+		fmt.Println("   to recite the ids in scope; responses are matched for those ids by substring.")
 		fmt.Printf("   Requests validated                   : %d\n", res.valReqs)
 		// Two tests, mirroring the cache-coherency eval CLI's layout: UUID
 		// correctness (per-stamp presence, Contains anywhere in the response)
@@ -1527,8 +1531,12 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		// and a session that lost its context does not get it back.
 		fmt.Printf("   Series with back-to-back garbage     : %d of %d that produced any, %d scanned\n",
 			res.valSeries.garbageRunSeries, res.valSeries.garbageSeries, res.valSeries.classifiedSeries)
-		fmt.Printf("   Series never recovering from a miss  : %d of %d that missed, %d scored\n",
-			res.valSeries.missToEndSeries, res.valSeries.missSeries, res.valSeries.scoredSeries)
+		// "asked to recite" and not "scored": the denominator is the series that
+		// carried a marker the model was told to repeat, which is a population
+		// a reader cannot infer and is far smaller than the request count. A
+		// bare "scored" says neither what was measured nor over what.
+		fmt.Printf("   Series never recovering from a miss  : %d of %d that missed, %d asked to recite\n",
+			res.valSeries.missToEndSeries, res.valSeries.missSeries, res.valSeries.askedSeries)
 		// Named, not just counted. The count says the fleet has the fault; these
 		// say which conversation to open, and the first two fields are the same
 		// s/t coordinates the per-request error lines carry, so a run can be
