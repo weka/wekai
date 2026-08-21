@@ -207,6 +207,34 @@ func (d *requestDumper) dump(meta dumpMeta, request, response, merged []byte) {
 	}
 }
 
+// WriteReport writes one derived file beside the exchanges, and reports where.
+//
+// The capture already holds the bytes for the exchanges it kept; this is for
+// the findings ABOUT a run that the summary can only show a capped list of. A
+// terminal line ending in "… and 21 more" is a pointer to nowhere unless the
+// rest is written down somewhere, and the capture directory is where a reader
+// is already looking.
+//
+// It creates the directory if nothing has yet — a run can have failures worth
+// naming without a single corrupt response — so callers must only call it when
+// they actually have something to write, or the lazy-directory contract that
+// keeps clean runs from littering /tmp is lost.
+func (d *requestDumper) WriteReport(name string, content []byte) string {
+	if d == nil || len(content) == 0 {
+		return ""
+	}
+	dir := d.ensureDir()
+	if dir == "" {
+		return ""
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "[dump] cannot write %s: %v\n", path, err)
+		return ""
+	}
+	return path
+}
+
 // sanitizeName keeps an instance id usable as a filename. Replay instance ids
 // come from captured traffic, so nothing guarantees they are path-safe.
 //

@@ -319,3 +319,33 @@ func TestInstancesOfOneSessionAreCountedSeparately(t *testing.T) {
 		t.Errorf("run = %s, want 7:2:2 — session 7's failing agent stopped reciting on turn 2", s)
 	}
 }
+
+// A run names the conversation, not just its series number. Every agent of a
+// session shares that number, and the instance id is what the capture's
+// filenames are built from — so without both, a reported failure cannot be
+// traced to the bytes behind it.
+func TestMissRunNamesTheConversation(t *testing.T) {
+	var h instanceVerifyHistory
+	const guid = "sess-abc:sess-abc::sha256:deadbeef"
+	h.observe(guid, 4, 1, true, false, true, false)
+	h.observe(guid, 4, 2, true, false, true, true)
+	h.observe(guid, 4, 3, true, false, true, true)
+
+	got := h.totals()
+	if len(got.missToEnd) != 1 {
+		t.Fatalf("named %d runs, want 1", len(got.missToEnd))
+	}
+	run := got.missToEnd[0]
+	if run.Session != "sess-abc" {
+		t.Errorf("Session = %q, want sess-abc", run.Session)
+	}
+	// The instance half keeps its own colons: ids in this corpus are
+	// "<session>::sha256:<hash>", so only the FIRST colon separates the two.
+	if run.Instance != "sess-abc::sha256:deadbeef" {
+		t.Errorf("Instance = %q, want the whole instance id including its own colons", run.Instance)
+	}
+	if run.ID != "4:2:2" || run.ID != run.String() {
+		t.Errorf("ID = %q, want the %q the summary prints, so a line seen on the terminal greps "+
+			"out of the report file", run.ID, run.String())
+	}
+}

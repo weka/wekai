@@ -57,6 +57,10 @@ type instanceVerifyHistory struct {
 
 // instanceVerifyState is one instance's running history on one lap.
 type instanceVerifyState struct {
+	// guid is this instance's session:instance identity, kept so a reported
+	// failure can name the conversation rather than only its series number —
+	// every agent of a session shares that number.
+	guid string
 	// seriesNum is the SESSION's dispatch index — the same s%d the per-request
 	// error lines carry, so a reported run can be grepped for. Shared by every
 	// instance of that session, so two entries reporting the same number are
@@ -95,7 +99,7 @@ func (h *instanceVerifyHistory) observe(guid string, seriesNum, turn int, classi
 	key := strconv.Itoa(seriesNum) + "|" + guid
 	s := h.byDispatch[key]
 	if s == nil {
-		s = &instanceVerifyState{seriesNum: seriesNum}
+		s = &instanceVerifyState{seriesNum: seriesNum, guid: guid}
 		h.byDispatch[key] = s
 	}
 	if classified {
@@ -145,9 +149,18 @@ type instanceVerifyTotals struct {
 // seriesMissRun locates one instance's unrecovered tail of misses, by the
 // SESSION series number it belongs to.
 type seriesMissRun struct {
-	Series int // the run's series index, as in the s%d of an error line
-	Turn   int // the turn its first unrecovered miss landed on, as in t%d
-	Length int // how many consecutive misses ran from there to the end
+	Series int `json:"series"` // series index, as in the s%d of an error line
+	Turn   int `json:"turn"`   // the turn its first unrecovered miss landed on, as in t%d
+	Length int `json:"length"` // how many consecutive misses ran from there to the end
+	// Session and Instance disambiguate what Series cannot: every agent of one
+	// session carries the same series number, so three entries reading 128 are
+	// three sub-agents. Instance is also what the capture's filenames are built
+	// from, which is how a run here reaches the bytes behind it.
+	Session  string `json:"session"`
+	Instance string `json:"instance"`
+	// ID is the series:turn:length the summary prints, carried verbatim so a
+	// line seen on the terminal can be found in this file by grep.
+	ID string `json:"id"`
 }
 
 func (r seriesMissRun) String() string {
@@ -209,9 +222,17 @@ func (h *instanceVerifyHistory) totals() instanceVerifyTotals {
 		// ended rather than about anything failing to recover.
 		if s.misses > 0 && s.misses == s.missTail && s.missTail >= 2 {
 			t.missToEndInstances++
-			t.missToEnd = append(t.missToEnd, seriesMissRun{
+			run := seriesMissRun{
 				Series: s.seriesNum, Turn: s.missTailTurn, Length: s.missTail,
-			})
+			}
+			// The guid is session:instance, and a session id carries no colon,
+			// so the first one splits them. The instance half keeps its own
+			// colons, which is what the capture's filenames are derived from.
+			if session, instance, ok := strings.Cut(s.guid, ":"); ok {
+				run.Session, run.Instance = session, instance
+			}
+			run.ID = run.String()
+			t.missToEnd = append(t.missToEnd, run)
 		}
 	}
 	// Map order is random, so a run would otherwise report the same failures in

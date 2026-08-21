@@ -1574,6 +1574,37 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 			}
 			fmt.Printf("   %-37s: %d in %s\n", label, n, dir)
 		}
+		// The capped list above points at nothing once it says "and N more", so
+		// the whole set goes beside the captured exchanges — the place a reader
+		// following that line is already headed. Written only when there is
+		// something to write, which keeps a clean run from creating a directory
+		// to announce that nothing went wrong.
+		if runs := res.valInstances.missToEnd; len(runs) > 0 {
+			// run_id and seed rather than the model: this summary is only
+			// printed for a single-model run, and those two are what identify
+			// the content on the fleet and reproduce it.
+			report := struct {
+				Signal    string          `json:"signal"`
+				RunID     string          `json:"run_id"`
+				Seed      int64           `json:"seed"`
+				Instances int             `json:"instances"`
+				Runs      []seriesMissRun `json:"runs"`
+			}{
+				Signal:    "instances never recovering from a presence miss",
+				RunID:     cfg.RunID,
+				Seed:      cfg.Seed,
+				Instances: len(runs),
+				Runs:      runs,
+			}
+			if b, err := json.MarshalIndent(report, "", "  "); err == nil {
+				if path := cfg.dumper.WriteReport("never-recovered.json", append(b, '\n')); path != "" {
+					if abs, err := filepath.Abs(path); err == nil {
+						path = abs
+					}
+					fmt.Printf("   %-37s: %d in %s\n", "Never-recovered instances (full)", len(runs), path)
+				}
+			}
+		}
 	}
 	// Repeated from the run's first line, because that is thousands of progress
 	// lines ago by the time anyone reads a summary, and the seed is what makes
