@@ -293,6 +293,11 @@ type requestDataRecord struct {
 	SeriesGUID string `json:"series_guid"`
 	SeriesNum  int    `json:"series_num"`
 	RequestNum int    `json:"request_num"`
+	// Turn is this request's 1-based position within its own instance, which
+	// RequestNum is not — that one counts the whole run. Carried because the
+	// summary locates a failure as series:turn:length, and without it that
+	// triple cannot be joined back to the rows it came from.
+	Turn int `json:"turn"`
 
 	// Cache status
 	CacheHit bool `json:"cache_hit"` // server-reported where available, else the TTFT heuristic

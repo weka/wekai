@@ -552,6 +552,7 @@ func recordReplayRequest(
 			SeriesGUID:           metrics.SeriesGUID,
 			SeriesNum:            metrics.SeriesNum,
 			RequestNum:           metrics.RequestNum,
+			Turn:                 metrics.CycleNum,
 			CacheHit:             cacheHit,
 			CacheHitRatio:        cacheHitRatio,
 			ServerCacheConfirmed: serverCacheConfirmed,
