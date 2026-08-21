@@ -1570,6 +1570,14 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 			fmt.Printf("   %-37s: %d in %s\n", label, n, dir)
 		}
 	}
+	// Repeated from the run's first line, because that is thousands of progress
+	// lines ago by the time anyone reads a summary, and the seed is what makes
+	// a result reproducible at all — an arm nobody can rerun is an anecdote.
+	if cfg.Seed != 0 {
+		fmt.Println(strings.Repeat("-", 62))
+		fmt.Printf(" Run seed           : %d (run-id %s)\n", cfg.Seed, cfg.RunID)
+		fmt.Printf(" Reproduce with     : --seed=%d\n", cfg.Seed)
+	}
 	fmt.Println(strings.Repeat("=", 62))
 }
 
