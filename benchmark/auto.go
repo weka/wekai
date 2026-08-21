@@ -1480,15 +1480,6 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 	if cfg.Verify {
 		fmt.Println(strings.Repeat("-", 62))
 		fmt.Println(" UUID validation (replay)")
-		// The mechanism, once, because every count below is a count of it and
-		// none of them mean anything without it.
-		fmt.Println("   Each user turn carries a [ref-id: <uuid>] marker and the request asks the model")
-		fmt.Println("   to recite the ids in scope; responses are matched for those ids by substring.")
-		// Named because the alternative is the reader doing this subtraction and
-		// getting it wrong: a 256-session run reporting 686 instances looks like
-		// a bug until you know a session fans out.
-		fmt.Println("   The two instance counts below are per AGENT — main and sub-agents each own")
-		fmt.Println("   their own prefix — so they run above the session count the run was given.")
 		fmt.Printf("   Requests validated                   : %d\n", res.valReqs)
 		// Two tests, mirroring the cache-coherency eval CLI's layout: UUID
 		// correctness (per-stamp presence, Contains anywhere in the response)
@@ -1534,14 +1525,14 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 		// not. The same argument holds for a miss nothing later in the series
 		// recovers from: a model that declines one request answers the next,
 		// and a session that lost its context does not get it back.
-		fmt.Printf("   Instances with back-to-back garbage  : %d of %d that produced any, %d scanned\n",
-			res.valInstances.garbageRunInstances, res.valInstances.garbageInstances, res.valInstances.classifiedInstances)
+		fmt.Printf("   Instances with back-to-back garbage  : %d of %d that produced any\n",
+			res.valInstances.garbageRunInstances, res.valInstances.garbageInstances)
 		// "asked to recite" and not "scored": the denominator is the series that
 		// carried a marker the model was told to repeat, which is a population
 		// a reader cannot infer and is far smaller than the request count. A
 		// bare "scored" says neither what was measured nor over what.
-		fmt.Printf("   Instances never recovering a miss    : %d of %d that missed, %d asked to recite\n",
-			res.valInstances.missToEndInstances, res.valInstances.missInstances, res.valInstances.askedInstances)
+		fmt.Printf("   Instances never recovering a miss    : %d of %d that missed\n",
+			res.valInstances.missToEndInstances, res.valInstances.missInstances)
 		// Named, not just counted. The count says the fleet has the fault; these
 		// say which conversation to open, and the first two fields are the same
 		// s/t coordinates the per-request error lines carry, so a run can be
@@ -1550,7 +1541,7 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 			fmt.Printf("     series:turn:length                 : %s\n", runs)
 		}
 		// Both denominators, because they are different populations: presence
-		// is scored only where a recite was asked, contamination on every
+		// is checked only where a recite was asked, contamination on every
 		// completed response. The window is printed with the count because a
 		// bare zero invites "no session ever saw another's content", and what
 		// was actually checked is "no session saw another's content among

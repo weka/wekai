@@ -124,14 +124,17 @@ func (h *instanceVerifyHistory) observe(guid string, seriesNum, turn int, classi
 	}
 }
 
-// instanceVerifyTotals is the run-level view, with the denominators each count
-// belongs to: "3 series went bad" means nothing without how many were watched,
-// and the two counts are watched over different populations.
+// instanceVerifyTotals is the run-level view. Each count is nested in the one
+// above it, so a row can report "N of M" without a reader having to hold a
+// third population in their head. The two widest — instances watched at all —
+// are not printed; they are what the tests observe observe()'s own rules
+// through, since an errored request joining either population would be the
+// bug those rules exist to prevent.
 type instanceVerifyTotals struct {
 	classifiedInstances int64 // instances with >=1 response scanned for corruption
 	garbageInstances    int64 // of those, ones that produced any garbage at all
 	garbageRunInstances int64 // of those, ones that produced it twice in a row
-	askedInstances      int64 // series with >=1 response asked to recite
+	askedInstances      int64 // instances with >=1 response asked to recite
 	missInstances       int64 // of those, ones that missed at least once
 	missToEndInstances  int64 // of those, ones that never recited correctly again
 	// missToEnd names them, sorted by series. A count says the fault exists;
