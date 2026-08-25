@@ -1709,10 +1709,18 @@ func TestAnAPIKeyImpliesTheInferenceAllowlist(t *testing.T) {
 	if code := get("/get_model_info"); code == http.StatusNotFound {
 		t.Error("GET /get_model_info = 404: a dialect route must still be served")
 	}
+	// Anthropic's Messages surface is one of this dialect's own routes, so a
+	// protected router serves it. That is the point of deriving the allowlist
+	// from the route table rather than writing one out: claiming a path makes it
+	// reachable on a protected listener without a second edit somewhere else.
+	if code := get("/v1/messages"); code == http.StatusNotFound {
+		t.Error("GET /v1/messages = 404: the dialect claims it, so a protected " +
+			"router must serve it")
+	}
 	// What is gone is everything the dialect does NOT claim: the passthrough
 	// tier, and the admin endpoints an operator must now ask for.
 	for _, path := range []string{
-		"/get_server_info", "/workers", "/readiness", "/anything", "/v1/messages",
+		"/get_server_info", "/workers", "/readiness", "/anything", "/v1/organizations/me",
 	} {
 		if code := get(path); code != http.StatusNotFound {
 			t.Errorf("GET %s = %d, want 404: a protected router serves this dialect's "+

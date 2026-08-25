@@ -123,8 +123,14 @@ func Reset() {
 // matching rather than growing without bound: a pathological unterminated line
 // degrades to "terminal not seen", which is safe because the load lease is bound
 // to the response body being finished, never to this marker (API-N3).
+//
+// Markers is a set because one dialect may serve several wire surfaces, and each
+// surface ends its stream its own way: an OpenAI stream closes with
+// `data: [DONE]`, an Anthropic one with `event: message_stop`. Any of them
+// terminates the stream — they cannot both appear in one response, so accepting
+// all of them costs a comparison per line and saves a whole dialect.
 type LineScanner struct {
-	Marker []byte
+	Markers [][]byte
 
 	carry  []byte
 	capped bool
@@ -152,8 +158,13 @@ func (s *LineScanner) Feed(p []byte) bool {
 			s.carry = append(s.carry, line...)
 			line = s.carry
 		}
-		if !s.capped && hasPrefix(trimCR(line), s.Marker) {
-			s.seen = true
+		if !s.capped {
+			for _, m := range s.Markers {
+				if hasPrefix(trimCR(line), m) {
+					s.seen = true
+					break
+				}
+			}
 		}
 		s.carry = s.carry[:0]
 		s.capped = false
