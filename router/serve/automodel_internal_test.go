@@ -46,7 +46,7 @@ func TestListModelsUsesTheBackendBasePath(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			models, err := listModels(context.Background(), srv.URL+tc.suffix)
+			models, err := listModels(context.Background(), srv.URL+tc.suffix, "")
 			if err != nil {
 				t.Fatalf("listModels: %v", err)
 			}
@@ -57,6 +57,37 @@ func TestListModelsUsesTheBackendBasePath(t *testing.T) {
 				t.Errorf("parsed %v, want [m]", models)
 			}
 		})
+	}
+}
+
+// A pool the router authenticates to itself must be probed with THAT key. Left
+// unauthenticated the listing is a 401, discovery gives up, and the route's model
+// reaches a vLLM that answers 404 for a name it does not serve.
+func TestListModelsPresentsThePoolCredential(t *testing.T) {
+	var auth, xapi string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth, xapi = r.Header.Get("Authorization"), r.Header.Get("X-Api-Key")
+		if auth != "Bearer inner-key" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":[{"id":"Qwen/Qwen3-32B"}]}`))
+	}))
+	defer srv.Close()
+
+	models, err := listModels(context.Background(), srv.URL, "inner-key")
+	if err != nil {
+		t.Fatalf("listModels: %v", err)
+	}
+	if auth != "Bearer inner-key" {
+		t.Errorf("Authorization %q, want the pool's credential", auth)
+	}
+	if xapi != "inner-key" {
+		t.Errorf("X-Api-Key %q; both styles are sent because a pool is configured "+
+			"by URL, not by which convention it speaks", xapi)
+	}
+	if len(models) != 1 || models[0] != "Qwen/Qwen3-32B" {
+		t.Errorf("parsed %v", models)
 	}
 }
 

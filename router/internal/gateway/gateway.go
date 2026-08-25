@@ -390,10 +390,10 @@ type modelsResponse struct {
 // already in the base. Trying both is cheaper than making an operator encode
 // which flavour each endpoint is.
 //
-// Credentials are forwarded from the CALLER's request rather than configured
-// here. A hosted provider returns 401 to an unauthenticated listing, so without
-// this a hosted pool silently contributes nothing to the merged result — which
-// looks identical to it having no models.
+// It authenticates the way the pool says to, in the proxy's precedence order and
+// for the proxy's reasons — see applyPoolCredential. This request goes to the
+// same upstream as the pool's inference traffic and must not treat credentials
+// differently just because it is a listing.
 func (s *Server) fetchModels(ctx context.Context, base string, from *http.Request, t Target) (*modelsResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -404,18 +404,7 @@ func (s *Server) fetchModels(ctx context.Context, base string, from *http.Reques
 		if err != nil {
 			return nil, err
 		}
-		if !t.StripAuth && from != nil {
-			for _, h := range []string{"Authorization", "X-Api-Key", "Anthropic-Version"} {
-				if v := from.Header.Get(h); v != "" {
-					req.Header.Set(h, v)
-				}
-			}
-			// Anthropic rejects a request without it, and no other provider
-			// minds an extra header.
-			if req.Header.Get("Anthropic-Version") == "" && req.Header.Get("X-Api-Key") != "" {
-				req.Header.Set("Anthropic-Version", "2023-06-01")
-			}
-		}
+		applyPoolCredential(req, from, t)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			lastErr = err
@@ -473,33 +462,44 @@ func (s *Server) poolByName(name string) (Target, bool) {
 	return Target{}, false
 }
 
-// stripInboundCredentials removes client credentials before forwarding, for a
-// route marked as pointing at an unauthenticated upstream. Forwarding them
-// there leaks a caller's key into someone else's logs.
-func stripInboundCredentials(r *http.Request) {
-	for _, h := range []string{"Authorization", "X-Api-Key", "Anthropic-Beta"} {
-		r.Header.Del(h)
-	}
-}
-
-// applyRouterCredential replaces the caller's credentials with the router's own
-// for this pool.
+// applyPoolCredential authenticates a request the ROUTER makes to a pool's
+// upstream, in the same precedence the proxy applies to a caller's request: the
+// pool's own credential replaces everything, forwarding is opt-in, and the
+// default sends nothing.
 //
-// The caller's are REPLACED, not merged: forwarding both would send a user's
-// key to an internal service that has no business seeing it, which is the leak
-// this feature exists to prevent in the other direction.
+// The precedence is restated here rather than shared because the proxy works on
+// an httputil.ProxyRequest and this on a plain one. What must not diverge is the
+// judgement. This is the one request to a pool's upstream that does not go
+// through the proxy, so a rule of its own here would be a hole straight past
+// `using <file>`: forwarding the caller's credential would hand a user's personal
+// key to the internal fleet the route exists to keep it away from, and would
+// present the wrong key to a pool that has its own.
 //
-// Both header styles are set because the two conventions coexist —
-// Authorization: Bearer for OpenAI-compatible servers, x-api-key for
+// Both header styles are set for a router credential because the two conventions
+// coexist — Authorization: Bearer for OpenAI-compatible servers, x-api-key for
 // Anthropic — and a pool is configured by URL, not by which flavour it speaks.
-// Sending the key twice to a server that reads one is harmless; guessing wrong
-// is a 401 an operator has to debug.
-func applyRouterCredential(r *http.Request, cred string) {
-	stripInboundCredentials(r)
-	r.Header.Set("Authorization", "Bearer "+cred)
-	r.Header.Set("X-Api-Key", cred)
-	if r.Header.Get("Anthropic-Version") == "" {
-		r.Header.Set("Anthropic-Version", "2023-06-01")
+// Sending the key twice to a server that reads one is harmless; guessing wrong is
+// a 401 an operator has to debug.
+func applyPoolCredential(req *http.Request, from *http.Request, t Target) {
+	switch {
+	case t.Credential != "":
+		req.Header.Set("Authorization", "Bearer "+t.Credential)
+		req.Header.Set("X-Api-Key", t.Credential)
+		req.Header.Set("Anthropic-Version", "2023-06-01")
+	case t.ForwardClientCredential && !t.StripAuth && from != nil:
+		// A hosted API the CALLER pays for: only their key can work here, and a
+		// hosted provider answers an unauthenticated listing with 401 — which
+		// looks exactly like a pool serving no models.
+		for _, h := range []string{"Authorization", "X-Api-Key", "Anthropic-Version"} {
+			if v := from.Header.Get(h); v != "" {
+				req.Header.Set(h, v)
+			}
+		}
+		// Anthropic rejects a request without it, and no other provider minds an
+		// extra header.
+		if req.Header.Get("Anthropic-Version") == "" && req.Header.Get("X-Api-Key") != "" {
+			req.Header.Set("Anthropic-Version", "2023-06-01")
+		}
 	}
 }
 

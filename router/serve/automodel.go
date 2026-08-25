@@ -64,7 +64,7 @@ const (
 // backend healthy enough to ask. It returns when it has an answer, when the
 // answer is settled as "do not rewrite", or when ctx ends.
 func resolveAutoModel(ctx context.Context, mode string, name string, reg *registry.Registry,
-	slot *atomic.Pointer[string], log *slog.Logger) {
+	cred string, slot *atomic.Pointer[string], log *slog.Logger) {
 	if mode == autoModelOff {
 		return
 	}
@@ -90,7 +90,7 @@ func resolveAutoModel(ctx context.Context, mode string, name string, reg *regist
 		var models []string
 		var err error
 		for _, b := range avail {
-			models, err = listModels(ctx, b.URL)
+			models, err = listModels(ctx, b.URL, cred)
 			if err == nil {
 				break
 			}
@@ -164,7 +164,18 @@ func redactURL(raw string) string {
 
 // listModels fetches the backend's model listing. The shape is the same on
 // OpenAI-compatible servers and on Anthropic itself, so one parse covers both.
-func listModels(ctx context.Context, backendURL string) ([]string, error) {
+//
+// cred is the pool's own credential, and the listing needs it: a fleet started
+// with vLLM's --api-key answers an unauthenticated listing with 401, which
+// discovery cannot tell from a backend that has no listing to give. It exhausts
+// its attempts, the route's model reaches the backend unrewritten, and vLLM
+// answers 404 for a model it does not serve — a backend error with nothing in it
+// to point at the credential.
+//
+// The CALLER's credential is never an option here: this runs on a background
+// goroutine at startup, where there is no caller, and a pool whose upstreams need
+// a user's key cannot be probed by the router on anyone's behalf.
+func listModels(ctx context.Context, backendURL, cred string) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, autoModelProbeTimeout)
 	defer cancel()
 
@@ -172,6 +183,13 @@ func listModels(ctx context.Context, backendURL string) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
+	}
+	if cred != "" {
+		// Both styles, for the same reason the proxy sets both: a pool is
+		// configured by URL, not by which credential convention it speaks.
+		req.Header.Set("Authorization", "Bearer "+cred)
+		req.Header.Set("X-Api-Key", cred)
+		req.Header.Set("Anthropic-Version", "2023-06-01")
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

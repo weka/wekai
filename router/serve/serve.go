@@ -361,6 +361,7 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			}
 			backends = append(backends, pool.Backend{URL: ep, Passive: passive})
 		}
+
 		flow := opts.flowConfig()
 		flow.PoolName = name
 		flow.Clock = clk
@@ -412,7 +413,7 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		// backend is healthy — see automodel.go for why both of those matter.
 		if rt.RewriteModel == "" && autoMode != autoModelOff {
 			rule.AutoModel = &atomic.Pointer[string]{}
-			go resolveAutoModel(ctx, autoMode, p.Name, p.Registry, rule.AutoModel, log)
+			go resolveAutoModel(ctx, autoMode, p.Name, p.Registry, cred, rule.AutoModel, log)
 		}
 		rules = append(rules, rule)
 	}

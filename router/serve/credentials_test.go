@@ -3,11 +3,13 @@ package serve_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -192,3 +194,101 @@ func TestRouterCredentialReplacesTheCallersRatherThanAddingToIt(t *testing.T) {
 }
 
 func redact(s, secret string) string { return strings.ReplaceAll(s, secret, "<REDACTED>") }
+
+// The merged model listing is a request the ROUTER makes to a pool's upstream,
+// and it is the one such request that does not go through the proxy. It must
+// therefore reach the same credential decision the proxy would: forwarding the
+// caller's key here would hand a user's personal credential to the internal fleet
+// that `using <file>` exists to keep it away from.
+func TestMergedModelListingUsesThePoolsOwnCredential(t *testing.T) {
+	const userKey = "user-personal-key"
+	const innerKey = "inner-secret-key"
+
+	var mu sync.Mutex
+	var fleetAuth, fleetKey, hostedKey string
+
+	fleet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			mu.Lock()
+			fleetAuth, fleetKey = r.Header.Get("Authorization"), r.Header.Get("X-Api-Key")
+			mu.Unlock()
+			if r.Header.Get("Authorization") != "Bearer "+innerKey {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			fmt.Fprint(w, `{"data":[{"id":"Qwen/Qwen3-32B"}]}`)
+			return
+		}
+		if r.URL.Path == "/metrics" {
+			fmt.Fprint(w, "vllm:num_requests_running 0\n")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fleet.Close()
+
+	hosted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			mu.Lock()
+			hostedKey = r.Header.Get("X-Api-Key")
+			mu.Unlock()
+			fmt.Fprint(w, `{"data":[{"id":"claude-sonnet-4-5"}]}`)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer hosted.Close()
+
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "inner-key")
+	if err := os.WriteFile(keyFile, []byte(innerKey+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h, err := serve.Handler(ctx, serve.Options{
+		HealthInterval: 20 * time.Millisecond,
+		HealthTimeout:  10 * time.Millisecond,
+		AutoModel:      "off",
+		Routes: []serve.Route{
+			{Name: "internal", Patterns: "qwen", Endpoints: []string{fleet.URL},
+				CredentialFile: keyFile},
+			{Name: "hosted", Patterns: "*", Endpoints: []string{hosted.URL},
+				ForwardClientCredential: true, Passive: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	rt := httptest.NewServer(h)
+	defer rt.Close()
+
+	eventually(t, func() bool {
+		req, _ := http.NewRequest(http.MethodGet, rt.URL+"/v1/models", nil)
+		req.Header.Set("X-Api-Key", userKey)
+		req.Header.Set("Authorization", "Bearer "+userKey)
+		resp, err := rt.Client().Do(req)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return strings.Contains(string(b), "Qwen/Qwen3-32B")
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Contains(fleetAuth, userKey) || fleetKey == userKey {
+		t.Errorf("the caller's key reached the internal fleet on /v1/models: "+
+			"Authorization=%q X-Api-Key=%q", fleetAuth, fleetKey)
+	}
+	if fleetAuth != "Bearer "+innerKey {
+		t.Errorf("fleet saw Authorization %q, want the pool's own credential", fleetAuth)
+	}
+	// The hosted pool is the case that DOES need the caller's key: nothing the
+	// router holds could pay for that call.
+	if hostedKey != userKey {
+		t.Errorf("hosted API saw X-Api-Key %q, want the caller's key", hostedKey)
+	}
+}
