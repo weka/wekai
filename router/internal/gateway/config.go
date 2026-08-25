@@ -65,6 +65,22 @@ type Config struct {
 	// the dialect's own routes only.
 	PathAllowlist []string
 
+	// UserPrefix reads the FIRST path segment of every request as the caller's
+	// name and removes it before anything else looks at the path, so a client
+	// that sets its base URL to http://router/<user> identifies itself without
+	// a header the SDK has no way to add.
+	//
+	// Every request is expected to carry one. That is the contract, not a
+	// heuristic: there is no way to tell a user named "v1" from a client that
+	// forgot its prefix, so the router does not try — a single-segment path is
+	// left alone (an infra probe), and everything else surrenders its first
+	// segment. A router running this way is dedicated to it.
+	//
+	// Stripping happens before the allowlist, the mux and the upstream path, so
+	// /<user>/v1/messages is authorised, routed and forwarded exactly as
+	// /v1/messages. The caller's own path still reaches capture intact.
+	UserPrefix bool
+
 	// CORSOrigins are the origins permitted to call the inference listener.
 	// A wildcard combined with an API key is rejected at construction (SEC-10).
 	CORSOrigins []string
@@ -103,6 +119,7 @@ func (c Config) Redacted() map[string]any {
 		"max_body_bytes":          c.MaxBodyBytes,
 		"max_concurrent_requests": c.MaxConcurrentRequests,
 		"path_allowlist":          c.PathAllowlist,
+		"user_prefix":             c.UserPrefix,
 		"cors_origins":            c.CORSOrigins,
 	}
 }

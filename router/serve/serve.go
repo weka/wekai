@@ -124,9 +124,13 @@ type Options struct {
 	// APIKeyFile is read at startup and takes precedence over APIKey. Prefer it:
 	// a key passed as a flag is visible in a process listing and in the pod
 	// spec that launched it.
-	APIKeyFile            string
-	CORSOrigins           []string
-	PathAllowlist         []string
+	APIKeyFile    string
+	CORSOrigins   []string
+	PathAllowlist []string
+	// UserPrefix reads the first path segment as the caller's name and strips it
+	// before the path is authorised, routed or forwarded — see
+	// gateway.Config.UserPrefix.
+	UserPrefix            bool
 	MaxBodyBytes          int64
 	MaxConcurrentRequests int
 
@@ -211,6 +215,7 @@ func (o Options) gatewayConfig() gateway.Config {
 		MaxBodyBytes:          o.MaxBodyBytes,
 		MaxConcurrentRequests: o.MaxConcurrentRequests,
 		PathAllowlist:         o.PathAllowlist,
+		UserPrefix:            o.UserPrefix,
 		CORSOrigins:           o.CORSOrigins,
 		DefaultCapacity:       1,
 		RetryTimeLimit:        o.RetryTimeLimit,

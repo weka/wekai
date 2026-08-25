@@ -190,7 +190,7 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		if err != nil {
 			return fmt.Errorf("init capture: %w", err)
 		}
-		hook = &captureAdapter{sink: sink, userPrefix: c.UserPrefix}
+		hook = &captureAdapter{sink: sink}
 		log.Printf("capture: mode=%s dir=%s buffer=%d", c.Capture, dir, c.CaptureBuffer)
 	}
 
@@ -225,6 +225,7 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		APIKeyFile:            c.APIKeyFile,
 		CORSOrigins:           c.CORSOrigins,
 		PathAllowlist:         c.PathAllowlist,
+		UserPrefix:            c.UserPrefix,
 		MaxBodyBytes:          c.MaxBodyBytes,
 		MaxConcurrentRequests: c.MaxConcurrent,
 		NodeConcurrency:       c.MaxNodeConc,
@@ -258,20 +259,15 @@ func (c *RouterServeCommand) Execute(args []string) error {
 // schema the replay tooling reads. serve knows nothing about that schema, and
 // this file knows nothing about routing — which is the point of the seam.
 type captureAdapter struct {
-	sink       *captureSink
-	userPrefix bool
+	sink *captureSink
 }
 
 func (a *captureAdapter) WantsResponseBody() bool { return a.sink.mode != captureRedacted }
 
 func (a *captureAdapter) Record(ev serve.Captured) {
-	user := ""
-	if a.userPrefix {
-		user, _ = stripUserPrefix(ev.Request.URL.Path)
-	}
 	rec := buildCaptureRecord(a.sink.mode, ev.ID, ev.Started, ev.Request,
 		ev.InboundHeaders, ev.ReqBody, ev.Backend, ev.Pool, ev.ModelOut,
-		ev.Status, ev.RespHeaders, ev.RespBody, ev.Total, ev.Total, nil, user)
+		ev.Status, ev.RespHeaders, ev.RespBody, ev.Total, ev.Total, nil, ev.User)
 	if rec != nil {
 		a.sink.offer(rec)
 	}
@@ -519,32 +515,6 @@ func matchesAny(rulePatterns, stripPatterns []string) bool {
 		}
 	}
 	return false
-}
-
-// inferencePaths is the whitelist of paths that carry Anthropic inference
-// payloads and therefore qualify for per-user routing and redacted capture.
-// Non-listed paths use the catch-all (default) rule unchanged and are skipped
-// in redacted capture mode. Conservative — prefer false negatives over
-// misrouting non-inference traffic through user-prefix logic.
-var inferencePaths = map[string]bool{
-	"/v1/messages":              true, // Anthropic Messages API
-	"/v1/messages/count_tokens": true, // token-count auxiliary endpoint
-}
-
-// isInferencePath reports whether path (after user-prefix stripping) is an
-// Anthropic inference endpoint qualifying for full per-user routing.
-func stripUserPrefix(p string) (user, newPath string) {
-	if len(p) == 0 || p[0] != '/' {
-		return "", p
-	}
-	rest := p[1:]
-	slash := strings.IndexByte(rest, '/')
-	if slash <= 0 {
-		return "", p // single segment — infra probe or bare path, pass through
-	}
-	first := rest[:slash]
-	tail := rest[slash:] // starts with '/'
-	return first, tail
 }
 
 func extractModel(body []byte) string {

@@ -95,6 +95,10 @@ type RouteInfo struct {
 	Pool     string
 	Backend  string
 	ModelOut string
+
+	// User is the caller identified by the leading path segment, when the
+	// router runs with per-user prefixes. Empty otherwise.
+	User string
 }
 
 // WithRouteHolder attaches a holder for a handler to populate, REUSING one an
@@ -111,6 +115,13 @@ func WithRouteHolder(ctx context.Context) (context.Context, *RouteInfo) {
 	}
 	ri := &RouteInfo{}
 	return context.WithValue(ctx, keyRouteClass, ri), ri
+}
+
+// SetUser records the caller a per-user path prefix named.
+func SetUser(ctx context.Context, user string) {
+	if ri, ok := ctx.Value(keyRouteClass).(*RouteInfo); ok {
+		ri.User = user
+	}
 }
 
 // SetRoute records the matched route class and dialect for this request.

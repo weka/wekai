@@ -242,12 +242,21 @@ router:
   # Async capture channel buffer size.
   captureBuffer: 512
 
-  # Per-user path-prefix routing (opt-in). When true, requests at
-  # /<user>/v1/<rest> route to /v1/<rest> upstream and the leading
-  # segment is captured as `user` on each record. Lets clients
-  # distinguish themselves by setting their ANTHROPIC_BASE_URL to
-  # http://router-host/<user>. Default off — behavior is unchanged
-  # unless this is enabled.
+  # Per-user path-prefix routing (opt-in). Requests at /<user>/v1/<rest> are
+  # authorised, routed and forwarded as /v1/<rest>, and the leading segment is
+  # recorded as `user` on each capture record. Lets clients identify themselves
+  # by setting ANTHROPIC_BASE_URL to http://router-host/<user>, which is the
+  # only handle an SDK gives you when it will not send an extra header.
+  #
+  # The segment is removed before the path allowlist, the route table and the
+  # upstream see it, so per-user traffic reaches the same routes — and the same
+  # prefix-cache affinity — as unprefixed traffic. Capture still stores the path
+  # the client actually sent.
+  #
+  # EVERY request is then expected to carry a prefix; that is the contract, not
+  # a guess. There is no way to tell a user named "v1" from a client that forgot
+  # its prefix, so a router with this on is dedicated to it. Single-segment
+  # paths (infra probes like /healthz) are left alone.
   userPrefix: false
 
 # Extra CLI args appended after the standard router flags. Use for anything

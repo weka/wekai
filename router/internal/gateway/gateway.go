@@ -172,6 +172,7 @@ func (s *Server) build() http.Handler {
 		accessLogMiddleware,
 		s.corsMiddleware,
 		s.bodyLimitMiddleware,
+		s.userPrefixMiddleware,
 		s.authMiddleware,
 		s.concurrencyMiddleware,
 	)

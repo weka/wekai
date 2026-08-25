@@ -25,7 +25,10 @@ type Captured struct {
 	Pool     string
 	Backend  string
 	ModelOut string
-	Total    time.Duration
+	// User is the caller a per-user path prefix named, empty when the router
+	// does not run with prefixes.
+	User  string
+	Total time.Duration
 }
 
 // CaptureHook receives each proxied exchange. It is an interface so this
@@ -46,9 +49,10 @@ type CaptureHook interface {
 // lifecycle, which is why the two routers could not merge without it: the
 // gateway streams responses and knows nothing about capture, and the capture
 // code knew everything about a proxy that no longer exists. As middleware it
-// needs exactly two things from inside — which pool served the request, and
-// which upstream — and those arrive through obs.RouteInfo, the same
-// fill-in-from-the-handler indirection the access log already uses.
+// needs a few things from inside — which pool served the request, which
+// upstream, and which user the path named — and those arrive through
+// obs.RouteInfo, the same fill-in-from-the-handler indirection the access log
+// already uses.
 //
 // Response bodies are teed, not buffered whole and replayed: a streaming
 // generation runs for minutes and can reach tens of megabytes, and holding one
@@ -91,7 +95,7 @@ func captureMiddleware(hook CaptureHook, next http.Handler) http.Handler {
 			ReqBody: reqBody, RespHeaders: cw.Header(), RespBody: cw.body.Bytes(),
 			Status: cw.statusOr(http.StatusOK), Pool: ri.Pool, Backend: ri.Backend,
 			//clockexempt: measures the exchange for the capture record, not a decision
-			ModelOut: ri.ModelOut, Total: time.Since(started),
+			ModelOut: ri.ModelOut, User: ri.User, Total: time.Since(started),
 		})
 	})
 }

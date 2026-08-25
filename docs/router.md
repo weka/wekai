@@ -607,6 +607,30 @@ router:
       mountPath: /etc/router
 ```
 
+## Per-user path prefixes
+
+`--user-prefix` reads the FIRST path segment of every request as the caller's
+name and removes it before anything else sees the path. A client sets
+
+```
+ANTHROPIC_BASE_URL=http://router:8080/alice
+```
+
+and its `/alice/v1/messages` is authorised, routed and forwarded as
+`/v1/messages`, with `alice` recorded on the capture record. It is the only
+handle available when the SDK will not send a header of your own.
+
+Stripping happens **before the path allowlist, the route table and the upstream
+path**, which is what makes per-user traffic ordinary traffic: it matches the
+same dialect routes, gets the same prefix-cache affinity, and reaches a hosted
+API on a path that API has heard of. Capture still records the path the client
+sent, with the user as a field of its own.
+
+**Every request is then expected to carry a prefix.** That is the contract
+rather than a heuristic — there is no way to tell a user named `v1` from a
+client that forgot its prefix — so a router running this way is dedicated to it.
+Single-segment paths are left alone, so infra probes still work.
+
 ## Readiness
 
 A router pod is **not ready until at least one endpoint is alive**. `/readiness`

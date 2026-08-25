@@ -21,9 +21,10 @@ import (
 //	3 accessLog    OBS-7  — wraps below everything, so 401/413/508 are all logged
 //	4 cors         GW-10  — MUST be OUTSIDE auth (see corsMiddleware)
 //	5 bodyLimit    GW-8   — arms MaxBytesReader on EVERY path, reads nothing
-//	6 auth         AUTH-4 — the single enforcement site in the binary
-//	7 concurrency  REL-10 — inside auth, so a flood cannot consume slots
-//	8 mux                 — the matched pattern determines route class and dialect
+//	6 userPrefix          — before auth and the mux, so both see the real path
+//	7 auth         AUTH-4 — the single enforcement site in the binary
+//	8 concurrency  REL-10 — inside auth, so a flood cannot consume slots
+//	9 mux                 — the matched pattern determines route class and dialect
 //
 // v1 got 4 and 5 wrong, and enforced 6 twice.
 func chain(h http.Handler, ms ...func(http.Handler) http.Handler) http.Handler {
@@ -285,6 +286,58 @@ func (s *Server) bodyLimitMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// userPrefixMiddleware removes the caller's name from the front of the path.
+//
+// It sits ahead of auth and the mux because everything downstream must see the
+// path the request is really for. Behind them, /alice/v1/messages would be
+// refused by an allowlist that knows only /v1/messages, would miss the dialect
+// route and fall to the passthrough tier — losing prefix affinity for every
+// request — and would reach the upstream with a leading segment it has never
+// heard of, which a hosted API answers with a 404.
+//
+// The request is CLONED rather than edited. Capture wraps this handler from the
+// outside and records the path as the client sent it, and a shallow copy would
+// share the URL and rewrite that record too. The user reaches capture through
+// obs instead, where it is a field of its own.
+func (s *Server) userPrefixMiddleware(next http.Handler) http.Handler {
+	if !s.cfg.UserPrefix {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, path := SplitUserPrefix(r.URL.Path)
+		if user == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		obs.SetUser(r.Context(), user)
+		r = r.Clone(r.Context())
+		r.URL.Path = path
+		// RawPath is only valid as an encoding of Path; a stale one would win
+		// over the path just computed.
+		r.URL.RawPath = ""
+		next.ServeHTTP(w, r)
+	})
+}
+
+// SplitUserPrefix separates the leading path segment from the rest.
+//
+// A single-segment path keeps its own: those are infra probes — /healthz, /
+// — that no client prefixes, and taking their only segment would leave nothing
+// to route. Anything longer surrenders its first segment unconditionally,
+// because under this contract every client sends one and there is no way to
+// tell a user named "v1" from a client that forgot.
+func SplitUserPrefix(p string) (user, rest string) {
+	if len(p) == 0 || p[0] != '/' {
+		return "", p
+	}
+	tail := p[1:]
+	slash := strings.IndexByte(tail, '/')
+	if slash <= 0 {
+		return "", p
+	}
+	return tail[:slash], tail[slash:]
 }
 
 // authMiddleware is the ONE enforcement site.
