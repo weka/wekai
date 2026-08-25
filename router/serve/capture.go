@@ -77,10 +77,15 @@ func captureMiddleware(hook CaptureHook, next http.Handler) http.Handler {
 			}
 		}
 
+		// Installed HERE, outside the gateway, so the holder capture reads is the
+		// same one the handlers within write to. The gateway's own access log
+		// reuses it rather than replacing it.
+		rctx, ri := obs.WithRouteHolder(r.Context())
+		r = r.WithContext(rctx)
+
 		cw := &captureWriter{ResponseWriter: w, keepBody: keepBody}
 		next.ServeHTTP(cw, r)
 
-		ri := obs.Target(r.Context())
 		hook.Record(Captured{
 			ID: id, Started: started, Request: r, InboundHeaders: inbound,
 			ReqBody: reqBody, RespHeaders: cw.Header(), RespBody: cw.body.Bytes(),

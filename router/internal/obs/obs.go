@@ -97,8 +97,18 @@ type RouteInfo struct {
 	ModelOut string
 }
 
-// WithRouteHolder attaches an empty holder for a handler to populate.
+// WithRouteHolder attaches a holder for a handler to populate, REUSING one an
+// outer middleware already installed.
+//
+// Sharing is the point. Capture wraps the gateway from outside and the access
+// log lives within it, so each would otherwise hold a holder the other never
+// sees — and the one capture reads is the one no handler ever wrote to, which is
+// how every captured record came to say it did not know which pool or backend
+// served it.
 func WithRouteHolder(ctx context.Context) (context.Context, *RouteInfo) {
+	if ri, ok := ctx.Value(keyRouteClass).(*RouteInfo); ok {
+		return ctx, ri
+	}
 	ri := &RouteInfo{}
 	return context.WithValue(ctx, keyRouteClass, ri), ri
 }
