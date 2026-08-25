@@ -80,9 +80,15 @@ router:
   # Restrict which paths may be proxied.
   #
   # Setting apiKey/apiKeyFile already restricts the router to the dialect's own
-  # routes — chat/completions, completions, embeddings, models and the rest —
-  # all requiring the key, with the passthrough tier and the admin endpoints
-  # closed. This overrides that default with a set of your own.
+  # routes — chat/completions, completions, embeddings, messages, models and the
+  # rest — all requiring the key, with the passthrough tier and the admin
+  # endpoints closed. This overrides that default with a set of your own.
+  #
+  # Both inference surfaces are dialect routes, so a protected router serves
+  # /v1/messages without being told to. What it does NOT cover is a hosted
+  # provider's non-inference surface — an Anthropic client calling
+  # /v1/organizations/*, say. Admit those with the "/v1/" subtree below, which
+  # still leaves the admin endpoints closed.
   #
   # WITHOUT a key, EMPTY MEANS EVERY PATH: any path the dialect does not claim
   # is passed through to a backend, which is what lets one router front both an
@@ -93,9 +99,7 @@ router:
   # "/v1/models"; a trailing "/" denotes a subtree.
   #
   #   pathAllowlist:
-  #     - /v1/chat/completions
-  #     - /v1/messages
-  #     - /v1/models
+  #     - /v1/            # every inference and provider path, admin still closed
   pathAllowlist: []
 
   # Split signals. The backend's own 429 is always on and needs no
@@ -194,9 +198,22 @@ router:
   # unauthenticated, which the router logs loudly at startup.
   apiKey: ""
 
-  # Optional catch-all upstream used if no --route matches.
+  # Optional catch-all upstream used if no --route matches. This is where
+  # unknown models and unknown API paths go, so it is what makes Anthropic the
+  # default path for everything the routes above do not claim.
+  #
+  # `using client` forwards the CALLER's key, which a hosted API the user pays
+  # for requires. Omitting it sends NO credential — the safe default, so a route
+  # nobody annotated cannot leak a user's key to an internal backend — and every
+  # request to Anthropic then comes back 401.
+  #
+  # A single hosted endpoint is proxied TRANSPARENTLY: the provider's answer is
+  # relayed verbatim, with no circuit breaker, no retry and no model rewriting.
+  # The router only speaks for itself when it cannot reach the upstream at all,
+  # and then it answers 502. Nothing to configure — it is derived from the same
+  # one-time probe that decides passive health, and logged at startup.
   default: ""
-  # default: "https://api.anthropic.com"
+  # default: "https://api.anthropic.com using client"
 
   # Patterns that trigger stripping of Authorization/x-api-key/anthropic-beta
   # headers before forwarding (useful for unauth'd internal upstreams).

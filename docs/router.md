@@ -26,9 +26,33 @@ path either way; there is no mode to switch.
 
 **Routing is by model, not by wire format.** Both OpenAI (`/v1/chat/completions`)
 and Anthropic (`/v1/messages`) bodies carry a `model` field, and the same rules
-apply to both. Any path the OpenAI dialect does not claim is still forwarded to
-the matched pool, unchanged — which is what lets one router front a local fleet
-and a hosted API at once.
+apply to both. Both surfaces are the dialect's own, so both get **prefix-cache
+affinity** — an Anthropic-format conversation concentrates on the backend already
+holding its KV exactly as an OpenAI one does. Any path the dialect does *not*
+claim is still forwarded to the matched pool unchanged, by load rather than by
+prefix, which is what lets one router front a local fleet and a hosted API at
+once.
+
+**An upstream the router cannot probe is proxied transparently.** A route with a
+single endpoint that answers neither `vllm:` metrics nor a model listing — a
+hosted API — becomes a plain proxy: whatever the provider answers is relayed
+verbatim, and the router applies **no circuit breaker, no retry, no routing
+policy and no model rewriting** to it. Only a fatal failure to reach the upstream
+at all — refused connection, DNS failure, timeout before the first byte —
+produces a router-authored answer, and that is a `502`.
+
+The reasoning is that each of those mechanisms is a judgement about a fleet the
+router manages, and none can be made about somebody else's service. A breaker
+answers 503 in place of the provider's own status and its `retry-after`; a retry
+bills a metered API twice for one request; affinity has no choice to make with one
+upstream. It is derived, never configured, and the startup log names every route
+it applied to.
+
+**Two unmanaged endpoints are still managed.** The condition is one endpoint, not
+"is hosted": with two, the router picks between them, and it then needs the
+breaker to notice one has died and the retry to reach the other. Passive health
+never changes on its own, so dropping both there would leave a dead endpoint in
+rotation permanently.
 
 **Endpoint kind is discovered, once.** An endpoint serving `vllm:` metrics at
 `/metrics` is treated as a vLLM instance: health-probed actively and eligible for
@@ -292,7 +316,7 @@ a client can point at one base URL for both.
 wekai router serve \
   --listen :8080 --metrics-listen 0.0.0.0:29000 \
   --route 'llama,mistral => http://vllm-a:8000|http://vllm-b:8000' \
-  --default 'https://api.anthropic.com' \
+  --default 'https://api.anthropic.com using client' \
   --strip-auth-when 'llama,mistral'
 ```
 
@@ -316,7 +340,7 @@ wekai router serve \
   --listen :8080 --metrics-listen 0.0.0.0:29000 \
   --route 'fast,small => pods:app=vllm,size=7b:http' \
   --route 'sonnet     => pods:app=vllm,size=70b:http as Qwen/Qwen3-32B' \
-  --default 'https://api.anthropic.com' \
+  --default 'https://api.anthropic.com using client' \
   --strip-auth-when 'fast,small,sonnet' \
   --max-node-concurrency 48
 ```
@@ -337,7 +361,9 @@ What each line does:
   saturation is predicted rather than discovered one refusal at a time.
 
 Both APIs route through the same rules, so a client on `/v1/messages` and one on
-`/v1/chat/completions` are matched identically.
+`/v1/chat/completions` are matched identically — and both are cache routed. Watch
+`router_route_decisions_total{decision="cache"}` against `decision="load"` to see
+it: a fleet serving Claude-shaped clients should sit almost entirely on `cache`.
 
 ### Helm
 
@@ -345,7 +371,7 @@ Both APIs route through the same rules, so a client on `/v1/messages` and one on
 router:
   routes:
     - "llama,mistral => http://vllm-a:8000|http://vllm-b:8000"
-  default: "https://api.anthropic.com"
+  default: "https://api.anthropic.com using client"
   stripAuthWhen:
     - "llama,mistral"
 ```
@@ -365,7 +391,7 @@ router:
         - pods: {app: vllm, size: 70b}
           port: http
       as: Qwen/Qwen3-32B
-  default: "https://api.anthropic.com"
+  default: "https://api.anthropic.com using client"
   stripAuthWhen: ["fast,small,sonnet"]
   signals:
     maxNodeConcurrency: 48
@@ -459,9 +485,16 @@ authenticates to each pool.
 
 **Setting an API key already does this.** A protected router serves the
 dialect's own routes — `/v1/chat/completions`, `/v1/completions`,
-`/v1/embeddings`, `/v1/models`, and the rest of the table — all of them
-requiring the key, and nothing else. The passthrough tier is closed, and so are
-the admin endpoints; ask for those explicitly if you want them.
+`/v1/embeddings`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, and
+the rest of the table — all of them requiring the key, and nothing else. The
+passthrough tier is closed, and so are the admin endpoints; ask for those
+explicitly if you want them.
+
+The list comes from the dialect's own route table, so claiming a path makes it
+reachable on a protected listener without a second edit anywhere. What that does
+NOT cover is a hosted provider's surface beyond inference — an Anthropic client
+calling `/v1/organizations/*`, say. Those need `--path-allowlist` (`/v1/` admits
+the subtree, and leaves the admin endpoints closed).
 
 Setting a key says this listener faces users, and proxying arbitrary paths
 through to a backend is not something a user-facing listener should do. The two

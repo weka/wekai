@@ -13,8 +13,14 @@ helm upgrade --install wekai-router ./chart/router \
   -n default \
   --set ingress.enabled=true \
   --set domain=wekai-router.example.com \
-  --set 'router.default=https://api.anthropic.com'
+  --set 'router.default=https://api.anthropic.com using client'
 ```
+
+`using client` forwards the CALLER's key to Anthropic. Without it the router
+sends no credential at all — the safe default, since a route that says nothing
+must not leak a user's key to an internal backend — and every request comes back
+401. A pool the ROUTER authenticates to says `using /path/to/mounted/secret`
+instead; see `secretMounts` in `values.yaml`.
 
 `ingress.className` defaults to empty so the cluster's default IngressClass
 picks up the resource. Set it explicitly if you need a non-default controller:
@@ -34,9 +40,9 @@ helm upgrade --install wekai-router ./chart/router \
   -n default \
   --set ingress.enabled=true \
   --set domain=wekai-router.example.com \
-  --set 'router.routes[0]=claude => https://api.anthropic.com' \
-  --set 'router.routes[1]=gpt,openai => https://api.openai.com' \
-  --set 'router.default=https://api.anthropic.com'
+  --set 'router.routes[0]=claude => https://api.anthropic.com using client' \
+  --set 'router.routes[1]=gpt,openai => https://api.openai.com using client' \
+  --set 'router.default=https://api.anthropic.com using client'
 ```
 
 When the `--set` form gets unwieldy, write a values file and pass `-f`:
