@@ -298,6 +298,44 @@ func (p *Proxy) Serve(
 	return res
 }
 
+// Relay forwards one request to one upstream and returns whatever that upstream
+// answered, unchanged.
+//
+// This is the whole of what the router does for an upstream it does not own — a
+// hosted API, most often. Every mechanism Serve applies is a judgement about a
+// fleet the router manages, and none of those judgements can be made about
+// somebody else's service:
+//
+//   - No circuit breaker. Its verdict is "this backend is unhealthy, stop using
+//     it", and acting on that means answering 503 in place of whatever the
+//     provider actually said. The provider's status IS the answer, and a router
+//     that replaces it has hidden the one thing the caller needed to see.
+//   - No retry. There is one endpoint, so there is nowhere to retry TO, and
+//     replaying a POST against a metered API bills the caller twice for one
+//     request.
+//   - No policy. Prefix affinity chooses among interchangeable backends; with a
+//     single upstream there is no choice to make, and marking it as holding a
+//     prefix would record a belief about a KV cache the router cannot see.
+//
+// What it keeps is what belongs to the router either way: the lease and its
+// in-flight accounting, the body and stream limits, the request id, and the
+// route's credential rules.
+func (p *Proxy) Relay(w http.ResponseWriter, r *http.Request, b *registry.Backend,
+	d dialect.Dialect, body []byte, auth Auth) Result {
+	committed := false
+	// canRetry false is precisely what makes ModifyResponse relay a retryable
+	// status instead of discarding it: a 429 or a 503 from the provider is the
+	// answer to this request, not a signal to go looking for a better one.
+	out := p.attempt(w, r, b, d, body, &committed, false, nil, nil, auth)
+	if out.err != nil {
+		metrics.UpstreamErrors.WithLabelValues(b.URL, kindOf(out.err)).Inc()
+		b.Failed.Add(1)
+	} else {
+		b.Served.Add(1)
+	}
+	return Result{Backend: b, Status: out.status, Attempts: 1, Err: out.err, Committed: committed}
+}
+
 type attemptOut struct {
 	status    int
 	err       error

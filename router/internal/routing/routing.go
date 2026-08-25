@@ -47,6 +47,8 @@ type Rule struct {
 	Credential string
 	// ForwardClientCredential passes the caller's credential upstream.
 	ForwardClientCredential bool
+	// Transparent makes this rule a plain proxy — see gateway.Target.
+	Transparent bool
 }
 
 func (r Rule) matches(model string) bool {
@@ -79,6 +81,11 @@ func (r Rule) String() string {
 	}
 	if r.StripAuth {
 		out += " (strip-auth)"
+	}
+	if r.Transparent {
+		// Worth a word at startup: it is derived rather than configured, and it
+		// changes what a caller sees when the upstream misbehaves.
+		out += " (transparent: upstream answers relayed verbatim, no breaker or retry)"
 	}
 	return out
 }
@@ -129,6 +136,7 @@ func (r Rule) target() gateway.Target {
 		StripAuth:               r.StripAuth,
 		Credential:              r.Credential,
 		ForwardClientCredential: r.ForwardClientCredential,
+		Transparent:             r.Transparent,
 	}
 }
 

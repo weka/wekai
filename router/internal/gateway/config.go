@@ -133,6 +133,15 @@ type Target struct {
 	// which a hosted API the user pays for requires and an internal one must
 	// never receive.
 	ForwardClientCredential bool
+	// Transparent makes this pool a plain proxy: the upstream's answer is
+	// relayed verbatim, and the router applies no circuit breaker, no retry and
+	// no routing policy to it.
+	//
+	// It is set for an upstream the router does not OWN — a hosted API — where
+	// every one of those mechanisms is a judgement the router is not in a
+	// position to make. See proxy.Relay for what each of them would otherwise
+	// do, and serve.Handler for how a route comes to be one.
+	Transparent bool
 }
 
 // Router maps a request's model to the pool that serves it.

@@ -205,11 +205,6 @@ func (s *Server) inferenceHandler(route dialect.Route, affine bool) http.Handler
 			Model:      intro.Model,
 			Stream:     intro.Stream,
 		}
-		if affine {
-			if units, ok := s.dialect.ExtractUnits(body, route.Class, nil); ok {
-				rr.Units = units
-			}
-		}
 
 		target, ok := s.router.Route(intro.Model)
 		if !ok {
@@ -229,6 +224,15 @@ func (s *Server) inferenceHandler(route dialect.Route, affine bool) http.Handler
 			Forward: target.ForwardClientCredential, Strip: target.StripAuth}
 		obs.SetTarget(ctx, target.Name, target.RewriteModel)
 
+		// Units are extracted only for a pool the router routes WITHIN. A
+		// transparent pool has one upstream and no choice to make, so a prefix
+		// would be computed on every request to decide nothing.
+		if affine && !target.Transparent {
+			if units, ok := s.dialect.ExtractUnits(body, route.Class, nil); ok {
+				rr.Units = units
+			}
+		}
+
 		candidates := s.candidates(target)
 		if len(candidates) == 0 {
 			// Never route to a known-bad backend to avoid an error (HLT-11).
@@ -237,6 +241,11 @@ func (s *Server) inferenceHandler(route dialect.Route, affine bool) http.Handler
 			// thing only: nothing is healthy.
 			s.dialect.WriteError(w, http.StatusServiceUnavailable,
 				"no_healthy_backends", "no healthy backend is available")
+			return
+		}
+
+		if target.Transparent {
+			s.relay(w, r, target, candidates[0], body, auth)
 			return
 		}
 
@@ -295,6 +304,37 @@ func (s *Server) inferenceHandler(route dialect.Route, affine bool) http.Handler
 				"upstream_unavailable", "all upstream attempts failed")
 		}
 	})
+}
+
+// relay serves a request against an upstream the router does not own.
+//
+// The upstream's answer — any status, any body, any headers — has already gone to
+// the client by the time this returns, which is the point: a provider's 429 with
+// its own retry-after, or its 500 naming what went wrong, is information the
+// caller acts on, and a router that substitutes its own view of the situation
+// destroys it.
+//
+// The one thing left to decide is what to say when there IS no answer to relay.
+// A refused connection, a DNS failure or a timeout before the first byte produces
+// no upstream response at all, so the router has to speak for itself — and 502 is
+// exactly that statement: this gateway could not reach the upstream. It says
+// nothing about the upstream's health, because nothing was learned about it.
+func (s *Server) relay(w http.ResponseWriter, r *http.Request, t Target,
+	b *registry.Backend, body []byte, auth proxy.Auth) {
+	res := s.px.Relay(w, r, b, s.dialect, body, auth)
+	if res.Backend != nil {
+		obs.SetBackend(r.Context(), res.Backend.URL)
+	}
+	if res.Err == nil || res.Committed {
+		// Either the upstream answered, or it began to and stopped partway. In
+		// the second case the status and some bytes are already on the wire and
+		// there is nothing left to write; the truncation is the honest report.
+		return
+	}
+	obs.Logger(r.Context()).Warn("transparent upstream could not be reached",
+		"pool", t.Name, "backend", b.URL, "err", res.Err)
+	s.dialect.WriteError(w, http.StatusBadGateway, "upstream_unreachable",
+		"could not reach the upstream for pool "+strconv.Quote(t.Name))
 }
 
 // candidates filters the snapshot to backends eligible for new traffic:

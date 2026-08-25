@@ -338,6 +338,9 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			name = poolName(rt.Patterns, i)
 		}
 		var backends []pool.Backend
+		// unmanaged counts endpoints the router cannot probe — a hosted API, or
+		// anything else that answers neither vLLM metrics nor a model listing.
+		unmanaged := 0
 		for _, ep := range rt.Endpoints {
 			// A backend URL ending in /v1 is almost always a mistake, and it
 			// degrades SILENTLY: the router appends the dialect's own paths, so
@@ -359,9 +362,25 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 					notVLLM = append(notVLLM, ep)
 				}
 			}
+			if passive {
+				unmanaged++
+			}
 			backends = append(backends, pool.Backend{URL: ep, Passive: passive})
 		}
 
+		// A route becomes a plain proxy when the router owns nothing about it to
+		// manage: one upstream it cannot probe, and no discovery that could add a
+		// second. Then affinity has no choice to make, retry has nowhere to go,
+		// and the circuit breaker's only effect is to answer 503 in place of what
+		// the provider actually said. See proxy.Relay.
+		//
+		// The single-endpoint condition is load-bearing, not a simplification. Two
+		// unmanaged endpoints ARE a fleet the router manages: it picks between
+		// them, and then it needs the breaker to notice one has died and the retry
+		// to send the request to the other. Dropping both there would leave a dead
+		// endpoint in rotation permanently, because passive health never changes
+		// on its own.
+		transparent := len(rt.Endpoints) == 1 && unmanaged == 1 && rt.DiscoverySelector == ""
 		flow := opts.flowConfig()
 		flow.PoolName = name
 		flow.Clock = clk
@@ -407,11 +426,17 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			StripAuth:               rt.StripAuth,
 			Credential:              cred,
 			ForwardClientCredential: rt.ForwardClientCredential,
+			Transparent:             transparent,
 		}
 		// Discovery only has something to add when the operator was not
 		// explicit. It runs in the background against the POOL, and only once a
 		// backend is healthy — see automodel.go for why both of those matter.
-		if rt.RewriteModel == "" && autoMode != autoModelOff {
+		//
+		// Never for a transparent route: the model the caller named is the model
+		// the provider is being asked for, and rewriting it would be the router
+		// editing a request it has undertaken to pass through. The probe would
+		// also be futile — a hosted listing needs a credential this has none of.
+		if rt.RewriteModel == "" && autoMode != autoModelOff && !transparent {
 			rule.AutoModel = &atomic.Pointer[string]{}
 			go resolveAutoModel(ctx, autoMode, p.Name, p.Registry, cred, rule.AutoModel, log)
 		}
