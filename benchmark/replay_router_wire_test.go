@@ -172,11 +172,14 @@ func TestEffectiveSystemBlocksSkipsHeader(t *testing.T) {
 		},
 	}
 	hdrText := synthText("uniq-header-per-req", 106, "")
+	openaiBuilder := func(r RouterReplayRequest, docs, model, runID string, outputRatio float64, forceVolume bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
+		return buildOpenAIChatCompletionsBody(r, docs, model, runID, outputRatio, forceVolume, charsPerToken, inj, false)
+	}
 	for _, builder := range []struct {
 		name string
 		fn   func(RouterReplayRequest, string, string, string, float64, bool, float64, *uuidInjection) ([]byte, string, error)
 	}{
-		{"openai", buildOpenAIChatCompletionsBody},
+		{"openai", openaiBuilder},
 		{"anthropic", buildAnthropicMessagesBody},
 	} {
 		body, canonical, err := builder.fn(req, "", "m", "", 0, false, 0, nil)
@@ -333,7 +336,7 @@ func TestBuildOpenAIChatCompletionsBodyForceOutput(t *testing.T) {
 
 	// force-output off: no ignore_eos, but the instruction still rides — the
 	// modes differ ONLY by engine enforcement.
-	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, 0, nil)
+	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, 0, nil, false)
 	if err != nil {
 		t.Fatalf("build (force-output off): %v", err)
 	}
@@ -349,7 +352,7 @@ func TestBuildOpenAIChatCompletionsBodyForceOutput(t *testing.T) {
 	}
 
 	// force-output on (default): ignore_eos=true AND the instruction is present.
-	body, _, err = buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, true, 0, nil)
+	body, _, err = buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, true, 0, nil, false)
 	if err != nil {
 		t.Fatalf("build (force-output on): %v", err)
 	}
@@ -384,7 +387,7 @@ func TestBuildAnthropicMessagesBodyOutputRatioMaxTokens(t *testing.T) {
 		t.Errorf("anthropic max_tokens = %v, want %v", got, want)
 	}
 
-	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0.25, false, 0, nil)
+	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0.25, false, 0, nil, false)
 	if err != nil {
 		t.Fatalf("openai build: %v", err)
 	}

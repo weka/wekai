@@ -2090,6 +2090,9 @@ func runSingleModelBenchmark(
 		// waits for the goroutine — no sample write can race the file close.
 		defer sampler.stop()
 	}
+	if sampler := startSGLangMetricsSampler(benchCtx, cfg.Model, rdw); sampler != nil {
+		defer sampler.stop()
+	}
 	if cfg.HotSeriesConcurrency > 0 {
 		st.hotGate = newConcurrencyGate(cfg.HotSeriesConcurrency*hotGateFanoutMultiplier, !cfg.FIFOGateOrder)
 	}
