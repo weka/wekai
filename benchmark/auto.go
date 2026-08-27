@@ -618,6 +618,17 @@ func (m cacheMetrics) DisplayHitRate() float64 {
 	return m.hitRate
 }
 
+// noCacheDataObserved reports whether, over a large-enough window, neither
+// cache signal has ever fired: the TTFT heuristic saw no warm request AND the
+// server never reported cached_tokens. In that case DisplayHitRate's 0% is a
+// real absence of data — the server may not support prompt caching, or (for
+// vLLM/SGLang) may simply not be configured to report it — rather than a
+// rounding artifact of an otherwise-working cache. Requiring minCount records
+// avoids flagging a run that just hasn't warmed up yet.
+func noCacheDataObserved(m cacheMetrics, minCount int) bool {
+	return m.count >= minCount && m.hitRate == 0 && !m.serverReported
+}
+
 // GlobalLocalCacheRate returns the all-time fraction of warm input tokens among all input tokens.
 // O(1): reads two running counters maintained in Add(), never scans history.
 // Purely local: a request is "cached" when its series already submitted this prefix before.
@@ -2835,6 +2846,14 @@ func runSingleModelBenchmark(
 		// Count-based window tied to concurrency — stays recent regardless of series count.
 		cm2 := st.stream.CacheMetrics(cfg.CacheWindowSize, cfg.MinStabilization)
 		hitRate := cm2.hitRate
+
+		// Latch cacheWarning once neither signal has ever shown a hit over a
+		// large-enough window — see noCacheDataObserved.
+		if noCacheDataObserved(cm2, cfg.MinStabilization) {
+			st.mu.Lock()
+			st.cacheWarning = true
+			st.mu.Unlock()
+		}
 
 		if cfg.VerboseCache && cm2.count > 0 && math.Abs(hitRate-lastVerboseHitRate) >= 0.03 {
 			lastVerboseHitRate = hitRate
