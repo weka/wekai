@@ -442,6 +442,21 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   #summaryTable tbody tr:hover td, #summaryTable tbody tr:hover .vcol { background: #1E2429; }
   #summaryTable tbody tr.row-hidden { opacity: 0.32; }
   #summaryTable .err-hot { color: #FF6B6B; }
+  /* Hover-help affordance, shared by summary headers and control labels: the
+     label TEXT itself is the hover target -- a dotted underline in a muted
+     colour plus a help cursor, the conventional "more info on hover"
+     affordance -- rather than a separate "?" glyph, which costs zero
+     horizontal space (the summary table has 8 columns to fit). Opens the
+     shared #helpTip custom tooltip; see its rules next to #tooltip below and
+     the wiring near the bottom of this script. */
+  .help-label { border-bottom: 1px dotted #8a9096; cursor: help; padding-bottom: 2px; }
+  /* Right-axis title for the Totals (ingest) layer: a real DOM node
+     positioned over the canvas (see totalsAxisLabel / drawTotalsAxis in the
+     script) rather than ctx.fillText, purely so it can carry the same
+     .help-label hover-tooltip affordance as everything else here. Centered
+     at (left, top) via the translate(-50%,-50%) trick, then rotated about
+     that same center -- see drawTotalsAxis for how left/top are computed. */
+  .totals-axis-label { position: fixed; font: 12px sans-serif; color: #C9C9C9; white-space: nowrap; z-index: 2; }
   /* Ratio-to-baseline sits BELOW its value, right-aligned under it, so the
      value column stays in one straight line under its header — inline, the
      ratio pushed each value left by its own width and the numbers no longer
@@ -476,6 +491,35 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   .legend-ctx { color: #C79FF1; font-size: 0.85em; }
   canvas { background: #171C20; border-radius: 8px; display: block; cursor: crosshair; }
   #tooltip { position: fixed; background: #1E2429; border: 1px solid #42464A; border-radius: 6px; padding: 8px 10px; font-size: 0.8em; pointer-events: none; display: none; z-index: 100; max-width: 300px; line-height: 1.5; }
+  /* Help tooltip for the .help-label affordance above: a second, independent
+     tooltip deliberately matching #tooltip's look (surface, border, radius,
+     padding, font) so the report reads as one system, but its own element
+     with its own lifecycle so the two can never fight over position or
+     visibility. opacity+visibility (not display) so the fade/translate
+     transition has something to animate. Always fixed + appended at the
+     body level (see the markup near #tooltip) so the summary panel's own
+     scroll container (.summary-wrap, overflow: auto) can never clip it --
+     an ancestor with overflow set COULD clip an absolutely-positioned
+     descendant, so fixed positioning sidesteps the question entirely
+     (matching #tooltip's own position: fixed). A small caret
+     (::after, rotated square) points at whichever trigger is active; its
+     side flips with .caret-top/.caret-bottom depending on whether the tip
+     landed below or above the trigger. */
+  .help-tip {
+    position: fixed; z-index: 150; background: #1E2429; border: 1px solid #42464A;
+    border-radius: 6px; padding: 8px 10px; font-size: 0.8em; line-height: 1.45;
+    max-width: 280px; color: #C9C9C9; box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+    opacity: 0; visibility: hidden; transform: translateY(4px);
+    transition: opacity 120ms ease-out, transform 120ms ease-out, visibility 120ms;
+    pointer-events: none;
+  }
+  .help-tip.visible { opacity: 1; visibility: visible; transform: translateY(0); }
+  .help-tip::after {
+    content: ""; position: absolute; width: 8px; height: 8px; background: #1E2429;
+    left: var(--caret-x, 16px); margin-left: -4px; transform: rotate(45deg);
+  }
+  .help-tip.caret-top::after { top: -5px; border-left: 1px solid #42464A; border-top: 1px solid #42464A; }
+  .help-tip.caret-bottom::after { bottom: -5px; border-right: 1px solid #42464A; border-bottom: 1px solid #42464A; }
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 200; display: none; }
   .modal { background: #1E2429; border: 1px solid #42464A; border-radius: 8px; padding: 16px; width: 440px; max-height: 72vh; overflow-y: auto; margin: 10vh auto 0; }
   .modal h2 { font-size: 1em; font-weight: 500; color: #F2F2EB; margin-bottom: 10px; }
@@ -508,21 +552,20 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
     <div class="panel-title">Controls<span class="spacer"></span><button class="panel-toggle" id="controlsToggle" title="Collapse">&minus;</button></div>
     <div class="panel-body">
     <div class="controls">
-      <label><input type="checkbox" id="showTTFT" checked> TTFT p50</label>
-      <label><input type="checkbox" id="showTTFTP95"> TTFT p95</label>
-      <label><input type="checkbox" id="showResp" checked> Show Response Time</label>
-      <label><input type="checkbox" id="showDots"> Show Requests</label>
-      <label><input type="checkbox" id="showErrors" checked> Show Errors</label>
-      <label><input type="checkbox" id="showTotals" checked> Show Totals (ingest)</label>
-      <label><input type="checkbox" id="showXAxisValues"> Show X-axis values</label>
-      <button id="resetZoom" disabled>Reset Zoom</button>
+      <label><input type="checkbox" id="showTTFT" checked> <span class="help-label" id="hlpTtft50" tabindex="0" aria-describedby="helpTip" data-tip="Median time to first token, rolling window. The prefill cost.">TTFT p50</span></label>
+      <label><input type="checkbox" id="showTTFTP95"> <span class="help-label" id="hlpTtft95" tabindex="0" aria-describedby="helpTip" data-tip="Tail time to first token, rolling window.">TTFT p95</span></label>
+      <label><input type="checkbox" id="showResp" checked> <span class="help-label" id="hlpResp" tabindex="0" aria-describedby="helpTip" data-tip="Time to last token: the whole request, prefill plus all decode.">Response Time / TTLT</span></label>
+      <label><input type="checkbox" id="showDots"> <span class="help-label" id="hlpReqs" tabindex="0" aria-describedby="helpTip" data-tip="One dot per request. Shows spread the percentile lines hide.">Requests</span></label>
+      <label><input type="checkbox" id="showErrors"> <span class="help-label" id="hlpErrors" tabindex="0" aria-describedby="helpTip" data-tip="Error-rate bars anchored on the response line.">Errors</span></label>
+      <label><input type="checkbox" id="showTotals"> <span class="help-label" id="hlpTotals" tabindex="0" aria-describedby="helpTip" data-tip="Cumulative ingest tokens, stacked. Normalized to the run's final total.">Totals (ingest)</span></label>
       <span id="zoomInfo" style="font-size:0.8em;color:#8a9096;"></span>
     </div>
     <div class="controls">
       <button id="ctxFilterBtn" style="border-color:#7C03EC;">Context Filter</button>
       <button id="selectAll">Select All</button>
       <button id="deselectAll">Deselect All</button>
-      <input id="variantFilter" type="text" placeholder="Filter variants..." style="font-size:0.8em;padding:3px 8px;background:#1E2429;color:#F2F2EB;border:1px solid #42464A;border-radius:4px;width:200px;">
+      <button id="downloadRequestsBtn"><span class="help-label" id="hlpDlReqs" tabindex="0" aria-describedby="helpTip" data-tip="CSV of per-request rows (arm, start time, TTFT, response time, tokens, cache hit, error) for the CURRENT view — zoom window, hidden arms, and the context/series filters all apply. Generated in the browser; nothing leaves the page.">Download Requests CSV</span></button>
+      <button id="downloadSummaryBtn"><span class="help-label" id="hlpDlSummary" tabindex="0" aria-describedby="helpTip" data-tip="CSV of the summary panel's numbers (same metrics, same baseline ratios) for the CURRENT view.">Download Summary CSV</span></button>
     </div>
     </div>
   </div>
@@ -537,9 +580,14 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 </div>
 <canvas id="chart"></canvas>
 <div id="tooltip"></div>
+<div id="helpTip" class="help-tip" role="tooltip"></div>
 <div id="ctxModal" class="modal-backdrop">
   <div class="modal">
     <h2>Variants &amp; context filter</h2>
+    <div class="modal-actions" style="margin-top:0;">
+      <button id="variantSelectAll">Select All</button>
+      <button id="variantDeselectAll">Deselect All</button>
+    </div>
     <div id="ctxModalSeries"></div>
     <div class="modal-section-title">In-dataset series (empty selection = all)</div>
     <div class="modal-sn-row">
@@ -560,6 +608,11 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
         <input id="ctxMax" type="number" min="0" step="10" placeholder="max">
         <span>k tok</span>
       </div>
+    </div>
+    <div class="modal-section-title">Export current view</div>
+    <div class="modal-actions" style="margin-top:0;">
+      <button id="modalDownloadRequestsBtn"><span class="help-label" id="hlpDlReqsModal" tabindex="0" aria-describedby="helpTip" data-tip="CSV of per-request rows for the view as currently APPLIED — zoom window, hidden arms, and the applied context/series filters. Click Apply first if you just changed the band above.">Download Requests CSV</span></button>
+      <button id="modalDownloadSummaryBtn"><span class="help-label" id="hlpDlSummaryModal" tabindex="0" aria-describedby="helpTip" data-tip="CSV of the summary panel's numbers for the view as currently applied.">Download Summary CSV</span></button>
     </div>
     <div class="modal-actions">
       <button id="ctxApply">Apply</button>
@@ -701,9 +754,16 @@ function computeDerived(s) {
   s._winConcSource = s.conc > 0 ? "recorded" : (CONCURRENCY > 0 ? "--concurrency" : "default");
   s._winConc = seriesConc;
   s._winSize = winSize;
-  // Plotted lines: rolling-window percentiles. Response = p50 only; TTFT =
-  // p50 and p95 (dash pattern encodes the percentile, color the series).
+  // Plotted lines: rolling-window percentiles. Response = p50 (plus p10/p90
+  // for the "ribbon" Requests render mode -- a spread envelope around the
+  // same p50 line, same rolling window, computed here alongside it so it can
+  // never drift out of sync); TTFT = p50 and p95 (dash pattern encodes the
+  // percentile, color the series). recalcYMax deliberately never reads
+  // _respP10/_respP90 -- the axis must stay independent of which Requests
+  // mode is selected.
   s._respP50 = [];
+  s._respP10 = [];
+  s._respP90 = [];
   s._ttftP50 = [];
   s._ttftP95 = [];
   // Anchor the rolling-percentile line at ~TARGET_LINE_POINTS x-positions
@@ -725,6 +785,8 @@ function computeDerived(s) {
     const resps = win.map(r => r.resp);
     const t = sorted[i].t;
     s._respP50.push({ t: t, v: percentile(resps, 0.5) });
+    s._respP10.push({ t: t, v: percentile(resps, 0.1) });
+    s._respP90.push({ t: t, v: percentile(resps, 0.9) });
     s._ttftP50.push({ t: t, v: ttfts.length ? percentile(ttfts, 0.5) : 0 });
     s._ttftP95.push({ t: t, v: ttfts.length ? percentile(ttfts, 0.95) : 0 });
   };
@@ -832,49 +894,107 @@ const seriesColors = [];
 const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
 const tooltip = document.getElementById("tooltip");
-const dpr = window.devicePixelRatio || 1;
+const helpTip = document.getElementById("helpTip");
+// helpTriggers collects every ".help-label" hover-help element so the
+// tooltip wiring near the bottom of this script can attach to all of them
+// the same way, whether they came from the static markup (control-layer
+// labels, grabbed here by id) or are built later in JS (summary column
+// headers, the Cache Mix toggle -- each pushes itself in as it's created).
+const helpTriggers = ["hlpTtft50", "hlpTtft95", "hlpResp", "hlpReqs", "hlpErrors", "hlpTotals",
+    "hlpDlReqs", "hlpDlSummary", "hlpDlReqsModal", "hlpDlSummaryModal"]
+  .map(id => document.getElementById(id)).filter(Boolean);
+
+// totalsAxisLabel: the rotated title for the Totals-layer right axis (see
+// drawTotalsAxis, later in this script). Canvas text can't itself be a hover
+// target, so this is a real DOM node -- created once, positioned every
+// draw() to sit over the canvas at the axis's location, hidden (display:none)
+// whenever that axis isn't drawn. Pushed into helpTriggers (BEFORE the
+// listener-attach loop near the bottom of this script) so it gets the exact
+// same hover/focus tooltip wiring as every other .help-label here.
+const totalsAxisLabel = document.createElement("span");
+totalsAxisLabel.id = "hlpTotalsAxis";
+totalsAxisLabel.className = "help-label totals-axis-label";
+totalsAxisLabel.tabIndex = 0;
+totalsAxisLabel.ariaDescribedBy = "helpTip";
+totalsAxisLabel.dataset.tip = "Cumulative input tokens processed, stacked across visible arms. Right axis.";
+totalsAxisLabel.textContent = "Cumulative ingest tokens";
+totalsAxisLabel.style.display = "none";
+// Parented under .controls purely so it exists in the DOM somewhere real
+// (matching how the Cache Mix toggle label is appended below) -- position:
+// fixed takes it out of that flex layout entirely, so it never affects the
+// controls row; drawTotalsAxis() places it by absolute viewport coordinates.
+document.querySelector(".controls").appendChild(totalsAxisLabel);
+helpTriggers.push(totalsAxisLabel);
 
 const margin = { top: 30, right: 20, bottom: 50, left: 70 };
 
-// Annotation rows (cumulative request/error counts per series) are always
-// printed under the axis: computeXStepSec keeps tick count at ~11-17 for any
-// span, so the columns no longer overlap (the old flat 5m step crammed dozens
-// of columns on multi-hour runs). Hover on a gridline still shows the same
-// per-tick breakdown as a tooltip. Constant retained for the hover fallback
-// threshold only.
+// Per-tick cumulative request/error counts are no longer printed under the
+// axis (that was the "X-axis values" layer, removed). Hovering near an
+// x-axis gridline on a long view still surfaces the same per-series
+// breakdown via tooltip (see tickHover below) -- ANNOTATION_ROWS_MAX_DURATION
+// is that fallback's activation threshold.
 const ANNOTATION_ROWS_MAX_DURATION = 3600;
 let W, H, plotW, plotH;
+// mixReserveH is the vertical px the cache-mix band block claims at the TOP
+// of the plot, when at least one latency layer is visible -- see mapY() and
+// computeMixReserveH(). Recomputed once per draw() into this module-level
+// var rather than inside mapY itself: mapY runs per plotted point (tens of
+// thousands of calls per draw) and cacheMixLayout() does real layout work,
+// so it must not run per point. 0 keeps mapY's old full-plot-height mapping
+// (cache mix off, or claiming the whole plot because no latency layer is on).
+let mixReserveH = 0;
 let hiddenSeries = new Set();
+// { cb, i } pairs for the context-filter modal's per-variant checkboxes,
+// (re)populated by rebuildList() on each modal open. renderState() writes
+// through this array so a Select All/Deselect All click (or any other
+// hiddenSeries mutation) is reflected the moment the modal is next drawn,
+// even though the rows themselves are rebuilt from scratch each open.
+let modalRowCheckboxes = [];
 // Positions of the x-axis ticks drawn in the most recent draw() call, so
 // mousemove can hover-match a tick even when its annotation row isn't
 // printed (long views -- see ANNOTATION_ROWS_MAX_DURATION).
 let currentTicks = [];
 
 // Zoom state
-let globalTMin = Infinity, globalTMax = -Infinity, globalYMax = 0;
+let globalTMin = Infinity, globalTMax = -Infinity;
 let viewTMin, viewTMax, viewYMax;
 let dragStart = null; // pixel X where drag began
 let dragCurrent = null;
 
+// calcBottomMargin: fixed room for the time-axis tick labels ("0s", "30m",
+// "1h", ...) drawn at margin.top + plotH + 6 in 11px monospace (see draw()'s
+// X-axis section) -- no per-arm content lives down here anymore, so this is
+// just enough vertical space for that one line of text.
 function calcBottomMargin() {
-  const duration = (viewTMax - viewTMin) / 1000;
-  // Per-tick request-count rows only when "Show X-axis values" is on (the
-  // totals volume layer carries the same story by default).
-  let reqRows = 0;
-  if (typeof xAxisValuesEnabled === "function" && xAxisValuesEnabled()) {
-    reqRows = DATA.filter((_, i) => !hiddenSeries.has(i)).length;
-  }
-  // Dataset size gets NO axis rows: it's a slow-moving level, so a per-tick
-  // column of near-identical "ds:13.5M" readings cost one row per series
-  // (140px on a 10-variant report) to repeat what the band label and the band
-  // hover already say exactly. The band is the place for it.
-  // 20px for the time label + 14px per printed row (single line each);
-  // adaptive ticks (11-17 columns) leave ample width.
-  return 20 + reqRows * 14;
+  return 20;
+}
+
+// TOTALS_AXIS_TARGET_STEPS: tick count target shared by calcRightMargin
+// (sizing the margin) and drawTotalsAxis (drawing into it) -- one constant so
+// the two can never disagree about how many ticks the axis actually gets.
+const TOTALS_AXIS_TARGET_STEPS = 5;
+
+// calcRightMargin mirrors calcBottomMargin above: the right axis (the Totals
+// ingest-token scale added by drawTotalsAxis) only claims plot width when
+// that layer is actually contributing pixels -- volumeGeometry() is the
+// EXACT SAME gate drawTotals() itself uses (checkbox on AND at least one
+// visible series carries ingest data), so the axis, its margin, and the
+// stack it labels all appear and disappear together. Sized to the widest
+// tick label this run will actually draw (same niceSteps/fmtTokens pair
+// drawTotalsAxis uses) plus room for the tick mark, a small gap, and the
+// rotated title -- otherwise 20, the original always-on right gutter.
+function calcRightMargin() {
+  const geo = volumeGeometry();
+  if (!geo) return 20;
+  ctx.font = "11px monospace";
+  let maxW = 0;
+  niceSteps(geo.finalTotal, TOTALS_AXIS_TARGET_STEPS).forEach(v => {
+    maxW = Math.max(maxW, ctx.measureText(fmtTokens(v)).width);
+  });
+  return Math.ceil(maxW) + 4 /* tick mark */ + 8 /* label gap */ + 6 /* breathing room */ + 18 /* rotated title */;
 }
 
 function resize() {
-  margin.bottom = calcBottomMargin();
   W = Math.min(window.innerWidth - 32, 1800);
   // Measure the header instead of assuming a fixed chrome allowance: the
   // controls/summary grid reflows with variant count and viewport width (it
@@ -883,6 +1003,14 @@ function resize() {
   const headEl = document.getElementById("header");
   const headH = headEl ? headEl.getBoundingClientRect().height : 160;
   H = Math.max(420, Math.min(window.innerHeight - headH - 40, 800));
+  margin.bottom = calcBottomMargin();
+  margin.right = calcRightMargin();
+  // Re-read devicePixelRatio on every resize() rather than closing over a
+  // module-level constant: dragging the window to a display with a
+  // different pixel density fires the window "resize" listener but a
+  // stale dpr would leave canvas.width/height (and the ctx transform)
+  // matched to the OLD display until a full page reload.
+  const dpr = window.devicePixelRatio || 1;
   canvas.style.width = W + "px";
   canvas.style.height = H + "px";
   canvas.width = W * dpr;
@@ -892,13 +1020,13 @@ function resize() {
   plotH = H - margin.top - margin.bottom;
 }
 
-// Compute global ranges
+// Compute global ranges. The latency y-axis is NOT derived here -- it comes
+// from the rolling percentile lines, which only exist after computeDerived(),
+// so it's left to recalcYMax() below once the view bounds are set.
 DATA.forEach(s => {
   s.records.forEach(r => {
     if (r.t < globalTMin) globalTMin = r.t;
     if (r.t > globalTMax) globalTMax = r.t;
-    if (r.resp > globalYMax) globalYMax = r.resp;
-    if (r.ttft > globalYMax) globalYMax = r.ttft;
   });
   // Cache-mix samples extend the time range (a final sample can land after
   // the last request completes) but never the latency axis.
@@ -912,8 +1040,8 @@ DATA.forEach(s => {
   });
 });
 if (globalTMax === globalTMin) globalTMax = globalTMin + 1000;
-globalYMax *= 1.1;
-viewTMin = globalTMin; viewTMax = globalTMax; viewYMax = globalYMax;
+viewTMin = globalTMin; viewTMax = globalTMax;
+recalcYMax();
 
 function isZoomed() { return viewTMin !== globalTMin || viewTMax !== globalTMax; }
 
@@ -1001,8 +1129,9 @@ function updateInfo() {
     if (countEl) countEl.innerHTML = "(" + formatCount(perSeries[i].ok, perSeries[i].err) + ")";
   });
 
-  document.getElementById("resetZoom").disabled = !isZoomed();
-  document.getElementById("zoomInfo").textContent = isZoomed() ? "Drag to zoom, click Reset or double-click to reset" : "Drag on chart to zoom into timeframe";
+  // No Reset button: Esc and double-click are the exits, so the hint has to
+  // carry the affordance the button used to provide.
+  document.getElementById("zoomInfo").textContent = isZoomed() ? "Esc or double-click to exit zoom" : "Drag on chart to zoom into timeframe";
 }
 
 // Legend
@@ -1020,17 +1149,38 @@ DATA.forEach((s, i) => {
     s.name + ' <span class="legend-count" id="legend-count-' + i + '">(' + formatCount(ok, err) + ')</span>' + ctxHint;
   item.onclick = () => {
     if (hiddenSeries.has(i)) hiddenSeries.delete(i); else hiddenSeries.add(i);
-    item.classList.toggle("hidden");
-    draw();
+    renderState();
   };
   legendEl.appendChild(item);
   legendItems.push(item);
 });
 
-function syncLegendVisuals() {
+// renderState is the single authoritative sync from hiddenSeries (the one
+// piece of state a variant's visibility actually lives in) to every UI
+// surface that depends on it -- legend chips, the context-filter modal's
+// per-variant checkboxes (if the modal has been opened at least once), and
+// the summary panel's row dimming -- followed by a full recompute/redraw
+// (the latency axis must exclude hidden series, so it needs a recalc too).
+// Call this from every path that mutates hiddenSeries instead of hand-
+// rolling a partial update: previously three different call sites each
+// nudged a subset of these (syncLegendVisuals only touched the legend, the
+// modal checkboxes were written once on open and then went stale, and the
+// top-level buttons only ever drove the legend), which is exactly how the
+// modal and the legend drifted out of sync with each other. Uses the
+// two-arg classList.toggle(cls, force) form throughout so every element is
+// SET to the current state rather than flipped relative to its own history.
+function renderState() {
   legendItems.forEach((item, i) => {
     item.classList.toggle("hidden", hiddenSeries.has(i));
   });
+  modalRowCheckboxes.forEach(({ cb, i }) => {
+    cb.checked = !hiddenSeries.has(i);
+  });
+  sumRows.forEach((tr, i) => {
+    tr.classList.toggle("row-hidden", hiddenSeries.has(i));
+  });
+  recalcYMax();
+  draw();
 }
 
 // --- Summary panel: per-variant totals over the SELECTED timeframe ---
@@ -1047,21 +1197,21 @@ function syncLegendVisuals() {
 // ratio-to-baseline; better says which direction is an improvement, which
 // decides the ratio tint (more tokens is good, more latency is not).
 const SUMMARY_METRICS = [
-  { key: "in",      short: "Input",  label: "Input tokens (prompt = uncached + server-cached)", better: "up",
+  { key: "in",      short: "Input",  label: "Prompt tokens processed, cached plus uncached. The metric KV offload improves directly.", better: "up",
     val: st => st.prompt,               fmt: st => fmtTokens(st.prompt) },
-  { key: "out",     short: "Output", label: "Output tokens", better: "up",
+  { key: "out",     short: "Output", label: "Generated tokens. A property of the workload, not something offload changes.", better: "up",
     val: st => st.outTok,               fmt: st => fmtTokens(st.outTok) },
-  { key: "reqs",    short: "Reqs",   label: "Completed (non-error) requests", better: "up",
+  { key: "reqs",    short: "Reqs",   label: "Completed non-error requests in this window.", better: "up",
     val: st => st.ok,                   fmt: st => st.ok.toLocaleString() },
-  { key: "inrate",  short: "In/s",   label: "Avg input tokens/s", better: "up",
+  { key: "inrate",  short: "In/s",   label: "Input tokens per second. The headline throughput number.", better: "up",
     val: st => st.prompt / st.spanSec,  fmt: st => fmtTokens(st.prompt / st.spanSec) },
-  { key: "outrate", short: "Out/s",  label: "Avg output tokens/s", better: "up",
+  { key: "outrate", short: "Out/s",  label: "Output tokens per second.", better: "up",
     val: st => st.outTok / st.spanSec,  fmt: st => fmtTokens(st.outTok / st.spanSec) },
-  { key: "ttft50",  short: "TTFT50", label: "TTFT p50 over the selected window (non-error requests)", better: "down",
+  { key: "ttft50",  short: "TTFT50", label: "Median time to first token. Includes retry and queue wait.", better: "down",
     val: st => st.ttft50,               fmt: st => fmtMs(st.ttft50) },
-  { key: "ttft95",  short: "TTFT95", label: "TTFT p95 over the selected window (non-error requests)", better: "down",
+  { key: "ttft95",  short: "TTFT95", label: "95th-percentile time to first token: the tail users notice.", better: "down",
     val: st => st.ttft95,               fmt: st => fmtMs(st.ttft95) },
-  { key: "err1k",   short: "Err/1k", label: "Errors per 1000 requests", better: "down",
+  { key: "err1k",   short: "Err/1k", label: "Errors per 1,000 requests, so arms with different request counts compare.", better: "down",
     val: st => st.total ? st.err / st.total * 1000 : 0,
     fmt: st => (st.total ? st.err / st.total * 1000 : 0).toFixed(1) },
 ];
@@ -1110,8 +1260,19 @@ const sumRows = [];
   head.appendChild(vth);
   SUMMARY_METRICS.forEach(m => {
     const th = document.createElement("th");
-    th.textContent = m.short;
-    th.title = m.label;
+    // The abbreviated header text itself is the hover target (dotted
+    // underline via .help-label, wired up near the bottom of this script) --
+    // an abbreviation alone doesn't visibly invite a hover, so the
+    // underline gives it that affordance without spending a "?" glyph's
+    // worth of the column's width.
+    const span = document.createElement("span");
+    span.className = "help-label";
+    span.tabIndex = 0;
+    span.ariaDescribedBy = "helpTip";
+    span.dataset.tip = m.label;
+    span.textContent = m.short;
+    helpTriggers.push(span);
+    th.appendChild(span);
     head.appendChild(th);
   });
   const body = document.getElementById("sumBody");
@@ -1152,6 +1313,11 @@ const sumRows = [];
       val.className = "sum-val";
       const ratio = document.createElement("span");
       ratio.className = "sum-ratio";
+      // Hover-help trigger, same as the column headers above -- wired up
+      // (and left inert until renderSummary populates a tip) near the
+      // bottom of this script. Only carries the .help-label affordance
+      // while it actually holds a ratio; see renderSummary.
+      helpTriggers.push(ratio);
       td.appendChild(val);
       td.appendChild(ratio);
       tr.appendChild(td);
@@ -1162,8 +1328,7 @@ const sumRows = [];
     // the legend entry — with 10 arms the summary is where you're looking.
     tr.onclick = () => {
       if (hiddenSeries.has(i)) hiddenSeries.delete(i); else hiddenSeries.add(i);
-      syncLegendVisuals();
-      draw();
+      renderState();
     };
     sumCells.push(cells);
     sumRatios.push(ratios);
@@ -1192,11 +1357,18 @@ function renderSummary(perSeries) {
       if (rText) {
         const ratio = m.val(st) / m.val(baseStats);
         const good = m.better === "up" ? ratio > 1 : ratio < 1;
-        rEl.className = "sum-ratio " + (ratio === 1 ? "" : (good ? "up" : "down"));
-        rEl.title = m.short + " is " + rText + " of " + DATA[BASELINE_INDEX].name;
+        // help-label only while there IS a ratio to explain -- an empty
+        // cell (the baseline's own row) gets no dotted-underline/help-cursor
+        // affordance and no tab stop, since there's nothing to hover.
+        rEl.className = "sum-ratio help-label " + (ratio === 1 ? "" : (good ? "up" : "down"));
+        rEl.tabIndex = 0;
+        rEl.ariaDescribedBy = "helpTip";
+        rEl.dataset.tip = "Share of the HBM baseline. Green is better, orange is worse. " +
+          m.short + " is " + rText + " of " + DATA[BASELINE_INDEX].name;
       } else {
         rEl.className = "sum-ratio";
-        rEl.title = "";
+        rEl.tabIndex = -1;
+        rEl.dataset.tip = "";
       }
       // The cached share is what a KV-offload arm actually buys, so it rides
       // along as a hover on the input cell instead of costing a column.
@@ -1274,42 +1446,31 @@ function wirePanelToggle(btnId, panelId) {
 wirePanelToggle("controlsToggle", "controlsPanel");
 wirePanelToggle("summaryToggle", "summaryPanel");
 
-document.getElementById("selectAll").addEventListener("click", () => {
-  const filter = document.getElementById("variantFilter").value.toLowerCase();
-  DATA.forEach((s, i) => {
-    if (!filter || s.name.toLowerCase().includes(filter)) hiddenSeries.delete(i);
+// Top-level Select All/Deselect All are a master on/off for the PLOTTED
+// LAYER checkboxes (not variants -- that control moved into the
+// context-filter modal, next to the per-variant checkboxes it actually
+// governs; see the ctxModal block below). "X-axis values" is an annotation
+// toggle, not a plotted layer, and is deliberately excluded. Cache Mix only
+// exists in the DOM when the dataset carries samples, hence the guard.
+const LAYER_CHECKBOX_IDS = ["showTTFT", "showTTFTP95", "showResp", "showDots", "showErrors", "showTotals"];
+function setAllLayers(on) {
+  LAYER_CHECKBOX_IDS.concat(HAS_CACHE_MIX ? ["showCacheMix"] : []).forEach(id => {
+    const cb = document.getElementById(id);
+    if (cb) cb.checked = on;
   });
-  syncLegendVisuals();
+  recalcYMax();
   draw();
-});
-
-document.getElementById("deselectAll").addEventListener("click", () => {
-  const filter = document.getElementById("variantFilter").value.toLowerCase();
-  DATA.forEach((s, i) => {
-    if (!filter || s.name.toLowerCase().includes(filter)) hiddenSeries.add(i);
-  });
-  syncLegendVisuals();
-  draw();
-});
-
-document.getElementById("variantFilter").addEventListener("input", (e) => {
-  const filter = e.target.value.toLowerCase();
-  legendItems.forEach((item, i) => {
-    const matches = !filter || DATA[i].name.toLowerCase().includes(filter);
-    item.style.display = matches ? "" : "none";
-    if (filter) {
-      if (matches) hiddenSeries.delete(i); else hiddenSeries.add(i);
-      item.classList.toggle("hidden", hiddenSeries.has(i));
-    }
-  });
-  if (filter) draw();
-});
+}
+document.getElementById("selectAll").addEventListener("click", () => setAllLayers(true));
+document.getElementById("deselectAll").addEventListener("click", () => setAllLayers(false));
 
 function mapX(t) { return margin.left + ((t - viewTMin) / (viewTMax - viewTMin)) * plotW; }
 function unmapX(px) { return viewTMin + ((px - margin.left) / plotW) * (viewTMax - viewTMin); }
 
 function mapY(v) {
-  return margin.top + plotH - (v / viewYMax) * plotH;
+  const top = margin.top + mixReserveH;
+  const h = Math.max(plotH - mixReserveH, 1);
+  return top + h - (v / viewYMax) * h;
 }
 
 function niceSteps(maxVal, targetSteps) {
@@ -1327,17 +1488,48 @@ function niceSteps(maxVal, targetSteps) {
   return steps;
 }
 
+// recalcYMax scales the latency y-axis. Must be called after every change
+// that can move the dominant series: zoom, context/series filter, or
+// hidden-series toggle -- otherwise the axis keeps scaling to a series
+// that's no longer (or wasn't yet) on screen, or mapY runs against a stale
+// max.
+//
+// The max is taken from the ROLLING LINES actually drawn -- resp/TTLT p50,
+// TTFT p50, TTFT p95 -- DELIBERATELY IGNORING which of those layers is
+// currently checked (ticking a layer must reveal a line, never rescale the
+// chart from under you) and DELIBERATELY EXCLUDING raw per-request values
+// and the p10-p90 ribbon. On a long run the tallest raw value tends to be a
+// request that hit the timeout, well above anything the percentile lines
+// reach, so including it stands the axis far above the readable range and
+// pins TTFT p50 flat against the bottom. Totals and cache-mix are normalized on their own
+// scales and never reach this axis.
 function recalcYMax() {
   viewYMax = 0;
+  const bump = v => { if (v > viewYMax) viewYMax = v; };
+  const scan = pts => {
+    (pts || []).forEach(p => {
+      if (p.t < viewTMin || p.t > viewTMax) return;
+      bump(p.v);
+    });
+  };
   DATA.forEach((s, si) => {
     if (hiddenSeries.has(si)) return;
-    s._view.forEach(r => {
-      if (r.t < viewTMin || r.t > viewTMax) return;
-      if (r.resp > viewYMax) viewYMax = r.resp;
-      if (r.ttft > viewYMax) viewYMax = r.ttft;
-    });
+    scan(s._respP50);
+    scan(s._ttftP50);
+    scan(s._ttftP95);
   });
   viewYMax = Math.max(viewYMax * 1.1, 1);
+}
+
+// resetZoomView is the shared "exit zoom" action -- back to the full time
+// range, latency axis rescaled to the widest window (the axis follows the
+// time window, never the layer checkboxes -- see recalcYMax).
+// Used by the Reset Zoom button, double-click, and ESC.
+function resetZoomView() {
+  viewTMin = globalTMin;
+  viewTMax = globalTMax;
+  recalcYMax();
+  draw();
 }
 
 // computeXStepSec picks the x-axis tick interval (seconds) for a given view
@@ -1582,7 +1774,17 @@ function windowRates(byT, t, windowMs) {
     inTok += (r.in || 0) + (r.ca || 0);
     outTok += (r.out || 0);
   }
-  const spanS = Math.max((t - t0) / 1000, 1e-9);
+  // Same degenerate-span problem windowStats() floors above: near a
+  // series' first record, t0 clamps to byT[0].t and (t - t0) collapses
+  // toward 0, which would blow the /spanS divisions up toward billions of
+  // tok/s. Unlike windowStats() (which has a whole-view width to fall back
+  // to for its rate denominator), there's no meaningful trailing window to
+  // substitute here, so suppress the rate outright rather than floor it to
+  // a tiny-but-nonzero span that just produces a smaller huge number — a
+  // missing figure beats a wrong one. Callers already treat a null return
+  // as "nothing to show" (see the volHover tooltip).
+  const spanS = (t - t0) / 1000;
+  if (spanS < 1) return null;
   return { n: n, rps: n / spanS, inPerSec: inTok / spanS, outPerSec: outTok / spanS, spanS: spanS };
 }
 
@@ -1693,9 +1895,29 @@ function cacheMixEnabled() {
   return HAS_CACHE_MIX && cb && cb.checked;
 }
 
-function xAxisValuesEnabled() {
-  const cb = document.getElementById("showXAxisValues");
-  return cb ? cb.checked : true;
+// anyPlotLayerVisible: whether at least one layer OTHER than cache mix needs
+// room in the plot -- used by cacheMixLayout/computeMixReserveH to decide
+// whether the cache-mix bands should keep sharing the plot, or -- when cache
+// mix is the only thing left on screen -- expand to claim the whole plot
+// height. This is NOT just "the four latency lines" (the ones recalcYMax
+// scales the axis to): it must also cover every layer that occupies plot
+// space or the mapY() coordinate space, or that layer draws straight through
+// (or gets crushed by) a full-height band block:
+//   - showErrors: error bars are drawn at mapY(b.respAvg) (see the error-rate
+//     bars block in draw()) -- that's the latency coordinate space, so bands
+//     claiming the whole plot means bars draw straight through them.
+//   - showTotals: the totals/ingest layer needs the region BELOW the bands
+//     (volumeGeometry() derives ceilingY from the band block's bottom edge)
+//     -- if bands claim the whole plot, that region is crushed to nothing.
+// A future reader narrowing this back to "just the latency lines" will
+// silently reintroduce both bugs -- don't re-narrow without re-checking both.
+function anyPlotLayerVisible() {
+  return document.getElementById("showTTFT").checked ||
+    document.getElementById("showTTFTP95").checked ||
+    document.getElementById("showResp").checked ||
+    document.getElementById("showDots").checked ||
+    document.getElementById("showErrors").checked ||
+    document.getElementById("showTotals").checked;
 }
 
 // volumeGeometry: shared state for the ingest volume layer — the visible
@@ -1762,6 +1984,62 @@ function drawTotals() {
   ctx.globalAlpha = 1;
 }
 
+// drawTotalsAxis renders the right-hand y-axis for the Totals (ingest) layer,
+// in absolute tokens -- ticks/labels MUST use exactly the same geometry as
+// drawTotals()'s stack (volumeGeometry() for finalTotal/ceilingY, totalsY()
+// for the fraction->pixel mapping), so a tick always lines up with the stack
+// it's labelling rather than being re-derived and risking drift. Gated on
+// the identical volumeGeometry() check drawTotals() and calcRightMargin()
+// use, so the axis, its title, and its reserved margin all appear/disappear
+// together. Deliberately does NOT draw new horizontal gridlines across the
+// plot (that would double the existing latency grid) -- just short tick
+// marks and labels on the right edge, styled to match the left latency axis.
+function drawTotalsAxis() {
+  const geo = volumeGeometry();
+  if (!geo) { totalsAxisLabel.style.display = "none"; return; }
+  const { finalTotal, ceilingY } = geo;
+  const bottom = margin.top + plotH;
+  const xEdge = margin.left + plotW;
+
+  ctx.save();
+  ctx.strokeStyle = "#42464A";
+  ctx.lineWidth = 1;
+  ctx.fillStyle = "#8a9096";
+  ctx.font = "11px monospace";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  niceSteps(finalTotal, TOTALS_AXIS_TARGET_STEPS).forEach(v => {
+    const y = totalsY(v / finalTotal, margin.top, plotH, ceilingY);
+    if (y < ceilingY - 0.5 || y > bottom + 0.5) return; // guard float slop only
+    ctx.beginPath();
+    ctx.moveTo(xEdge, y);
+    ctx.lineTo(xEdge + 4, y);
+    ctx.stroke();
+    ctx.fillText(fmtTokens(v), xEdge + 8, y);
+  });
+  ctx.restore();
+
+  // Rotated axis title: a real DOM node (totalsAxisLabel, created once near
+  // the top of this script) so it can carry the standard .help-label
+  // tooltip -- centered on the vertical span the totals layer actually
+  // occupies (ceilingY..bottom), not the whole plot, so it stays next to its
+  // own ticks even when cache-mix bands claim the top of the chart. Canvas
+  // draw coordinates (W, margin, plotH, ...) are in the same CSS-pixel space
+  // as the canvas element's own box (see resize()'s dpr handling), so the
+  // trigger's screen position is just the canvas's own top-left plus that
+  // coordinate -- the same rect-plus-offset approach the mouse handlers
+  // below already use. translate(-50%,-50%) centers the label on that point
+  // before rotate(90deg) spins it about the same center, so the rotation
+  // itself can't shift the label off the point.
+  const rect = canvas.getBoundingClientRect();
+  const cx = W - 14;
+  const cy = (ceilingY + bottom) / 2;
+  totalsAxisLabel.style.display = "block";
+  totalsAxisLabel.style.left = (rect.left + cx) + "px";
+  totalsAxisLabel.style.top = (rect.top + cy) + "px";
+  totalsAxisLabel.style.transform = "translate(-50%, -50%) rotate(90deg)";
+}
+
 // cacheMixLayout computes the band geometry shared by drawCacheMix and the
 // overlay hover lookup in mousemove. null when the overlay is off/empty.
 function cacheMixLayout() {
@@ -1772,9 +2050,20 @@ function cacheMixLayout() {
     if ((s.mix && s.mix.length) || (s.adt && s.adt.length)) bands.push({ s, si });
   });
   if (!bands.length) return null;
-  let bandH = MIX_BAND_H;
-  if (bands.length * bandH > plotH * 0.6) {
-    bandH = Math.max(24, Math.floor(plotH * 0.6 / bands.length));
+  // With every other layer off (latency lines, dots, errors, totals), cache
+  // mix is the only thing left to look at: let the bands claim the whole plot
+  // instead of sharing it under the usual 60% cap. Re-evaluated on every
+  // draw, so re-enabling any of those layers reverts to the banded layout
+  // immediately. The 24px floor (shared with the banded case) keeps the
+  // per-band labels legible either way.
+  let bandH;
+  if (!anyPlotLayerVisible()) {
+    bandH = Math.max(24, Math.floor(plotH / bands.length));
+  } else {
+    bandH = MIX_BAND_H;
+    if (bands.length * bandH > plotH * 0.6) {
+      bandH = Math.max(24, Math.floor(plotH * 0.6 / bands.length));
+    }
   }
   bands.forEach((b, bi) => { b.yTop = margin.top + bi * bandH; b.bandH = bandH; });
   // Active-dataset scale is re-framed to the CURRENT view, not the whole run,
@@ -1794,6 +2083,28 @@ function cacheMixLayout() {
     b.adtRange = adtWindowRange([b.adtPts]);
   });
   return { bands };
+}
+
+// computeMixReserveH returns the vertical space (px, measured down from
+// margin.top) the cache-mix band block occupies when it shares the plot with
+// at least one other layer -- the two must never draw into the same pixels
+// (a tall TTFT p95 line reaches the top of the axis and used to draw
+// straight through the bands; error bars, drawn at
+// mapY(b.respAvg), have the identical problem; and the totals layer needs
+// the region below the bands, via volumeGeometry()'s ceilingY, so it must
+// not be told the bands own the whole plot). 0 when cache mix is off/empty,
+// or when it claims the WHOLE plot because nothing else is visible (the
+// !anyPlotLayerVisible() branch inside cacheMixLayout) -- that case is
+// unchanged existing behavior: nothing else is on screen to reserve space
+// for. draw() writes the result into the module-level mixReserveH once per
+// draw; mapY reads that var instead of calling this (or cacheMixLayout)
+// itself, since mapY runs per plotted point.
+function computeMixReserveH() {
+  if (!anyPlotLayerVisible()) return 0;
+  const layout = cacheMixLayout();
+  if (!layout || !layout.bands.length) return 0;
+  const last = layout.bands[layout.bands.length - 1];
+  return last.yTop + last.bandH - margin.top;
 }
 
 // adtY maps a dataset size onto its band. A 2px inset keeps the extremes off
@@ -1890,10 +2201,159 @@ function drawCacheMix() {
   });
 }
 
+// --- Requests layer: density-gated render mode ---
+// Zoomed out over a long run there can be dozens of requests per pixel
+// column; two 2.5px dots plus a connector per request saturates into a
+// solid smear. The
+// p10-p90 ribbon (drawRequestRibbon) trades per-request detail for a spread
+// signal while the view is dense, and falls back to plain individual dots
+// (drawRequestDotsCurrent, connectors included) once the view is zoomed in
+// far enough that individual requests are legible again -- see
+// effectiveReqMode.
+const REQ_DENSITY_GATE = 2; // requests per pixel column of the current view
+
+// requestDensityPerPx counts series s's records inside the current view and
+// divides by plotW -- the same "requests per pixel column" measure used to
+// describe the smear in the first place.
+function requestDensityPerPx(s) {
+  if (!plotW) return 0;
+  let n = 0;
+  s._view.forEach(r => { if (r.t >= viewTMin && r.t <= viewTMax) n++; });
+  return n / plotW;
+}
+
+// effectiveReqMode resolves the mode actually rendered THIS draw: the ribbon
+// when the chart is dense, individual dots (drawRequestDotsCurrent) once it's
+// sparse enough to read them. The gate is decided ONCE for the whole chart,
+// from the DENSEST visible series -- not per series. Gating per series meant
+// two arms with different request counts crossed the threshold at different
+// zoom levels, so one arm would flip to dots while the other stayed a
+// ribbon: the same picture drawn two different ways, which reads as a bug
+// and makes the arms incomparable. Whatever the busiest arm needs, every arm
+// gets.
+function maxRequestDensityPerPx() {
+  let d = 0;
+  DATA.forEach((s, si) => {
+    if (hiddenSeries.has(si)) return;
+    const v = requestDensityPerPx(s);
+    if (v > d) d = v;
+  });
+  return d;
+}
+
+function effectiveReqMode() {
+  return maxRequestDensityPerPx() < REQ_DENSITY_GATE ? "dots-current" : "ribbon";
+}
+
+// dotsAreDrawn: true exactly when drawRequestDotsCurrent's per-request dots
+// are what's actually on screen this frame, as opposed to the density-gated
+// ribbon (drawRequestRibbon) or nothing at all. This is the SAME test draw()
+// uses to decide whether to call drawRequestDotsCurrent (see the "Data
+// points" block below) -- shared here rather than duplicated so the
+// mousemove hover hit-test can never drift from what's actually drawn. Before
+// this existed, mousemove checked showDots alone, so hovering in ribbon mode
+// hit-tested phantom dot positions that were never rendered and pre-empted
+// the line/percentile tooltip underneath.
+function dotsAreDrawn() {
+  return document.getElementById("showDots").checked && effectiveReqMode() !== "ribbon";
+}
+
+// drawRequestDotsCurrent is today's Requests rendering, unchanged: a
+// TTFT/response dot pair per request joined by a faint connector, error
+// requests drawn larger and red. This is the "dots-current" baseline and
+// also what the ribbon falls back to under the density gate.
+function drawRequestDotsCurrent(s, color, showErrors) {
+  s._view.forEach(r => {
+    if (r.t < viewTMin || r.t > viewTMax) return;
+    if (r.err && !showErrors) return;
+    const x = mapX(r.t);
+
+    {
+      const y1 = mapY(r.ttft);
+      const y2 = mapY(r.resp);
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = 0.2;
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, y1); ctx.lineTo(x, y2); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    if (r.ttft > 0) {
+      const y = mapY(r.ttft);
+      ctx.beginPath();
+      ctx.arc(x, y, r.err ? 4 : 2.5, 0, Math.PI * 2);
+      if (r.err) {
+        ctx.fillStyle = "#FF6B6B";
+        ctx.fill();
+      } else {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+    }
+
+    {
+      const y = mapY(r.resp);
+      ctx.beginPath();
+      ctx.arc(x, y, r.err ? 4 : 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = r.err ? "#FF6B6B" : color;
+      ctx.globalAlpha = r.err ? 0.8 : 0.7;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  });
+}
+
+// drawRequestRibbon fills the rolling p10-p90 response/TTLT spread envelope
+// for series s (same rolling window as _respP50 -- built alongside it in
+// computeDerived, so it can't drift out of sync) as a translucent band in
+// the arm's own color. Deliberately drawn by draw() BEFORE the
+// rolling-percentile lines section, so the existing p50 line paints on top
+// of the ribbon rather than the ribbon covering it.
+function drawRequestRibbon(s, color) {
+  const p10 = s._respP10, p90 = s._respP90;
+  if (!p10 || !p90 || p10.length < 2) return;
+  ctx.beginPath();
+  let started = false;
+  for (let i = 0; i < p10.length; i++) {
+    const p = p10[i];
+    if (p.t < viewTMin || p.t > viewTMax) continue;
+    const x = mapX(p.t), y = mapY(p.v);
+    if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+  }
+  if (!started) return; // nothing in view
+  // p10/p90 share the same anchor t's by construction (computeDerived pushes
+  // both in the same loop), so walking p90 in reverse over the same view
+  // filter closes the envelope correctly.
+  for (let i = p90.length - 1; i >= 0; i--) {
+    const p = p90[i];
+    if (p.t < viewTMin || p.t > viewTMax) continue;
+    ctx.lineTo(mapX(p.t), mapY(p.v));
+  }
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 0.17;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
 function draw() {
-  // Recalc bottom margin for visible series count
-  const newBottom = calcBottomMargin();
-  if (margin.bottom !== newBottom) { margin.bottom = newBottom; resize(); }
+  // Recalc the right margin: whether the Totals layer's ingest-token axis is
+  // currently contributing pixels (see calcRightMargin) can change between
+  // frames from a checkbox toggle or a series being hidden/shown. The bottom
+  // margin (calcBottomMargin) is a fixed constant and never changes, so it's
+  // only set once, in resize().
+  const newRight = calcRightMargin();
+  if (margin.right !== newRight) {
+    margin.right = newRight;
+    resize();
+  }
+
+  // Reserve the cache-mix band strip (if any) at the top of the plot BEFORE
+  // anything below reads mapY, so every line/dot/gridline/hover this frame
+  // (and until the next draw()) agrees on the same compressed latency
+  // region. See mapY() and computeMixReserveH().
+  mixReserveH = computeMixReserveH();
 
   const showTTFT = document.getElementById("showTTFT").checked;
   const showResp = document.getElementById("showResp").checked;
@@ -1914,7 +2374,12 @@ function draw() {
   const ySteps = niceSteps(viewYMax, 8);
   ySteps.forEach(v => {
     const y = mapY(v);
-    if (y >= margin.top && y <= margin.top + plotH) {
+    // Bound against the RESERVED top (margin.top + mixReserveH), not the
+    // plot's raw top: mapY already compresses every v into that region, so
+    // this just keeps the check honest about where ticks can land -- the
+    // topmost tick (v === viewYMax) must still pass at y === margin.top +
+    // mixReserveH exactly.
+    if (y >= margin.top + mixReserveH && y <= margin.top + plotH) {
       ctx.beginPath(); ctx.moveTo(margin.left, y); ctx.lineTo(margin.left + plotW, y); ctx.stroke();
       let label = v >= 1000 ? (v/1000).toFixed(v >= 10000 ? 0 : 1) + "s" : v.toFixed(0) + "ms";
       ctx.fillText(label, margin.left - 6, y);
@@ -1926,7 +2391,6 @@ function draw() {
   ctx.textBaseline = "top";
   const duration = (viewTMax - viewTMin) / 1000;
   const xStepSec = computeXStepSec(duration);
-  const showAnnotationRows = true; // adaptive tick density keeps columns readable at any span
   const startSec = Math.ceil(((viewTMin - globalTMin) / 1000) / xStepSec) * xStepSec;
   currentTicks = []; // rebuilt every draw; consumed by mousemove hover lookup
   for (let s = startSec; s <= (viewTMax - globalTMin) / 1000; s += xStepSec) {
@@ -1936,57 +2400,6 @@ function draw() {
     currentTicks.push({ x, tickTime });
     ctx.beginPath(); ctx.moveTo(x, margin.top); ctx.lineTo(x, margin.top + plotH); ctx.stroke();
     ctx.fillText(formatTickLabel(s), x, margin.top + plotH + 6);
-    if (!showAnnotationRows) continue;
-    ctx.font = "9px monospace";
-    let row = 0;
-    if (xAxisValuesEnabled()) tickStats(tickTime).forEach(({ si, cumReqs, cumErrs, maxSn }) => {
-      const yBase = margin.top + plotH + 20 + row * 14;
-      const snPart = "@" + maxSn;
-      ctx.textAlign = "left";
-      let cx;
-      if (cumErrs > 0) {
-        const p1 = "" + cumReqs + "(E";
-        const p2 = "" + cumErrs;
-        const p3 = ")";
-        const fullW = ctx.measureText(p1 + p2 + p3 + snPart).width;
-        cx = x - fullW / 2;
-        ctx.fillStyle = "#C9C9C9";
-        ctx.fillText(p1, cx, yBase);
-        cx += ctx.measureText(p1).width;
-        ctx.fillStyle = "#FF6B6B";
-        ctx.fillText(p2, cx, yBase);
-        cx += ctx.measureText(p2).width;
-        ctx.fillStyle = "#C9C9C9";
-        ctx.fillText(p3, cx, yBase);
-        cx += ctx.measureText(p3).width;
-      } else {
-        const fullW = ctx.measureText("" + cumReqs + snPart).width;
-        cx = x - fullW / 2;
-        ctx.fillStyle = "#C9C9C9";
-        ctx.fillText("" + cumReqs, cx, yBase);
-        cx += ctx.measureText("" + cumReqs).width;
-      }
-      ctx.fillStyle = "#8a9096";
-      ctx.fillText(snPart, cx, yBase);
-      ctx.textAlign = "center";
-      row++;
-    });
-    ctx.font = "11px monospace";
-    ctx.fillStyle = "#8a9096";
-  }
-
-  // Row-identity chips: annotation text is neutral, so a small colored chip
-  // at the left edge of each request-count row names its series.
-  {
-    let row = 0;
-    const chip = si => {
-      ctx.fillStyle = seriesColors[si];
-      ctx.fillRect(margin.left - 13, margin.top + plotH + 20 + row * 14 + 1, 7, 7);
-      row++;
-    };
-    if (xAxisValuesEnabled()) {
-      DATA.forEach((ds, si) => { if (!hiddenSeries.has(si)) chip(si); });
-    }
   }
 
   // Y axis label
@@ -1999,6 +2412,11 @@ function draw() {
   ctx.font = "12px sans-serif";
   ctx.fillText("Latency", 0, 0);
   ctx.restore();
+
+  // Right axis (Totals/ingest layer, absolute tokens) -- no-ops and hides
+  // its title when the layer isn't contributing pixels. Drawn here,
+  // unclipped, alongside the rest of the axis chrome -- see drawTotalsAxis.
+  drawTotalsAxis();
 
   // X axis label
   ctx.fillStyle = "#C9C9C9";
@@ -2022,6 +2440,18 @@ function draw() {
   // band region), then latency lines on top of both.
   drawTotals();
   drawCacheMix();
+
+  // Requests layer, ribbon mode: fill the p10-p90 spread envelope HERE,
+  // before the percentile lines below, so the existing p50 line paints on
+  // top of the ribbon rather than the ribbon covering it. The dots-current
+  // fallback keeps its historical position later, drawn OVER the lines --
+  // see the "Data points" block.
+  if (showDots) {
+    DATA.forEach((s, si) => {
+      if (hiddenSeries.has(si)) return;
+      if (effectiveReqMode() === "ribbon") drawRequestRibbon(s, seriesColors[si]);
+    });
+  }
 
   // Rolling-percentile lines: pattern encodes the percentile, color the
   // series. Response p50 solid; TTFT p50 dense dots; TTFT p95 sparse
@@ -2078,54 +2508,14 @@ function draw() {
     });
   }
 
-  // Data points (only when showDots is enabled)
-  if (showDots) {
+  // Data points (only when showDots is enabled). The ribbon is drawn
+  // earlier, under the percentile lines, and is skipped here; the
+  // dots-current fallback keeps its original z-order (drawn over the lines
+  // and error bars) -- see effectiveReqMode.
+  if (dotsAreDrawn()) {
     DATA.forEach((s, si) => {
       if (hiddenSeries.has(si)) return;
-      const color = seriesColors[si];
-
-      s._view.forEach(r => {
-        if (r.t < viewTMin || r.t > viewTMax) return;
-        if (r.err && !showErrors) return;
-        const x = mapX(r.t);
-
-        // Connector line between TTFT and response
-        if (showTTFT && showResp) {
-          const y1 = mapY(r.ttft);
-          const y2 = mapY(r.resp);
-          ctx.strokeStyle = color;
-          ctx.globalAlpha = 0.2;
-          ctx.lineWidth = 1;
-          ctx.beginPath(); ctx.moveTo(x, y1); ctx.lineTo(x, y2); ctx.stroke();
-          ctx.globalAlpha = 1;
-        }
-
-        // TTFT dot (hollow circle)
-        if (showTTFT && r.ttft > 0) {
-          const y = mapY(r.ttft);
-          ctx.beginPath();
-          ctx.arc(x, y, r.err ? 4 : 2.5, 0, Math.PI * 2);
-          if (r.err) {
-            ctx.fillStyle = "#FF6B6B";
-            ctx.fill();
-          } else {
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-          }
-        }
-
-        // Response time dot (solid circle)
-        if (showResp) {
-          const y = mapY(r.resp);
-          ctx.beginPath();
-          ctx.arc(x, y, r.err ? 4 : 2.5, 0, Math.PI * 2);
-          ctx.fillStyle = r.err ? "#FF6B6B" : color;
-          ctx.globalAlpha = r.err ? 0.8 : 0.7;
-          ctx.fill();
-          ctx.globalAlpha = 1;
-        }
-      });
+      drawRequestDotsCurrent(s, seriesColors[si], showErrors);
     });
   }
 
@@ -2237,8 +2627,16 @@ canvas.addEventListener("mousemove", e => {
   // Tooltip
   let best = null, bestDist = 20;
 
-  // Check proximity to dots (only when showDots is enabled)
-  if (document.getElementById("showDots").checked) {
+  // Check proximity to dots -- ONLY when dots are actually the thing drawn
+  // this frame (see dotsAreDrawn(): showDots checked AND effectiveReqMode()
+  // isn't "ribbon"). At high density the Requests layer renders a p10-p90
+  // ribbon instead, with no dots on screen; testing showDots alone here used
+  // to hit-test phantom dot positions in that case, and since dots were
+  // checked before lines with a wider radius, a phantom hit could pre-empt
+  // the p50/TTFT line tooltip the user was actually pointing at. Falling
+  // through leaves best null so the "proximity to average lines" check
+  // below runs instead, exactly as if dots were off.
+  if (dotsAreDrawn()) {
     DATA.forEach((s, si) => {
       if (hiddenSeries.has(si)) return;
       s._view.forEach(r => {
@@ -2295,10 +2693,9 @@ canvas.addEventListener("mousemove", e => {
     }
   }
 
-  // On long views the per-tick annotation rows aren't printed (see
-  // ANNOTATION_ROWS_MAX_DURATION) to avoid an overlapping label band --
-  // hovering near any x-axis gridline surfaces the same per-series
-  // cumulative breakdown via tooltip instead.
+  // On long views (see ANNOTATION_ROWS_MAX_DURATION), hovering near any
+  // x-axis gridline surfaces a per-series cumulative request/error breakdown
+  // via tooltip (tickHover below).
   // Ingest-volume hover: lowest priority of the shaped hovers — never
   // steals from dot/line or band tooltips.
   let volHover = null;
@@ -2324,7 +2721,7 @@ canvas.addEventListener("mousemove", e => {
       const p50 = percentile(vals, 0.5);
       const p95 = percentile(vals, 0.95);
       const fmt = v => v >= 1000 ? (v/1000).toFixed(2) + "s" : v.toFixed(0) + "ms";
-      const lineLabel = { resp50: "Response p50", ttft50: "TTFT p50", ttft95: "TTFT p95" }[best.type] || best.type;
+      const lineLabel = { resp50: "Resp/TTLT p50", ttft50: "TTFT p50", ttft95: "TTFT p95" }[best.type] || best.type;
       // Count total requests, errors, and max series index up to this point
       let totalUpTo = 0, errUpTo = 0, maxSnSeen = 0;
       best.s._view.forEach(r => { if (r.t <= best.t) { totalUpTo++; if (r.err) errUpTo++; if (r.sn > maxSnSeen) maxSnSeen = r.sn; } });
@@ -2357,7 +2754,7 @@ canvas.addEventListener("mousemove", e => {
       showTooltip(e,
         "<b>" + best.s.name + "</b> (series " + r.sn + ", req " + r.rn + ")<br>" +
         "TTFT: " + r.ttft.toFixed(1) + " ms<br>" +
-        "Response: " + r.resp.toFixed(1) + " ms<br>" +
+        "Resp/TTLT: " + r.resp.toFixed(1) + " ms<br>" +
         "<span style='color:#8a9096'>—</span><br>" +
         "Input: " + fmtTokens(prompt) + " tok" +
         (vsMed ? " <span style='color:#8a9096'>(" + vsMed + ")</span>" : "") + "<br>" +
@@ -2440,19 +2837,18 @@ window.addEventListener("mouseup", () => {
 });
 
 // Double-click to reset zoom
-canvas.addEventListener("dblclick", () => {
-  viewTMin = globalTMin; viewTMax = globalTMax; viewYMax = globalYMax;
-  draw();
-});
+canvas.addEventListener("dblclick", resetZoomView);
 
 // Reset button
-document.getElementById("resetZoom").addEventListener("click", () => {
-  viewTMin = globalTMin; viewTMax = globalTMax; viewYMax = globalYMax;
-  draw();
-});
 
-// Wire up controls
-["showTTFT","showTTFTP95","showResp","showDots","showErrors","showTotals","showXAxisValues"].forEach(id => {
+// Wire up controls. The four latency-plotting layers can change which
+// series is now tallest, so they recompute the y-axis; the annotation-only
+// and normalized-elsewhere layers (errors, totals) never affect that axis
+// and just redraw.
+["showTTFT", "showTTFTP95", "showResp", "showDots"].forEach(id => {
+  document.getElementById(id).addEventListener("change", () => { recalcYMax(); draw(); });
+});
+["showErrors", "showTotals"].forEach(id => {
   document.getElementById(id).addEventListener("change", draw);
 });
 
@@ -2469,18 +2865,118 @@ const CACHE_MIX_DEFAULT_MAX_SERIES = 4;
 function cacheMixDefaultOn(seriesCount) { return seriesCount <= CACHE_MIX_DEFAULT_MAX_SERIES; }
 if (HAS_CACHE_MIX) {
   const lbl = document.createElement("label");
-  lbl.innerHTML = '<input type="checkbox" id="showCacheMix"> Show Cache Mix ' +
+  lbl.innerHTML = '<input type="checkbox" id="showCacheMix"> ' +
+    '<span class="help-label" id="hlpCacheMix" tabindex="0" aria-describedby="helpTip" ' +
+    'data-tip="Where prompt tokens came from: recompute, local cache, or external KV.">Cache Mix</span> ' +
     '<span style="color:' + MIX_COMPUTE_COLOR + '">&#9632;</span>compute ' +
     '<span style="color:' + MIX_LOCAL_COLOR + '">&#9632;</span>local cache ' +
     '<span style="color:' + MIX_EXTERNAL_COLOR + '">&#9632;</span>external KV ' +
     '<span style="color:' + ADT_LINE_COLOR + '">&#8213;</span>active dataset (tokens)';
   document.querySelector(".controls").appendChild(lbl);
+  helpTriggers.push(document.getElementById("hlpCacheMix"));
   const cb = document.getElementById("showCacheMix");
   // Set the property rather than baking "checked" into the markup: one source
   // of truth for the default, and it survives the element already existing.
   cb.checked = cacheMixDefaultOn(DATA.length);
   cb.addEventListener("change", draw);
 }
+
+// --- Help tooltip: shared by every .help-label trigger (control-layer
+// labels, summary column headers, the Cache Mix toggle -- collected into
+// helpTriggers as each is created, see above) ---
+// Replaces the old native "title" tooltip (browser-controlled ~1-2s delay,
+// OS-styled box, no styling control) with one custom element, reused by
+// moving/toggling it rather than one div per trigger. Deliberately matches
+// #tooltip's visual language (surface #1E2429, border #42464A, 6px radius,
+// 0.8em font) -- see the .help-tip rules -- but is otherwise fully
+// independent: its own show/hide state, so it can never fight the chart
+// hover tooltip over position or visibility.
+let helpShowTimer = null, helpHideTimer = null;
+
+// placeHelpTip positions #helpTip near trigger, viewport-aware: prefers
+// below the trigger, flips above when that would clip the bottom edge, and
+// clamps horizontally so it never renders off-screen. Always fixed/page
+// coordinates (matching placeTooltip's approach for the chart tooltip) so
+// the summary panel's own scroll container can't clip it. The small caret
+// tracks the trigger's horizontal center, clamped inside the box, so it
+// still roughly points at the trigger even when the box itself got clamped.
+function placeHelpTip(trigger) {
+  const r = trigger.getBoundingClientRect();
+  const gap = 8, pad = 4;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const tw = helpTip.offsetWidth, th = helpTip.offsetHeight;
+  let top = r.bottom + gap;
+  let below = true;
+  if (top + th > vh - pad) {
+    top = r.top - gap - th;
+    below = false;
+  }
+  top = Math.min(Math.max(top, pad), Math.max(pad, vh - pad - th));
+  let left = r.left + r.width / 2 - tw / 2;
+  left = Math.min(Math.max(left, pad), Math.max(pad, vw - pad - tw));
+  helpTip.style.left = left + "px";
+  helpTip.style.top = top + "px";
+  // below === true means the tip sits BELOW the trigger, so the caret goes
+  // on the tip's TOP edge, pointing up at it (and vice versa).
+  helpTip.classList.toggle("caret-top", below);
+  helpTip.classList.toggle("caret-bottom", !below);
+  const caretX = Math.min(Math.max(r.left + r.width / 2 - left, 10), Math.max(10, tw - 10));
+  helpTip.style.setProperty("--caret-x", caretX + "px");
+}
+
+// showHelpTip: ~120ms show delay (the whole point is being faster than the
+// native tooltip's ~1-2s), except when the tip is ALREADY visible for a
+// neighboring trigger -- then content and position swap immediately, so
+// moving across adjacent triggers reads as one continuous tooltip instead of
+// re-delaying every time. A trigger with no tip text (e.g. a summary row's
+// ratio cell before it holds a baseline comparison) shows nothing rather
+// than an empty floating box.
+function showHelpTip(trigger) {
+  clearTimeout(helpShowTimer);
+  clearTimeout(helpHideTimer);
+  const text = trigger.dataset.tip || "";
+  if (!text) return;
+  if (helpTip.classList.contains("visible")) {
+    helpTip.textContent = text;
+    placeHelpTip(trigger);
+    return;
+  }
+  helpShowTimer = setTimeout(() => {
+    helpTip.textContent = text;
+    placeHelpTip(trigger);
+    helpTip.classList.add("visible");
+  }, 120);
+}
+
+// hideHelpTip: a short (~60ms) grace before hiding, so moving the pointer
+// between adjacent triggers doesn't flicker the tip closed and back open.
+function hideHelpTip() {
+  clearTimeout(helpShowTimer);
+  helpHideTimer = setTimeout(() => helpTip.classList.remove("visible"), 60);
+}
+
+// hideHelpTipNow: immediate hide, no grace period -- used by the Escape
+// handler below, where a delayed hide would read as unresponsive.
+function hideHelpTipNow() {
+  clearTimeout(helpShowTimer);
+  clearTimeout(helpHideTimer);
+  helpTip.classList.remove("visible");
+}
+
+// Keyboard/hover parity: every trigger is a tabbable element (tabindex="0"
+// in the markup) carrying aria-describedby="helpTip", and role="tooltip" is
+// set on #helpTip itself in the markup -- so the tooltip is reachable and
+// announced the same way for a keyboard/screen-reader user as for a mouse
+// hover. Escape hides it; see the keydown handler in the context-filter
+// modal block below, which checks helpTip's visibility FIRST so this can
+// never be shadowed by (or shadow) the modal-close / exit-zoom precedence
+// chain it already implements.
+helpTriggers.forEach(el => {
+  el.addEventListener("mouseenter", () => showHelpTip(el));
+  el.addEventListener("mouseleave", hideHelpTip);
+  el.addEventListener("focus", () => showHelpTip(el));
+  el.addEventListener("blur", hideHelpTip);
+});
 
 // Context-filter modal: the series selector — per-series rows with color
 // dot, visibility checkbox, and max-context hint — plus the numeric
@@ -2551,8 +3047,22 @@ if (HAS_CACHE_MIX) {
     snFilter.clear();
     rebuildSnList();
   });
+  // Variant select-all/deselect-all live here, beside the per-variant
+  // checkboxes they actually control (the top-level buttons of the same
+  // name now govern the plotted-layer checkboxes instead -- see
+  // setAllLayers above). renderState() is what makes clicking one of these
+  // immediately update every checkbox below plus the legend and the chart.
+  document.getElementById("variantSelectAll").addEventListener("click", () => {
+    DATA.forEach((_, i) => hiddenSeries.delete(i));
+    renderState();
+  });
+  document.getElementById("variantDeselectAll").addEventListener("click", () => {
+    DATA.forEach((_, i) => hiddenSeries.add(i));
+    renderState();
+  });
   const rebuildList = () => {
     listEl.innerHTML = "";
+    modalRowCheckboxes = [];
     DATA.forEach((s, i) => {
       const row = document.createElement("div");
       row.className = "modal-series-row";
@@ -2561,9 +3071,9 @@ if (HAS_CACHE_MIX) {
       cb.checked = !hiddenSeries.has(i);
       cb.addEventListener("change", () => {
         if (cb.checked) hiddenSeries.delete(i); else hiddenSeries.add(i);
-        syncLegendVisuals();
-        draw();
+        renderState();
       });
+      modalRowCheckboxes.push({ cb, i });
       row.appendChild(cb);
       const dot = document.createElement("div");
       dot.className = "legend-dot";
@@ -2583,7 +3093,17 @@ if (HAS_CACHE_MIX) {
   openBtn.addEventListener("click", () => { rebuildList(); rebuildSnList(); modal.style.display = "block"; });
   document.getElementById("ctxClose").addEventListener("click", closeModal);
   modal.addEventListener("click", e => { if (e.target === modal) closeModal(); });
-  window.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+  // Single ordered ESC handler (do not add a second competing listener):
+  // the help tooltip takes precedence when visible (dismiss it without
+  // touching the modal/zoom underneath), then the modal when open, else a
+  // single-step zoom exit (same effect as Reset Zoom), else no-op. No
+  // multi-level zoom history.
+  window.addEventListener("keydown", e => {
+    if (e.key !== "Escape") return;
+    if (helpTip.classList.contains("visible")) { hideHelpTipNow(); return; }
+    if (modal.style.display === "block") { closeModal(); return; }
+    if (isZoomed()) resetZoomView();
+  });
   // Band inputs are in K TOKENS: "300" means 300,000 tokens.
   document.getElementById("ctxApply").addEventListener("click", () => {
     const minK = parseFloat(document.getElementById("ctxMin").value) || 0;
@@ -2598,6 +3118,213 @@ if (HAS_CACHE_MIX) {
     applyCtxFilter(0, 0);
   });
 }
+
+// --- Data export: per-request rows CSV + summary panel CSV -------------
+// A copied report is often read somewhere the run's own JSONL is not
+// reachable, so this is the only way it yields its numbers back out. Pure client side —
+// Blob + a throwaway <a download>, no network, no library — so it works
+// offline exactly like the rest of the report. Both exports honor the
+// CURRENT view precisely the way the chart and summary panel already do, by
+// reusing their own state instead of recomputing scope independently:
+// viewTMin/viewTMax for the zoom window, hiddenSeries for deselected arms,
+// and s._view (already shaped by applyCtxFilter) for the context-band and
+// in-dataset series filters. Scope can't drift from the display because
+// there is no second source of truth for it.
+
+// csvField/csvRow: RFC-4180-ish escaping — a field is quoted (with embedded
+// quotes doubled) only when it contains a comma, quote, or newline, so plain
+// arm names/numbers stay unquoted and readable.
+function csvField(v) {
+  const s = v === undefined || v === null ? "" : String(v);
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+function csvRow(fields) { return fields.map(csvField).join(","); }
+
+// visibleIndices: series indices NOT currently hidden via the legend or the
+// context-filter modal's per-variant checkboxes — "what the user is looking
+// at" for both exports.
+function visibleIndices() { return DATA.map((_, i) => i).filter(i => !hiddenSeries.has(i)); }
+
+// scopeElapsedLabel mirrors renderSummary's #sumRange text exactly (same
+// off() computation) so an export's stated scope always agrees with what the
+// summary panel prints on screen.
+function scopeElapsedLabel() {
+  const off = t => formatTickLabel(Math.round((t - globalTMin) / 1000));
+  return isZoomed() ? (off(viewTMin) + " - " + off(viewTMax)) : ("full run (" + off(globalTMax) + ")");
+}
+// scopeToken: a filesystem-safe scope token for filenames — "full", or
+// "zoom-<start>s-<end>s" in elapsed seconds from each arm's own run start
+// (the common relative axis every arm is time-aligned to, see the
+// per-series t-normalization above DATA.forEach), so one token names the
+// window unambiguously for every included arm.
+function scopeToken() {
+  if (!isZoomed()) return "full";
+  const s0 = Math.round((viewTMin - globalTMin) / 1000);
+  const s1 = Math.round((viewTMax - globalTMin) / 1000);
+  return "zoom-" + s0 + "s-" + s1 + "s";
+}
+
+// provenanceHeader builds the "#"-prefixed comment lines shared by both
+// exports: included/excluded arms, the baseline, the active scope (zoomed
+// window with each included arm's own absolute start/end, or "full run"),
+// the context band and in-dataset series filters when active, recorded run
+// params per arm (gracefully absent on legacy reports), and a generation
+// timestamp. extraLines is appended last, for an export-specific caveat.
+function provenanceHeader(kind, extraLines) {
+  const lines = [];
+  lines.push("# wekai benchmark report -- " + kind + " export");
+  lines.push("# generated " + new Date().toISOString());
+  const visible = visibleIndices();
+  const hidden = DATA.map((_, i) => i).filter(i => hiddenSeries.has(i));
+  lines.push("# arms included (" + visible.length + "): " + visible.map(i => DATA[i].name).join(", "));
+  if (hidden.length) {
+    lines.push("# arms hidden/deselected, excluded from this export (" + hidden.length + "): " +
+      hidden.map(i => DATA[i].name).join(", "));
+  }
+  if (BASELINE_INDEX >= 0) {
+    lines.push("# baseline arm (ratio columns are % of this arm): " + DATA[BASELINE_INDEX].name +
+      (hiddenSeries.has(BASELINE_INDEX)
+        ? " (hidden/excluded above, but ratios below still use its recorded numbers, same as the on-screen panel)"
+        : ""));
+  }
+  if (isZoomed()) {
+    lines.push("# scope: zoomed window, elapsed " + scopeElapsedLabel() + " (from each arm's own run start)");
+    visible.forEach(i => {
+      const s = DATA[i];
+      lines.push("#   " + s.name + " absolute window: " + new Date(s.t0 + viewTMin).toISOString() +
+        " to " + new Date(s.t0 + viewTMax).toISOString());
+    });
+  } else {
+    lines.push("# scope: full run (" + scopeElapsedLabel() + ")");
+  }
+  if (ctxFilterActive()) {
+    lines.push("# context-band filter (input+cached tokens per request): >= " +
+      (ctxFilter.min > 0 ? ctxFilter.min : "0") + ", <= " + (ctxFilter.max > 0 ? ctxFilter.max : "unbounded"));
+  }
+  if (snFilter.size > 0) {
+    lines.push("# in-dataset series filter (sn): " + Array.from(snFilter).sort((a, b) => a - b).join(","));
+  }
+  const paramLines = visible.map(i => ({ name: DATA[i].name, ps: paramsSummaryFor(DATA[i]) })).filter(x => x.ps);
+  if (paramLines.length) {
+    paramLines.forEach(x => lines.push("# run params [" + x.name + "]: " + x.ps));
+  } else {
+    lines.push("# run params: not recorded for any included arm (predates the run_params header)");
+  }
+  (extraLines || []).forEach(l => lines.push("# " + l));
+  lines.push("#");
+  return lines;
+}
+
+// buildRequestsRows: one row per request, from every visible arm's CURRENT
+// view (context band + series filter already applied via s._view), clipped
+// to the current zoom window -- exactly the rows windowStats() sums for the
+// summary panel over the same scope.
+function buildRequestsRows() {
+  const header = ["arm", "start_time", "ttft_ms", "response_time_ms", "series_num",
+    "request_num", "cache_hit", "input_tokens", "cached_tokens", "output_tokens", "is_error"];
+  const rows = [csvRow(header)];
+  visibleIndices().forEach(i => {
+    const s = DATA[i];
+    s._view.forEach(r => {
+      if (r.t < viewTMin || r.t > viewTMax) return;
+      rows.push(csvRow([
+        s.name,
+        new Date(s.t0 + r.t).toISOString(),
+        r.ttft, r.resp, r.sn, r.rn,
+        r.ch ? "true" : "false",
+        r.in, r.ca, r.out,
+        r.err ? "true" : "false",
+      ]));
+    });
+  });
+  return rows;
+}
+
+// SUMMARY_CSV_COLUMNS names each SUMMARY_METRICS key for the CSV header --
+// the on-screen abbreviations ("In/s", "TTFT50"...) aren't clear column
+// names on their own, so the mapping lives in exactly one place.
+const SUMMARY_CSV_COLUMNS = {
+  in: "input_tokens", out: "output_tokens", reqs: "requests",
+  inrate: "input_tokens_per_sec", outrate: "output_tokens_per_sec",
+  ttft50: "ttft_p50_ms", ttft95: "ttft_p95_ms", err1k: "errors_per_1k",
+};
+
+// summaryRatioPct mirrors fmtRatio's own gating exactly (a zero/negative/
+// non-finite baseline yields no ratio, just as on screen) but returns the
+// numeric percentage instead of a formatted string, so the CSV's ratio
+// column is a plain number a spreadsheet can compute with.
+function summaryRatioPct(v, base) {
+  if (!(base > 0) || !isFinite(v) || v < 0) return "";
+  return Math.round((v / base) * 10000) / 100;
+}
+
+// buildSummaryRows reuses the exact per-series stats seriesStats() already
+// computed for the on-screen panel (the same call renderSummary() makes), so
+// the CSV can never disagree with what's displayed for this scope. Rows
+// cover only the currently visible arms; when the baseline arm itself is
+// hidden its numbers still back every other row's ratio column, exactly as
+// the on-screen panel does (renderSummary reads perSeries[BASELINE_INDEX]
+// unconditionally, regardless of hiddenSeries).
+function buildSummaryRows() {
+  const perSeries = seriesStats();
+  const header = ["arm", "is_baseline"];
+  SUMMARY_METRICS.forEach(m => {
+    header.push(SUMMARY_CSV_COLUMNS[m.key]);
+    if (BASELINE_INDEX >= 0) header.push(SUMMARY_CSV_COLUMNS[m.key] + "_pct_of_baseline");
+  });
+  const rows = [csvRow(header)];
+  const baseStats = BASELINE_INDEX >= 0 ? perSeries[BASELINE_INDEX] : null;
+  visibleIndices().forEach(i => {
+    const s = DATA[i];
+    const st = perSeries[i];
+    const row = [s.name, i === BASELINE_INDEX ? "true" : "false"];
+    SUMMARY_METRICS.forEach(m => {
+      row.push(st ? m.val(st) : "");
+      if (BASELINE_INDEX >= 0) {
+        row.push(baseStats && st && i !== BASELINE_INDEX ? summaryRatioPct(m.val(st), m.val(baseStats)) : "");
+      }
+    });
+    rows.push(csvRow(row));
+  });
+  return rows;
+}
+
+// triggerDownload builds a Blob from the given lines and clicks a throwaway
+// <a download> at its object URL -- no network, no external library. The
+// object URL is revoked right after the synthetic click so it doesn't leak.
+function triggerDownload(filename, lines) {
+  const blob = new Blob([lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function downloadRequestsCsv() {
+  const filename = "wekai-requests-" + visibleIndices().length + "arms-" + scopeToken() + ".csv";
+  const notes = [
+    "NOTE: this is the 10-field JSONL subset (t, ttft, resp, err, sn, rn, ch, in, ca, out) -- the",
+    "full per-request record (prompts, full timestamps, and more) lives in the run's .jsonl files",
+    "on the results volume.",
+  ];
+  triggerDownload(filename, provenanceHeader("per-request rows", notes).concat(buildRequestsRows()));
+}
+function downloadSummaryCsv() {
+  const filename = "wekai-summary-" + visibleIndices().length + "arms-" + scopeToken() + ".csv";
+  triggerDownload(filename, provenanceHeader("summary panel", []).concat(buildSummaryRows()));
+}
+["downloadRequestsBtn", "modalDownloadRequestsBtn"].forEach(id => {
+  const btn = document.getElementById(id);
+  if (btn) btn.addEventListener("click", downloadRequestsCsv);
+});
+["downloadSummaryBtn", "modalDownloadSummaryBtn"].forEach(id => {
+  const btn = document.getElementById(id);
+  if (btn) btn.addEventListener("click", downloadSummaryCsv);
+});
 
 window.addEventListener("resize", () => { resize(); draw(); });
 resize();

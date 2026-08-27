@@ -90,8 +90,8 @@ func TestGenerateVisualizationWithCacheMixSamples(t *testing.T) {
 		"drawCacheMix", "showCacheMix", "HAS_CACHE_MIX", // overlay code paths
 		"MIX_COMPUTE_COLOR", "active dataset (tokens)",
 		"MIX_TOTAL_MAX", "mixStackHeight", "mixRate", // absolute band scaling
-		"drawTotals", "totalsStack", "showTotals", "showXAxisValues", // totals volume layer + axis toggle
-		"volumeGeometry", "volumeHoverAt", "windowRates", "Show Totals (ingest)", // ingest volume + hover
+		"drawTotals", "totalsStack", "showTotals", // totals volume layer
+		"volumeGeometry", "volumeHoverAt", "windowRates", "Totals (ingest)", // ingest volume + hover
 		"ctxModal", "ctxInBand", "applyCtxFilter", "Context Filter", "max ctx", // context-size filter modal
 	} {
 		if !strings.Contains(html, want) {
@@ -445,7 +445,7 @@ __el("showTTFT", { checked: true }); __el("showTTFTP95", { checked: false });
 __el("showResp", { checked: true });
 __el("showDots", { checked: false }); __el("showErrors", { checked: true });
 __el("showCacheMix", { checked: true });
-__el("showTotals", { checked: true }); __el("showXAxisValues", { checked: false });
+__el("showTotals", { checked: true });
 __el("resetZoom"); __el("zoomInfo"); __el("info"); __el("legend");
 __el("selectAll"); __el("deselectAll"); __el("seriesFilter");
 const document = {
@@ -990,7 +990,8 @@ console.log("ALL_OK");
 // of chart height on a 10-variant report — to repeat, in near-identical
 // numbers across every tick, what the band label and band hover already state
 // exactly. Enabling the cache-mix overlay must no longer grow the bottom
-// margin at all; only "Show X-axis values" may.
+// margin at all; the bottom margin is now a fixed constant regardless of
+// series count or which layers are visible.
 func TestNoDatasetAxisRowsJS(t *testing.T) {
 	nodeBin, err := exec.LookPath("node")
 	if err != nil {
@@ -1025,30 +1026,14 @@ func TestNoDatasetAxisRowsJS(t *testing.T) {
 	probe := `
 function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
 assert(DATA.length === 3 && DATA.every(s => s.adt && s.adt.length), "3 sampled series in the fixture");
-const mix = document.getElementById("showCacheMix"), xax = document.getElementById("showXAxisValues");
+const mix = document.getElementById("showCacheMix");
 
 // The cache-mix overlay must not buy any bottom margin.
-mix.checked = false; xax.checked = false;
+mix.checked = false;
 const bare = calcBottomMargin();
 mix.checked = true;
 assert(calcBottomMargin() === bare, "cache-mix overlay must not grow the bottom margin (got " +
   calcBottomMargin() + " vs " + bare + ")");
-
-// The x-axis values toggle still buys one row per visible series, and that
-// remains the ONLY thing that does.
-xax.checked = true;
-const withRows = calcBottomMargin();
-assert(withRows === bare + 3 * 14, "x-axis values add one row per series, got " + withRows);
-mix.checked = false;
-assert(calcBottomMargin() === withRows, "rows come from the x-axis toggle alone");
-
-// Chart height actually reclaims the space: overlay on, axis values off.
-mix.checked = true; xax.checked = false;
-resize(); draw();
-const tallPlotH = plotH;
-xax.checked = true;
-resize(); draw();
-assert(plotH < tallPlotH, "axis rows still cost plot height when explicitly enabled");
 console.log("ALL_OK");
 `
 	jsPath := filepath.Join(dir, "axis_rows_test.js")
@@ -1688,7 +1673,7 @@ assert(out.indexOf("Output: 2.5k tok") >= 0, "output shown: " + out);
 assert(out.indexOf("20.0x median ctx") >= 0, "context vs the series median shown: " + out);
 // The identity and latency lines it already carried must survive.
 assert(out.indexOf("series 1, req 10") >= 0, "identity kept: " + out);
-assert(out.indexOf("Response: 40000.0 ms") >= 0, "response time kept: " + out);
+assert(out.indexOf("Resp/TTLT: 40000.0 ms") >= 0, "response time kept: " + out);
 
 // An ordinary request reads as ordinary: 80% cached, 1.0x the median.
 const ord = hoverRequest(3);
