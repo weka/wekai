@@ -48,7 +48,7 @@ type replayPoster struct {
 	epMu       sync.Mutex
 	epResolved string // latched endpoint; "" until the first success
 	epFellBack bool
-	apiType    string // "anthropic", "openai", or "openai_vllm"
+	apiType    string // "anthropic", "openai", "openai_vllm", or "openai_sglang"
 	client     *http.Client
 	// retryBudget is the total time a request may spend waiting out 429s
 	// before the shed stands as an error. Defaults to retry429Budget; a field
@@ -207,18 +207,20 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 		return nil, fmt.Errorf("parse model spec: %w", err)
 	}
 
-	// Accepted target types: anthropic (original), openai, openai_vllm.
-	// openai_vllm is treated identically to openai in the replay path — both
-	// use /v1/chat/completions. The distinction matters for the Chat path
-	// (max_tokens vs max_completion_tokens) but replay requests carry their
-	// own max_tokens so it's irrelevant here.
+	// Accepted target types: anthropic (original), openai, openai_vllm,
+	// openai_sglang. openai_vllm and openai_sglang are treated identically to
+	// openai in the replay path — all three use /v1/chat/completions. The
+	// distinction matters for the Chat path (max_tokens vs
+	// max_completion_tokens, and SGLang's return_cached_tokens_details) but
+	// replay requests carry their own max_tokens and opt into cached-token
+	// reporting explicitly below, so the type only selects that behavior.
 	switch dyn.Type {
 	case "anthropic":
 		// OK — existing behaviour.
-	case "openai", "openai_vllm":
+	case "openai", "openai_vllm", "openai_sglang":
 		// OK — new path.
 	default:
-		return nil, fmt.Errorf("router-replay supports type=anthropic, type=openai, or type=openai_vllm (got %q)", dyn.Type)
+		return nil, fmt.Errorf("router-replay supports type=anthropic, type=openai, type=openai_vllm, or type=openai_sglang (got %q)", dyn.Type)
 	}
 
 	base := ""
@@ -235,7 +237,7 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 	// local endpoints); OpenAI targets use Bearer auth with the OpenAI key
 	// (or dummy-key for local endpoints).
 	apiKey := keys.Anthropic
-	if dyn.Type == "openai" || dyn.Type == "openai_vllm" {
+	if dyn.Type == "openai" || dyn.Type == "openai_vllm" || dyn.Type == "openai_sglang" {
 		apiKey = keys.OpenAI
 	}
 	if apiKey == "" {
@@ -246,7 +248,7 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 	// The primary attempt appends it to the operator's base verbatim; the
 	// fallback inserts /v1 (see the struct comment for the contract).
 	leaf := "/messages"
-	if dyn.Type == "openai" || dyn.Type == "openai_vllm" {
+	if dyn.Type == "openai" || dyn.Type == "openai_vllm" || dyn.Type == "openai_sglang" {
 		leaf = "/chat/completions"
 	}
 	epPrimary := base + leaf
@@ -581,8 +583,8 @@ func (p *replayPoster) do(
 	var canonical string
 	var err error
 	switch p.apiType {
-	case "openai", "openai_vllm":
-		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj)
+	case "openai", "openai_vllm", "openai_sglang":
+		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj, p.apiType == "openai_sglang")
 	default:
 		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj)
 	}
@@ -742,7 +744,7 @@ func (p *replayPoster) do(
 	// consumers compute must describe the attempt the server actually ran, so
 	// that backoff cannot make a healthy fleet look slow. The client-side wait
 	// is added back into TotalResponseTime below, where it belongs.
-	if p.apiType == "openai" || p.apiType == "openai_vllm" {
+	if p.apiType == "openai" || p.apiType == "openai_vllm" || p.apiType == "openai_sglang" {
 		if req.Stream {
 			consumeOpenAISSE(respReader, attemptStart, &m)
 		} else {
@@ -1267,8 +1269,8 @@ func (p *replayPoster) dryDo(
 	inj := p.buildInjection(req, su)
 	var canonical string
 	switch p.apiType {
-	case "openai", "openai_vllm":
-		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj)
+	case "openai", "openai_vllm", "openai_sglang":
+		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj, p.apiType == "openai_sglang")
 	default:
 		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj)
 	}
