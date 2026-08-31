@@ -98,6 +98,21 @@ func firstLineConformity(resp string, expected []string) bool {
 	return strings.HasPrefix(strings.TrimSpace(resp), strings.Join(expected, ", "))
 }
 
+// conformsAnyChannel scores output conformity leniently: the recited list may
+// open EITHER the content or the reasoning trace. A model that answers by
+// opening its reasoning with the list has demonstrated the same recall as one
+// that opens its content with it, and which channel carries it is a property
+// of the serving stack's reasoning support, not of the cache under test.
+//
+// content and reasoning are empty for consumers that do not split the two; in
+// that case merged is scored, which is what those consumers have always done.
+func conformsAnyChannel(content, reasoning, merged string, expected []string) bool {
+	if content == "" && reasoning == "" {
+		return firstLineConformity(merged, expected)
+	}
+	return firstLineConformity(content, expected) || firstLineConformity(reasoning, expected)
+}
+
 // recall from cached KV context, not an echo of the ask.
 func replayReciteWindowInstruction(labels []string) string {
 	if len(labels) == 0 {

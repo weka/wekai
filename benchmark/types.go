@@ -37,9 +37,15 @@ type RequestMetrics struct {
 	// check that cares about ORDER, because a model that emits reasoning
 	// streams it BEFORE its content and it lands at the front of Response.
 	//
-	// Score presence against Response, ordering against ContentOnly. Empty
-	// when a consumer does not split the two — callers fall back to Response.
-	ContentOnly      string
+	// Score presence against Response, ordering against ContentOnly and
+	// ReasoningOnly. Both are empty when a consumer does not split the
+	// channels — callers fall back to Response.
+	ContentOnly string
+	// ReasoningOnly is the reasoning/thinking trace alone. Ordering is scored
+	// leniently: a model that opens its reasoning with the recited list has
+	// demonstrated the same recall as one that opens its content with it, and
+	// which channel it chose is a serving-stack detail, not a cache result.
+	ReasoningOnly    string
 	IsImplicitCached bool    // True if TTFT is 50%+ faster than baseline for this series
 	IsEmpty          bool    // True if the response body was empty (potential server error)
 	LocalCacheRatio  float64 // estimated fraction of this request's prompt that was repeated (in [0,1])
@@ -100,5 +106,5 @@ type RequestMetrics struct {
 	// ignore_eos setting cannot explain).
 	GarbageVerdict string
 	LeakedUUIDs    []string // "uuid(series=N)" entries for any OTHER session's UUID found here
-	ExactMatch     bool     // first line of ContentOnly is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
+	ExactMatch     bool     // content OR reasoning opens with the ordered, comma-joined ExpectedUUIDs list (output conformity)
 }

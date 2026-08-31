@@ -1201,3 +1201,50 @@ func TestContentOnlyStreamingSeparatesReasoning(t *testing.T) {
 		t.Errorf("firstLineConformity(ContentOnly) = false, want true")
 	}
 }
+
+// TestConformsAnyChannel pins the lenient conformity rule: the recited list
+// may open either channel. Recall is what is being measured; which channel a
+// serving stack puts it in is not.
+func TestConformsAnyChannel(t *testing.T) {
+	want := []string{"u1", "u2"}
+	cases := []struct {
+		name                       string
+		content, reasoning, merged string
+		conform                    bool
+	}{
+		{"content leads", "u1, u2 then prose", "idle musing", "", true},
+		{"reasoning leads, content does not", "here is the answer", "u1, u2 recalled", "", true},
+		{"both lead", "u1, u2", "u1, u2", "", true},
+		{"neither leads", "here is the answer", "idle musing", "", false},
+		{"split absent, merged leads", "", "", "u1, u2 then prose", true},
+		{"split absent, merged does not", "", "", "prose first", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := conformsAnyChannel(c.content, c.reasoning, c.merged, want)
+			if got != c.conform {
+				t.Errorf("conformsAnyChannel(%q,%q,%q) = %v, want %v",
+					c.content, c.reasoning, c.merged, got, c.conform)
+			}
+		})
+	}
+}
+
+// TestReasoningLeadingListScoresConforming is the end-to-end shape of the
+// lenient rule through a real consumer: the model opened its reasoning with
+// the list and its content with prose, which must still score as conforming.
+func TestReasoningLeadingListScoresConforming(t *testing.T) {
+	body := strings.NewReader(`{
+		"choices": [{"index": 0, "message": {"role": "assistant", "content": "Sure, here you go.", "reasoning": "u1, u2 — those are the ids"}, "finish_reason": "stop"}],
+		"usage": {"prompt_tokens": 10, "completion_tokens": 5}
+	}`)
+	var m RequestMetrics
+	consumeOpenAIPlain(body, time.Now(), &m)
+
+	if m.ReasoningOnly != "u1, u2 — those are the ids" {
+		t.Errorf("m.ReasoningOnly = %q, want the reasoning trace alone", m.ReasoningOnly)
+	}
+	if !conformsAnyChannel(m.ContentOnly, m.ReasoningOnly, m.Response, []string{"u1", "u2"}) {
+		t.Errorf("want conforming: reasoning opens with the list")
+	}
+}

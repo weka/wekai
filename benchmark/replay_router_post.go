@@ -896,15 +896,10 @@ func (p *replayPoster) do(
 		for i, u := range inj.ReciteUUIDs {
 			m.UUIDFound[i] = strings.Contains(m.Response, u)
 		}
-		// Ordering is scored on content only: m.Response carries the
-		// reasoning trace ahead of the content, which fails the prefix test
-		// even when the content leads with the list correctly. Falls back to
-		// Response when a consumer does not split the two.
-		conformitySrc := m.ContentOnly
-		if conformitySrc == "" {
-			conformitySrc = m.Response
-		}
-		m.ExactMatch = firstLineConformity(conformitySrc, inj.ReciteUUIDs)
+		// Ordering is scored per channel, not on m.Response: that string
+		// carries the reasoning trace ahead of the content, which fails a
+		// prefix test even when the content leads with the list correctly.
+		m.ExactMatch = conformsAnyChannel(m.ContentOnly, m.ReasoningOnly, m.Response, inj.ReciteUUIDs)
 		// Attribute every miss while the injection is still in hand: only here
 		// is it known which markers this request actually sent.
 		cls := classifyRecite(m.Response, inj, m.UUIDFound)
@@ -1073,6 +1068,7 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	var firstToken sync.Once
 	var resp strings.Builder
 	var contentOnly strings.Builder
+	var reasoningOnly strings.Builder
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -1133,6 +1129,7 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 			// arrive before content ones, so `resp` above leads with the
 			// reasoning trace. See RequestMetrics.ContentOnly.
 			contentOnly.WriteString(content)
+			reasoningOnly.WriteString(reasoning)
 		}
 	}
 	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
@@ -1143,6 +1140,7 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	m.TotalResponseTime = time.Since(startTime)
 	m.Response = resp.String()
 	m.ContentOnly = contentOnly.String()
+	m.ReasoningOnly = reasoningOnly.String()
 }
 
 // consumeOpenAIPlain reads a non-streaming OpenAI chat/completions response.
@@ -1188,6 +1186,7 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 		}
 		m.Response = reasoning + msg.Content
 		m.ContentOnly = msg.Content
+		m.ReasoningOnly = reasoning
 	}
 	cached := 0
 	if resp.Usage.PromptTokensDetails != nil {
