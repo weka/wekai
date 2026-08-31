@@ -629,6 +629,35 @@ func noCacheDataObserved(m cacheMetrics, minCount int) bool {
 	return m.count >= minCount && m.hitRate == 0 && !m.serverReported
 }
 
+// cacheWarningMessage tailors the cacheWarning explanation to what the model
+// spec's type= actually names, when it names one of the two backends known
+// to gate cached_tokens reporting behind a server-launch flag: vLLM's
+// --enable-prompt-tokens-details and SGLang's --enable-cache-report. Both
+// require the client to ask per-request (already done for type=openai_sglang
+// — see llm/chat_clients.go and replay_router_wire.go) AND the server to be
+// launched with the matching flag; wekai controls only the former; a
+// deployment missing the latter looks from here exactly like a server that
+// genuinely never caches — the message says both are possible rather than
+// asserting whichever cause a client can never observe from the API alone.
+func cacheWarningMessage(modelSpec string) string {
+	generic := "Server may not support prompt caching, or is not configured to report it"
+	if !llm.IsDynamicModel(modelSpec) {
+		return generic
+	}
+	dyn, err := llm.ParseDynamicModel(modelSpec)
+	if err != nil {
+		return generic
+	}
+	switch dyn.Type {
+	case "openai_vllm":
+		return generic + " (vLLM must be launched with --enable-prompt-tokens-details)"
+	case "openai_sglang":
+		return generic + " (SGLang must be launched with --enable-cache-report)"
+	default:
+		return generic
+	}
+}
+
 // GlobalLocalCacheRate returns the all-time fraction of warm input tokens among all input tokens.
 // O(1): reads two running counters maintained in Add(), never scans history.
 // Purely local: a request is "cached" when its series already submitted this prefix before.
@@ -1448,7 +1477,7 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 	fmt.Printf(" Cache hit rate     : %.1f%%\n", res.cacheHitRate*100)
 	fmt.Printf(" Tok/s in/out       : %s / %s\n", formatKilo(res.inputTokPerSec), formatKilo(res.outputTokPerSec))
 	if res.cacheWarning {
-		fmt.Println(" ⚠  Server may not support prompt caching")
+		fmt.Printf(" ⚠  %s\n", cacheWarningMessage(cfg.Model))
 	}
 	fmt.Println(strings.Repeat("-", 62))
 	totalInput := res.totalInputCold + res.totalInputWarm
