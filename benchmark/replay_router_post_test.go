@@ -1145,3 +1145,59 @@ func TestPassStampReachesTheMarkers(t *testing.T) {
 			"holding its own", p0[0])
 	}
 }
+
+// TestContentOnlySeparatesReasoningFromContent pins the split that keeps
+// presence and ordering scored on different text. Response merges the
+// reasoning trace so a UUID recited only there still counts as present;
+// ContentOnly must NOT carry it, because ordering is scored on a prefix and
+// a leading reasoning trace fails that test even when the content is correct.
+func TestContentOnlySeparatesReasoningFromContent(t *testing.T) {
+	body := strings.NewReader(`{
+		"choices": [{"index": 0, "message": {"role": "assistant", "content": "u1, u2", "reasoning": "first I recall u1, u2 then answer"}, "finish_reason": "stop"}],
+		"usage": {"prompt_tokens": 10, "completion_tokens": 5}
+	}`)
+	var m RequestMetrics
+	consumeOpenAIPlain(body, time.Now(), &m)
+
+	if !strings.Contains(m.Response, "first I recall") {
+		t.Errorf("m.Response = %q, want the reasoning merged in for presence scoring", m.Response)
+	}
+	if strings.Contains(m.ContentOnly, "first I recall") {
+		t.Errorf("m.ContentOnly = %q, want it free of the reasoning trace", m.ContentOnly)
+	}
+	if m.ContentOnly != "u1, u2" {
+		t.Errorf("m.ContentOnly = %q, want exactly the content", m.ContentOnly)
+	}
+	// The whole point: ordering passes on ContentOnly and fails on Response.
+	if !firstLineConformity(m.ContentOnly, []string{"u1", "u2"}) {
+		t.Errorf("firstLineConformity(ContentOnly) = false, want true")
+	}
+	if firstLineConformity(m.Response, []string{"u1", "u2"}) {
+		t.Errorf("firstLineConformity(Response) = true; the reasoning prefix should defeat it")
+	}
+}
+
+// TestContentOnlyStreamingSeparatesReasoning is the SSE counterpart: vLLM
+// streams reasoning deltas before content deltas, so Response leads with the
+// trace while ContentOnly must accumulate content alone.
+func TestContentOnlyStreamingSeparatesReasoning(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"reasoning":"thinking about u1, u2"}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"content":"u1, u2"}}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n")
+	var m RequestMetrics
+	consumeOpenAISSE(strings.NewReader(sse), time.Now(), &m)
+
+	if !strings.Contains(m.Response, "thinking about") {
+		t.Errorf("m.Response = %q, want reasoning merged for presence", m.Response)
+	}
+	if m.ContentOnly != "u1, u2" {
+		t.Errorf("m.ContentOnly = %q, want only the content deltas", m.ContentOnly)
+	}
+	if !firstLineConformity(m.ContentOnly, []string{"u1", "u2"}) {
+		t.Errorf("firstLineConformity(ContentOnly) = false, want true")
+	}
+}

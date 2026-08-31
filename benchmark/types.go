@@ -30,13 +30,22 @@ type RequestMetrics struct {
 	TotalResponseTime time.Duration // Total time for request
 	UsageData         tools.ExecutionUsageData
 	Error             error
-	Response          string  // The actual response content
-	IsImplicitCached  bool    // True if TTFT is 50%+ faster than baseline for this series
-	IsEmpty           bool    // True if the response body was empty (potential server error)
-	LocalCacheRatio   float64 // estimated fraction of this request's prompt that was repeated (in [0,1])
-	CachedPrompt      string  // Full system prompt text (only populated on error/empty for diagnostics)
-	Question          string  // The user question sent with the request (only populated on error/empty)
-	RawResponseTail   string  // raw SSE tail (last bytes); only populated on error/empty for diagnostics
+	Response          string // The actual response content
+	// ContentOnly is the assistant's content stream WITHOUT the reasoning
+	// trace. Response merges reasoning in, so a UUID recalled inside a
+	// reasoning trace still counts as PRESENT; that merge is wrong for any
+	// check that cares about ORDER, because a model that emits reasoning
+	// streams it BEFORE its content and it lands at the front of Response.
+	//
+	// Score presence against Response, ordering against ContentOnly. Empty
+	// when a consumer does not split the two — callers fall back to Response.
+	ContentOnly      string
+	IsImplicitCached bool    // True if TTFT is 50%+ faster than baseline for this series
+	IsEmpty          bool    // True if the response body was empty (potential server error)
+	LocalCacheRatio  float64 // estimated fraction of this request's prompt that was repeated (in [0,1])
+	CachedPrompt     string  // Full system prompt text (only populated on error/empty for diagnostics)
+	Question         string  // The user question sent with the request (only populated on error/empty)
+	RawResponseTail  string  // raw SSE tail (last bytes); only populated on error/empty for diagnostics
 	// Retries429 / RetryWait record the client-side backoff a request spent
 	// waiting out 429s before it was served (or gave up). TimeToFirstToken
 	// measures the attempt that actually ran, so it stays a server-latency
@@ -91,5 +100,5 @@ type RequestMetrics struct {
 	// ignore_eos setting cannot explain).
 	GarbageVerdict string
 	LeakedUUIDs    []string // "uuid(series=N)" entries for any OTHER session's UUID found here
-	ExactMatch     bool     // first line of Response is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
+	ExactMatch     bool     // first line of ContentOnly is exactly the ordered, comma-joined ExpectedUUIDs list (output conformity)
 }

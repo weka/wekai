@@ -896,7 +896,15 @@ func (p *replayPoster) do(
 		for i, u := range inj.ReciteUUIDs {
 			m.UUIDFound[i] = strings.Contains(m.Response, u)
 		}
-		m.ExactMatch = firstLineConformity(m.Response, inj.ReciteUUIDs)
+		// Ordering is scored on content only: m.Response carries the
+		// reasoning trace ahead of the content, which fails the prefix test
+		// even when the content leads with the list correctly. Falls back to
+		// Response when a consumer does not split the two.
+		conformitySrc := m.ContentOnly
+		if conformitySrc == "" {
+			conformitySrc = m.Response
+		}
+		m.ExactMatch = firstLineConformity(conformitySrc, inj.ReciteUUIDs)
 		// Attribute every miss while the injection is still in hand: only here
 		// is it known which markers this request actually sent.
 		cls := classifyRecite(m.Response, inj, m.UUIDFound)
@@ -1064,6 +1072,7 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	scanner.Buffer(make([]byte, 1<<16), 16<<20)
 	var firstToken sync.Once
 	var resp strings.Builder
+	var contentOnly strings.Builder
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -1120,6 +1129,10 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 			}
 			resp.WriteString(content)
 			resp.WriteString(reasoning)
+			// Content-only stream, for ordering checks: reasoning deltas
+			// arrive before content ones, so `resp` above leads with the
+			// reasoning trace. See RequestMetrics.ContentOnly.
+			contentOnly.WriteString(content)
 		}
 	}
 	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
@@ -1129,6 +1142,7 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	}
 	m.TotalResponseTime = time.Since(startTime)
 	m.Response = resp.String()
+	m.ContentOnly = contentOnly.String()
 }
 
 // consumeOpenAIPlain reads a non-streaming OpenAI chat/completions response.
@@ -1173,6 +1187,7 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 			reasoning = msg.Reasoning
 		}
 		m.Response = reasoning + msg.Content
+		m.ContentOnly = msg.Content
 	}
 	cached := 0
 	if resp.Usage.PromptTokensDetails != nil {
