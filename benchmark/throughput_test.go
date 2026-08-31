@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -87,6 +88,60 @@ func TestDisplayHitRateServerCache(t *testing.T) {
 			t.Errorf("DisplayHitRate() = %f, want hitRate = %f", cm.DisplayHitRate(), cm.hitRate)
 		}
 	})
+}
+
+// TestNoCacheDataObserved locks down the distinction noCacheDataObserved
+// exists to draw: a genuinely absent cache signal (server not caching, or not
+// reporting it) versus a cache that is working but happens to show 0% right
+// now (e.g. still warming up, or a heuristic miss offset by a nonzero server
+// report).
+func TestNoCacheDataObserved(t *testing.T) {
+	cases := []struct {
+		name string
+		cm   cacheMetrics
+		min  int
+		want bool
+	}{
+		{"neither signal ever fired, enough records", cacheMetrics{count: 20, hitRate: 0, serverReported: false}, 10, true},
+		{"below minCount — too early to tell", cacheMetrics{count: 5, hitRate: 0, serverReported: false}, 10, false},
+		{"server reported even though heuristic is 0", cacheMetrics{count: 20, hitRate: 0, serverReported: true}, 10, false},
+		{"heuristic found hits", cacheMetrics{count: 20, hitRate: 0.4, serverReported: false}, 10, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := noCacheDataObserved(c.cm, c.min); got != c.want {
+				t.Errorf("noCacheDataObserved(%+v, %d) = %v, want %v", c.cm, c.min, got, c.want)
+			}
+		})
+	}
+}
+
+// TestCacheWarningMessage locks down that the warning names the actual
+// server-launch flag for vLLM/SGLang, rather than a generic message that
+// leaves the operator to guess between "server doesn't cache at all" and
+// "server caches but wasn't launched with the flag that reports it" — the
+// distinction that prompted this message in the first place (see
+// cacheWarningMessage's doc comment for the exact flags and why both a
+// client-side opt-in and a server-side flag are required).
+func TestCacheWarningMessage(t *testing.T) {
+	cases := []struct {
+		name         string
+		spec         string
+		wantContains string
+	}{
+		{"vllm names its flag", "dynamic/http://h:1/v1,type=openai_vllm,model=m", "--enable-prompt-tokens-details"},
+		{"sglang names its flag", "dynamic/http://h:1/v1,type=openai_sglang,model=m", "--enable-cache-report"},
+		{"plain openai gets the generic message", "dynamic/http://h:1/v1,type=openai,model=m", "may not support"},
+		{"non-dynamic model gets the generic message", "gpt-4", "may not support"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := cacheWarningMessage(c.spec)
+			if !strings.Contains(got, c.wantContains) {
+				t.Errorf("cacheWarningMessage(%q) = %q, want it to contain %q", c.spec, got, c.wantContains)
+			}
+		})
+	}
 }
 
 // TestWarmTokensIncludeServerCache reproduces the multi-backend anomaly where an

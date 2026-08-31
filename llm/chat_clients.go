@@ -281,7 +281,7 @@ func getDynamicChatGetter(model string, params *ChatParams) *ChatGetter {
 
 	// Determine client type based on config
 	switch dynConfig.Type {
-	case "openai", "openai_vllm":
+	case "openai", "openai_vllm", "openai_sglang":
 		modelInfo.ClientType = ClientTypeOpenAI
 	case "openai_responses":
 		modelInfo.ClientType = ClientTypeOpenAIResponses
@@ -314,7 +314,7 @@ func getDynamicChatGetter(model string, params *ChatParams) *ChatGetter {
 	// treatment the openai branches have used since this code was written.
 	var apiKey string
 	switch dynConfig.Type {
-	case "openai", "openai_vllm", "openai_responses":
+	case "openai", "openai_vllm", "openai_sglang", "openai_responses":
 		apiKey = params.APIKeys.OpenAI
 	case "anthropic":
 		apiKey = params.APIKeys.Anthropic
@@ -350,8 +350,19 @@ func getDynamicChatGetter(model string, params *ChatParams) *ChatGetter {
 		APIKey:                 apiKey,
 		StreamResponseCallback: responseCallback,
 		StreamThinkingCallback: thinkingCallback,
-		UseCompatMaxTokens:     dynConfig.Type == "openai_vllm",
+		UseCompatMaxTokens:     dynConfig.Type == "openai_vllm" || dynConfig.Type == "openai_sglang",
 		WebSearchEnabled:       params.WebSearchEnabled,
+	}
+	if dynConfig.Type == "openai_sglang" {
+		// SGLang only populates usage.prompt_tokens_details.cached_tokens when
+		// asked per-request. This is necessary but not sufficient: the server
+		// must ALSO be launched with --enable-cache-report
+		// (sglang/srt/entrypoints/openai/serving_chat.py checks both the
+		// request field and tokenizer_manager.server_args.enable_cache_report),
+		// same two-sided requirement as vLLM's --enable-prompt-tokens-details.
+		// Without either half, cache hit rate always reads as 0 against an
+		// SGLang backend — see cacheWarningMessage in benchmark/auto.go.
+		llmConfigTemplate.ExtraBodyParams = map[string]interface{}{"return_cached_tokens_details": true}
 	}
 
 	// selectBaseURL returns a random endpoint when multiple are configured,

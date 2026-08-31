@@ -215,6 +215,13 @@ func TestNewReplayPoster_OpenAI(t *testing.T) {
 			wantFallback: "http://127.0.0.1:8000/v1/v1/chat/completions",
 		},
 		{
+			name:         "openai_sglang type, /v1 base",
+			modelSpec:    "dynamic/http://127.0.0.1:8000/v1,type=openai_sglang,model=my-model",
+			wantType:     "openai_sglang",
+			wantPrimary:  "http://127.0.0.1:8000/v1/chat/completions",
+			wantFallback: "http://127.0.0.1:8000/v1/v1/chat/completions",
+		},
+		{
 			name:         "anthropic type, /v1 base",
 			modelSpec:    "dynamic/http://127.0.0.1:8000/v1,type=anthropic,model=claude",
 			wantType:     "anthropic",
@@ -467,6 +474,70 @@ func TestOpenAIReplayEndToEnd(t *testing.T) {
 	}
 }
 
+// TestOpenAISGLangReplaySetsReturnCachedTokensDetails confirms
+// type=openai_sglang is accepted by newReplayPoster's type allow-list and
+// that the wire body it builds carries return_cached_tokens_details — SGLang's
+// per-request opt-in for usage.prompt_tokens_details.cached_tokens (vLLM's
+// equivalent is the server-launch flag --enable-prompt-tokens-details, so
+// type=openai_vllm needs no such field — see TestOpenAIReplayEndToEnd, which
+// exercises type=openai without it). Without this, cache hit rate reads as 0
+// against every SGLang response, same failure mode as an unflagged vLLM
+// server.
+func TestOpenAISGLangReplaySetsReturnCachedTokensDetails(t *testing.T) {
+	var receivedBody map[string]interface{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			w.WriteHeader(404)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Errorf("failed to decode request body: %v", err)
+			w.WriteHeader(400)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprintf(w, `data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"test-model","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}`+"\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		fmt.Fprintf(w, `data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11,"prompt_tokens_details":{"cached_tokens":5}}}`+"\n\n")
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+	}))
+	defer ts.Close()
+
+	modelSpec := fmt.Sprintf("dynamic/%s,type=openai_sglang,model=test-model", ts.URL)
+	keys := llm.APIKeys{OpenAI: "sk-test-123"}
+	p, err := newReplayPoster(modelSpec, keys, "", "", false, 0, 0, 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newReplayPoster: %v", err)
+	}
+	if p.apiType != "openai_sglang" {
+		t.Fatalf("apiType = %q, want openai_sglang", p.apiType)
+	}
+
+	req := RouterReplayRequest{
+		RequestID:    1,
+		Stream:       true,
+		OutputTokens: 100,
+		SystemBlocks: []RouterReplaySystemBlock{{Hash: "syshash", Bytes: 250}},
+		Messages: []RouterReplayMessage{
+			{Role: "user", Hash: "msghash1", Bytes: 60, BlockTypes: []string{"text"}},
+		},
+	}
+	st := &autoState{stream: newCompletionStream(200)}
+	metrics := p.do(context.Background(), req, strings.Repeat("x", 300), 1, "session-1", "instance-1", 1, st, nil)
+	if metrics.Error != nil {
+		t.Fatalf("unexpected error: %v", metrics.Error)
+	}
+	if v, ok := receivedBody["return_cached_tokens_details"]; !ok || v != true {
+		t.Errorf("return_cached_tokens_details = %v (present=%v), want true", v, ok)
+	}
+	if metrics.UsageData.CachedTokens.Count != 5 {
+		t.Errorf("cached tokens = %d, want 5", metrics.UsageData.CachedTokens.Count)
+	}
+}
+
 // TestOpenAIReplayToolTranslation verifies that assistant messages with
 // tool_use blocks are translated into proper OpenAI tool_calls (not flattened).
 func TestOpenAIReplayToolTranslation(t *testing.T) {
@@ -485,7 +556,7 @@ func TestOpenAIReplayToolTranslation(t *testing.T) {
 		},
 	}
 
-	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, 0, nil)
+	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, 0, nil, false)
 	if err != nil {
 		t.Fatalf("buildOpenAIChatCompletionsBody: %v", err)
 	}
@@ -548,7 +619,7 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 				{Role: "user", Hash: "h1", Bytes: 50, BlockTypes: []string{"text"}},
 			},
 		}
-		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "run-42", 0, false, 0, nil)
+		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "run-42", 0, false, 0, nil, false)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
@@ -577,7 +648,7 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 				{Role: "user", Hash: "h1", Bytes: 50, BlockTypes: []string{"text"}},
 			},
 		}
-		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, 0, nil)
+		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, 0, nil, false)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
@@ -605,7 +676,7 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 				{Role: "user", Hash: "h1", Bytes: 50, BlockTypes: []string{"text"}},
 			},
 		}
-		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, 0, nil)
+		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, 0, nil, false)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
@@ -631,7 +702,7 @@ func TestOpenAIBodyBuilderExtra(t *testing.T) {
 			Stream:       true,
 			OutputTokens: 100,
 		}
-		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, 0, nil)
+		body, _, err := buildOpenAIChatCompletionsBody(req, docs, "test-model", "", 0, false, 0, nil, false)
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}

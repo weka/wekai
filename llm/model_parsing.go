@@ -9,7 +9,7 @@ import (
 type DynamicModelConfig struct {
 	BaseURL         string   // Base URL for the API endpoint — always BaseURLs[0] (for backward compat, model fetching, display)
 	BaseURLs        []string // All endpoint URLs; random selection happens per call when len > 1
-	Type            string   // Client type: "openai", "anthropic", "gemini" (default: "openai")
+	Type            string   // Client type: "openai", "openai_vllm", "openai_sglang", "anthropic", "gemini" (default: "openai")
 	ContextSize     int      // Context size if specified (0 = use default)
 	MaxTokens       int      // Maximum output tokens if specified (0 = use default)
 	Model           string   // Model identifier to send to the API (optional, can be extracted from /models endpoint)
