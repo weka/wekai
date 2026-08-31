@@ -89,6 +89,32 @@ func TestDisplayHitRateServerCache(t *testing.T) {
 	})
 }
 
+// TestNoCacheDataObserved locks down the distinction noCacheDataObserved
+// exists to draw: a genuinely absent cache signal (server not caching, or not
+// reporting it) versus a cache that is working but happens to show 0% right
+// now (e.g. still warming up, or a heuristic miss offset by a nonzero server
+// report).
+func TestNoCacheDataObserved(t *testing.T) {
+	cases := []struct {
+		name string
+		cm   cacheMetrics
+		min  int
+		want bool
+	}{
+		{"neither signal ever fired, enough records", cacheMetrics{count: 20, hitRate: 0, serverReported: false}, 10, true},
+		{"below minCount — too early to tell", cacheMetrics{count: 5, hitRate: 0, serverReported: false}, 10, false},
+		{"server reported even though heuristic is 0", cacheMetrics{count: 20, hitRate: 0, serverReported: true}, 10, false},
+		{"heuristic found hits", cacheMetrics{count: 20, hitRate: 0.4, serverReported: false}, 10, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := noCacheDataObserved(c.cm, c.min); got != c.want {
+				t.Errorf("noCacheDataObserved(%+v, %d) = %v, want %v", c.cm, c.min, got, c.want)
+			}
+		})
+	}
+}
+
 // TestWarmTokensIncludeServerCache reproduces the multi-backend anomaly where an
 // aggressively-caching backend reported near-zero "warm" tokens despite serving
 // more requests. Providers subtract server-cached tokens out of prompt_tokens, so
