@@ -90,6 +90,16 @@ const (
 // DefaultNames are the upstream counters aggregated unless told otherwise.
 // Anything else in a scrape is ignored: a router that re-exported every vLLM
 // series would multiply cardinality by the fleet size for no one's benefit.
+//
+// A caller fronting SGLang backends can add SGLang's counter-shaped series
+// (e.g. "sglang:prompt_tokens_total", "sglang:generation_tokens_total") to
+// Names — this aggregator is generic over counter names and the delta scheme
+// applies to them just as it does to vLLM's. Do NOT add
+// "sglang:cache_hit_rate": it is a GAUGE already expressed as a ratio, not a
+// monotonic counter, and running it through delta-on-restart accumulation
+// would silently produce a meaningless number. A gauge must be sampled as a
+// current value (see benchmark/sglang_metrics.go for that shape), never
+// summed here.
 var DefaultNames = []string{"vllm:prompt_tokens_by_source_total"}
 
 // Config configures the aggregator.
