@@ -355,9 +355,13 @@ func getDynamicChatGetter(model string, params *ChatParams) *ChatGetter {
 	}
 	if dynConfig.Type == "openai_sglang" {
 		// SGLang only populates usage.prompt_tokens_details.cached_tokens when
-		// asked per-request; vLLM's equivalent is the server-launch flag
-		// --enable-prompt-tokens-details. Without this, cache hit rate always
-		// reads as 0 against an SGLang backend.
+		// asked per-request. This is necessary but not sufficient: the server
+		// must ALSO be launched with --enable-cache-report
+		// (sglang/srt/entrypoints/openai/serving_chat.py checks both the
+		// request field and tokenizer_manager.server_args.enable_cache_report),
+		// same two-sided requirement as vLLM's --enable-prompt-tokens-details.
+		// Without either half, cache hit rate always reads as 0 against an
+		// SGLang backend — see cacheWarningMessage in benchmark/auto.go.
 		llmConfigTemplate.ExtraBodyParams = map[string]interface{}{"return_cached_tokens_details": true}
 	}
 
