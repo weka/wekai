@@ -201,7 +201,30 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 // which otherwise pins max_tokens to what the model produced in the original
 // capture (making the model stop early on replay). Otherwise falls back to the
 // original precedence: output_tokens, then max_tokens, then 1 as a guard.
+// replayMinOutputTokens is a FLOOR under every replayed request's max_tokens,
+// set once from --replay-min-output-tokens before any request is sent and
+// read-only thereafter (same shape as the reciteReserveTokens family of tuning
+// values above).
+//
+// A ratio cannot express this. --replay-output-ratio scales with InputTokens, so
+// short early turns still get single-digit budgets, and the recorded
+// OutputTokens are whatever the original capture happened to produce — a median
+// of 19 tokens on the 5k-session set. That is survivable for a model that
+// answers immediately and fatal for one that reasons first: it spends the whole
+// budget thinking, gets cut off at finish_reason=length, and is scored as having
+// failed to recite. The floor gives every request room to finish reasoning AND
+// answer, so the score measures recall rather than output budget.
+var replayMinOutputTokens int
+
 func pickMaxTokens(req RouterReplayRequest, outputRatio float64) int {
+	n := pickMaxTokensRaw(req, outputRatio)
+	if replayMinOutputTokens > 0 && n < replayMinOutputTokens {
+		return replayMinOutputTokens
+	}
+	return n
+}
+
+func pickMaxTokensRaw(req RouterReplayRequest, outputRatio float64) int {
 	if outputRatio > 0 && req.InputTokens > 0 {
 		n := int(math.Round(float64(req.InputTokens) * outputRatio))
 		if n < 1 {

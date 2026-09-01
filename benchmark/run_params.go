@@ -57,12 +57,13 @@ type runParamsRecord struct {
 	MaxOutputTokens   int     `json:"max_output_tokens,omitempty"`
 
 	// Source of work: router replay, dataset replay, or synthetic.
-	RouterReplayFile  string  `json:"router_replay_file,omitempty"`
-	RouterReplayRoles string  `json:"router_replay_roles,omitempty"`
-	ReplayOutputRatio float64 `json:"replay_output_ratio,omitempty"`
-	ForceOutputVolume bool    `json:"force_output_volume,omitempty"`
-	FromDataset       string  `json:"from_dataset,omitempty"`
-	ReplaySeries      int     `json:"replay_series,omitempty"`
+	RouterReplayFile      string  `json:"router_replay_file,omitempty"`
+	RouterReplayRoles     string  `json:"router_replay_roles,omitempty"`
+	ReplayOutputRatio     float64 `json:"replay_output_ratio,omitempty"`
+	ReplayMinOutputTokens int     `json:"replay_min_output_tokens,omitempty"`
+	ForceOutputVolume     bool    `json:"force_output_volume,omitempty"`
+	FromDataset           string  `json:"from_dataset,omitempty"`
+	ReplaySeries          int     `json:"replay_series,omitempty"`
 
 	// Synthetic-prompt shaping (ignored in replay modes).
 	Step                  int `json:"step,omitempty"`
@@ -100,12 +101,13 @@ func buildRunParams(cfg AutoBenchmarkConfig, now time.Time) runParamsRecord {
 		TotalRequests:   cfg.Total,
 		MaxOutputTokens: cfg.MaxOutputTokens,
 
-		RouterReplayFile:  cfg.RouterReplayFile,
-		RouterReplayRoles: cfg.RouterReplayRoles,
-		ReplayOutputRatio: cfg.ReplayOutputRatio,
-		ForceOutputVolume: cfg.forceVolume(),
-		FromDataset:       cfg.FromDataset,
-		ReplaySeries:      cfg.ReplaySeries,
+		RouterReplayFile:      cfg.RouterReplayFile,
+		RouterReplayRoles:     cfg.RouterReplayRoles,
+		ReplayOutputRatio:     cfg.ReplayOutputRatio,
+		ReplayMinOutputTokens: cfg.ReplayMinOutputTokens,
+		ForceOutputVolume:     cfg.forceVolume(),
+		FromDataset:           cfg.FromDataset,
+		ReplaySeries:          cfg.ReplaySeries,
 
 		Step:                  cfg.Step,
 		StepStartingTokens:    cfg.StepStartingTokens,

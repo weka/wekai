@@ -293,6 +293,7 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		RouterReplayFile:              c.RouterReplayFile,
 		RouterReplayRoles:             c.RouterReplayRoles,
 		ReplayOutputRatio:             c.ReplayOutputRatio,
+		ReplayMinOutputTokens:         c.ReplayMinOutputTokens,
 		// Force-output (short continue-generating instruction + vLLM
 		VerifyForceEOS:     c.VerifyForceEOS,
 		DryRun:             c.DryRun,
@@ -331,6 +332,12 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 	}
 	if c.ReplayOutputRatio > 0 && c.RouterReplayFile == "" {
 		return fmt.Errorf("--replay-output-ratio requires --router-replay-file")
+	}
+	if c.ReplayMinOutputTokens < 0 {
+		return fmt.Errorf("--replay-min-output-tokens must be >= 0, got %d", c.ReplayMinOutputTokens)
+	}
+	if c.ReplayMinOutputTokens > 0 && c.RouterReplayFile == "" {
+		return fmt.Errorf("--replay-min-output-tokens requires --router-replay-file")
 	}
 
 	// Parse --replay-series-indices / --replay-series-range into a set of

@@ -408,3 +408,35 @@ func TestBuildAnthropicMessagesBodyOutputRatioMaxTokens(t *testing.T) {
 		t.Errorf("anthropic max_tokens (no ratio) = %v, want %v", got, want)
 	}
 }
+
+// TestPickMaxTokensFloor pins --replay-min-output-tokens: it raises a budget
+// that would otherwise be too small for a model to finish reasoning and then
+// answer, and never lowers one that is already larger.
+func TestPickMaxTokensFloor(t *testing.T) {
+	defer func() { replayMinOutputTokens = 0 }()
+
+	req := RouterReplayRequest{InputTokens: 4000, OutputTokens: 19}
+
+	replayMinOutputTokens = 0
+	if got := pickMaxTokens(req, 0); got != 19 {
+		t.Errorf("floor off: pickMaxTokens() = %d, want the recorded 19", got)
+	}
+
+	replayMinOutputTokens = 512
+	if got := pickMaxTokens(req, 0); got != 512 {
+		t.Errorf("floor on: pickMaxTokens() = %d, want 512", got)
+	}
+
+	// A budget already above the floor is untouched.
+	big := RouterReplayRequest{InputTokens: 4000, OutputTokens: 4096}
+	if got := pickMaxTokens(big, 0); got != 4096 {
+		t.Errorf("floor must not lower a larger budget: got %d, want 4096", got)
+	}
+
+	// The floor also applies over --replay-output-ratio, which scales with
+	// input and so still yields tiny budgets on short turns.
+	short := RouterReplayRequest{InputTokens: 100}
+	if got := pickMaxTokens(short, 0.02); got != 512 {
+		t.Errorf("floor over ratio: got %d, want 512", got)
+	}
+}

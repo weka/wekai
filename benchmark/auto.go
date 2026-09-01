@@ -247,6 +247,9 @@ type AutoBenchmarkConfig struct {
 	// model stops almost immediately on replay — a ~500:1 input:output run).
 	// 0 = off (original precedence: output_tokens, then max_tokens, then 1).
 	ReplayOutputRatio float64
+	// ReplayMinOutputTokens (--replay-min-output-tokens) floors every replayed
+	// request's max_tokens. See pickMaxTokens.
+	ReplayMinOutputTokens int
 	// VerifyForceEOS keeps ignore_eos on under --verify. See forceVolume for
 	// the rule it feeds.
 	VerifyForceEOS bool
@@ -2125,6 +2128,9 @@ func runSingleModelBenchmark(
 				break
 			}
 			pp.outputRatio = cfg.ReplayOutputRatio
+			// Package-level floor: set once, identical for every poster, read-only
+			// for the rest of the run (see replayMinOutputTokens).
+			replayMinOutputTokens = cfg.ReplayMinOutputTokens
 			pp.limitContext = cfg.LimitContext
 			pp.replayCharsPerToken = cfg.ReplayCharsPerToken
 			pp.forceVolume = cfg.forceVolume()
