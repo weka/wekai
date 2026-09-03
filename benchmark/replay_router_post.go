@@ -49,7 +49,19 @@ type replayPoster struct {
 	epResolved string // latched endpoint; "" until the first success
 	epFellBack bool
 	apiType    string // "anthropic", "openai", or "openai_vllm"
-	client     *http.Client
+	// reasoningEffort and thinking come straight from the model spec's
+	// reasoning_effort=/thinking= parameters (llm.DynamicModelConfig, parsed
+	// once in newReplayPoster). Only wired into the OpenAI/vLLM chat-
+	// completions body (see buildOpenAIChatCompletionsBody): Anthropic's
+	// "thinking" is a structured {type,budget_tokens} object, not a string,
+	// so there is no equivalent passthrough on that path. reasoningEffort is
+	// tri-state — "" sends "none" explicitly, "omit" drops the key, any
+	// other value is forwarded verbatim (see buildOpenAIChatCompletionsBody's
+	// doc for why). thinking is a plain passthrough with no default: "" omits
+	// the key, anything else is forwarded verbatim.
+	reasoningEffort string
+	thinking        string
+	client          *http.Client
 	// retryBudget is the total time a request may spend waiting out 429s
 	// before the shed stands as an error. Defaults to retry429Budget; a field
 	// rather than a constant so a test can exercise the give-up path without
@@ -265,14 +277,16 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 		model = "dry-run"
 	}
 	return &replayPoster{
-		model:      model,
-		epPrimary:  epPrimary,
-		epFallback: epFallback,
-		apiKey:     apiKey,
-		apiType:    dyn.Type,
-		runID:      runID,
-		dryRun:     dryRun,
-		estimator:  estimator,
+		model:           model,
+		epPrimary:       epPrimary,
+		epFallback:      epFallback,
+		apiKey:          apiKey,
+		apiType:         dyn.Type,
+		reasoningEffort: dyn.ReasoningEffort,
+		thinking:        dyn.Thinking,
+		runID:           runID,
+		dryRun:          dryRun,
+		estimator:       estimator,
 		dryRates: struct {
 			coldTPS   int
 			warmTPS   int
@@ -582,7 +596,7 @@ func (p *replayPoster) do(
 	var err error
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj)
+		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj, p.reasoningEffort, p.thinking)
 	default:
 		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj)
 	}
@@ -1282,7 +1296,7 @@ func (p *replayPoster) dryDo(
 	var canonical string
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj)
+		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj, p.reasoningEffort, p.thinking)
 	default:
 		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj)
 	}

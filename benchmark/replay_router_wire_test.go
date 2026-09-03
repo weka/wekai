@@ -176,7 +176,9 @@ func TestEffectiveSystemBlocksSkipsHeader(t *testing.T) {
 		name string
 		fn   func(RouterReplayRequest, string, string, string, float64, bool, float64, *uuidInjection) ([]byte, string, error)
 	}{
-		{"openai", buildOpenAIChatCompletionsBody},
+		{"openai", func(req RouterReplayRequest, docs, modelName, runID string, outputRatio float64, forceVolume bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
+			return buildOpenAIChatCompletionsBody(req, docs, modelName, runID, outputRatio, forceVolume, charsPerToken, inj, "", "")
+		}},
 		{"anthropic", buildAnthropicMessagesBody},
 	} {
 		body, canonical, err := builder.fn(req, "", "m", "", 0, false, 0, nil)
@@ -333,7 +335,7 @@ func TestBuildOpenAIChatCompletionsBodyForceOutput(t *testing.T) {
 
 	// force-output off: no ignore_eos, but the instruction still rides — the
 	// modes differ ONLY by engine enforcement.
-	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, 0, nil)
+	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, 0, nil, "", "")
 	if err != nil {
 		t.Fatalf("build (force-output off): %v", err)
 	}
@@ -349,7 +351,7 @@ func TestBuildOpenAIChatCompletionsBodyForceOutput(t *testing.T) {
 	}
 
 	// force-output on (default): ignore_eos=true AND the instruction is present.
-	body, _, err = buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, true, 0, nil)
+	body, _, err = buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, true, 0, nil, "", "")
 	if err != nil {
 		t.Fatalf("build (force-output on): %v", err)
 	}
@@ -364,6 +366,62 @@ func TestBuildOpenAIChatCompletionsBodyForceOutput(t *testing.T) {
 		t.Error("continue-generating instruction missing from body when forceOutput=true")
 	}
 }
+
+// TestBuildOpenAIChatCompletionsBodyReasoningEffortThinking verifies
+// reasoning_effort's tri-state handling and thinking's plain passthrough (see
+// buildOpenAIChatCompletionsBody's doc, and replayPoster.reasoningEffort/
+// thinking): reasoning_effort defaults to an explicit "none" when the model
+// spec doesn't set it (some servers otherwise default to a high effort that
+// skews replay content and timing), "omit" reproduces the pre-existing
+// behavior of sending no key at all, and any other value is forwarded
+// verbatim. thinking has no default — absent unless the spec sets it.
+func TestBuildOpenAIChatCompletionsBodyReasoningEffortThinking(t *testing.T) {
+	docs := strings.Repeat("doc content ", 50)
+	req := RouterReplayRequest{InputTokens: 100}
+
+	cases := []struct {
+		name            string
+		reasoningEffort string
+		thinking        string
+		wantEffort      *string // nil = key absent
+		wantThinking    *string // nil = key absent
+	}{
+		{name: "unset defaults to none", reasoningEffort: "", thinking: "", wantEffort: strPtr("none"), wantThinking: nil},
+		{name: "low forwarded verbatim", reasoningEffort: "low", thinking: "", wantEffort: strPtr("low"), wantThinking: nil},
+		{name: "omit drops the key", reasoningEffort: "omit", thinking: "", wantEffort: nil, wantThinking: nil},
+		{name: "thinking forwarded when set", reasoningEffort: "", thinking: "on", wantEffort: strPtr("none"), wantThinking: strPtr("on")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, 0, nil, c.reasoningEffort, c.thinking)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			var parsed map[string]interface{}
+			if err := json.Unmarshal(body, &parsed); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			got, ok := parsed["reasoning_effort"]
+			if c.wantEffort == nil {
+				if ok {
+					t.Errorf("reasoning_effort present = %v, want absent", got)
+				}
+			} else if !ok || got != *c.wantEffort {
+				t.Errorf("reasoning_effort = %v (present=%v), want %q", got, ok, *c.wantEffort)
+			}
+			got, ok = parsed["thinking"]
+			if c.wantThinking == nil {
+				if ok {
+					t.Errorf("thinking present = %v, want absent", got)
+				}
+			} else if !ok || got != *c.wantThinking {
+				t.Errorf("thinking = %v (present=%v), want %q", got, ok, *c.wantThinking)
+			}
+		})
+	}
+}
+
+func strPtr(s string) *string { return &s }
 
 // TestBuildAnthropicMessagesBodyOutputRatioMaxTokens verifies the emitted
 // max_tokens reflects the retargeted value when --replay-output-ratio is set,
@@ -384,7 +442,7 @@ func TestBuildAnthropicMessagesBodyOutputRatioMaxTokens(t *testing.T) {
 		t.Errorf("anthropic max_tokens = %v, want %v", got, want)
 	}
 
-	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0.25, false, 0, nil)
+	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0.25, false, 0, nil, "", "")
 	if err != nil {
 		t.Fatalf("openai build: %v", err)
 	}

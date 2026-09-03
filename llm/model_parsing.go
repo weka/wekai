@@ -7,15 +7,28 @@ import (
 
 // DynamicModelConfig holds configuration for a dynamically-specified model
 type DynamicModelConfig struct {
-	BaseURL         string   // Base URL for the API endpoint — always BaseURLs[0] (for backward compat, model fetching, display)
-	BaseURLs        []string // All endpoint URLs; random selection happens per call when len > 1
-	Type            string   // Client type: "openai", "anthropic", "gemini" (default: "openai")
-	ContextSize     int      // Context size if specified (0 = use default)
-	MaxTokens       int      // Maximum output tokens if specified (0 = use default)
-	Model           string   // Model identifier to send to the API (optional, can be extracted from /models endpoint)
-	Alias           string   // Optional short alias for display purposes (e.g., "local", "gpu")
-	ReasoningEffort string   // "low", "medium", "high" — empty means no reasoning effort set
-	Thinking        string   // Raw "thinking" value forwarded verbatim into the request body (e.g. "on"/"off"/"enabled"); empty means unset
+	BaseURL     string   // Base URL for the API endpoint — always BaseURLs[0] (for backward compat, model fetching, display)
+	BaseURLs    []string // All endpoint URLs; random selection happens per call when len > 1
+	Type        string   // Client type: "openai", "anthropic", "gemini" (default: "openai")
+	ContextSize int      // Context size if specified (0 = use default)
+	MaxTokens   int      // Maximum output tokens if specified (0 = use default)
+	Model       string   // Model identifier to send to the API (optional, can be extracted from /models endpoint)
+	Alias       string   // Optional short alias for display purposes (e.g., "local", "gpu")
+	// ReasoningEffort is "low", "medium", "high", or any other value the
+	// target server accepts. For type=openai/openai_vllm targets — both the
+	// plain Chat client (llm/openai.go) and router-replay's body builder
+	// (benchmark.buildOpenAIChatCompletionsBody) — it is resolved through
+	// ResolveReasoningEffort's three-state contract: empty sends "none"
+	// explicitly (some servers, e.g. vLLM serving DeepSeek-V4, otherwise
+	// default to "high" and inject a large reasoning instruction that skews
+	// content and timing); "omit" drops the key from the body entirely, for
+	// reproducing a run captured before this field was ever sent; any other
+	// value is forwarded verbatim. For type=anthropic/gemini targets this
+	// string instead maps to llm.ReasoningEffort's own token-budgeting
+	// semantics (llm/anthropic.go, llm/gemini.go), unrelated to that
+	// three-state contract.
+	ReasoningEffort string
+	Thinking        string // Raw "thinking" value forwarded verbatim into the request body (e.g. "on"/"off"/"enabled"); empty means unset
 }
 
 // ParseDynamicModel parses a dynamic model identifier

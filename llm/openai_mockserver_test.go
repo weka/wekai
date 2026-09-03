@@ -266,3 +266,56 @@ func TestOpenAIMockServer_HTTPError(t *testing.T) {
 		t.Errorf("expected status 429, got %d", apiErr.StatusCode)
 	}
 }
+
+// TestOpenAIMockServer_ReasoningEffort verifies ResolveReasoningEffort's
+// three-state contract on the wire: an unset ReasoningEffort sends "none"
+// explicitly (see ResolveReasoningEffort's doc for why a server-side default
+// isn't good enough), ReasoningEffortOmit sends no reasoning_effort key at
+// all, and any other value is forwarded verbatim.
+func TestOpenAIMockServer_ReasoningEffort(t *testing.T) {
+	cases := []struct {
+		name       string
+		effort     ReasoningEffort
+		wantValue  string
+		wantAbsent bool
+	}{
+		{name: "unset defaults to none", effort: "", wantValue: "none"},
+		{name: "low forwarded verbatim", effort: ReasoningEffortLow, wantValue: "low"},
+		{name: "omit sends no key", effort: ReasoningEffortOmit, wantAbsent: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := mockserver.NewOpenAIMockServer([]mockserver.OpenAIMockTurn{
+				{Content: "ok"},
+			})
+			defer srv.Close()
+
+			config := LLMConfig{
+				Model:                  "gpt-4o-test",
+				APIKey:                 "test-api-key",
+				BaseURL:                srv.BaseURL,
+				MaxTokens:              1024,
+				ReasoningEffort:        c.effort,
+				StreamResponseCallback: func(string) {},
+				StreamThinkingCallback: func(string) {},
+			}
+			client := NewOpenAiLLMClient(config).(*OpenAiChat)
+			_, err := client.Request(context.Background(), []ContentPart{&TextContent{Text: "hi"}}, nil)
+			if err != nil {
+				t.Fatalf("Request failed: %v", err)
+			}
+
+			req := srv.LastRequest()
+			got, present := req["reasoning_effort"]
+			if c.wantAbsent {
+				if present {
+					t.Errorf("reasoning_effort present = %v, want absent", got)
+				}
+				return
+			}
+			if !present || got != c.wantValue {
+				t.Errorf("reasoning_effort = %v (present=%v), want %q", got, present, c.wantValue)
+			}
+		})
+	}
+}

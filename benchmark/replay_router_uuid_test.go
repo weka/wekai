@@ -436,7 +436,7 @@ func TestWireInjectionDeterminism(t *testing.T) {
 			var body []byte
 			var err error
 			if kind == "openai" {
-				body, _, err = buildOpenAIChatCompletionsBody(r, docs, "model", "", 0, false, 0, inj)
+				body, _, err = buildOpenAIChatCompletionsBody(r, docs, "model", "", 0, false, 0, inj, "", "")
 			} else {
 				body, _, err = buildAnthropicMessagesBody(r, docs, "model", "", 0, false, 0, inj)
 			}

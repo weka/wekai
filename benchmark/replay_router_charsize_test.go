@@ -129,7 +129,7 @@ func TestBuildOpenAIChatCompletionsBodyCharsPerToken(t *testing.T) {
 		return msg["content"].(string)
 	}
 
-	byteBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, 0, nil)
+	byteBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, 0, nil, "", "")
 	if err != nil {
 		t.Fatalf("build (charsPerToken=0): %v", err)
 	}
@@ -140,7 +140,7 @@ func TestBuildOpenAIChatCompletionsBodyCharsPerToken(t *testing.T) {
 
 	const charsPerToken = 3.4
 	wantLen := int(math.Round(150 * charsPerToken))
-	tokBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, charsPerToken, nil)
+	tokBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, charsPerToken, nil, "", "")
 	if err != nil {
 		t.Fatalf("build (charsPerToken=3.4): %v", err)
 	}

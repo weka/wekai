@@ -11,16 +11,49 @@ const (
 	ProviderZAI        = "zai"
 )
 
-// ReasoningEffort defines levels of computational effort for LLM reasoning.
-// Note: Currently primarily influences Anthropic token budgeting.
+// ReasoningEffort defines levels of computational effort for LLM reasoning,
+// forwarded as reasoning_effort in an OpenAI-compatible request body (see
+// ResolveReasoningEffort). It also influences Anthropic token budgeting
+// (llm/anthropic.go) and Gemini thinking config (llm/gemini.go), which read
+// the value directly rather than through ResolveReasoningEffort.
 type ReasoningEffort string
 
 const (
-	ReasoningEffortNone   ReasoningEffort = "none"   // Default/no specific effort adjustment
+	// ReasoningEffortNone is both an explicit no-effort value and the
+	// resolved default for an unset field (see ResolveReasoningEffort): a
+	// caller that never sets ReasoningEffort still gets an explicit value on
+	// the wire instead of depending on whatever the server defaults to (some
+	// servers, e.g. vLLM serving DeepSeek-V4, default to "high" and inject a
+	// large reasoning instruction).
+	ReasoningEffortNone   ReasoningEffort = "none"
 	ReasoningEffortLow    ReasoningEffort = "low"    // Lower computational budget
 	ReasoningEffortMedium ReasoningEffort = "medium" // Medium computational budget
 	ReasoningEffortHigh   ReasoningEffort = "high"   // Higher computational budget
+	// ReasoningEffortOmit is a sentinel recognized only by
+	// ResolveReasoningEffort: it resolves to ok=false, meaning send no
+	// reasoning_effort key at all, for reproducing behavior captured before
+	// this field ever existed.
+	ReasoningEffortOmit ReasoningEffort = "omit"
 )
+
+// ResolveReasoningEffort applies ReasoningEffort's three-state contract for
+// OpenAI-compatible request bodies: an unset field resolves to
+// ReasoningEffortNone so the wire always carries an explicit value;
+// ReasoningEffortOmit resolves to ok=false, telling the caller to omit the
+// reasoning_effort key entirely; any other value passes through verbatim.
+// Both the generic OpenAI Chat client (llm/openai.go) and the router-replay
+// OpenAI/vLLM body builder (benchmark.buildOpenAIChatCompletionsBody) call
+// this, so the three states behave identically at both call sites.
+func ResolveReasoningEffort(effort ReasoningEffort) (value string, ok bool) {
+	switch effort {
+	case ReasoningEffortOmit:
+		return "", false
+	case "":
+		return string(ReasoningEffortNone), true
+	default:
+		return string(effort), true
+	}
+}
 
 // ClientType identifies the underlying client implementation
 type ClientType string

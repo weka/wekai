@@ -230,8 +230,8 @@ func (l *OpenAiChat) request(ctx context.Context, toolset *tools.ToolSet, histor
 		payload["tools"] = toolset.AsOpenAi()
 	}
 
-	if l.config.ReasoningEffort != "" {
-		payload["reasoning_effort"] = string(l.config.ReasoningEffort)
+	if value, ok := ResolveReasoningEffort(l.config.ReasoningEffort); ok {
+		payload["reasoning_effort"] = value
 	}
 
 	if l.config.Thinking != "" {

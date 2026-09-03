@@ -26,6 +26,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+
+	"github.com/weka/wekai/llm"
 )
 
 // verboseOutputInstruction is appended as a system block/message in every
@@ -616,7 +618,24 @@ func buildOpenAITools(spec *RouterReplayToolsSpec, docs string, charsPerToken fl
 //
 // inj carries the UUID cache-coherency injection (--verify,
 // router path — see replay_router_uuid.go); nil means "no injection".
-func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceVolume bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
+// reasoningEffort and thinking come from the model spec's reasoning_effort=/
+// thinking= parameters (llm.DynamicModelConfig — see replayPoster's fields of
+// the same name).
+//
+// reasoningEffort is resolved by llm.ResolveReasoningEffort — the same
+// three-state contract the generic OpenAI Chat client (llm/openai.go) uses,
+// so replay and non-replay traffic default identically: unset sends "none"
+// explicitly (some servers default a high effort otherwise — vLLM 0.28
+// defaults DeepSeek-V4 to "high", which injects a large reasoning
+// instruction that skews replay content and timing); "omit" drops the key
+// from the body entirely, for reproducing a run captured before this field
+// was ever sent; any other value (low/medium/high/max/...) is forwarded
+// verbatim.
+//
+// thinking is a plain passthrough with no default, mirroring how the
+// non-replay OpenAI client (llm/openai.go) forwards it: added to the body
+// only when non-empty.
+func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceVolume bool, charsPerToken float64, inj *uuidInjection, reasoningEffort string, thinking string) ([]byte, string, error) {
 	var stampByHash map[string]turnStamp
 	if inj != nil {
 		stampByHash = inj.StampByHash
@@ -636,6 +655,12 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		body["stream_options"] = map[string]interface{}{
 			"include_usage": true,
 		}
+	}
+	if value, ok := llm.ResolveReasoningEffort(llm.ReasoningEffort(reasoningEffort)); ok {
+		body["reasoning_effort"] = value
+	}
+	if thinking != "" {
+		body["thinking"] = thinking
 	}
 
 	// Build messages array: system blocks first, then user/assistant messages.
