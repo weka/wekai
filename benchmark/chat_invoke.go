@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/weka/wekai/llm"
@@ -48,8 +50,9 @@ func InvokeChat(ctx context.Context, chatGetter *llm.ChatGetter, toolset *tools.
 	}
 	accumulateUsage(&usage, modelInfo, response.Usage)
 
+	modelName := modelInfo.Provider + "/" + modelInfo.ModelIdentifier
 	for len(response.ToolCalls) > 0 {
-		toolResponses := executeToolCallsParallel(ctx, toolset, response.ToolCalls, &usage)
+		toolResponses := executeToolCallsParallel(ctx, toolset, modelName, response.ToolCalls, &usage)
 
 		response, err = callWithRetry(ctx, func() (*llm.Response, error) {
 			return chat.Respond(ctx, toolResponses, nil, toolset)
@@ -60,7 +63,7 @@ func InvokeChat(ctx context.Context, chatGetter *llm.ChatGetter, toolset *tools.
 		accumulateUsage(&usage, modelInfo, response.Usage)
 	}
 
-	usage.ModelName = modelInfo.Provider + "/" + modelInfo.ModelIdentifier
+	usage.ModelName = modelName
 	usage.TotalCost = usage.InputTokens.Cost + usage.OutputTokens.Cost +
 		usage.CachedTokens.Cost + usage.ReasoningTokens.Cost
 
@@ -70,7 +73,13 @@ func InvokeChat(ctx context.Context, chatGetter *llm.ChatGetter, toolset *tools.
 // executeToolCallsParallel runs every tool call in response in parallel,
 // merges each tool's own usage (if any) into usage as a sub-execution, and
 // returns the callID->result map Chat.Respond expects.
-func executeToolCallsParallel(ctx context.Context, toolset *tools.ToolSet, calls llm.ToolsCalls, usage *tools.ExecutionUsageData) map[string]string {
+//
+// toolset may be nil — a call site that never configured tools (e.g. the
+// coherency eval) still has to handle a model emitting tool_calls anyway;
+// GetToolByName is nil-safe and reports "not found" for every name in that
+// case. That is a MODEL behaviour to record in the tool result and let the
+// caller's normal scoring see, not a process failure — it must never panic.
+func executeToolCallsParallel(ctx context.Context, toolset *tools.ToolSet, modelName string, calls llm.ToolsCalls, usage *tools.ExecutionUsageData) map[string]string {
 	type result struct {
 		callID    string
 		content   string
@@ -86,6 +95,7 @@ func executeToolCallsParallel(ctx context.Context, toolset *tools.ToolSet, calls
 			r := result{callID: tc.CallId}
 			tool := toolset.GetToolByName(tc.Name)
 			if tool == nil {
+				warnMissingTool(modelName, tc.Name)
 				r.content = fmt.Sprintf("Tool '%s' not found", tc.Name)
 				results[idx] = r
 				return
@@ -111,6 +121,32 @@ func executeToolCallsParallel(ctx context.Context, toolset *tools.ToolSet, calls
 		}
 	}
 	return toolResponses
+}
+
+// lastMissingToolWarnNs rate-limits warnMissingTool the same way auto.go's
+// --print-errors-threshold rate-limits its stderr output: a shared
+// unix-nano timestamp, CAS'd forward so concurrent callers coalesce onto one
+// winner instead of flooding stderr per-request under concurrency.
+var lastMissingToolWarnNs atomic.Int64
+
+const missingToolWarnInterval = 5 * time.Second
+
+// warnMissingTool logs (rate-limited) that a model called a tool this run
+// never made available — either no ToolSet was configured for the call site
+// at all, or the set doesn't contain this name. This is expected, recoverable
+// model behaviour (e.g. an agentic model probing for tools in a plain-recite
+// eval), not a bug, so it is a warning rather than an error.
+func warnMissingTool(modelName, toolName string) {
+	now := time.Now().UnixNano()
+	last := lastMissingToolWarnNs.Load()
+	if now-last < int64(missingToolWarnInterval) {
+		return
+	}
+	if !lastMissingToolWarnNs.CompareAndSwap(last, now) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[%s] warn: model called tool %q but no such tool is configured for this run; recording a \"not found\" tool result\n",
+		modelName, toolName)
 }
 
 // accumulateUsage adds one LLM response's token usage into usage, pricing it

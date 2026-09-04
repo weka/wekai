@@ -202,7 +202,15 @@ func (ts *ToolSet) SortedTools() []*Tool {
 	return tools
 }
 
+// GetToolByName looks up a tool by name. A nil ToolSet (no tools configured
+// for this call) or an unrecognized name both return nil — the caller is
+// expected to treat "no such tool" as a model-behaviour fact to record, not a
+// programming error, matching the nil-safe pattern used by AsOpenAi/
+// AsOpenAiResponses/AsAnthropic above.
 func (ts *ToolSet) GetToolByName(name string) *Tool {
+	if ts == nil {
+		return nil
+	}
 	return ts.Tools[name]
 }
 
