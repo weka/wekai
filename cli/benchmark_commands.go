@@ -293,7 +293,6 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		RouterReplayFile:              c.RouterReplayFile,
 		RouterReplayRoles:             c.RouterReplayRoles,
 		ReplayOutputRatio:             c.ReplayOutputRatio,
-		ReplayMinOutputTokens:         c.ReplayMinOutputTokens,
 		// Force-output (short continue-generating instruction + vLLM
 		VerifyForceEOS:     c.VerifyForceEOS,
 		DryRun:             c.DryRun,
@@ -332,12 +331,6 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 	}
 	if c.ReplayOutputRatio > 0 && c.RouterReplayFile == "" {
 		return fmt.Errorf("--replay-output-ratio requires --router-replay-file")
-	}
-	if c.ReplayMinOutputTokens < 0 {
-		return fmt.Errorf("--replay-min-output-tokens must be >= 0, got %d", c.ReplayMinOutputTokens)
-	}
-	if c.ReplayMinOutputTokens > 0 && c.RouterReplayFile == "" {
-		return fmt.Errorf("--replay-min-output-tokens requires --router-replay-file")
 	}
 
 	// Parse --replay-series-indices / --replay-series-range into a set of
@@ -421,6 +414,18 @@ func (c *BenchmarkVisualizeCommand) Execute(args []string) error {
 	if err != nil {
 		return err
 	}
+	if c.Public {
+		interval, err := parsePublicInterval(c.PublicInterval)
+		if err != nil {
+			return err
+		}
+		htmlPath, err := benchmark.GeneratePublicVisualization(dir, c.Concurrency, maxElapsed, interval)
+		if err != nil {
+			return fmt.Errorf("generate public visualization: %w", err)
+		}
+		fmt.Printf("Public visualization saved to: %s\n", htmlPath)
+		return nil
+	}
 	htmlPath, err := benchmark.GenerateVisualizationWithOptions(dir, c.Concurrency, maxElapsed)
 	if err != nil {
 		return fmt.Errorf("generate visualization: %w", err)
@@ -478,6 +483,18 @@ func (c *BenchmarkVisualizeMergeCommand) Execute(args []string) error {
 	if err != nil {
 		return err
 	}
+	if c.Public {
+		interval, err := parsePublicInterval(c.PublicInterval)
+		if err != nil {
+			return err
+		}
+		htmlPath, err := benchmark.GenerateVisualizationMergedPublic(dirs, labels, c.Output, c.Concurrency, maxElapsed, interval)
+		if err != nil {
+			return fmt.Errorf("generate merged public visualization: %w", err)
+		}
+		fmt.Printf("Merged public visualization saved to: %s\n", htmlPath)
+		return nil
+	}
 	htmlPath, err := benchmark.GenerateVisualizationMerged(dirs, labels, c.Output, c.Concurrency, maxElapsed)
 	if err != nil {
 		return fmt.Errorf("generate merged visualization: %w", err)
@@ -497,6 +514,23 @@ func parseMaxElapsed(s string) (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("--max-elapsed must be positive, got %s", d)
+	}
+	return d, nil
+}
+
+// parsePublicInterval parses --public-interval ("" falls back to
+// benchmark.DefaultPublicInterval, matching GeneratePublicVisualization's own
+// interval<=0 default so the CLI and library agree on it).
+func parsePublicInterval(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid --public-interval %q (want a Go duration like 30s or 1m): %w", s, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("--public-interval must be positive, got %s", d)
 	}
 	return d, nil
 }

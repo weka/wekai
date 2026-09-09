@@ -69,6 +69,26 @@ func deriveSourceLabel(dir string, records []requestDataRecord) string {
 // different wall-clock starts each cut at their own elapsed cutoff (see
 // truncateToElapsed). Merged JSONL and CSVs carry only the kept rows.
 func GenerateVisualizationMerged(dirs []string, labels []string, outputDir string, concurrency int, maxElapsed time.Duration) (string, error) {
+	outDir, err := prepareMergedSources(dirs, labels, outputDir, maxElapsed)
+	if err != nil {
+		return "", err
+	}
+	// Explicit --labels must win as the DISPLAYED series names too, not just
+	// the merged filenames: pin display names to the label-derived basenames
+	// so a record alias shared by both arms can't collapse them into one name.
+	// maxElapsed 0: the sources were already truncated per-arm above.
+	return generateVisualization(outDir, concurrency, len(labels) > 0, 0)
+}
+
+// prepareMergedSources is the file-merging half of GenerateVisualizationMerged
+// (and, via GenerateVisualizationMergedPublic, of the --public merge path):
+// it reads every source directory's .jsonl files, writes one merged JSONL per
+// source (run_params header first, when recorded) plus the combined/per-source
+// full and chunked CSVs, and returns the output directory ready for either
+// report generator to read. Extracted so both callers share identical merge
+// semantics (label resolution, truncation, collision-safe naming) instead of
+// risking two copies drifting apart.
+func prepareMergedSources(dirs []string, labels []string, outputDir string, maxElapsed time.Duration) (string, error) {
 	if len(dirs) == 0 {
 		return "", fmt.Errorf("no directories provided")
 	}
@@ -210,11 +230,7 @@ func GenerateVisualizationMerged(dirs []string, labels []string, outputDir strin
 	}
 	fmt.Fprintf(os.Stderr, "CSVs saved to: %s and %s\n", fullDir, chunkedDir)
 
-	// Explicit --labels must win as the DISPLAYED series names too, not just
-	// the merged filenames: pin display names to the label-derived basenames
-	// so a record alias shared by both arms can't collapse them into one name.
-	// maxElapsed 0: the sources were already truncated per-arm above.
-	return generateVisualization(outputDir, concurrency, len(labels) > 0, 0)
+	return outputDir, nil
 }
 
 type taggedRecord struct {
