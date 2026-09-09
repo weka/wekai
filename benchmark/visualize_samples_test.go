@@ -791,8 +791,8 @@ function expect(si, mi, want, label) {
   const got = sumCells[si][mi].textContent;
   assert(got === want, label + ": want " + JSON.stringify(want) + ", got " + JSON.stringify(got));
 }
-assert(SUMMARY_METRICS.length === 8, "eight metric columns, got " + SUMMARY_METRICS.length);
-assert(sumCells.length === DATA.length && sumCells[0].length === 8, "one row per variant, eight cells each");
+assert(SUMMARY_METRICS.length === 9, "nine metric columns, got " + SUMMARY_METRICS.length);
+assert(sumCells.length === DATA.length && sumCells[0].length === 9, "one row per variant, nine cells each");
 assert(sumRows.length === DATA.length, "one <tr> per variant");
 expect(0, 0, "2.5k", "input tokens");
 expect(0, 1, "250",  "output tokens");
@@ -802,6 +802,11 @@ expect(0, 4, "8",    "avg output/s");
 expect(0, 5, "150ms","ttft p50");
 expect(0, 6, "150ms","ttft p95");
 expect(0, 7, "250.0","errors per 1k");
+// Cached input is a per-TOKEN share: this fixture has 500 uncached +
+// 2000 server-cached = 2500 prompt tokens, so 2000/2500 = 80.0%. Asserting
+// the value, not just the column count -- a count check would pass on a
+// column that computed the wrong thing.
+expect(0, 8, "80.0%","cached input share");
 // TTFT percentiles are backed by the non-error requests only: the errored
 // 4th row must not count even though it carries a ttft.
 assert(sumCells[0][5].title.indexOf("3 non-error requests") === 0, "ttft sample count, got " + sumCells[0][5].title);
