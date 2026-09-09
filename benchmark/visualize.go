@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -111,31 +112,126 @@ type vizRecord struct {
 	InputTokens  int // net-of-cache input tokens
 	CachedTokens int // server-cached prompt tokens
 	OutputTokens int // completion tokens
+
+	// Fields below this line exist so the report (and its in-report CSV
+	// export) is a COMPLETE archive of the run — everything a reader would
+	// otherwise have to go back to the raw .jsonl on the results volume for.
+	// Turn is this request's 1-based position within its own instance,
+	// distinct from RequestNum (see requestDataRecord.Turn).
+	Turn int
+	// ServerCacheConfirmed/IsColdStart/IsEmpty mirror the same-named
+	// requestDataRecord fields. LocalCacheRatio estimates repeated-prompt
+	// share client-side, rounded to 4 decimals at emit time (see
+	// generateVisualization) — a report is read on-screen, not fed back into
+	// arithmetic that needs float64 precision, and the untruncated value was
+	// most of the per-record byte cost this struct added.
+	//
+	// CacheHitRatio is deliberately NOT stored here: it is exactly
+	// CachedTokens / (InputTokens + CachedTokens) when either is non-zero,
+	// else 1 if CacheHit else 0 (see replay.go's cacheHitRatio derivation) —
+	// both operands are already present on this struct, so storing it too
+	// would be a pure redundant cost on every record. The report and its CSV
+	// export derive it client-side (see deriveCacheHitRatio in the template).
+	ServerCacheConfirmed bool
+	IsColdStart          bool
+	IsEmpty              bool
+	LocalCacheRatio      float64
+	// GuidIdx is this record's index into its series' GuidTable (see
+	// seriesData.GuidTable / buildGuidTable), or -1 when the record carries
+	// no series_guid (legacy data). SeriesGUID is per-instance
+	// (session_id + ":" + instance_id — see replay_router.go), NOT per
+	// series_num: one router-replay session runs all its included
+	// sub-agent instances under a single series_num, so distinct GUIDs
+	// sharing one series_num is the normal case, not an anomaly. Interning
+	// each distinct GUID once per arm and storing only this small integer
+	// per record keeps the per-record cost to an int while still letting
+	// every record recover its OWN guid, which a series_num-keyed table
+	// cannot do.
+	GuidIdx int
+	// UUID validation (router-replay --verify only); zero/false when the
+	// feature is off, exactly like requestDataRecord's copies.
+	UUIDExpected   int
+	UUIDFound      int
+	UUIDLeaked     int
+	UUIDExactMatch bool
+	// Raw UUID detail, populated ONLY on a miss or a leak (nil otherwise) —
+	// see MarshalJSON: a record with a clean match costs nothing extra for
+	// carrying these.
+	ExpectedUUIDsRaw []string
+	FoundMask        []bool
+	LeakedUUIDsRaw   []string
 }
 
-// MarshalJSON emits vizRecord as a positional array —
-// [t,ttft,resp,err,sn,rn,ch,in,ca,out], matching REC_FIELDS in the report
-// template — instead of a JSON object. The object shape repeats all 10 key
-// strings per record; across the ~137k records a typical merged report
-// carries, that's several MB of pure key-name bytes. The report's load-time
-// rehydration shim (immediately after `const RAW_DATA = {{.Data}}` in the
-// template) converts each row back into a
-// {t,ttft,resp,err,sn,rn,ch,in,ca,out} object with an absolute t, so every
-// downstream render/filter/compute function is unchanged. err/ch are emitted
-// as 0/1 and rehydrated back to real booleans by the shim. Field order here
-// MUST match REC_FIELDS in the template exactly.
+// MarshalJSON emits vizRecord as a positional array — the first 16 slots,
+// always present, are
+// [t,ttft,resp,err,sn,rn,ch,in,ca,out,turn,scc,cs,ie,lcr,gi], matching
+// REC_FIELDS in the report template — instead of a JSON object. The object
+// shape repeats every key string per record; across the ~137k records a
+// typical merged report carries, that's several MB of pure key-name bytes.
+// The report's load-time rehydration shim (immediately after `const
+// RAW_DATA = {{.Data}}` in the template) converts each row back into a
+// plain object with an absolute t, so every downstream render/filter/
+// compute function is unchanged. Bool fields are emitted as 0/1 and
+// rehydrated back to real booleans by the shim. Field order here MUST match
+// REC_FIELDS in the template exactly. gi is GuidIdx, an index into the
+// series' GuidTable (see seriesData.GuidTable) or -1 when this record
+// carries no guid; cache_hit_ratio is deliberately NOT one of these 16 —
+// see the field doc on vizRecord for why it's derived client-side instead.
+//
+// Two further slots are trailing-optional, each omitted outright (not even
+// a zero/empty placeholder) when this record has nothing to say there:
+//   - 16-19, the UUID validation quad [ue,uf,ul,uem] — present only when
+//     this request actually carries UUID data (see hasUUIDData below).
+//   - 20, [expected_uuids_raw, found_mask, leaked_uuids_raw] — present only
+//     on an actual miss/leak, and only ever alongside 16-19.
+//
+// A JSON array can simply be shorter when trailing elements are absent, so
+// the report template's rehydration reads row[i] with an explicit default
+// rather than assuming a fixed length.
 func (r vizRecord) MarshalJSON() ([]byte, error) {
-	errV, chV := 0, 0
-	if r.IsError {
-		errV = 1
+	b := func(v bool) float64 {
+		if v {
+			return 1
+		}
+		return 0
 	}
-	if r.CacheHit {
-		chV = 1
+	// Positions 0-15 are always present. 16-19 (the UUID validation quad)
+	// are appended ONLY when this request actually carries UUID data —
+	// requestDataRecord's own doc says these are "0 when the feature is
+	// off", which for the overwhelming majority of runs (router-replay
+	// --verify not in use) means EVERY record's quad is the zero value.
+	// Rather than pay for four extra zeroed slots on every single record of
+	// every non-verify run, a record with nothing to say here simply ends
+	// at position 15 — the same "a trailing element can just be absent"
+	// convention the UUID detail slot below already relies on. A request
+	// carrying real UUID data (however that data reads) always gets the
+	// quad, so no information is lost — the omission only ever applies to
+	// records whose quad IS the zero value already.
+	row := []any{
+		r.T, r.TTFT, r.ResponseMs, b(r.IsError), float64(r.SeriesNum), float64(r.RequestNum),
+		b(r.CacheHit), float64(r.InputTokens), float64(r.CachedTokens), float64(r.OutputTokens),
+		float64(r.Turn), b(r.ServerCacheConfirmed), b(r.IsColdStart), b(r.IsEmpty),
+		r.LocalCacheRatio, float64(r.GuidIdx),
 	}
-	return json.Marshal([10]float64{
-		r.T, r.TTFT, r.ResponseMs, float64(errV), float64(r.SeriesNum), float64(r.RequestNum),
-		float64(chV), float64(r.InputTokens), float64(r.CachedTokens), float64(r.OutputTokens),
-	})
+	hasUUIDData := r.UUIDExpected != 0 || r.UUIDFound != 0 || r.UUIDLeaked != 0 || r.UUIDExactMatch
+	if hasUUIDData {
+		row = append(row, float64(r.UUIDExpected), float64(r.UUIDFound), float64(r.UUIDLeaked), b(r.UUIDExactMatch))
+		// A 21st slot carries [expected_uuids_raw, found_mask, leaked_uuids_raw],
+		// appended only on an actual miss/leak (by construction, whenever any
+		// of these is non-empty, UUIDExpected/UUIDLeaked are already non-zero,
+		// so hasUUIDData is guaranteed true here -- see the fields' doc on
+		// vizRecord).
+		if len(r.ExpectedUUIDsRaw) > 0 || len(r.FoundMask) > 0 || len(r.LeakedUUIDsRaw) > 0 {
+			maskBits := make([]int, len(r.FoundMask))
+			for i, v := range r.FoundMask {
+				if v {
+					maskBits[i] = 1
+				}
+			}
+			row = append(row, [3]any{r.ExpectedUUIDsRaw, maskBits, r.LeakedUUIDsRaw})
+		}
+	}
+	return json.Marshal(row)
 }
 
 // seriesData is one variant's data as embedded in a report.html's RAW_DATA.
@@ -158,13 +254,63 @@ type seriesData struct {
 	// reader can see the workload shape without a side file. Omitted entirely
 	// for legacy data.
 	Params *vizRunParams `json:"params,omitempty"`
+	// GuidTable is a de-duplicated, per-arm array of every distinct
+	// series_guid seen in this series' records (see buildGuidTable). Each
+	// vizRecord carries only GuidIdx, its index into this table, instead of
+	// repeating a 36-byte GUID inline. GUIDs are per-instance (session x
+	// sub-agent), not per series_num, so the table is bounded by that count —
+	// not by request count. Omitted entirely when no record carried a GUID
+	// (legacy data).
+	GuidTable []string `json:"guidTable,omitempty"`
+}
+
+// buildGuidTable interns each record's series_guid into a de-duplicated,
+// per-arm table and returns each record's index into it, in the same order
+// as records (index -1 for a record with no GUID). A GUID is per-instance
+// (session_id + ":" + instance_id — see replay_router.go), not per
+// series_num: one router-replay session runs all its included sub-agent
+// instances under a single series_num, so many distinct GUIDs legitimately
+// share one series_num. Interning is therefore keyed on the GUID string
+// itself, never on series_num, so every record recovers its OWN guid via
+// GuidIdx -- there is nothing here to collide.
+func buildGuidTable(records []requestDataRecord) ([]string, []int) {
+	var table []string
+	seen := map[string]int{}
+	idx := make([]int, len(records))
+	for i, r := range records {
+		if r.SeriesGUID == "" {
+			idx[i] = -1
+			continue
+		}
+		gi, ok := seen[r.SeriesGUID]
+		if !ok {
+			gi = len(table)
+			seen[r.SeriesGUID] = gi
+			table = append(table, r.SeriesGUID)
+		}
+		idx[i] = gi
+	}
+	return table, idx
+}
+
+// round4 rounds v to 4 decimal places. Applied to LocalCacheRatio at emit
+// time (see generateVisualization): a report is read on-screen, not fed back
+// into arithmetic that needs float64 precision, and the untruncated value
+// was most of the per-record byte cost of adding it to vizRecord.
+func round4(v float64) float64 {
+	return math.Round(v*10000) / 10000
 }
 
 // vizRunParams is the subset of runParamsRecord the report displays. Kept
 // separate from runParamsRecord so adding a recorded field doesn't silently
 // grow every embedded report by a column nobody asked for.
 type vizRunParams struct {
-	Summary     string `json:"summary"`
+	Summary string `json:"summary"`
+	// Model identifies the arm even when Name has been pinned to a
+	// --labels override (visualize_merge.go), which otherwise leaves the
+	// requests CSV export with no model identification at all. See
+	// provenanceHeader's per-arm "model" line.
+	Model       string `json:"model,omitempty"`
 	Concurrency int    `json:"concurrency,omitempty"`
 	HotConc     int    `json:"hot,omitempty"`
 	MaxSeries   int    `json:"maxSeries,omitempty"`
@@ -180,6 +326,7 @@ type vizRunParams struct {
 func buildVizRunParams(p runParamsRecord) *vizRunParams {
 	return &vizRunParams{
 		Summary:     p.summaryLine(),
+		Model:       p.Model,
 		Concurrency: p.Concurrency,
 		HotConc:     p.HotSeriesConcurrency,
 		MaxSeries:   p.MaxSeries,
@@ -238,23 +385,37 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 				haveT0 = true
 			}
 		}
+		guidTable, guidIdx := buildGuidTable(records)
 		var vr []vizRecord
-		for _, r := range records {
+		for i, r := range records {
 			vr = append(vr, vizRecord{
-				T:            float64(r.StartTime.UnixMilli()) - t0,
-				TTFT:         r.TTFT,
-				ResponseMs:   r.ResponseMs,
-				IsError:      r.IsError,
-				SeriesNum:    r.SeriesNum,
-				RequestNum:   r.RequestNum,
-				CacheHit:     r.CacheHit,
-				InputTokens:  r.InputTokens,
-				CachedTokens: r.CachedTokens,
-				OutputTokens: r.OutputTokens,
+				T:                    float64(r.StartTime.UnixMilli()) - t0,
+				TTFT:                 r.TTFT,
+				ResponseMs:           r.ResponseMs,
+				IsError:              r.IsError,
+				SeriesNum:            r.SeriesNum,
+				RequestNum:           r.RequestNum,
+				CacheHit:             r.CacheHit,
+				InputTokens:          r.InputTokens,
+				CachedTokens:         r.CachedTokens,
+				OutputTokens:         r.OutputTokens,
+				Turn:                 r.Turn,
+				ServerCacheConfirmed: r.ServerCacheConfirmed,
+				IsColdStart:          r.IsColdStart,
+				IsEmpty:              r.IsEmpty,
+				LocalCacheRatio:      round4(r.LocalCacheRatio),
+				GuidIdx:              guidIdx[i],
+				UUIDExpected:         r.UUIDExpected,
+				UUIDFound:            r.UUIDFound,
+				UUIDLeaked:           r.UUIDLeaked,
+				UUIDExactMatch:       r.UUIDExactMatch,
+				ExpectedUUIDsRaw:     r.ExpectedUUIDsRaw,
+				FoundMask:            r.FoundMask,
+				LeakedUUIDsRaw:       r.LeakedUUIDsRaw,
 			})
 		}
 		mix, adt := buildSampleViz(samples)
-		sd := seriesData{Name: name, T0: t0, Records: vr, Mix: mix, Adt: adt}
+		sd := seriesData{Name: name, T0: t0, Records: vr, Mix: mix, Adt: adt, GuidTable: guidTable}
 		if hasParams {
 			sd.Conc = params.effectiveConcurrency()
 			sd.Params = buildVizRunParams(params)
@@ -627,24 +788,48 @@ const RAW_DATA = {{.Data}};
 
 // --- Rehydrate positional records back into the object shape the rest of
 // this script expects (everything below reads r.t, r.ttft, r.resp, r.err,
-// r.sn, r.rn, r.ch, r.in, r.ca, r.out as object properties). The Go emitter
-// (benchmark/visualize.go) writes each record as a positional array
-// [t,ttft,resp,err,sn,rn,ch,in,ca,out] (REC_FIELDS order, must match
+// r.sn, r.rn, r.ch, r.in, r.ca, r.out, plus the archive fields below, as
+// object properties). The Go emitter (benchmark/visualize.go) writes each
+// record as a positional array (REC_FIELDS order, must match
 // vizRecord.MarshalJSON there) with t delta-encoded against a per-series t0,
-// instead of repeating 10 JSON key strings per record — across ~137k records
-// that was several MB of pure key-name bytes. This is encoding-only: after
-// this loop, RAW_DATA[i].records is structurally identical to the
-// pre-optimization array-of-objects shape (absolute epoch t, real booleans),
-// so nothing below this point needs to change.
-const REC_FIELDS = ["t", "ttft", "resp", "err", "sn", "rn", "ch", "in", "ca", "out"];
-const REC_BOOL_FIELDS = ["err", "ch"];
+// instead of repeating a JSON key string per field per record — across
+// ~137k records that was several MB of pure key-name bytes. This is
+// encoding-only: after this loop, RAW_DATA[i].records is structurally
+// identical to a plain array-of-objects shape (absolute epoch t, real
+// booleans), so nothing below this point needs to change.
+//
+// Two trailing slots are optional, each simply absent from a row that has
+// nothing to say there (see vizRecord.MarshalJSON in benchmark/visualize.go
+// for the full rule): row[16..19] (the UUID validation quad ue/uf/ul/uem)
+// on any request that never carried UUID data, and row[20]
+// ([expected_uuids_raw, found_mask, leaked_uuids_raw]) on any request
+// without an actual miss/leak. REC_FIELDS.forEach below reads row[i] with
+// an explicit not-undefined check and default rather than assuming every
+// row has all 20 fixed positions, so a short row costs nothing and still
+// decodes to the correct (zero/false/empty) values.
+//
+// gi (GuidIdx) is this record's index into its series' guidTable — NOT a
+// series_num-keyed lookup. series_guid is per-instance (session x
+// sub-agent), and one router-replay session runs every included instance
+// under a single series_num, so a series_num-keyed table cannot recover a
+// record's own guid. Each record instead carries a small integer index, and
+// o.guid below resolves it from the per-arm table, per record.
+const REC_FIELDS = ["t", "ttft", "resp", "err", "sn", "rn", "ch", "in", "ca", "out",
+  "turn", "scc", "cs", "ie", "lcr", "gi", "ue", "uf", "ul", "uem"];
+const REC_BOOL_FIELDS = ["err", "ch", "scc", "cs", "ie", "uem"];
 RAW_DATA.forEach(s => {
   const t0 = s.t0 || 0;
+  const guidTable = s.guidTable || [];
   s.records = (s.records || []).map(row => {
     const o = {};
-    REC_FIELDS.forEach((k, i) => { o[k] = row[i]; });
+    REC_FIELDS.forEach((k, i) => { o[k] = row[i] !== undefined ? row[i] : 0; });
     o.t += t0;
     REC_BOOL_FIELDS.forEach(k => { o[k] = !!o[k]; });
+    const extra = row[20];
+    o.exp = (extra && extra[0]) || [];
+    o.fmask = ((extra && extra[1]) || []).map(Boolean);
+    o.leak = (extra && extra[2]) || [];
+    o.guid = (o.gi >= 0 && guidTable[o.gi]) || "";
     return o;
   });
 });
@@ -1214,6 +1399,19 @@ const SUMMARY_METRICS = [
   { key: "err1k",   short: "Err/1k", label: "Errors per 1,000 requests, so arms with different request counts compare.", better: "down",
     val: st => st.total ? st.err / st.total * 1000 : 0,
     fmt: st => (st.total ? st.err / st.total * 1000 : 0).toFixed(1) },
+  // Promoted out of the Input cell's hover title, where this was the only
+  // value in the panel you had to hover one arm and then the other to
+  // compare -- in a panel that exists for side-by-side reading -- and the
+  // only one carrying no ratio-to-baseline row.
+  //
+  // Deliberately a per-TOKEN share (cached prompt tokens / all prompt
+  // tokens), NOT the per-REQUEST "cache hit rate" (the share of requests
+  // with server_cache_confirmed). Those are different numbers on the same
+  // run and are easy to quote interchangeably by mistake, so the label
+  // says "Cached input" rather than anything with "hit rate" in it.
+  { key: "cached",  short: "Cached input", label: "Share of prompt tokens served from cache rather than recomputed. Token share, not the share of requests that hit.", better: "up",
+    val: st => st.prompt > 0 ? st.caTok / st.prompt * 100 : 0,
+    fmt: st => st.prompt > 0 ? (st.caTok / st.prompt * 100).toFixed(1) + "%" : "-" },
 ];
 
 // --- Ratio to the HBM baseline ---
@@ -3181,6 +3379,15 @@ function provenanceHeader(kind, extraLines) {
     lines.push("# arms hidden/deselected, excluded from this export (" + hidden.length + "): " +
       hidden.map(i => DATA[i].name).join(", "));
   }
+  // The arm NAME is not reliably the model: --labels (visualize_merge.go)
+  // pins Name to the caller-supplied label, and without this line that
+  // leaves the export with no model identification at all for a labeled
+  // arm. Recorded per-arm from the run_params header; absent (no line) for
+  // an arm with no recorded params.
+  visible.forEach(i => {
+    const m = DATA[i].params && DATA[i].params.model;
+    if (m) lines.push("# model [" + DATA[i].name + "]: " + m);
+  });
   if (BASELINE_INDEX >= 0) {
     lines.push("# baseline arm (ratio columns are % of this arm): " + DATA[BASELINE_INDEX].name +
       (hiddenSeries.has(BASELINE_INDEX)
@@ -3215,13 +3422,42 @@ function provenanceHeader(kind, extraLines) {
   return lines;
 }
 
+// deriveCacheHitRatio recomputes r.chr (vizRecord no longer stores it -- see
+// the CacheHitRatio doc on vizRecord in benchmark/visualize.go) as EXACTLY
+// the value replay.go/auto.go compute when writing the JSONL: cached /
+// (input + cached) when either is non-zero, else 1 if cache_hit else 0 (the
+// TTFT-heuristic-only path, where no usage was reported at all).
+function deriveCacheHitRatio(r) {
+  const denom = r.in + r.ca;
+  if (denom > 0) return r.ca / denom;
+  return r.ch ? 1 : 0;
+}
+
 // buildRequestsRows: one row per request, from every visible arm's CURRENT
 // view (context band + series filter already applied via s._view), clipped
 // to the current zoom window -- exactly the rows windowStats() sums for the
-// summary panel over the same scope.
+// summary panel over the same scope. Carries every per-request field the
+// report embeds (see vizRecord in benchmark/visualize.go), so this export IS
+// the archive of the run -- deliberately excluded are the diagnostic text
+// fields (prompt/question/response/raw-tail) and error_message, which stay
+// error-only detail in the raw .jsonl, plus end_time (== start_time +
+// response_time_ms). model is NOT excluded on the same "the arm name
+// already carries it" theory as end_time -- under --labels the arm name is
+// the caller-supplied label, not the model -- so it is instead recorded per
+// arm in provenanceHeader's "# model [arm]: ..." line above these rows.
+// Token column order (input_tokens, output_tokens, cached_tokens) matches
+// the merged CSV (visualize_merge.go's csvHeader) so the two exports are at
+// actual parity, not just nominal.
+// expected_uuids_raw/found_mask/leaked_uuids_raw are "|"-joined since they're
+// naturally lists; found_mask is per-position true/false against
+// expected_uuids_raw, empty on any row without a miss or leak.
 function buildRequestsRows() {
-  const header = ["arm", "start_time", "ttft_ms", "response_time_ms", "series_num",
-    "request_num", "cache_hit", "input_tokens", "cached_tokens", "output_tokens", "is_error"];
+  const header = ["arm", "start_time", "series_guid", "series_num", "request_num", "turn",
+    "ttft_ms", "response_time_ms", "cache_hit", "cache_hit_ratio", "server_cache_confirmed",
+    "is_cold_start", "input_tokens", "output_tokens", "cached_tokens", "local_cache_ratio",
+    "is_error", "is_empty",
+    "uuid_expected", "uuid_found", "uuid_leaked", "uuid_exact_match",
+    "expected_uuids_raw", "found_mask", "leaked_uuids_raw"];
   const rows = [csvRow(header)];
   visibleIndices().forEach(i => {
     const s = DATA[i];
@@ -3230,10 +3466,22 @@ function buildRequestsRows() {
       rows.push(csvRow([
         s.name,
         new Date(s.t0 + r.t).toISOString(),
-        r.ttft, r.resp, r.sn, r.rn,
+        r.guid || "",
+        r.sn, r.rn, r.turn,
+        r.ttft, r.resp,
         r.ch ? "true" : "false",
-        r.in, r.ca, r.out,
+        deriveCacheHitRatio(r),
+        r.scc ? "true" : "false",
+        r.cs ? "true" : "false",
+        r.in, r.out, r.ca,
+        r.lcr,
         r.err ? "true" : "false",
+        r.ie ? "true" : "false",
+        r.ue, r.uf, r.ul,
+        r.uem ? "true" : "false",
+        (r.exp || []).join("|"),
+        (r.fmask || []).join("|"),
+        (r.leak || []).join("|"),
       ]));
     });
   });
@@ -3247,6 +3495,7 @@ const SUMMARY_CSV_COLUMNS = {
   in: "input_tokens", out: "output_tokens", reqs: "requests",
   inrate: "input_tokens_per_sec", outrate: "output_tokens_per_sec",
   ttft50: "ttft_p50_ms", ttft95: "ttft_p95_ms", err1k: "errors_per_1k",
+  cached: "cached_input_pct",
 };
 
 // summaryRatioPct mirrors fmtRatio's own gating exactly (a zero/negative/
@@ -3307,9 +3556,11 @@ function triggerDownload(filename, lines) {
 function downloadRequestsCsv() {
   const filename = "wekai-requests-" + visibleIndices().length + "arms-" + scopeToken() + ".csv";
   const notes = [
-    "NOTE: this is the 10-field JSONL subset (t, ttft, resp, err, sn, rn, ch, in, ca, out) -- the",
-    "full per-request record (prompts, full timestamps, and more) lives in the run's .jsonl files",
-    "on the results volume.",
+    "NOTE: excludes only the diagnostic text fields (prompt/question/response/raw-tail, error-only",
+    "in the raw .jsonl) and error_message -- read a failure from the run's .jsonl on the results",
+    "volume. end_time is start_time + response_time_ms; model is recorded per arm in the",
+    "'# model [arm]: ...' lines above, NOT by the arm name -- under --labels the arm name is the",
+    "caller-supplied label, not the model.",
   ];
   triggerDownload(filename, provenanceHeader("per-request rows", notes).concat(buildRequestsRows()));
 }

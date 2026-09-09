@@ -2270,6 +2270,12 @@ func runSingleModelBenchmark(
 			}
 			isFirstRequest := true
 			var coldStartTTFT time.Duration
+			// turnNum is this instance's own 1-based request counter --
+			// requestNum (below) counts the whole run, not this session, and
+			// resets to 0 whenever ExhaustSessions recycles seriesGUID (a new
+			// instance under the same series_num), mirroring what CycleNum
+			// means on the router-replay path (replay.go's requestDataRecord.Turn).
+			var turnNum int
 
 			var endpointOverride string
 			if endpointRouter != nil {
@@ -2300,6 +2306,7 @@ func runSingleModelBenchmark(
 				}
 
 				requestNum := int(st.totalCompleted.Load()) + 1
+				turnNum++
 				reqTimeout := cfg.RequestTimeout
 				if reqTimeout == 0 {
 					reqTimeout = 5 * time.Minute
@@ -2341,6 +2348,7 @@ func runSingleModelBenchmark(
 							}
 							isFirstRequest = true
 							coldStartTTFT = 0
+							turnNum = 0
 							st.datasetTracker.Reset(seriesNum)
 						} else {
 							cachedPrompt = buildSeriesPrompt(fullDocs, seriesGUID, groupGUID, maxDocTokens, useShared)
@@ -2480,6 +2488,7 @@ func runSingleModelBenchmark(
 						SeriesGUID:           seriesGUID,
 						SeriesNum:            seriesNum,
 						RequestNum:           requestNum,
+						Turn:                 turnNum,
 						CacheHit:             cacheHit,
 						CacheHitRatio:        cacheHitRatio,
 						ServerCacheConfirmed: serverCacheConfirmed,

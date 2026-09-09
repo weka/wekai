@@ -224,6 +224,26 @@ type taggedRecord struct {
 
 const csvMaxRows = 8000
 
+// csvHeader lists every column the on-disk merged CSV carries per request.
+// Brought to parity with the report's embedded per-request archive
+// (benchmark/visualize.go's vizRecord / buildRequestsRows): turn,
+// cache_hit_ratio, and the UUID validation fields were added here as the
+// same completeness fix, and token columns are ordered input_tokens,
+// output_tokens, cached_tokens in both exports (buildRequestsRows matches
+// this order) -- an earlier version of this comment claimed parity while
+// the two actually disagreed on that order. error_message stays (it already
+// had a column, unlike the report's embedded data, which deliberately
+// excludes it and the other diagnostic text fields -- see requestDataRecord
+// in auto.go).
+// expected_uuids_raw/found_mask/leaked_uuids_raw are "|"-joined lists, empty
+// on any row without a UUID miss or leak.
+//
+// All NEW columns (turn, cache_hit_ratio, and everything from uuid_expected
+// on) are appended AFTER the original 20 -- source .. is_empty keep their
+// original positions unchanged -- rather than inserted where their
+// neighboring field lives in requestDataRecord. Any existing consumer of
+// merged.csv that reads by position keeps working; only a reader that reads
+// by header name sees the new columns at all.
 var csvHeader = []string{
 	"source", "time_offset_ms", "start_time", "end_time",
 	"ttft_ms", "response_time_ms",
@@ -231,6 +251,9 @@ var csvHeader = []string{
 	"cache_hit", "server_cache_confirmed", "is_cold_start",
 	"input_tokens", "output_tokens", "cached_tokens", "local_cache_ratio",
 	"is_error", "error_message", "is_empty",
+	"turn", "cache_hit_ratio",
+	"uuid_expected", "uuid_found", "uuid_leaked", "uuid_exact_match",
+	"expected_uuids_raw", "found_mask", "leaked_uuids_raw",
 }
 
 func computeSourceStarts(records []taggedRecord) map[string]int64 {
@@ -247,6 +270,10 @@ func computeSourceStarts(records []taggedRecord) map[string]int64 {
 func recordToRow(tr taggedRecord, sourceStart map[string]int64) []string {
 	r := tr.record
 	offsetMs := r.StartTime.UnixMilli() - sourceStart[tr.source]
+	foundMask := make([]string, len(r.FoundMask))
+	for i, v := range r.FoundMask {
+		foundMask[i] = strconv.FormatBool(v)
+	}
 	return []string{
 		tr.source,
 		strconv.FormatInt(offsetMs, 10),
@@ -268,6 +295,15 @@ func recordToRow(tr taggedRecord, sourceStart map[string]int64) []string {
 		strconv.FormatBool(r.IsError),
 		r.ErrorMessage,
 		strconv.FormatBool(r.IsEmpty),
+		strconv.Itoa(r.Turn),
+		strconv.FormatFloat(r.CacheHitRatio, 'f', 6, 64),
+		strconv.Itoa(r.UUIDExpected),
+		strconv.Itoa(r.UUIDFound),
+		strconv.Itoa(r.UUIDLeaked),
+		strconv.FormatBool(r.UUIDExactMatch),
+		strings.Join(r.ExpectedUUIDsRaw, "|"),
+		strings.Join(foundMask, "|"),
+		strings.Join(r.LeakedUUIDsRaw, "|"),
 	}
 }
 
