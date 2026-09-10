@@ -428,6 +428,20 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 		return "", fmt.Errorf("marshal series data: %w", err)
 	}
 
+	// pubTplJSON carries publicReportTemplateHTML (the "Download Public
+	// Report" button's ported template, benchmark/visualize_public.go) into
+	// the page as a JSON string literal: json.Marshal handles all escaping
+	// mechanically (quotes, backslashes, newlines, control chars) and
+	// \u-escapes "<"/">"/"&" by default, so the template's own literal
+	// </script> can never break out of THIS page's <script> tag -- see
+	// PublicTemplate's use in vizTemplate below (template.JS suppresses
+	// html/template's own JS-context re-escaping, so the value lands as
+	// exactly this JSON literal).
+	pubTplJSON, err := json.Marshal(publicReportTemplateHTML)
+	if err != nil {
+		return "", fmt.Errorf("marshal public report template: %w", err)
+	}
+
 	concStr := "0"
 	if concurrency > 0 {
 		concStr = fmt.Sprintf("%d", concurrency)
@@ -441,8 +455,9 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 	defer out.Close()
 
 	if err := vizTemplate.Execute(out, map[string]template.JS{
-		"Data":        template.JS(seriesJSON),
-		"Concurrency": template.JS(concStr),
+		"Data":           template.JS(seriesJSON),
+		"Concurrency":    template.JS(concStr),
+		"PublicTemplate": template.JS(pubTplJSON),
 	}); err != nil {
 		return "", fmt.Errorf("execute template: %w", err)
 	}
@@ -728,6 +743,11 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
       <button id="downloadRequestsBtn"><span class="help-label" id="hlpDlReqs" tabindex="0" aria-describedby="helpTip" data-tip="CSV of per-request rows (arm, start time, TTFT, response time, tokens, cache hit, error) for the CURRENT view — zoom window, hidden arms, and the context/series filters all apply. Generated in the browser; nothing leaves the page.">Download Requests CSV</span></button>
       <button id="downloadSummaryBtn"><span class="help-label" id="hlpDlSummary" tabindex="0" aria-describedby="helpTip" data-tip="CSV of the summary panel's numbers (same metrics, same baseline ratios) for the CURRENT view.">Download Summary CSV</span></button>
     </div>
+    <div class="controls">
+      <label><span class="help-label" id="hlpPubRes" tabindex="0" aria-describedby="helpTip" data-tip="Downsample cadence for the exported public report's lines. Does not affect this page.">Resolution</span> <select id="pubResolution"><option value="15000">15s</option><option value="30000" selected>30s</option><option value="60000">1m</option><option value="300000">5m</option></select></label>
+      <label><span class="help-label" id="hlpPubSmooth" tabindex="0" aria-describedby="helpTip" data-tip="Display smoothing applied inside the exported file only. Does not affect this page.">Smoothing</span> <select id="pubSmoothing"><option value="0">None</option><option value="60000">1m</option><option value="120000">2m</option><option value="300000" selected>5m</option></select></label>
+      <button id="downloadPublicBtn"><span class="help-label" id="hlpDlPublic" tabindex="0" aria-describedby="helpTip" data-tip="Downloads a self-contained aggregate-only HTML report, generated entirely in the browser: per-request rows, series/request numbers, GUIDs, run IDs, endpoint URLs, and the raw model spec are absent from the file entirely, not merely hidden. Includes every arm regardless of the current legend/context-filter state, unlike the CSV exports above.">Download Public Report</span></button>
+    </div>
     </div>
   </div>
   <div class="panel" id="summaryPanel">
@@ -774,6 +794,7 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
     <div class="modal-actions" style="margin-top:0;">
       <button id="modalDownloadRequestsBtn"><span class="help-label" id="hlpDlReqsModal" tabindex="0" aria-describedby="helpTip" data-tip="CSV of per-request rows for the view as currently APPLIED — zoom window, hidden arms, and the applied context/series filters. Click Apply first if you just changed the band above.">Download Requests CSV</span></button>
       <button id="modalDownloadSummaryBtn"><span class="help-label" id="hlpDlSummaryModal" tabindex="0" aria-describedby="helpTip" data-tip="CSV of the summary panel's numbers for the view as currently applied.">Download Summary CSV</span></button>
+      <button id="modalDownloadPublicBtn"><span class="help-label" id="hlpDlPublicModal" tabindex="0" aria-describedby="helpTip" data-tip="Downloads a self-contained aggregate-only HTML report, using the Resolution/Smoothing selects in the main controls panel. Per-request data is absent from the file entirely, not merely hidden, and every arm is included regardless of visibility/filter state.">Download Public Report</span></button>
     </div>
     <div class="modal-actions">
       <button id="ctxApply">Apply</button>
@@ -912,45 +933,45 @@ let snFilter = new Set();
 // rolling-percentile lines, and error bars. Called once per series at load
 // and again on every context-filter change — never per frame, so 90k-row
 // datasets stay responsive.
-function computeDerived(s) {
-  const view = s._view;
+// computeDerivedFrom is the pure computation behind computeDerived: given a
+// record view and an arm's recorded concurrency (0 = not recorded), returns
+// every derived structure as a plain object rather than writing through a
+// series. This is what lets the public-report export (buildPublicReportHtml,
+// below) recompute the SAME percentile lines/window sizing over its own
+// full-run, never-view-filtered record set without mutating any live page
+// state — the interactive report's own s._view reflects whatever
+// context/series filter happens to be active on screen, which the export
+// must ignore.
+function computeDerivedFrom(view, conc) {
   const byT = view.slice().sort((a, b) => a.t - b.t);
-  s._byT = byT;
-  s._cumTimes = byT.map(r => r.t);
-  s._cumTokens = [];
-  s._cumOutTokens = []; // cumulative OUTPUT tokens, aligned with _cumTimes
+  const cumTimes = byT.map(r => r.t);
+  const cumTokens = [];
+  const cumOutTokens = []; // cumulative OUTPUT tokens, aligned with cumTimes
   let ingestAcc = 0, outAcc = 0;
   byT.forEach(r => {
     ingestAcc += (r.in || 0) + (r.ca || 0);
     outAcc += (r.out || 0);
-    s._cumTokens.push(ingestAcc);
-    s._cumOutTokens.push(outAcc);
+    cumTokens.push(ingestAcc);
+    cumOutTokens.push(outAcc);
   });
   const sorted = view.filter(r => !r.err).slice().sort((a, b) => a.t - b.t);
-  s._sorted = sorted;
   // Rolling-percentile window, in requests. Precedence, most trustworthy
   // first: the concurrency this arm RECORDED in its run_params header, then
   // the report-wide --concurrency the caller passed, then DEFAULT_WINDOW_REQS.
   // The per-arm value matters in a merged report whose arms ran at different
   // concurrency — one global number smooths one arm correctly and the other
   // wrongly, with nothing on screen saying so.
-  const seriesConc = s.conc > 0 ? s.conc : CONCURRENCY;
+  const seriesConc = conc > 0 ? conc : CONCURRENCY;
   const winSize = seriesConc > 0 ? seriesConc * 3 : DEFAULT_WINDOW_REQS;
-  s._winConcSource = s.conc > 0 ? "recorded" : (CONCURRENCY > 0 ? "--concurrency" : "default");
-  s._winConc = seriesConc;
-  s._winSize = winSize;
+  const winConcSource = conc > 0 ? "recorded" : (CONCURRENCY > 0 ? "--concurrency" : "default");
   // Plotted lines: rolling-window percentiles. Response = p50 (plus p10/p90
   // for the "ribbon" Requests render mode -- a spread envelope around the
   // same p50 line, same rolling window, computed here alongside it so it can
   // never drift out of sync); TTFT = p50 and p95 (dash pattern encodes the
   // percentile, color the series). recalcYMax deliberately never reads
-  // _respP10/_respP90 -- the axis must stay independent of which Requests
+  // respP10/respP90 -- the axis must stay independent of which Requests
   // mode is selected.
-  s._respP50 = [];
-  s._respP10 = [];
-  s._respP90 = [];
-  s._ttftP50 = [];
-  s._ttftP95 = [];
+  const respP50 = [], respP10 = [], respP90 = [], ttftP50 = [], ttftP95 = [];
   // Anchor the rolling-percentile line at ~TARGET_LINE_POINTS x-positions
   // rather than one per request. A per-record anchor makes this loop
   // O(n*winSize) with a fresh winSize-wide slice + 3 sorts allocated every
@@ -969,11 +990,11 @@ function computeDerived(s) {
     const ttfts = win.map(r => r.ttft).filter(v => v > 0);
     const resps = win.map(r => r.resp);
     const t = sorted[i].t;
-    s._respP50.push({ t: t, v: percentile(resps, 0.5) });
-    s._respP10.push({ t: t, v: percentile(resps, 0.1) });
-    s._respP90.push({ t: t, v: percentile(resps, 0.9) });
-    s._ttftP50.push({ t: t, v: ttfts.length ? percentile(ttfts, 0.5) : 0 });
-    s._ttftP95.push({ t: t, v: ttfts.length ? percentile(ttfts, 0.95) : 0 });
+    respP50.push({ t: t, v: percentile(resps, 0.5) });
+    respP10.push({ t: t, v: percentile(resps, 0.1) });
+    respP90.push({ t: t, v: percentile(resps, 0.9) });
+    ttftP50.push({ t: t, v: ttfts.length ? percentile(ttfts, 0.5) : 0 });
+    ttftP95.push({ t: t, v: ttfts.length ? percentile(ttfts, 0.95) : 0 });
   };
   for (let i = 0; i < sorted.length; i += stride) pushAnchor(i);
   // Always anchor the final record so the line reaches the true end of the run
@@ -983,7 +1004,7 @@ function computeDerived(s) {
   }
   // Error bars: sample every winSize points from the view (including
   // errors), each bar anchored at the response p50 line at that time.
-  s._errBars = [];
+  const errBars = [];
   let avgIdx = 0;
   for (let i = winSize - 1; i < byT.length; i += winSize) {
     const start = Math.max(0, i - winSize + 1);
@@ -991,11 +1012,26 @@ function computeDerived(s) {
     for (let j = start; j <= i; j++) { total++; if (byT[j].err) errs++; }
     if (errs > 0) {
       const t = byT[i].t;
-      while (avgIdx < s._respP50.length - 1 && s._respP50[avgIdx].t < t) avgIdx++;
-      const respAvg = s._respP50.length > 0 ? s._respP50[Math.min(avgIdx, s._respP50.length - 1)].v : 0;
-      s._errBars.push({ t: t, errRate: errs / total, errs: errs, total: total, respAvg: respAvg });
+      while (avgIdx < respP50.length - 1 && respP50[avgIdx].t < t) avgIdx++;
+      const respAvg = respP50.length > 0 ? respP50[Math.min(avgIdx, respP50.length - 1)].v : 0;
+      errBars.push({ t: t, errRate: errs / total, errs: errs, total: total, respAvg: respAvg });
     }
   }
+  return {
+    _byT: byT, _cumTimes: cumTimes, _cumTokens: cumTokens, _cumOutTokens: cumOutTokens,
+    _sorted: sorted, _winConcSource: winConcSource, _winConc: seriesConc, _winSize: winSize,
+    _respP50: respP50, _respP10: respP10, _respP90: respP90, _ttftP50: ttftP50, _ttftP95: ttftP95,
+    _errBars: errBars,
+  };
+}
+
+// computeDerived rebuilds every derived structure of a series from its
+// current view: cumulative ingest/output (volume layer + hover rates),
+// rolling-percentile lines, and error bars. Called once per series at load
+// and again on every context-filter change — never per frame, so 90k-row
+// datasets stay responsive.
+function computeDerived(s) {
+  Object.assign(s, computeDerivedFrom(s._view, s.conc));
 }
 
 DATA.forEach(s => {
@@ -1086,7 +1122,8 @@ const helpTip = document.getElementById("helpTip");
 // labels, grabbed here by id) or are built later in JS (summary column
 // headers, the Cache Mix toggle -- each pushes itself in as it's created).
 const helpTriggers = ["hlpTtft50", "hlpTtft95", "hlpResp", "hlpReqs", "hlpErrors", "hlpTotals",
-    "hlpDlReqs", "hlpDlSummary", "hlpDlReqsModal", "hlpDlSummaryModal"]
+    "hlpDlReqs", "hlpDlSummary", "hlpDlReqsModal", "hlpDlSummaryModal",
+    "hlpPubRes", "hlpPubSmooth", "hlpDlPublic", "hlpDlPublicModal"]
   .map(id => document.getElementById(id)).filter(Boolean);
 
 // totalsAxisLabel: the rotated title for the Totals-layer right axis (see
@@ -1230,11 +1267,14 @@ recalcYMax();
 
 function isZoomed() { return viewTMin !== globalTMin || viewTMax !== globalTMax; }
 
-// windowStats reduces a series' current view to everything the header needs,
-// in ONE pass: request counts, token volumes, and the record-time extent used
-// as the rate denominator. Called once per series per draw() (via updateInfo),
-// including during a zoom drag, so it must stay single-pass — the old
-// countRecords did the same walk for counts alone.
+// windowStats reduces a records array to everything the header needs, over
+// [tLo, tHi] (both bounds inclusive), in ONE pass: request counts, token
+// volumes, and the record-time extent used as the rate denominator. Called
+// once per series per draw() (via updateInfo), including during a zoom drag,
+// so it must stay single-pass — the old countRecords did the same walk for
+// counts alone. Also reused by the public-report export
+// (buildPublicReportHtml, below) with the export's own full-run [tLo, tHi]
+// instead of the current on-screen view.
 //
 // Token semantics, per the net-of-cache contract in
 // benchmark/replay_router_post.go (buildReplayUsage): r.in EXCLUDES cached
@@ -1242,7 +1282,7 @@ function isZoomed() { return viewTMin !== globalTMin || viewTMax !== globalTMax;
 // processed = in + ca. That matches the "ingest" volume layer, which sums the
 // same pair. Volumes include errored requests (a failed request still cost
 // its prompt); "completed" counts only non-errors.
-function windowStats(records) {
+function windowStats(records, tLo, tHi) {
   let ok = 0, err = 0, inTok = 0, caTok = 0, outTok = 0;
   let tFirst = Infinity, tLast = -Infinity;
   // TTFT percentiles come from non-error requests that actually reported a
@@ -1250,7 +1290,7 @@ function windowStats(records) {
   // zoomed summary agrees with the curve it sits above.
   const ttfts = [];
   records.forEach(r => {
-    if (r.t < viewTMin || r.t > viewTMax) return;
+    if (r.t < tLo || r.t > tHi) return;
     if (r.err) err++; else {
       ok++;
       if (r.ttft > 0) ttfts.push(r.ttft);
@@ -1271,7 +1311,7 @@ function windowStats(records) {
   // otherwise dilute its rate with empty time it never ran through. Falls
   // back to the window width when the extent is degenerate (0 or 1 record).
   let spanSec = total > 1 ? (tLast - tFirst) / 1000 : 0;
-  if (spanSec <= 0) spanSec = Math.max((viewTMax - viewTMin) / 1000, 1);
+  if (spanSec <= 0) spanSec = Math.max((tHi - tLo) / 1000, 1);
   return {
     ok, err, total, inTok, caTok, outTok, prompt: inTok + caTok, spanSec,
     ttft50: percentileSorted(sortedTtft, 0.5),
@@ -1281,7 +1321,7 @@ function windowStats(records) {
 }
 
 function countRecords(records) {
-  const s = windowStats(records);
+  const s = windowStats(records, viewTMin, viewTMax);
   return { ok: s.ok, err: s.err, total: s.total };
 }
 
@@ -1299,7 +1339,7 @@ let statsEpoch = 0;
 function seriesStats() {
   const key = viewTMin + "|" + viewTMax + "|" + statsEpoch;
   if (statsCache && statsCacheKey === key) return statsCache;
-  statsCache = DATA.map(s => windowStats(s._view));
+  statsCache = DATA.map(s => windowStats(s._view, viewTMin, viewTMax));
   statsCacheKey = key;
   return statsCache;
 }
@@ -3541,8 +3581,11 @@ function buildSummaryRows() {
 // triggerDownload builds a Blob from the given lines and clicks a throwaway
 // <a download> at its object URL -- no network, no external library. The
 // object URL is revoked right after the synthetic click so it doesn't leak.
-function triggerDownload(filename, lines) {
-  const blob = new Blob([lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+// mime defaults to the CSV exports' own type, so existing callers below are
+// unaffected; the public-report export (below) passes "text/html" and a
+// single-element lines array (the "\r\n"-join is then a no-op).
+function triggerDownload(filename, lines, mime) {
+  const blob = new Blob([lines.join("\r\n")], { type: mime || "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -3568,6 +3611,461 @@ function downloadSummaryCsv() {
   const filename = "wekai-summary-" + visibleIndices().length + "arms-" + scopeToken() + ".csv";
   triggerDownload(filename, provenanceHeader("summary panel", []).concat(buildSummaryRows()));
 }
+
+// --- Public (aggregate-only) report export ------------------------------
+// Builds a self-contained aggregate-only HTML document -- entirely
+// client-side, from data already loaded into THIS page -- and downloads it
+// via Blob exactly like the CSV exports above. Unlike the CSV exports, the
+// public report always includes EVERY arm regardless of the current legend/
+// context-filter state (matching what the former --public CLI flag always
+// did; see the button's own data-tip). Per-request data (series_num,
+// request_num, series_guid, run_id, endpoint URLs, the raw model-spec
+// string) is never read into the exported payload -- see the explicit
+// field whitelist in buildPublicReportHtml's payload construction below;
+// a future field added to a series/params object here must be deliberately
+// added to that whitelist, never inherited by a spread.
+
+const PUBLIC_TEMPLATE = {{.PublicTemplate}};
+
+// pubFill replaces every occurrence of each key in map with its value,
+// using split/join rather than String.prototype.replace(str, str): arm
+// labels (from --labels) and JSON payloads can contain "$", and replace's
+// special replacement sequences (matched-substring/before-match/after-
+// match/capture-group backreferences, "$$") would corrupt output built
+// that way.
+function pubFill(tpl, map) {
+  let out = tpl;
+  Object.keys(map).forEach(k => { out = out.split(k).join(map[k]); });
+  return out;
+}
+
+// pubEsc HTML-escapes a value for the exported document's markup. The old
+// Go pipeline got this for free from html/template on every interpolation;
+// this export owns that responsibility explicitly for every value it writes
+// into HTML, since arm names/labels (from --labels) are arbitrary strings
+// that can legitimately contain "&"/quotes/angle brackets.
+function pubEsc(v) {
+  return String(v == null ? "" : v)
+    .split("&").join("&amp;").split("<").join("&lt;").split(">").join("&gt;")
+    .split('"').join("&quot;").split("'").join("&#39;");
+}
+
+// pubArmOrigin computes the ONE shared origin for every layer of one arm's
+// exported chart -- respP50/ttft/errBars/cum (derived from records) as well
+// as mix/adt (the metrics-sampler's own series) -- so a real lead/lag
+// between the request clock and the sampler clock stays visible on the
+// shared axis instead of each layer silently keeping its own separate zero.
+// Operates on s.records/s.mix/s.adt as already loaded (already shifted once
+// by this page's own per-series normalization, see the DATA.forEach above)
+// -- the computation below is translation-invariant, so it reaches the same
+// relative answer regardless of that earlier shift.
+//
+// A mix/adt timestamp more than one run-window's duration outside
+// [recMin, recMax] is corrupt input, not a legitimate early/late sample: it
+// is reported to the console (naming the arm) and dropped before the
+// min-scan, rather than being allowed to drag the shared origin -- and
+// therefore the whole exported chart -- off axis. When the arm's own
+// request span is degenerate (0 or 1 record) there is no meaningful
+// duration to test against, so the check is skipped rather than flagging
+// every mix/adt point as corrupt by default. Returns the additive shift to
+// apply to every record's t (so records land on the shared origin), the
+// origin itself (to subtract from mix/adt), the filtered mix/adt, and how
+// many samples were dropped (surfaced in the exported footer so a drop is
+// disclosed, not silent).
+function pubArmOrigin(s) {
+  const records = s.records || [];
+  let recMin = Infinity, recMax = -Infinity;
+  records.forEach(r => { if (r.t < recMin) recMin = r.t; if (r.t > recMax) recMax = r.t; });
+  const haveRec = isFinite(recMin);
+  const duration = haveRec ? recMax - recMin : 0;
+  const checkCorruption = haveRec && duration > 0;
+  const inWindow = t => !checkCorruption || (t >= recMin - duration && t <= recMax + duration);
+
+  let dropped = 0;
+  const filteredMix = (s.mix || []).filter(m => {
+    const ok = inWindow(m.t0) && inWindow(m.t1);
+    if (!ok) {
+      dropped++;
+      console.warn("public report export: arm " + s.name + " cache-mix sample at t=" + m.t0 +
+        "ms is outside the run's request window -- dropping as corrupt input");
+    }
+    return ok;
+  });
+  const filteredAdt = (s.adt || []).filter(p => {
+    const ok = inWindow(p.t);
+    if (!ok) {
+      dropped++;
+      console.warn("public report export: arm " + s.name + " active-dataset sample at t=" + p.t +
+        "ms is outside the run's request window -- dropping as corrupt input");
+    }
+    return ok;
+  });
+
+  let origin = 0, haveOrigin = false;
+  if (haveRec) { origin = recMin; haveOrigin = true; }
+  filteredMix.forEach(m => { if (!haveOrigin || m.t0 < origin) { origin = m.t0; haveOrigin = true; } });
+  filteredAdt.forEach(p => { if (!haveOrigin || p.t < origin) { origin = p.t; haveOrigin = true; } });
+  if (!haveOrigin) return { shift: 0, origin: 0, mix: filteredMix, adt: filteredAdt, dropped };
+  const shift = haveRec ? recMin - origin : 0;
+  return { shift, origin, mix: filteredMix, adt: filteredAdt, dropped };
+}
+
+// pubDownsamplePts is the step-function resolution downsample (boundary
+// anchored at pts[0].t, last point at-or-before each boundary kept, final
+// point always kept; intervalMs<=0 returns the input unchanged) applied to
+// a percentile line at export-build time -- this happens ONCE, before the
+// exported file's own display smoothing (computed at LOAD time inside the
+// exported file's own script), matching how the two stages always composed.
+function pubDownsamplePts(pts, intervalMs) {
+  if (!pts || !pts.length || !(intervalMs > 0)) return pts || [];
+  let boundary = pts[0].t + intervalMs;
+  const out = [];
+  let last = null;
+  pts.forEach(p => {
+    while (p.t >= boundary) {
+      if (last) out.push(last);
+      boundary += intervalMs;
+    }
+    last = p;
+  });
+  if (last) out.push(last);
+  return out;
+}
+
+// pubDownsampleMix coalesces raw cache-mix segments into buckets whose
+// START is at least intervalMs apart, summing each source's token delta and
+// extending the bucket's end -- exact arithmetic (every raw token counted
+// exactly once), not an approximation. t0/t1 land on the arm's shared
+// origin (see pubArmOrigin) instead of this page's own per-arm-relative
+// axis.
+function pubDownsampleMix(mix, origin, intervalMs) {
+  if (!mix || !mix.length) return [];
+  const sorted = mix.slice().sort((a, b) => a.t0 - b.t0);
+  const out = [];
+  let cur = null;
+  sorted.forEach(seg => {
+    const rt0 = seg.t0 - origin, rt1 = seg.t1 - origin;
+    if (!cur || (intervalMs > 0 && rt0 - cur.t0 >= intervalMs)) {
+      if (cur) out.push(cur);
+      cur = { t0: rt0, t1: rt1, c: seg.c, lc: seg.lc, ec: seg.ec };
+    } else {
+      cur.t1 = rt1;
+      cur.c += seg.c; cur.lc += seg.lc; cur.ec += seg.ec;
+    }
+  });
+  if (cur) out.push(cur);
+  return out;
+}
+
+// pubDownsampleAdt applies the same step-function reduction as
+// pubDownsamplePts (last point at-or-before each boundary, final point
+// always kept; intervalMs<=0 keeps every point), carrying the series-count
+// field along and landing t on the arm's shared origin.
+function pubDownsampleAdt(adt, origin, intervalMs) {
+  if (!adt || !adt.length) return [];
+  const sorted = adt.slice().sort((a, b) => a.t - b.t);
+  const toPub = p => ({ t: p.t - origin, v: p.v, s: p.s });
+  if (!(intervalMs > 0)) return sorted.map(toPub);
+  let boundary = sorted[0].t + intervalMs;
+  const out = [];
+  let last = null;
+  sorted.forEach(p => {
+    while (p.t >= boundary) {
+      if (last) out.push(toPub(last));
+      boundary += intervalMs;
+    }
+    last = p;
+  });
+  if (last) out.push(toPub(last));
+  return out;
+}
+
+// pubBuildCum computes the running (input+cached) and output token sums
+// over records sorted by time, then downsamples with the same step-function
+// rule as pubDownsamplePts, applied directly over the paired
+// {cumIn,cumOut} value so both cumulative curves are guaranteed to share
+// the exact same downsampled t set rather than risking two independent
+// reductions drifting apart by a point.
+function pubBuildCum(records, intervalMs) {
+  if (!records || !records.length) return [];
+  const sorted = records.slice().sort((a, b) => a.t - b.t);
+  let cumIn = 0, cumOut = 0;
+  const full = sorted.map(r => {
+    cumIn += (r.in || 0) + (r.ca || 0);
+    cumOut += (r.out || 0);
+    return { t: r.t, cumIn, cumOut };
+  });
+  if (!(intervalMs > 0)) return full;
+  let boundary = full[0].t + intervalMs;
+  const out = [];
+  let last = null;
+  full.forEach(p => {
+    while (p.t >= boundary) {
+      if (last) out.push(last);
+      boundary += intervalMs;
+    }
+    last = p;
+  });
+  if (last) out.push(last);
+  return out;
+}
+
+// pubIntervalErrBars computes a wall-clock-interval error rate directly
+// from every record (errors included) -- deliberately NOT
+// computeDerivedFrom's own errBars, whose window is sized off the run's
+// concurrency: this export's error-rate cadence must depend only on the
+// selected resolution, not on a number the exported file carries no other
+// trace of. A bucket with zero errors is omitted. respP50Down anchors each
+// bar's displayed value at the response line's value at-or-after the
+// bucket's time, via a two-pointer merge.
+function pubIntervalErrBars(records, intervalMs, respP50Down) {
+  if (!(intervalMs > 0) || !records || !records.length) return [];
+  const buckets = new Map();
+  records.forEach(r => {
+    const idx = Math.floor(r.t / intervalMs);
+    let b = buckets.get(idx);
+    if (!b) { b = { errs: 0, total: 0 }; buckets.set(idx, b); }
+    b.total++;
+    if (r.err) b.errs++;
+  });
+  const idxs = Array.from(buckets.keys()).sort((a, b) => a - b);
+  const out = [];
+  let pi = 0;
+  idxs.forEach(idx => {
+    const b = buckets.get(idx);
+    if (b.errs === 0) return;
+    const t = idx * intervalMs;
+    while (pi < respP50Down.length - 1 && respP50Down[pi].t < t) pi++;
+    let respAvg = 0;
+    if (respP50Down.length > 0) respAvg = respP50Down[Math.min(pi, respP50Down.length - 1)].v;
+    out.push({ t, errRate: pubRoundN(b.errs / b.total, 4), errs: b.errs, total: b.total, respAvg: pubRoundN(respAvg, 1) });
+  });
+  return out;
+}
+
+// pubRoundN rounds v to the given number of decimal places -- keeps the
+// exported JSON small: a percentile line's value or an error rate carries
+// no meaningful information past 1-4 decimals, but a float's default JSON
+// encoding would otherwise spend most of the exported bytes on precision no
+// chart pixel can show.
+function pubRoundN(v, decimals) {
+  if (!isFinite(v)) return 0;
+  const scale = Math.pow(10, decimals);
+  return Math.round(v * scale) / scale;
+}
+
+// pubResolutionLabel maps the export's numeric resolution selection to its
+// <option> label text (matching the #pubResolution select above) -- a pure
+// lookup, not a DOM read, so buildPublicReportHtml has no DOM dependency at
+// all and can be called directly (e.g. from a test) without stubbing
+// document/Blob/URL.
+function pubResolutionLabel(ms) {
+  const known = { 15000: "15s", 30000: "30s", 60000: "1m", 300000: "5m" };
+  return known[ms] || formatTickLabel(Math.round(ms / 1000));
+}
+
+// pubSummaryHeadHtml renders the summary table's per-metric <th> cells,
+// reusing SUMMARY_METRICS verbatim (the same metric set/order the on-screen
+// panel uses) so the exported table can never drift from it.
+function pubSummaryHeadHtml() {
+  return SUMMARY_METRICS.map(m =>
+    '<th><span class="help-label" tabindex="0" data-tip="' + pubEsc(m.label) + '">' + pubEsc(m.short) + '</span></th>'
+  ).join("");
+}
+
+// pubSummaryCell computes one metric cell's value/ratio/tint exactly the
+// way the on-screen renderSummary does (reusing fmtRatio and the metric's
+// own val/fmt/better, never re-deriving the comparison), for the isBaseline
+// row.
+function pubSummaryCell(m, st, baseStats, isBaselineRow) {
+  const val = st ? m.fmt(st) : "-";
+  let ratio = "", tint = "";
+  if (baseStats && st && !isBaselineRow) {
+    ratio = fmtRatio(m.val(st), m.val(baseStats));
+    if (ratio) {
+      const r = m.val(st) / m.val(baseStats);
+      const good = m.better === "up" ? r > 1 : r < 1;
+      tint = r === 1 ? "" : (good ? "up" : "down");
+    }
+  }
+  return { val, ratio, tint };
+}
+
+// pubSummaryBodyHtml renders one <tr> per row (arm), matching the markup
+// generateVisualizationPublic used to produce server-side: a legend-dot
+// colored per row.color, a summary-name with a title combining the arm's
+// name/params/window-info, a "(baseline)" chip on the baseline row, and one
+// metric cell per SUMMARY_METRICS entry with its ratio-to-baseline
+// (pubSummaryCell). Every interpolated value goes through pubEsc.
+function pubSummaryBodyHtml(rows, baseStats) {
+  return rows.map((row, ri) => {
+    const titleBits = [row.name];
+    if (row.paramsSummary) titleBits.push("params: " + row.paramsSummary);
+    titleBits.push(row.windowInfo);
+    const cells = SUMMARY_METRICS.map(m => {
+      const c = pubSummaryCell(m, row.stats, baseStats, row.isBaseline);
+      const ratioSpan = c.ratio
+        ? '<span class="sum-ratio help-label ' + c.tint + '" tabindex="0" data-tip="Share of the baseline arm. Green is better, orange is worse.">' + pubEsc(c.ratio) + '</span>'
+        : '<span class="sum-ratio"></span>';
+      return '<td><span class="sum-val">' + pubEsc(c.val) + '</span>' + ratioSpan + '</td>';
+    }).join("");
+    const baselineChip = row.isBaseline ? '<span class="sum-baseline">(baseline)</span>' : '';
+    return '<tr data-si="' + ri + '">' +
+      '<td class="vcol"><span class="summary-head"><span class="legend-dot" style="background:' + pubEsc(row.color) + '"></span>' +
+      '<span class="summary-name" title="' + pubEsc(titleBits.join("\n")) + '">' + pubEsc(row.name) + '</span>' +
+      baselineChip + '</span></td>' + cells + '</tr>';
+  }).join("");
+}
+
+// buildPublicReportHtml renders a complete, self-contained aggregate-only
+// HTML document -- as a string -- at the given resolution/smoothing
+// selections (both in ms; resolutionMs<=0 defaults to 30000, matching the
+// former --public CLI flag's own default). Pure function: no DOM writes, no
+// Blob, no download (see downloadPublicReport below for that), which is
+// what lets it be called directly under Node with no Blob/URL/document
+// stubbing. Includes every arm regardless of the current legend/context-
+// filter state -- unlike the CSV exports, which honor the current view.
+//
+// Order matters and must not be reordered: the records-only tMin/tMax range
+// (recTMin/recTMax below, used for the summary stats) is captured BEFORE it
+// is extended by mix/adt tails (used for the exported chart's displayed
+// range and the footer's stated run length) -- reversing that would
+// silently change every summary number without necessarily failing a test
+// that isn't specifically checking for it.
+function buildPublicReportHtml(resolutionMs, smoothingMs) {
+  const intervalMs = resolutionMs > 0 ? resolutionMs : 30000;
+  const smoothMs = smoothingMs > 0 ? smoothingMs : 0;
+
+  // Per arm: shared origin, full (never view-filtered) shifted records, and
+  // the full-run percentile lines derived from them.
+  const arms = DATA.map(s => {
+    const o = pubArmOrigin(s);
+    const shiftedRecords = (s.records || []).map(r => (
+      { t: r.t + o.shift, err: r.err, ttft: r.ttft, resp: r.resp, in: r.in, ca: r.ca, out: r.out }
+    ));
+    const derived = computeDerivedFrom(shiftedRecords, s.conc);
+    return { s, origin: o.origin, shiftedRecords, derived, mixRaw: o.mix, adtRaw: o.adt, dropped: o.dropped };
+  });
+
+  // Records-only global range, captured BEFORE the mix/adt tail extension
+  // below -- this is what the whole-run summary stats use.
+  let recTMin = Infinity, recTMax = -Infinity;
+  arms.forEach(a => {
+    a.shiftedRecords.forEach(r => {
+      if (r.t < recTMin) recTMin = r.t;
+      if (r.t > recTMax) recTMax = r.t;
+    });
+  });
+  if (!isFinite(recTMin)) { recTMin = 0; recTMax = 0; }
+  if (recTMax === recTMin) recTMax = recTMin + 1000;
+
+  // Per-arm downsampled arrays, at the export's own resolution.
+  arms.forEach(a => {
+    const respP50Down = pubDownsamplePts(a.derived._respP50, intervalMs);
+    a.respP50 = respP50Down.map(p => ({ t: p.t, v: pubRoundN(p.v, 1) }));
+    a.ttftP50 = pubDownsamplePts(a.derived._ttftP50, intervalMs).map(p => ({ t: p.t, v: pubRoundN(p.v, 1) }));
+    a.ttftP95 = pubDownsamplePts(a.derived._ttftP95, intervalMs).map(p => ({ t: p.t, v: pubRoundN(p.v, 1) }));
+    a.errBars = pubIntervalErrBars(a.shiftedRecords, intervalMs, respP50Down);
+    a.mix = pubDownsampleMix(a.mixRaw, a.origin, intervalMs);
+    a.adt = pubDownsampleAdt(a.adtRaw, a.origin, intervalMs);
+    a.cum = pubBuildCum(a.shiftedRecords, intervalMs);
+  });
+
+  // Extend tMax with mix/adt tails, same as this page's own globalTMin/
+  // globalTMax scan (a final sample can land after the last request
+  // completes). tMin/tMax (as opposed to recTMin/recTMax above) are the
+  // exported chart's displayed range and the footer's stated run length.
+  let tMin = recTMin, tMax = recTMax;
+  arms.forEach(a => {
+    (a.mix || []).forEach(m => { if (m.t1 > tMax) tMax = m.t1; });
+    (a.adt || []).forEach(p => { if (p.t > tMax) tMax = p.t; });
+  });
+  if (tMax === tMin) tMax = tMin + 1000;
+
+  const hasCacheMix = arms.some(a => (a.mix && a.mix.length) || (a.adt && a.adt.length));
+
+  // Whole-run summary stats over the records-only range captured above,
+  // BEFORE the mix/adt extension changed tMax.
+  arms.forEach(a => { a.stats = windowStats(a.shiftedRecords, recTMin, recTMax); });
+  const baselineIdx = BASELINE_INDEX; // already computed report-wide, in DATA's own display order
+  const baseStats = baselineIdx >= 0 ? arms[baselineIdx].stats : null;
+  const summaryRows = arms.map((a, i) => ({
+    name: a.s.name,
+    color: seriesColors[i],
+    isBaseline: i === baselineIdx,
+    paramsSummary: paramsSummaryFor(a.s),
+    windowInfo: "rolling window: " + (a.derived._winSize || 0) + " reqs (" + a.derived._winConcSource + ")",
+    stats: a.stats,
+  }));
+
+  const droppedTotal = arms.reduce((n, a) => n + (a.dropped || 0), 0);
+  const runLengthSec = (tMax - tMin) / 1000;
+  const resolutionLabel = pubResolutionLabel(intervalMs);
+  let footer = "Run length " + formatTickLabel(Math.round(runLengthSec)) +
+    ". Downsampled to " + resolutionLabel + " intervals. Per-request detail is not included in this file.";
+  if (droppedTotal > 0) {
+    footer += " " + droppedTotal + " cache-mix/dataset sample(s) outside the run's request window were dropped as corrupt input (see the browser console at export time).";
+  }
+  footer += " Generated " + new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC.";
+
+  // The payload whitelist is the security boundary: every field is listed
+  // explicitly, never a spread of the live series object and never a
+  // blanket JSON.stringify of it -- so a future field added to a series/
+  // params object above requires a deliberate look at this list before it
+  // can reach a file meant to omit per-request specifics (series_num,
+  // request_num, series_guid, run_id, endpoint URLs, the raw model spec).
+  const payload = arms.map((a, i) => ({
+    name: a.s.name,
+    color: seriesColors[i],
+    ok: a.stats.ok,
+    err: a.stats.err,
+    params: paramsSummaryFor(a.s) || undefined,
+    respP50: a.respP50.map(p => [p.t, p.v]),
+    ttftP50: a.ttftP50.map(p => [p.t, p.v]),
+    ttftP95: a.ttftP95.map(p => [p.t, p.v]),
+    errBars: a.errBars.map(b => [b.t, b.errRate, b.errs, b.total, b.respAvg]),
+    mix: a.mix.map(m => [m.t0, m.t1, m.c, m.lc, m.ec]),
+    adt: a.adt.map(p => [p.t, p.v, p.s]),
+    cum: a.cum.map(p => [p.t, p.cumIn, p.cumOut]),
+  }));
+
+  const map = {
+    "@@PUB_CACHEMIX_CHECKBOX@@": hasCacheMix
+      ? '<label><input type="checkbox" id="showCacheMix"> <span class="help-label" data-tip="Where prompt tokens came from: recompute, local cache, or external KV.">Cache Mix</span></label>'
+      : "",
+    "@@PUB_SUMMARY_LABEL@@": pubEsc("full run (" + formatTickLabel(Math.round(runLengthSec)) + ")"),
+    "@@PUB_HASRATIOS_CLASS@@": baselineIdx >= 0 ? ' class="has-ratios"' : "",
+    "@@PUB_SUMMARY_HEAD@@": pubSummaryHeadHtml(),
+    "@@PUB_SUMMARY_BODY@@": pubSummaryBodyHtml(summaryRows, baseStats),
+    "@@PUB_FOOTER@@": pubEsc(footer),
+    "/*@PUB_DATA@*/[]": JSON.stringify(payload),
+    "/*@PUB_CONCURRENCY@*/0": String(CONCURRENCY || 0),
+    "/*@PUB_HASCACHEMIX@*/false": String(hasCacheMix),
+    "/*@PUB_INTERVALMS@*/0": String(intervalMs),
+    "/*@PUB_TMIN@*/0": String(tMin),
+    "/*@PUB_TMAX@*/0": String(tMax),
+    "/*@PUB_SMOOTHMS@*/0": String(smoothMs),
+  };
+  return pubFill(PUBLIC_TEMPLATE, map);
+}
+
+// downloadPublicReport reads the two export selects and triggers the
+// download -- the only DOM-touching step in this whole feature; everything
+// that computes the document itself (buildPublicReportHtml) is DOM-free.
+function downloadPublicReport() {
+  const resEl = document.getElementById("pubResolution");
+  const smoothEl = document.getElementById("pubSmoothing");
+  const resolutionMs = resEl ? parseInt(resEl.value, 10) || 30000 : 30000;
+  const smoothingMs = smoothEl ? parseInt(smoothEl.value, 10) || 0 : 0;
+  const html = buildPublicReportHtml(resolutionMs, smoothingMs);
+  const filename = "wekai-public-" + DATA.length + "arms-" + pubResolutionLabel(resolutionMs) + ".html";
+  triggerDownload(filename, [html], "text/html;charset=utf-8");
+}
+["downloadPublicBtn", "modalDownloadPublicBtn"].forEach(id => {
+  const btn = document.getElementById(id);
+  if (btn) btn.addEventListener("click", downloadPublicReport);
+});
+
 ["downloadRequestsBtn", "modalDownloadRequestsBtn"].forEach(id => {
   const btn = document.getElementById(id);
   if (btn) btn.addEventListener("click", downloadRequestsCsv);

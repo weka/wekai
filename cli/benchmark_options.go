@@ -124,25 +124,21 @@ func (c *BenchmarkAutoOptions) FIFOGateOrder() bool { return !flagOn(c.RandomGat
 
 // BenchmarkVisualizeOptions contains options for the benchmark visualize subcommand
 type BenchmarkVisualizeOptions struct {
-	Concurrency    int    `long:"concurrency" description:"Override the concurrency used for the moving-average window (window = concurrency*3). Normally unnecessary: runs record their own concurrency in the reqdata JSONL and each arm is sized from its own. Use only for data recorded before run params were saved, or to force a different smoothing window." default:"0"`
-	MaxElapsed     string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
-	Public         bool   `long:"public" description:"Emit an aggregate-only report (report-public.html, never overwriting report.html) safe to share externally: per-request data is absent from the file, not just hidden -- only downsampled rolling-percentile/error-rate/cache-mix/ingest series and a precomputed whole-run summary table (which does not reprice on zoom). Strips run_id, endpoint URLs, and the raw model-spec string; arm names come from --labels when given."`
-	PublicInterval string `long:"public-interval" description:"Downsample interval for --public series (e.g. 30s, 1m). Default 30s." default:"30s"`
-	Args           struct {
+	Concurrency int    `long:"concurrency" description:"Override the concurrency used for the moving-average window (window = concurrency*3). Normally unnecessary: runs record their own concurrency in the reqdata JSONL and each arm is sized from its own. Use only for data recorded before run params were saved, or to force a different smoothing window." default:"0"`
+	MaxElapsed  string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
+	Args        struct {
 		Dir string `positional-arg-name:"directory" description:"Directory containing .jsonl request data files" required:"yes"`
 	} `positional-args:"yes"`
 }
 
 // BenchmarkVisualizeMergeOptions contains options for the benchmark visualize-merge subcommand
 type BenchmarkVisualizeMergeOptions struct {
-	All            bool   `long:"all" description:"Treat the first argument as a parent directory and include all subdirectories"`
-	Output         string `long:"output" short:"o" description:"Output directory for merged results (default: auto-generated next to input)"`
-	Concurrency    int    `long:"concurrency" description:"Override the concurrency used for the moving-average window (window = concurrency*3). Normally unnecessary: runs record their own concurrency in the reqdata JSONL and each arm is sized from its own. Use only for data recorded before run params were saved, or to force a different smoothing window." default:"0"`
-	Labels         string `long:"labels" description:"Comma-separated labels for each input directory, in positional order (overrides auto-detected model aliases / directory names). Count must exactly match the number of directories (post --all expansion)."`
-	MaxElapsed     string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
-	Public         bool   `long:"public" description:"Emit an aggregate-only report (report-public.html, never overwriting report.html) safe to share externally: per-request data is absent from the file, not just hidden -- only downsampled rolling-percentile/error-rate/cache-mix/ingest series and a precomputed whole-run summary table (which does not reprice on zoom). Strips run_id, endpoint URLs, and the raw model-spec string; arm names come from --labels when given."`
-	PublicInterval string `long:"public-interval" description:"Downsample interval for --public series (e.g. 30s, 1m). Default 30s." default:"30s"`
-	Args           struct {
+	All         bool   `long:"all" description:"Treat the first argument as a parent directory and include all subdirectories"`
+	Output      string `long:"output" short:"o" description:"Output directory for merged results (default: auto-generated next to input)"`
+	Concurrency int    `long:"concurrency" description:"Override the concurrency used for the moving-average window (window = concurrency*3). Normally unnecessary: runs record their own concurrency in the reqdata JSONL and each arm is sized from its own. Use only for data recorded before run params were saved, or to force a different smoothing window." default:"0"`
+	Labels      string `long:"labels" description:"Comma-separated labels for each input directory, in positional order (overrides auto-detected model aliases / directory names). Count must exactly match the number of directories (post --all expansion)."`
+	MaxElapsed  string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
+	Args        struct {
 		Dirs []string `positional-arg-name:"directories" description:"Directories containing .jsonl request data files"`
 	} `positional-args:"yes"`
 }

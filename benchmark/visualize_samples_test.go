@@ -453,6 +453,7 @@ const document = {
   createElement: () => __el("dyn" + Math.random()),
   createTextNode: text => ({ nodeType: 3, textContent: String(text) }),
   querySelector: () => __el("controls"),
+  querySelectorAll: () => [],
 };
 const window = {
   innerWidth: 1600, innerHeight: 900, devicePixelRatio: 1,
