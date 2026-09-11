@@ -744,9 +744,7 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
       <button id="downloadSummaryBtn"><span class="help-label" id="hlpDlSummary" tabindex="0" aria-describedby="helpTip" data-tip="CSV of the summary panel's numbers (same metrics, same baseline ratios) for the CURRENT view.">Download Summary CSV</span></button>
     </div>
     <div class="controls">
-      <label><span class="help-label" id="hlpPubRes" tabindex="0" aria-describedby="helpTip" data-tip="Downsample cadence for the exported public report's lines. Does not affect this page.">Resolution</span> <select id="pubResolution"><option value="15000">15s</option><option value="30000" selected>30s</option><option value="60000">1m</option><option value="300000">5m</option></select></label>
-      <label><span class="help-label" id="hlpPubSmooth" tabindex="0" aria-describedby="helpTip" data-tip="Display smoothing applied inside the exported file only. Does not affect this page.">Smoothing</span> <select id="pubSmoothing"><option value="0">None</option><option value="60000">1m</option><option value="120000">2m</option><option value="300000" selected>5m</option></select></label>
-      <button id="downloadPublicBtn"><span class="help-label" id="hlpDlPublic" tabindex="0" aria-describedby="helpTip" data-tip="Downloads a self-contained aggregate-only HTML report, generated entirely in the browser: per-request rows, series/request numbers, GUIDs, run IDs, endpoint URLs, and the raw model spec are absent from the file entirely, not merely hidden. Includes every arm regardless of the current legend/context-filter state, unlike the CSV exports above.">Download Public Report</span></button>
+      <button id="pubReportBtn" style="border-color:#7C03EC;"><span class="help-label" id="hlpPubReport" tabindex="0" aria-describedby="helpTip" data-tip="Opens the Public Report export: a self-contained aggregate-only HTML report, generated entirely in the browser. Per-request rows, series/request numbers, GUIDs, run IDs, endpoint URLs, and the raw model spec are absent from the file entirely, not merely hidden. Includes every arm regardless of the current legend/context-filter state, unlike the CSV exports above.">Public Report</span></button>
     </div>
     </div>
   </div>
@@ -794,12 +792,33 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
     <div class="modal-actions" style="margin-top:0;">
       <button id="modalDownloadRequestsBtn"><span class="help-label" id="hlpDlReqsModal" tabindex="0" aria-describedby="helpTip" data-tip="CSV of per-request rows for the view as currently APPLIED — zoom window, hidden arms, and the applied context/series filters. Click Apply first if you just changed the band above.">Download Requests CSV</span></button>
       <button id="modalDownloadSummaryBtn"><span class="help-label" id="hlpDlSummaryModal" tabindex="0" aria-describedby="helpTip" data-tip="CSV of the summary panel's numbers for the view as currently applied.">Download Summary CSV</span></button>
-      <button id="modalDownloadPublicBtn"><span class="help-label" id="hlpDlPublicModal" tabindex="0" aria-describedby="helpTip" data-tip="Downloads a self-contained aggregate-only HTML report, using the Resolution/Smoothing selects in the main controls panel. Per-request data is absent from the file entirely, not merely hidden, and every arm is included regardless of visibility/filter state.">Download Public Report</span></button>
     </div>
     <div class="modal-actions">
       <button id="ctxApply">Apply</button>
       <button id="ctxReset">Reset</button>
       <button id="ctxClose">Close</button>
+    </div>
+  </div>
+</div>
+<div id="pubModal" class="modal-backdrop">
+  <div class="modal">
+    <h2>Public report export</h2>
+    <p class="modal-sn-note" style="margin-top:0;">Self-contained aggregate-only HTML report, generated entirely in the browser: per-request rows, series/request numbers, GUIDs, run IDs, endpoint URLs, and the raw model spec are absent from the file entirely, not merely hidden. Includes every arm regardless of the current legend/context-filter state. Always covers the full run, regardless of the current zoom — unlike the CSV exports, which honor the current view.</p>
+    <div class="modal-band">
+      <label><span class="help-label" id="hlpPubRes" tabindex="0" aria-describedby="helpTip" data-tip="Downsample cadence for the exported report's lines. Does not affect this page.">Resolution</span>
+      <select id="pubResolution">
+        <option value="15000">15s</option>
+        <option value="30000" selected>30s</option>
+        <option value="60000">1m</option>
+        <option value="120000">2m</option>
+        <option value="300000">5m</option>
+        <option value="600000">10m</option>
+      </select></label>
+    </div>
+    <div class="modal-sn-note" id="pubSizeEstimate"></div>
+    <div class="modal-actions">
+      <button id="downloadPublicBtn"><span class="help-label" id="hlpDlPublic" tabindex="0" aria-describedby="helpTip" data-tip="Downloads the report at the selected resolution.">Download Public Report</span></button>
+      <button id="pubModalClose">Close</button>
     </div>
   </div>
 </div>
@@ -3333,13 +3352,16 @@ helpTriggers.forEach(el => {
   modal.addEventListener("click", e => { if (e.target === modal) closeModal(); });
   // Single ordered ESC handler (do not add a second competing listener):
   // the help tooltip takes precedence when visible (dismiss it without
-  // touching the modal/zoom underneath), then the modal when open, else a
-  // single-step zoom exit (same effect as Reset Zoom), else no-op. No
-  // multi-level zoom history.
+  // touching the modal/zoom underneath), then whichever modal is open (this
+  // context-filter modal, or the public-report modal -- see its own wiring
+  // further down), else a single-step zoom exit (same effect as Reset
+  // Zoom), else no-op. No multi-level zoom history.
   window.addEventListener("keydown", e => {
     if (e.key !== "Escape") return;
     if (helpTip.classList.contains("visible")) { hideHelpTipNow(); return; }
     if (modal.style.display === "block") { closeModal(); return; }
+    const pubModal = document.getElementById("pubModal");
+    if (pubModal && pubModal.style.display === "block") { pubModal.style.display = "none"; return; }
     if (isZoomed()) resetZoomView();
   });
   // Band inputs are in K TOKENS: "300" means 300,000 tokens.
@@ -3860,7 +3882,7 @@ function pubRoundN(v, decimals) {
 // all and can be called directly (e.g. from a test) without stubbing
 // document/Blob/URL.
 function pubResolutionLabel(ms) {
-  const known = { 15000: "15s", 30000: "30s", 60000: "1m", 300000: "5m" };
+  const known = { 15000: "15s", 30000: "30s", 60000: "1m", 120000: "2m", 300000: "5m", 600000: "10m" };
   return known[ms] || formatTickLabel(Math.round(ms / 1000));
 }
 
@@ -3918,13 +3940,14 @@ function pubSummaryBodyHtml(rows, baseStats) {
 }
 
 // buildPublicReportHtml renders a complete, self-contained aggregate-only
-// HTML document -- as a string -- at the given resolution/smoothing
-// selections (both in ms; resolutionMs<=0 defaults to 30000, matching the
-// former --public CLI flag's own default). Pure function: no DOM writes, no
-// Blob, no download (see downloadPublicReport below for that), which is
-// what lets it be called directly under Node with no Blob/URL/document
-// stubbing. Includes every arm regardless of the current legend/context-
-// filter state -- unlike the CSV exports, which honor the current view.
+// HTML document -- as a string -- at the given resolution (in ms;
+// resolutionMs<=0 defaults to 30000, matching the former --public CLI
+// flag's own default). Pure function: no DOM writes, no Blob, no download
+// (see downloadPublicReport below for that), which is what lets it be
+// called directly under Node with no Blob/URL/document stubbing. Includes
+// every arm regardless of the current legend/context-filter state, and
+// always covers the FULL run regardless of the current zoom -- unlike the
+// CSV exports, which honor the current view.
 //
 // Order matters and must not be reordered: the records-only tMin/tMax range
 // (recTMin/recTMax below, used for the summary stats) is captured BEFORE it
@@ -3932,9 +3955,8 @@ function pubSummaryBodyHtml(rows, baseStats) {
 // range and the footer's stated run length) -- reversing that would
 // silently change every summary number without necessarily failing a test
 // that isn't specifically checking for it.
-function buildPublicReportHtml(resolutionMs, smoothingMs) {
+function buildPublicReportHtml(resolutionMs) {
   const intervalMs = resolutionMs > 0 ? resolutionMs : 30000;
-  const smoothMs = smoothingMs > 0 ? smoothingMs : 0;
 
   // Per arm: shared origin, full (never view-filtered) shifted records, and
   // the full-run percentile lines derived from them.
@@ -4041,30 +4063,64 @@ function buildPublicReportHtml(resolutionMs, smoothingMs) {
     "/*@PUB_DATA@*/[]": JSON.stringify(payload),
     "/*@PUB_CONCURRENCY@*/0": String(CONCURRENCY || 0),
     "/*@PUB_HASCACHEMIX@*/false": String(hasCacheMix),
-    "/*@PUB_INTERVALMS@*/0": String(intervalMs),
     "/*@PUB_TMIN@*/0": String(tMin),
     "/*@PUB_TMAX@*/0": String(tMax),
-    "/*@PUB_SMOOTHMS@*/0": String(smoothMs),
   };
   return pubFill(PUBLIC_TEMPLATE, map);
 }
 
-// downloadPublicReport reads the two export selects and triggers the
-// download -- the only DOM-touching step in this whole feature; everything
-// that computes the document itself (buildPublicReportHtml) is DOM-free.
-function downloadPublicReport() {
+// fmtBytes renders a byte count compactly for the public-report modal's file
+// size estimate (see updatePubSizeEstimate below) -- same order-of-magnitude
+// style as fmtTokens, but with byte units.
+function fmtBytes(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + " KB";
+  return n + " B";
+}
+
+// currentPubResolutionMs reads the public-report modal's Resolution select --
+// the only input buildPublicReportHtml needs from the DOM.
+function currentPubResolutionMs() {
   const resEl = document.getElementById("pubResolution");
-  const smoothEl = document.getElementById("pubSmoothing");
-  const resolutionMs = resEl ? parseInt(resEl.value, 10) || 30000 : 30000;
-  const smoothingMs = smoothEl ? parseInt(smoothEl.value, 10) || 0 : 0;
-  const html = buildPublicReportHtml(resolutionMs, smoothingMs);
+  return resEl ? parseInt(resEl.value, 10) || 30000 : 30000;
+}
+
+// downloadPublicReport reads the resolution select and triggers the
+// download -- one of only two DOM-touching steps in this whole feature (the
+// other being updatePubSizeEstimate below); everything that computes the
+// document itself (buildPublicReportHtml) is DOM-free.
+function downloadPublicReport() {
+  const resolutionMs = currentPubResolutionMs();
+  const html = buildPublicReportHtml(resolutionMs);
   const filename = "wekai-public-" + DATA.length + "arms-" + pubResolutionLabel(resolutionMs) + ".html";
   triggerDownload(filename, [html], "text/html;charset=utf-8");
 }
-["downloadPublicBtn", "modalDownloadPublicBtn"].forEach(id => {
-  const btn = document.getElementById(id);
-  if (btn) btn.addEventListener("click", downloadPublicReport);
-});
+document.getElementById("downloadPublicBtn").addEventListener("click", downloadPublicReport);
+
+// Public-report modal: single entry point (pubReportBtn) for the export's
+// Resolution select and download button, modelled on the ctxModal block
+// above -- open on click, close on its own Close button or a backdrop
+// click; Escape is handled by the ctxModal block's single shared keydown
+// listener, not a second one here (see its comment). The size estimate
+// recomputes the actual export at the selected resolution and reports its
+// length -- cheap because it is the exact same computation
+// downloadPublicReport itself performs, just discarded instead of saved.
+{
+  const pubModal = document.getElementById("pubModal");
+  const pubSizeEl = document.getElementById("pubSizeEstimate");
+  const updatePubSizeEstimate = () => {
+    const html = buildPublicReportHtml(currentPubResolutionMs());
+    pubSizeEl.textContent = "Approximate file size at this resolution: " + fmtBytes(html.length) + ".";
+  };
+  document.getElementById("pubReportBtn").addEventListener("click", () => {
+    updatePubSizeEstimate();
+    pubModal.style.display = "block";
+  });
+  document.getElementById("pubResolution").addEventListener("change", updatePubSizeEstimate);
+  const closePubModal = () => { pubModal.style.display = "none"; };
+  document.getElementById("pubModalClose").addEventListener("click", closePubModal);
+  pubModal.addEventListener("click", e => { if (e.target === pubModal) closePubModal(); });
+}
 
 ["downloadRequestsBtn", "modalDownloadRequestsBtn"].forEach(id => {
   const btn = document.getElementById(id);

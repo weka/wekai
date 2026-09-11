@@ -154,7 +154,7 @@ func names(data []rawPublicSeries) []string {
 // ---------------------------------------------------------------------------
 // Shared node harness: generate a full interactive report from a fixture
 // directory, extract its embedded <script> body, and call
-// buildPublicReportHtml(resolutionMs, smoothingMs) directly under node --
+// buildPublicReportHtml(resolutionMs) directly under node --
 // no DOM/Blob/URL stubbing needed for the call itself (buildPublicReportHtml
 // is a pure function per its own doc comment in visualize.go), only the
 // reportDOMStub the OUTER script's own top-level setup code needs to load at
@@ -206,13 +206,13 @@ func nodeOrSkip(t *testing.T) string {
 
 // buildPublicExport runs script (an interactive report's own extracted
 // <script> body) under node with reportDOMStub, calls
-// buildPublicReportHtml(resolutionMs, smoothingMs), and returns the
-// resulting exported HTML document as a string.
-func buildPublicExport(t *testing.T, script string, resolutionMs, smoothingMs int) string {
+// buildPublicReportHtml(resolutionMs), and returns the resulting exported
+// HTML document as a string.
+func buildPublicExport(t *testing.T, script string, resolutionMs int) string {
 	t.Helper()
 	nodeBin := nodeOrSkip(t)
 	probe := `
-const __result = buildPublicReportHtml(` + strconv.Itoa(resolutionMs) + `, ` + strconv.Itoa(smoothingMs) + `);
+const __result = buildPublicReportHtml(` + strconv.Itoa(resolutionMs) + `);
 console.log("===PUBLIC_EXPORT_START===");
 console.log(JSON.stringify(__result));
 console.log("===PUBLIC_EXPORT_END===");
@@ -274,7 +274,7 @@ func TestPublicReportOmitsPerRequestData(t *testing.T) {
 	writePublicFixtureFile(t, dir, "b", wekaRecs, wekaSamples, pubSecretRunID+"-b")
 
 	script := generateInteractiveScript(t, dir, 8)
-	html := buildPublicExport(t, script, 30000, 300000)
+	html := buildPublicExport(t, script, 30000)
 
 	// --- ABSENCE assertions -------------------------------------------------
 	forbidden := []struct{ substr, why string }{
@@ -484,7 +484,7 @@ func TestPublicExportLabelsSuppressAlias(t *testing.T) {
 			t.Fatalf("generate merged interactive report with labels: %v", err)
 		}
 		script := extractOuterScript(t, htmlPath)
-		html := buildPublicExport(t, script, 30000, 300000)
+		html := buildPublicExport(t, script, 30000)
 		if strings.Contains(html, secretAlias2) {
 			t.Errorf("export contains internal alias %q even though --labels was given", secretAlias2)
 		}
@@ -503,7 +503,7 @@ func TestPublicExportLabelsSuppressAlias(t *testing.T) {
 			t.Fatalf("generate merged interactive report without labels: %v", err)
 		}
 		script := extractOuterScript(t, htmlPath)
-		html := buildPublicExport(t, script, 30000, 300000)
+		html := buildPublicExport(t, script, 30000)
 		if !strings.Contains(html, secretAlias2) {
 			t.Errorf("expected the internal alias %q to appear as the arm's display name when --labels is omitted -- "+
 				"if this now fails because the alias is suppressed, update this test's comment, don't just relax it",
@@ -518,12 +518,8 @@ func TestPublicExportLabelsSuppressAlias(t *testing.T) {
 //   - The footer must state the run length, the selected downsample
 //     interval, and that per-request detail is not included -- these are
 //     what let a recipient without access to the raw data judge how much
-//     resolution they're looking at, rather than mistaking a smoothed
+//     resolution they're looking at, rather than mistaking a downsampled
 //     aggregate for the real thing.
-//   - The exported file's OWN script states, once, how the latency lines/
-//     cache-mix bands/dataset line are derived: a smoothing disclosure
-//     naming the actual window selected (or "none" when None is picked),
-//     the cache-mix "exact" wording, and the dataset-line "mean" wording.
 //   - Both TTFT p50 AND p95 must be emitted (not just p50): p95 is the
 //     deliberate guardrail against a heavy tail being hidden by only ever
 //     publishing the median -- a median-only report could show a "fast"
@@ -537,130 +533,111 @@ func TestPublicExportHonestyAffordances(t *testing.T) {
 	writePublicFixtureFile(t, dir, "a", recs, samples, pubSecretRunID+"-c")
 
 	script := generateInteractiveScript(t, dir, 8)
-
-	t.Run("smoothing selected", func(t *testing.T) {
-		html := buildPublicExport(t, script, 45000, 60000)
-		for _, want := range []string{
-			"Run length", "Downsampled to",
-			"Per-request detail is not included in this file",
-		} {
-			if !strings.Contains(html, want) {
-				t.Errorf("footer missing %q", want)
-			}
+	html := buildPublicExport(t, script, 45000)
+	for _, want := range []string{
+		"Run length", "Downsampled to",
+		"Per-request detail is not included in this file",
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("footer missing %q", want)
 		}
-		// The smoothing disclosure is built at LOAD time inside the exported
-		// file's own script (footerDisclosureText, written into
-		// #footerDisclosure via textContent) -- it is never baked into the
-		// static HTML, so it must be read by actually running the inner
-		// script, not by grepping the raw document.
-		disclosure := runInnerScriptAndGetFooterDisclosure(t, html)
-		for _, want := range []string{"1m moving average", "Cache mix re-aggregated to 1m (exact)", "dataset line uses the mean"} {
-			if !strings.Contains(disclosure, want) {
-				t.Errorf("footer disclosure %q missing %q", disclosure, want)
-			}
-		}
-		data := extractPublicData(t, html)
-		if len(data) != 1 {
-			t.Fatalf("PUBLIC_DATA has %d series, want 1", len(data))
-		}
-		s := data[0]
-		if len(s.TTFTP50) == 0 {
-			t.Errorf("ttftP50 is empty -- TTFT p50 series must be emitted")
-		}
-		if len(s.TTFTP95) == 0 {
-			t.Errorf("ttftP95 is empty -- TTFT p95 must be emitted alongside p50 so a heavy tail cannot be hidden behind the median alone")
-		}
-	})
-
-	t.Run("smoothing None", func(t *testing.T) {
-		html := buildPublicExport(t, script, 30000, 0)
-		disclosure := runInnerScriptAndGetFooterDisclosure(t, html)
-		if !strings.Contains(disclosure, "Smoothing: none") {
-			t.Errorf("footer disclosure %q missing the smoothing-none wording", disclosure)
-		}
-	})
-}
-
-// runInnerScriptAndGetFooterDisclosure executes the exported file's own
-// <script> under node with reportDOMStub and returns the #footerDisclosure
-// element's resulting textContent -- the disclosure text is written by the
-// script at load time, not present in the static HTML.
-func runInnerScriptAndGetFooterDisclosure(t *testing.T, html string) string {
-	t.Helper()
-	nodeBin := nodeOrSkip(t)
-	innerScript := extractInnerScript(t, html)
-	probe := `
-console.log("===DISCLOSURE_START===");
-console.log(document.getElementById("footerDisclosure").textContent);
-console.log("===DISCLOSURE_END===");
-`
-	jsPath := filepath.Join(t.TempDir(), "disclosure_probe.js")
-	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+innerScript+"\n"+probe), 0o644); err != nil {
-		t.Fatal(err)
 	}
-	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
-	if err != nil {
-		t.Fatalf("node disclosure probe failed: %v\n%s", err, out)
+	data := extractPublicData(t, html)
+	if len(data) != 1 {
+		t.Fatalf("PUBLIC_DATA has %d series, want 1", len(data))
 	}
-	s := string(out)
-	si := strings.Index(s, "===DISCLOSURE_START===\n")
-	ei := strings.Index(s, "\n===DISCLOSURE_END===")
-	if si < 0 || ei < 0 {
-		t.Fatalf("could not find disclosure markers in node output:\n%s", s)
+	s := data[0]
+	if len(s.TTFTP50) == 0 {
+		t.Errorf("ttftP50 is empty -- TTFT p50 series must be emitted")
 	}
-	return s[si+len("===DISCLOSURE_START===\n") : ei]
+	if len(s.TTFTP95) == 0 {
+		t.Errorf("ttftP95 is empty -- TTFT p95 must be emitted alongside p50 so a heavy tail cannot be hidden behind the median alone")
+	}
 }
 
 // ---------------------------------------------------------------------------
-// TEST 5: resolution and smoothing selections actually change the export.
+// TEST 4b: no smoothing control, and no smoothing machinery/claim anywhere in
+// the export. The public report has exactly one client-side reduction left
+// (resolution/downsampling) -- a moving average, a re-aggregation window, or
+// a disclosure sentence about either would mean smoothing crept back in.
 // ---------------------------------------------------------------------------
 
-func TestPublicExportResolutionAndSmoothing(t *testing.T) {
+func TestPublicExportHasNoSmoothingMachinery(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 8, 12, 9, 30, 0, 0, time.UTC)
+	recs, samples := buildPublicFixtureArm("hbm-gpu", base, 6, 0)
+	writePublicFixtureFile(t, dir, "a", recs, samples, pubSecretRunID+"-nosmooth")
+
+	script := generateInteractiveScript(t, dir, 8)
+	html := buildPublicExport(t, script, 30000)
+
+	forbidden := []string{
+		"SMOOTH_WINDOW_MS", "computeSmoothed", "smoothPts", "mixNativeMs",
+		"mixBucketWidthMs", "reaggregateMix", "bucketMeanAdt", "windowPointsFor",
+		"footerDisclosure", "moving average", "Smoothing:", "pubSmoothing",
+	}
+	for _, f := range forbidden {
+		if strings.Contains(html, f) {
+			t.Errorf("public report contains forbidden smoothing-machinery string %q", f)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TEST 5: the resolution selection is the ONLY reduction left in the export
+// -- widening it must shrink both the point count and the overall file size,
+// across the full option set (15s/30s/1m/2m/5m/10m; at least 15s/30s/10m
+// checked explicitly per the plan).
+// ---------------------------------------------------------------------------
+
+func TestPublicExportResolutionChangesOutput(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC)
 	// 40 requests over ~13 minutes gives enough points to see resolution
-	// differences across 15s..5m.
+	// differences across 15s..10m.
 	recs, samples := buildPublicFixtureArm("hbm-gpu", base, 40, 0)
 	writePublicFixtureFile(t, dir, "a", recs, samples, pubSecretRunID+"-res")
 	script := generateInteractiveScript(t, dir, 8)
 
-	pointCountAt := func(resolutionMs int) int {
-		html := buildPublicExport(t, script, resolutionMs, 300000)
+	pointCountAt := func(resolutionMs int) (int, int) {
+		html := buildPublicExport(t, script, resolutionMs)
 		data := extractPublicData(t, html)
 		if len(data) != 1 {
 			t.Fatalf("PUBLIC_DATA has %d series, want 1", len(data))
 		}
-		return len(data[0].RespP50)
+		return len(data[0].RespP50), len(html)
 	}
 
-	resolutions := []int{15000, 30000, 60000, 300000}
-	var prev int
+	resolutions := []int{15000, 30000, 60000, 120000, 300000, 600000}
+	var prevN, prevSize int
 	for i, ms := range resolutions {
-		n := pointCountAt(ms)
+		n, size := pointCountAt(ms)
 		if n == 0 {
 			t.Fatalf("resolution %dms produced zero points", ms)
 		}
-		if i > 0 && n > prev {
-			t.Errorf("resolution %dms produced MORE points (%d) than the previous, finer resolution (%d) -- widening the interval must never increase point count", ms, n, prev)
+		if i > 0 && n > prevN {
+			t.Errorf("resolution %dms produced MORE points (%d) than the previous, finer resolution (%d) -- widening the interval must never increase point count", ms, n, prevN)
 		}
-		prev = n
+		if i > 0 && size > prevSize {
+			t.Errorf("resolution %dms produced a LARGER export (%d bytes) than the previous, finer resolution (%d bytes) -- fewer points must never grow the file", ms, size, prevSize)
+		}
+		prevN, prevSize = n, size
 	}
 
-	// Smoothing must never change how many points exist, only their values.
-	htmlNone := buildPublicExport(t, script, 30000, 0)
-	htmlSmooth := buildPublicExport(t, script, 30000, 300000)
-	dataNone := extractPublicData(t, htmlNone)
-	dataSmooth := extractPublicData(t, htmlSmooth)
-	if len(dataNone) != 1 || len(dataSmooth) != 1 {
-		t.Fatalf("expected 1 series in both exports")
+	// Explicit checks at the three resolutions the plan calls out by name:
+	// finer resolution must strictly shrink both point count and size
+	// relative to the coarsest one.
+	n15, size15 := pointCountAt(15000)
+	n30, size30 := pointCountAt(30000)
+	n10m, size10m := pointCountAt(600000)
+	if !(n15 >= n30 && n30 >= n10m) {
+		t.Errorf("expected non-increasing point counts 15s(%d) >= 30s(%d) >= 10m(%d)", n15, n30, n10m)
 	}
-	// Neither the exported PUBLIC_DATA points nor their point count are
-	// affected by smoothing -- smoothing is a LOAD-TIME-ONLY transform
-	// inside the exported file's own script (SMOOTH_WINDOW_MS), applied to
-	// PUBLIC_DATA after rehydration, never baked into the emitted arrays.
-	if len(dataNone[0].RespP50) != len(dataSmooth[0].RespP50) {
-		t.Errorf("smoothing changed PUBLIC_DATA point count: none=%d smooth=%d (smoothing must only affect the exported file's OWN rendering at load, never the embedded arrays)",
-			len(dataNone[0].RespP50), len(dataSmooth[0].RespP50))
+	if n15 == n10m {
+		t.Errorf("15s and 10m produced the SAME point count (%d) -- fixture/resolution spread too narrow to prove resolution changes output", n15)
+	}
+	if !(size15 >= size30 && size30 >= size10m) {
+		t.Errorf("expected non-increasing export size 15s(%d) >= 30s(%d) >= 10m(%d)", size15, size30, size10m)
 	}
 
 	// Footer text changes to match each resolution selection.
@@ -668,9 +645,9 @@ func TestPublicExportResolutionAndSmoothing(t *testing.T) {
 		ms    int
 		label string
 	}{
-		{15000, "15s"}, {30000, "30s"}, {60000, "1m"}, {300000, "5m"},
+		{15000, "15s"}, {30000, "30s"}, {60000, "1m"}, {120000, "2m"}, {300000, "5m"}, {600000, "10m"},
 	} {
-		html := buildPublicExport(t, script, tc.ms, 300000)
+		html := buildPublicExport(t, script, tc.ms)
 		want := "Downsampled to " + tc.label + " intervals"
 		if !strings.Contains(html, want) {
 			t.Errorf("resolution %dms: footer missing %q", tc.ms, want)
@@ -679,12 +656,73 @@ func TestPublicExportResolutionAndSmoothing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TEST 5b: the export is ZOOM-INVARIANT -- it always covers the full run, so
+// changing the interactive report's current view (viewTMin/viewTMax, the
+// same state the CSV exports honor) must NOT change buildPublicReportHtml's
+// output at all. This property is currently accidental (buildPublicReportHtml
+// never reads viewTMin/viewTMax) and is pinned here so it cannot regress into
+// "exports the flattering window".
+// ---------------------------------------------------------------------------
+
+func TestPublicExportIsZoomInvariant(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 8, 13, 9, 15, 0, 0, time.UTC)
+	recs, samples := buildPublicFixtureArm("hbm-gpu", base, 40, 0)
+	writePublicFixtureFile(t, dir, "a", recs, samples, pubSecretRunID+"-zoom")
+	script := generateInteractiveScript(t, dir, 8)
+
+	nodeBin := nodeOrSkip(t)
+	probe := `
+const before = buildPublicReportHtml(30000);
+// Simulate a 30-minute zoom window on the interactive report (the same
+// viewTMin/viewTMax state the CSV exports honor, and the drag-to-zoom
+// handler sets on mouseup) -- see isZoomed()/resetZoomView().
+viewTMin = globalTMin + 60000;
+viewTMax = Math.min(globalTMax, viewTMin + 30 * 60 * 1000);
+const after = buildPublicReportHtml(30000);
+console.log("===ZOOM_INVARIANT_START===");
+console.log(JSON.stringify({ equal: before === after, beforeLen: before.length, afterLen: after.length, zoomed: isZoomed() }));
+console.log("===ZOOM_INVARIANT_END===");
+`
+	jsPath := filepath.Join(t.TempDir(), "zoom_invariant_probe.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("node zoom-invariance probe failed: %v\n%s", err, out)
+	}
+	s := string(out)
+	const startMarker = "===ZOOM_INVARIANT_START===\n"
+	const endMarker = "\n===ZOOM_INVARIANT_END==="
+	si := strings.Index(s, startMarker)
+	ei := strings.Index(s, endMarker)
+	if si < 0 || ei < 0 || ei <= si {
+		t.Fatalf("could not locate zoom-invariance markers in node output:\n%s", s)
+	}
+	var result struct {
+		Equal     bool `json:"equal"`
+		BeforeLen int  `json:"beforeLen"`
+		AfterLen  int  `json:"afterLen"`
+		Zoomed    bool `json:"zoomed"`
+	}
+	if err := json.Unmarshal([]byte(s[si+len(startMarker):ei]), &result); err != nil {
+		t.Fatalf("decode zoom-invariance result: %v\nraw: %s", err, s[si+len(startMarker):ei])
+	}
+	if !result.Zoomed {
+		t.Fatalf("test setup bug: viewTMin/viewTMax change did not register as zoomed (isZoomed() returned false)")
+	}
+	if !result.Equal {
+		t.Errorf("buildPublicReportHtml output changed after zooming the interactive view (before=%d bytes, after=%d bytes) -- the public export must always cover the full run regardless of the current zoom", result.BeforeLen, result.AfterLen)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TEST 6: the exported inner script actually EXECUTES under a DOM stub, not
 // just parses. This is the strongest replacement for the coverage lost by
 // deleting the Go aggregation pipeline's own crosscheck test: it proves the
-// ported template's runtime code path (rehydration, computeSmoothed,
-// recalcYMax, draw, legend wiring) runs to completion against a real
-// generated export.
+// ported template's runtime code path (rehydration, recalcYMax, draw,
+// legend wiring) runs to completion against a real generated export.
 // ---------------------------------------------------------------------------
 
 func TestPublicExportInnerScriptRuns(t *testing.T) {
@@ -696,13 +734,12 @@ func TestPublicExportInnerScriptRuns(t *testing.T) {
 	writePublicFixtureFile(t, dir, "a", baseRecs, baseSamples, pubSecretRunID+"-run-a")
 	writePublicFixtureFile(t, dir, "b", wekaRecs, wekaSamples, pubSecretRunID+"-run-b")
 	script := generateInteractiveScript(t, dir, 8)
-	html := buildPublicExport(t, script, 30000, 300000)
+	html := buildPublicExport(t, script, 30000)
 	innerScript := extractInnerScript(t, html)
 
 	probe := `
 function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
 assert(typeof DATA !== "undefined" && DATA.length === 2, "DATA has 2 series, got " + (typeof DATA !== "undefined" ? DATA.length : "undefined"));
-assert(typeof SMOOTH !== "undefined" && SMOOTH.length === 2, "SMOOTH computed for 2 series");
 draw();
 const cb = document.getElementById("showCacheMix");
 if (cb) { cb.checked = true; draw(); }
@@ -727,7 +764,7 @@ console.log("ALL_OK");
 // at-or-before each boundary, final point always kept), never a mean --
 // see §0.3 of the implementation plan. This is a narrow, easy-to-regress
 // detail: a "fix" that switches to averaging would still produce the same
-// POINT COUNT (TestPublicExportResolutionAndSmoothing's own check would
+// POINT COUNT (TestPublicExportResolutionChangesOutput's own check would
 // stay green), so only a VALUE-level assertion like this one catches it.
 // Extracts pubDownsamplePts/pubDownsampleMix/pubDownsampleAdt as a
 // contiguous block (same technique as TestCacheMixLookupHelpersJS) and

@@ -128,7 +128,7 @@ const publicReportTemplateHTML = `<!DOCTYPE html>
 <canvas id="chart"></canvas>
 <div id="tooltip"></div>
 <div id="helpTip" class="help-tip" role="tooltip"></div>
-<div id="footer">@@PUB_FOOTER@@<span id="footerDisclosure"></span></div>
+<div id="footer">@@PUB_FOOTER@@</div>
 
 <script>
 const PUBLIC_DATA = /*@PUB_DATA@*/[];
@@ -145,12 +145,6 @@ PUBLIC_DATA.forEach(s => {
   s.mix = (s.mix || []).map(p => ({ t0: p[0], t1: p[1], c: p[2], lc: p[3], ec: p[4] }));
   s.adt = (s.adt || []).map(p => ({ t: p[0], v: p[1], s: p[2] }));
   s.cum = (s.cum || []).map(p => ({ t: p[0], cumIn: p[1], cumOut: p[2] }));
-  // s._mixNativeMs: this arm's own cache-mix cadence as emitted -- see
-  // mixNativeMs below (function declarations hoist, so it's fine to call
-  // before its textual definition). Precomputed once here rather than
-  // inside computeSmoothed so it never itself gets re-derived from
-  // already-re-aggregated (and therefore wider) buckets.
-  s._mixNativeMs = mixNativeMs(s.mix);
 });
 // Already server-sorted into display order (gpu first, dram, weka last --
 // see SortArmIndices in aggregate.go); the client never re-sorts.
@@ -158,12 +152,6 @@ const DATA = PUBLIC_DATA;
 const seriesColors = DATA.map(s => s.color);
 const CONCURRENCY = /*@PUB_CONCURRENCY@*/0;
 const HAS_CACHE_MIX = /*@PUB_HASCACHEMIX@*/false;
-// INTERVAL_MS is the actual server-side downsample cadence (--public-interval,
-// default 30s) every emitted point is already spaced at. The fixed 5-minute
-// smoothing below is a client-side, DISPLAY-ONLY moving average over those
-// already-downsampled points -- see the block below for why it must never be
-// described as a coarser percentile.
-const INTERVAL_MS = /*@PUB_INTERVALMS@*/0;
 
 const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
@@ -253,12 +241,12 @@ function mixRate(seg) {
 // report -- the single shared scale for all bands, deliberately NOT
 // per-series (a series peaking at 50k tok/min next to one peaking at 1M
 // renders mostly unfilled). UNLIKE visualize.go's version of this function,
-// this uses a RATE rather than the raw per-bucket total: the public
-// report's bands are re-aggregated to a wider (fixed 5-minute) bucket (see
-// reaggregateMix), and a bucket's raw total grows roughly
-// proportional to its width even when the underlying activity hasn't
-// changed -- only the rate is comparable across bucket widths, so only the
-// rate is a legitimate "peak" figure to label and scale against.
+// this uses a RATE rather than the raw per-bucket total: the export's
+// bucket width varies with the selected resolution, and a bucket's raw
+// total grows roughly proportional to its width even when the underlying
+// activity hasn't changed -- only the rate is comparable across bucket
+// widths, so only the rate is a legitimate "peak" figure to label and scale
+// against.
 function mixTotalMax(seriesArr) {
   let mx = 0;
   (seriesArr || []).forEach(s => (s.mix || []).forEach(m => {
@@ -341,203 +329,22 @@ function cumAt(cum, t) {
   return idx >= 0 ? { in: cum[idx].cumIn, out: cum[idx].cumOut } : { in: 0, out: 0 };
 }
 
-// --- Display smoothing: latency lines, cache-mix bands, and the
-// active-dataset line are each re-derived from the raw emitted samples at a
-// FIXED 5-minute window (there is no user control), chosen per layer by
-// whether the underlying quantity composes:
-//
-//   - respP50/ttftP50/ttftP95 (latency): a CENTERED MOVING AVERAGE over the
-//     already-emitted points. This is deliberately NOT a coarser percentile
-//     -- the embedded lines are already rolling percentiles over a
-//     request-count window, subsequently downsampled to INTERVAL_MS;
-//     percentiles do not compose, so there is no way to derive a true
-//     5-minute p95 from 30s-resolution p95 samples. Averaging the samples we
-//     already have is honest about what it is (see the footer disclosure --
-//     footerDisclosureText below) where re-deriving a "5 min p95" label
-//     would not be. APPROXIMATE.
-//   - cache-mix bands (compute/local_cache/external_cache): RE-AGGREGATED by
-//     SUMMING constituent buckets into wider ones (reaggregateMix). These
-//     are token SUMS per interval, and sums compose exactly -- combining N
-//     consecutive buckets into one is exact arithmetic, not an
-//     approximation, so this is NOT a moving average. EXACT.
-//   - active-dataset line (tokens/series): RE-AGGREGATED by AVERAGING
-//     (bucketMeanAdt), never summing -- this is a GAUGE (an instantaneous
-//     level at sample time), and summing a gauge across a wider bucket would
-//     scale it up by however many samples happened to land in that bucket,
-//     which is meaningless. The mean is the correct reduction for a gauge.
-//
-// The error-rate bars and cumulative-ingest curve are left alone: cumulative
-// ingest is already a running total (re-aggregating it is a no-op by
-// construction) and a smoothed error rate would misrepresent when errors
-// actually happened (see recommendation in the PR description).
-//
-// Ordering: SMOOTH is computed exactly ONCE, at load (computeSmoothed
-// below), never inside draw()/recalcYMax() and never recomputed afterwards
-// -- there is nothing left to change it. Zoom (viewTMin/viewTMax) only
-// selects a window out of that fixed series -- it never triggers a
-// recompute -- so panning/zooming is cheap and, more importantly, a
-// zoomed-in view can't re-derive a window with a different (misleadingly
-// cleaner) result than what the unzoomed chart showed for the same points.
-const SMOOTH_WINDOW_MS = /*@PUB_SMOOTHMS@*/0; // export-selected smoothing window in ms (0 = none) -- see block comment above
-
-// windowPointsFor converts the smoothing window (wall-clock ms) into a point
-// count against THIS report's actual emitted cadence (INTERVAL_MS) -- so 5
-// minutes means 10 points at the default 30s interval, but only 5 points if
-// --public-interval was set to 1m, matching the emitted data instead of a
-// hardcoded point count. The active-dataset line is emitted at this same
-// INTERVAL_MS cadence (see downsampleAdtPoints server-side), so this count
-// also drives its bucket-mean re-aggregation below.
-function windowPointsFor(ms) {
-  if (!(ms > 0) || !(INTERVAL_MS > 0)) return 1;
-  return Math.max(1, Math.round(ms / INTERVAL_MS));
-}
-
-// smoothPts is a CENTERED moving average of windowPoints points. The window
-// shrinks (never pads with zeros, never drops a point) at both ends: index i
-// averages over [i-half, i+halfHi] clamped to the array bounds, so the first
-// and last output points still equal a real local average of the points that
-// actually exist there, not a value dragged toward zero by an assumed
-// out-of-range neighbor. Every input point produces exactly one output
-// point, in order, so a moving average never changes the series' length.
-function smoothPts(pts, windowPoints) {
-  if (!pts || pts.length === 0 || windowPoints <= 1) return pts;
-  const n = pts.length;
-  const half = Math.floor((windowPoints - 1) / 2);
-  const halfHi = (windowPoints - 1) - half;
-  const prefix = new Float64Array(n + 1);
-  for (let i = 0; i < n; i++) prefix[i + 1] = prefix[i] + pts[i].v;
-  const out = new Array(n);
-  for (let i = 0; i < n; i++) {
-    const lo = Math.max(0, i - half);
-    const hi = Math.min(n - 1, i + halfHi);
-    const cnt = hi - lo + 1;
-    out[i] = { t: pts[i].t, v: (prefix[hi + 1] - prefix[lo]) / cnt };
-  }
-  return out;
-}
-
-// mixNativeMs estimates the arm's own cache-mix cadence as already emitted
-// (the median bucket width) rather than threading a new field through
-// PUBLIC_DATA for it. downsampleMixSegments (Go, server-side) only merges
-// raw sampler buckets when the sampler's OWN cadence is finer than
-// --public-interval; when the sampler is coarser (60s sampler, 30s
-// --public-interval, the reference fixture), the emitted mix bucket width is
-// the sampler's native cadence, not INTERVAL_MS -- so the two layers' native
-// cadences can legitimately differ, and re-aggregating the bands has to
-// snap to ITS OWN cadence, not the latency lines' one.
-function mixNativeMs(mix) {
-  if (!mix || !mix.length) return INTERVAL_MS;
-  const widths = mix.map(m => m.t1 - m.t0).filter(w => w > 0).sort((a, b) => a - b);
-  if (!widths.length) return INTERVAL_MS;
-  return widths[Math.floor(widths.length / 2)];
-}
-
-// mixBucketWidthMs snaps the selected smoothing window to a whole multiple
-// of this arm's native cache-mix cadence -- never finer than the data
-// actually is, and rounded to the NEAREST multiple (minimum 1x) so e.g. a
-// 2-minute selection against a 90s native cadence becomes 2x = 180s, not a
-// fractional 1.33x. ms<=0 ("None") means the native cadence itself, i.e. the
-// bands render exactly as emitted, with no further re-aggregation.
-function mixBucketWidthMs(nativeMs, windowMs) {
-  if (!(nativeMs > 0)) return windowMs > 0 ? windowMs : INTERVAL_MS;
-  if (!(windowMs > 0)) return nativeMs;
-  const mult = Math.max(1, Math.round(windowMs / nativeMs));
-  return mult * nativeMs;
-}
-
-// reaggregateMix re-buckets already-downsampled cache-mix segments to
-// bucketMs by SUMMING each source's token delta -- the exact same
-// "bucket start >= bucketMs apart" grouping rule downsampleMixSegments (Go)
-// used to build these segments in the first place, applied again
-// client-side. Summing sums is still exact: every raw token is counted
-// exactly once, in exactly one bucket, so the combined totals are identical
-// to the totals in the original (finer) segments -- only the bucket
-// boundaries move. The final, possibly short, bucket is kept as-is (never
-// merged into its neighbor, never dropped), matching the Go original.
-function reaggregateMix(segs, bucketMs) {
-  if (!segs || !segs.length || !(bucketMs > 0)) return segs;
-  const out = [];
-  let cur = null;
-  segs.forEach(s => {
-    if (cur === null || s.t0 - cur.t0 >= bucketMs) {
-      if (cur) out.push(cur);
-      cur = { t0: s.t0, t1: s.t1, c: s.c, lc: s.lc, ec: s.ec };
-    } else {
-      cur.t1 = s.t1;
-      cur.c += s.c;
-      cur.lc += s.lc;
-      cur.ec += s.ec;
-    }
-  });
-  if (cur) out.push(cur);
-  return out;
-}
-
-// bucketMeanAdt re-buckets the active-dataset line by the MEAN of
-// windowPoints consecutive (already INTERVAL_MS-spaced) points -- never the
-// sum, since active_dataset_tokens/active_series are GAUGES (an
-// instantaneous level at sample time, not an accumulating count), and
-// summing a gauge across a wider bucket would scale it by however many
-// samples happened to land there instead of describing the level. Buckets
-// are non-overlapping and tumbling (unlike the latency lines' centered
-// moving average) so every input point contributes to exactly one output
-// point; a trailing partial bucket is still averaged over the points it
-// actually has, never padded. windowPoints<=1 ("None") is a pure passthrough.
-function bucketMeanAdt(pts, windowPoints) {
-  if (!pts || !pts.length || windowPoints <= 1) return pts;
-  const out = [];
-  for (let i = 0; i < pts.length; i += windowPoints) {
-    const slice = pts.slice(i, Math.min(i + windowPoints, pts.length));
-    let sumT = 0, sumV = 0, sumS = 0;
-    slice.forEach(p => { sumT += p.t; sumV += p.v; sumS += p.s; });
-    const n = slice.length;
-    out.push({ t: sumT / n, v: sumV / n, s: sumS / n });
-  }
-  return out;
-}
-
-// computeSmoothed builds SMOOTH at the fixed SMOOTH_WINDOW_MS -- the moving
-// average for the three latency lines, the exact re-aggregation (summed)
-// for the cache-mix bands, and the re-aggregation (averaged) for the
-// active-dataset line. Called exactly once, at load (see the bottom of this
-// script) -- see the ordering note above.
-function computeSmoothed() {
-  const wp = windowPointsFor(SMOOTH_WINDOW_MS);
-  return DATA.map(s => ({
-    respP50: smoothPts(s.respP50, wp),
-    ttftP50: smoothPts(s.ttftP50, wp),
-    ttftP95: smoothPts(s.ttftP95, wp),
-    mix: reaggregateMix(s.mix, mixBucketWidthMs(s._mixNativeMs, SMOOTH_WINDOW_MS)),
-    adt: bucketMeanAdt(s.adt, wp),
-  }));
-}
-const SMOOTH = computeSmoothed();
-
-// footerDisclosureText states, once, how the latency lines and the
-// cache-mix bands/dataset line are derived from the raw samples -- see the
-// block comment above for why the treatment (and its honesty about being an
-// approximation vs. an exact re-aggregation) differs per layer.
-// formatTickLabel keeps the sample-interval wording in sync with the
-// server's actual --public-interval instead of hardcoding "30s".
-function footerDisclosureText() {
-  const sampleLabel = formatTickLabel(Math.round(INTERVAL_MS / 1000));
-  if (!(SMOOTH_WINDOW_MS > 0)) {
-    return " Smoothing: none. Latency lines, cache-mix bands, and the dataset line are shown exactly as emitted, at " + sampleLabel + " resolution.";
-  }
-  const smoothLabel = formatTickLabel(Math.round(SMOOTH_WINDOW_MS / 1000));
-  return " Latency lines: " + smoothLabel + " moving average of " + sampleLabel + " samples (approximate). Cache mix re-aggregated to " + smoothLabel + " (exact); dataset line uses the mean.";
-}
-
+// Latency lines, cache-mix bands, and the active-dataset line are drawn
+// directly from DATA: each series' respP50/ttftP50/ttftP95/mix/adt arrays
+// are already downsampled to the export's selected resolution by the
+// generator that built this file (see visualize.go's export builder), so
+// there is no further client-side reduction -- what is plotted is exactly
+// what was emitted.
 const MIX_COMPUTE_COLOR = "#a86853";
 const MIX_LOCAL_COLOR = "#756a99";
 const MIX_EXTERNAL_COLOR = "#7C03EC";
 const ADT_LINE_COLOR = "#F2F2EB";
 const MIX_BAND_H = 64;
 const MIX_FILL_ALPHA = 0.78;
-// MIX_TOTAL_MAX is computed once against the fixed, already re-aggregated
-// SMOOTH bands (computeSmoothed above) -- see mixTotalMax below for why it
-// is a RATE, not a raw per-bucket total.
-const MIX_TOTAL_MAX = mixTotalMax(SMOOTH);
+// MIX_TOTAL_MAX is computed once against DATA's already-downsampled mix
+// bands -- see mixTotalMax below for why it is a RATE, not a raw per-bucket
+// total.
+const MIX_TOTAL_MAX = mixTotalMax(DATA);
 const TOTALS_AXIS_TARGET_STEPS = 5;
 
 function cacheMixEnabled() {
@@ -555,17 +362,15 @@ function anyPlotLayerVisible() {
     document.getElementById("showErrors").checked ||
     document.getElementById("showTotals").checked;
 }
-// cacheMixLayout reads SMOOTH[si].mix/.adt -- the fixed, already
-// re-aggregated bands/dataset-line (see computeSmoothed) -- not the raw
-// DATA[si].mix/.adt. s is kept on each band purely for display (name,
-// color); mix/adt are carried alongside it so every caller below reads the
-// smoothed view, never the raw one.
+// cacheMixLayout reads each series' own mix/adt arrays directly -- already
+// downsampled to the export's resolution, so there is nothing further to
+// derive here. s is kept on each band purely for display (name, color).
 function cacheMixLayout() {
   if (!cacheMixEnabled()) return null;
   const bands = [];
   DATA.forEach((s, si) => {
     if (hiddenSeries.has(si)) return;
-    const mix = SMOOTH[si].mix, adt = SMOOTH[si].adt;
+    const mix = s.mix, adt = s.adt;
     if ((mix && mix.length) || (adt && adt.length)) bands.push({ s, si, mix, adt });
   });
   if (!bands.length) return null;
@@ -782,9 +587,9 @@ function recalcYMax() {
   const scan = pts => { (pts || []).forEach(p => { if (p.t < viewTMin || p.t > viewTMax) return; bump(p.v); }); };
   DATA.forEach((s, si) => {
     if (hiddenSeries.has(si)) return;
-    scan(SMOOTH[si].respP50);
-    scan(SMOOTH[si].ttftP50);
-    scan(SMOOTH[si].ttftP95);
+    scan(s.respP50);
+    scan(s.ttftP50);
+    scan(s.ttftP95);
   });
   viewYMax = Math.max(viewYMax * 1.1, 1);
 }
@@ -880,9 +685,9 @@ function draw() {
   DATA.forEach((s, si) => {
     if (hiddenSeries.has(si)) return;
     const color = seriesColors[si];
-    if (showResp) plotLine(SMOOTH[si].respP50, "resp50", color, 0.8, 2, false);
-    if (showTTFT) plotLine(SMOOTH[si].ttftP50, "ttft50", color, 0.8, 2, true);
-    if (showTTFTP95) plotLine(SMOOTH[si].ttftP95, "ttft95", color, 0.55, 1.5, true);
+    if (showResp) plotLine(s.respP50, "resp50", color, 0.8, 2, false);
+    if (showTTFT) plotLine(s.ttftP50, "ttft50", color, 0.8, 2, true);
+    if (showTTFTP95) plotLine(s.ttftP95, "ttft95", color, 0.55, 1.5, true);
   });
 
   if (showErrors) {
@@ -994,9 +799,9 @@ canvas.addEventListener("mousemove", e => {
         if (d < bestDist) { bestDist = d; best = { s, type, label, p }; }
       });
     };
-    if (document.getElementById("showResp").checked) checkLine(SMOOTH[si].respP50, "resp50", "Resp/TTLT p50");
-    if (document.getElementById("showTTFT").checked) checkLine(SMOOTH[si].ttftP50, "ttft50", "TTFT p50");
-    if (document.getElementById("showTTFTP95").checked) checkLine(SMOOTH[si].ttftP95, "ttft95", "TTFT p95");
+    if (document.getElementById("showResp").checked) checkLine(s.respP50, "resp50", "Resp/TTLT p50");
+    if (document.getElementById("showTTFT").checked) checkLine(s.ttftP50, "ttft50", "TTFT p50");
+    if (document.getElementById("showTTFTP95").checked) checkLine(s.ttftP95, "ttft95", "TTFT p95");
   });
   let mixHover = null;
   if (!best && mx >= margin.left && mx <= margin.left + plotW) {
@@ -1127,7 +932,6 @@ window.addEventListener("keydown", e => {
 });
 
 window.addEventListener("resize", () => { resize(); draw(); });
-document.getElementById("footerDisclosure").textContent = footerDisclosureText();
 recalcYMax();
 resize();
 draw();
