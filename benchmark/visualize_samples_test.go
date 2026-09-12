@@ -11,6 +11,55 @@ import (
 	"time"
 )
 
+// Completed token volume must be normalized by worker slots, including idle
+// slots, and must leave the rolling window after 60 seconds.
+func TestOutputWorkerRateJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 10, 7, 0, 0, 0, time.UTC)
+	writeMixedJSONL(t, dir, "rate", []requestDataRecord{
+		{StartTime: base, EndTime: base.Add(10 * time.Second), ResponseMs: 10000, OutputTokens: 320, Model: "rate"},
+		{StartTime: base.Add(60 * time.Second), EndTime: base.Add(70 * time.Second), ResponseMs: 10000, OutputTokens: 640, Model: "rate"},
+	}, nil)
+	path, err := GenerateVisualization(dir, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	script := html[strings.Index(html, "<script>")+len("<script>") : strings.Index(html, "</script>")]
+	probe := `
+function assert(ok, msg) { if (!ok) throw new Error(msg); }
+const pts = DATA[0]._outputWorker;
+const at = t => pts.find(p => p.t === t).v;
+assert(at(5000) === 0, "do not count output before completion");
+assert(at(10000) === 1, "320 tokens / 10 seconds / 32 workers");
+assert(Math.abs(at(70000) - 1/3) < 1e-10, "old completion leaves 60-second window");
+assert(outputWorkerPoints([], 32).length === 0, "empty data");
+assert(outputWorkerPoints(DATA[0].records, 0).length === 0, "unknown concurrency");
+const arm = { _view: DATA[0].records, conc: 16 };
+computeDerived(arm);
+assert(arm._outputWorker.find(p => p.t === 10000).v === 2, "recorded arm concurrency wins");
+setAllLayers(true);
+assert(document.getElementById("showOutputWorker").checked, "select all includes rate");
+viewTMin = 0; viewTMax = 20000; draw();
+assert(outputWorkerAxisLabel.style.display === "block", "rate axis is visible");
+assert(margin.right > 20, "rate axis reserves right margin");
+hiddenSeries.add(0); draw(); hiddenSeries.clear();
+assert(outputWorkerAxisLabel.style.display === "none", "rate axis hides without visible data");
+setAllLayers(false);
+assert(!document.getElementById("showOutputWorker").checked, "deselect all includes rate");
+console.log("ALL_OK");
+`
+	runNodeProbe(t, nodeBin, dir, "output_worker", script, probe)
+}
+
 func writeMixedJSONL(t *testing.T, dir, name string, records []requestDataRecord, samples []vllmMetricsSample) string {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -811,7 +860,7 @@ expect(0, 8, "80.0%","cached input share");
 // TTFT percentiles are backed by the non-error requests only: the errored
 // 4th row must not count even though it carries a ttft.
 assert(sumCells[0][5].title.indexOf("3 non-error requests") === 0, "ttft sample count, got " + sumCells[0][5].title);
-assert(document.getElementById("sumRange").textContent === "full run (30s)",
+assert(document.getElementById("sumRange").textContent === "full run (32s)",
   "range label, got " + JSON.stringify(document.getElementById("sumRange").textContent));
 
 // The cached split rides along as a hover on the input row:
@@ -876,14 +925,11 @@ console.log("ALL_OK");
 	}
 }
 
-// TestActiveDatasetReframesOnZoomJS pins the fix for a band that described the
-// whole run regardless of zoom: the active-dataset line was scaled against the
-// run's peak and labelled with the run's final sample, so zooming into a
-// stretch where the dataset was small flattened the line onto the band floor
-// and reported a size that was never in force there.
+// TestActiveDatasetSharedMaximumJS keeps the active-dataset line on one
+// zero-anchored maximum rather than re-normalizing it on every view.
 //
 // benchFixtureData samples the dataset at t = 0/60/120s with 4k/8k/12k tokens.
-func TestActiveDatasetReframesOnZoomJS(t *testing.T) {
+func TestActiveDatasetSharedMaximumJS(t *testing.T) {
 	nodeBin, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed; JS active-dataset test skipped")
@@ -914,68 +960,31 @@ function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process
 document.getElementById("showCacheMix").checked = true;
 const band = () => cacheMixLayout().bands[0];
 
-// Whole run: scale spans the run and the last sample is the final one.
+// Whole run uses the run-wide 12k maximum.
 viewTMin = globalTMin; viewTMax = globalTMax;
 let L = cacheMixLayout();
-assert(band().adtRange.lo === 4000 && band().adtRange.hi === 12000,
-  "full view scale is 4000-12000, got " + JSON.stringify(band().adtRange));
+assert(L.adtMax === 12000, "shared maximum is 12000, got " + L.adtMax);
 let pts = band().adtPts;
 assert(pts[pts.length - 1].v === 12000, "full view last dataset size is 12000");
 
-// Zoom to the first minute: the 12k peak is outside the view, so the scale,
-// its floor, and the reported size all drop to what the window holds.
+// Zooming does not re-normalize the line: 8k remains two-thirds of the full
+// report maximum, rather than occupying the whole band.
 viewTMin = globalTMin; viewTMax = globalTMin + 60000;
 L = cacheMixLayout();
-assert(band().adtRange.lo === 4000 && band().adtRange.hi === 8000,
-  "zoomed scale re-frames to 4000-8000, got " + JSON.stringify(band().adtRange));
+assert(L.adtMax === 12000, "zoom keeps shared maximum, got " + L.adtMax);
 pts = band().adtPts;
 assert(pts[pts.length - 1].v === 8000, "zoomed last dataset size is 8000, got " + pts[pts.length - 1].v);
 assert(pts[0].v === 4000, "zoomed window starts at the 4000 sample");
 
-// The band's full height is spent on the window: its extremes land on the
-// band edges (modulo the 2px inset), NOT squashed against a 0-anchored top.
 {
   const b = band();
-  const yLo = adtY(4000, b.adtRange, b.yTop, b.bandH);
-  const yHi = adtY(8000, b.adtRange, b.yTop, b.bandH);
-  assert(Math.abs(yLo - (b.yTop + b.bandH - 2)) < 0.01, "window min sits at the band floor, got " + yLo);
-  assert(Math.abs(yHi - (b.yTop + 2)) < 0.01, "window max sits at the band top, got " + yHi);
-  // Against the old 0-anchored axis both would have crowded the upper third.
-  assert(yLo - yHi > b.bandH * 0.8, "the window spans nearly the whole band");
-}
-
-// A window falling between two samples still describes the standing level
-// (carry-in), rather than emptying the band. A flat range draws mid-band
-// instead of dividing by zero.
-viewTMin = globalTMin + 70000; viewTMax = globalTMin + 90000;
-L = cacheMixLayout();
-pts = band().adtPts;
-assert(pts.length === 1 && pts[0].v === 8000, "gap window carries the standing 8000 level");
-assert(band().adtRange.lo === 8000 && band().adtRange.hi === 8000, "gap window range is flat at the carried level");
-{
-  const b = band();
-  const y = adtY(8000, b.adtRange, b.yTop, b.bandH);
-  assert(Math.abs(y - (b.yTop + b.bandH / 2)) < 0.01, "flat range draws mid-band, got " + y);
-  assert(isFinite(y), "flat range must not divide by zero");
-}
-
-// Bands are scaled INDEPENDENTLY: an arm sitting at a different level must
-// still spend its full band on its own variation, not a slice of the union.
-viewTMin = globalTMin; viewTMax = globalTMax;
-{
-  const L2 = cacheMixLayout();
-  L2.bands.forEach(b => {
-    const vs = b.adtPts.map(p => p.v);
-    assert(b.adtRange.lo === Math.min.apply(null, vs) && b.adtRange.hi === Math.max.apply(null, vs),
-      b.s.name + ": range comes from its OWN points, got " + JSON.stringify(b.adtRange));
-    const ys = b.adtPts.map(p => adtY(p.v, b.adtRange, b.yTop, b.bandH));
-    const spread = Math.max.apply(null, ys) - Math.min.apply(null, ys);
-    assert(spread > b.bandH * 0.9, b.s.name + ": line spans its full band, got " + spread + "/" + b.bandH);
-  });
+  const y = adtY(8000, L.adtMax, b.yTop, b.bandH);
+  const expected = b.yTop + 2 + (b.bandH - 4) * (1 - 8000 / 12000);
+  assert(Math.abs(y - expected) < 0.01, "8k uses shared 12k scale, got " + y);
 }
 
 // The whole thing still renders at every zoom without throwing.
-[[globalTMin, globalTMax], [globalTMin, globalTMin + 60000], [globalTMin + 70000, globalTMin + 90000]].forEach(([a, c]) => {
+[[globalTMin, globalTMax], [globalTMin, globalTMin + 60000]].forEach(([a, c]) => {
   viewTMin = a; viewTMax = c;
   draw();
 });

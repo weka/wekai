@@ -591,6 +591,9 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   .panel { background: #171C20; border: 1px solid #42464A; border-radius: 8px; padding: 10px 12px; min-width: 0; }
   .panel-title { font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.07em; color: #8a9096; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
   .panel-title .range { color: #C79FF1; text-transform: none; letter-spacing: 0; }
+  .zoom-reset-hint { color: #8a9096; text-transform: none; letter-spacing: 0; }
+  .zoom-reset { font-size: 1em; line-height: 1.1; padding: 1px 5px; background: transparent; color: #C9C9C9; border: 1px solid #42464A; border-radius: 4px; cursor: pointer; text-transform: none; letter-spacing: 0; }
+  .zoom-reset:hover { background: #2A3038; color: #F2F2EB; }
   .panel-title .spacer { margin-left: auto; }
   /* Collapse control: both panels can be shrunk vertically to hand their
      height back to the chart, which is the only element that benefits from
@@ -626,13 +629,13 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
      shared #helpTip custom tooltip; see its rules next to #tooltip below and
      the wiring near the bottom of this script. */
   .help-label { border-bottom: 1px dotted #8a9096; cursor: help; padding-bottom: 2px; }
-  /* Right-axis title for the Totals (ingest) layer: a real DOM node
+  /* Right-axis titles: real DOM nodes
      positioned over the canvas (see totalsAxisLabel / drawTotalsAxis in the
      script) rather than ctx.fillText, purely so it can carry the same
      .help-label hover-tooltip affordance as everything else here. Centered
      at (left, top) via the translate(-50%,-50%) trick, then rotated about
      that same center -- see drawTotalsAxis for how left/top are computed. */
-  .totals-axis-label { position: fixed; font: 12px sans-serif; color: #C9C9C9; white-space: nowrap; z-index: 2; }
+  .right-axis-label { position: fixed; font: 12px sans-serif; color: #C9C9C9; white-space: nowrap; z-index: 2; }
   /* Ratio-to-baseline sits BELOW its value, right-aligned under it, so the
      value column stays in one straight line under its header — inline, the
      ratio pushed each value left by its own width and the numbers no longer
@@ -734,6 +737,7 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
       <label><input type="checkbox" id="showDots"> <span class="help-label" id="hlpReqs" tabindex="0" aria-describedby="helpTip" data-tip="One dot per request. Shows spread the percentile lines hide.">Requests</span></label>
       <label><input type="checkbox" id="showErrors"> <span class="help-label" id="hlpErrors" tabindex="0" aria-describedby="helpTip" data-tip="Error-rate bars anchored on the response line.">Errors</span></label>
       <label><input type="checkbox" id="showTotals"> <span class="help-label" id="hlpTotals" tabindex="0" aria-describedby="helpTip" data-tip="Cumulative ingest tokens, stacked. Normalized to the run's final total.">Totals (ingest)</span></label>
+      <label><input type="checkbox" id="showOutputWorker"> <span id="hlpOutputWorker" class="help-label" tabindex="0" aria-describedby="helpTip" data-tip="Output tokens completed in the trailing 60 seconds, divided by elapsed seconds and configured concurrency (including idle slots). Shorter window at startup. Each arm uses its recorded concurrency, or the visualization concurrency override; unknown concurrency produces no line. Its scale appears on the right of the graph.">output/s/worker</span></label>
       <span id="zoomInfo" style="font-size:0.8em;color:#8a9096;"></span>
     </div>
     <div class="controls">
@@ -749,7 +753,7 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
     </div>
   </div>
   <div class="panel" id="summaryPanel">
-    <div class="panel-title">Summary<span class="range" id="sumRange"></span><span class="spacer"></span><button class="panel-toggle" id="summaryToggle" title="Collapse">&minus;</button></div>
+    <div class="panel-title">Summary<span class="range" id="sumRange"></span><span class="zoom-reset-hint" id="zoomResetHint" hidden>Esc to reset</span><button class="zoom-reset" id="resetZoom" hidden>Reset</button><span class="spacer"></span><button class="panel-toggle" id="summaryToggle" title="Collapse">&minus;</button></div>
     <div class="panel-body">
       <div class="summary-wrap"><table id="summaryTable"><thead><tr id="sumHead"></tr></thead><tbody id="sumBody"></tbody></table></div>
     </div>
@@ -947,6 +951,30 @@ function ctxFilterActive() { return ctxFilter.min > 0 || ctxFilter.max > 0; }
 // satisfy BOTH.
 let snFilter = new Set();
 
+// outputWorkerPoints: the output/s/worker layer -- output tokens completed in
+// the trailing 60s window, per elapsed second, per configured concurrency
+// slot (idle slots included). Sampled at ~2000 x-positions (>=5s apart) with
+// a two-pointer window so it stays O(n) over the sorted completion times.
+// Returns [] when concurrency is unknown, so the layer simply has no line.
+function outputWorkerPoints(records, concurrency) {
+  if (!(concurrency > 0) || !records.length) return [];
+  const ends = records.map(r => ({ t: r.t + Math.max(r.resp || 0, 0), out: Math.max(r.out || 0, 0) }))
+    .sort((a, b) => a.t - b.t);
+  const start = records.reduce((v, r) => Math.min(v, r.t), Infinity);
+  const end = ends[ends.length - 1].t;
+  if (end <= start) return [];
+  const step = Math.max(5000, (end - start) / 2000);
+  const points = [];
+  let left = 0, right = 0, tokens = 0;
+  for (let t = Math.min(start + step, end); ; t = Math.min(t + step, end)) {
+    while (right < ends.length && ends[right].t <= t) tokens += ends[right++].out;
+    while (left < right && ends[left].t <= t - 60000) tokens -= ends[left++].out;
+    points.push({ t, v: tokens / (Math.min(60000, t - start) / 1000) / concurrency });
+    if (t === end) break;
+  }
+  return points;
+}
+
 // computeDerived rebuilds every derived structure of a series from its
 // current view: cumulative ingest/output (volume layer + hover rates),
 // rolling-percentile lines, and error bars. Called once per series at load
@@ -981,6 +1009,7 @@ function computeDerivedFrom(view, conc) {
   // concurrency — one global number smooths one arm correctly and the other
   // wrongly, with nothing on screen saying so.
   const seriesConc = conc > 0 ? conc : CONCURRENCY;
+  const outputWorker = outputWorkerPoints(view, seriesConc);
   const winSize = seriesConc > 0 ? seriesConc * 3 : DEFAULT_WINDOW_REQS;
   const winConcSource = conc > 0 ? "recorded" : (CONCURRENCY > 0 ? "--concurrency" : "default");
   // Plotted lines: rolling-window percentiles. Response = p50 (plus p10/p90
@@ -1040,7 +1069,7 @@ function computeDerivedFrom(view, conc) {
     _byT: byT, _cumTimes: cumTimes, _cumTokens: cumTokens, _cumOutTokens: cumOutTokens,
     _sorted: sorted, _winConcSource: winConcSource, _winConc: seriesConc, _winSize: winSize,
     _respP50: respP50, _respP10: respP10, _respP90: respP90, _ttftP50: ttftP50, _ttftP95: ttftP95,
-    _errBars: errBars,
+    _errBars: errBars, _outputWorker: outputWorker,
   };
 }
 
@@ -1140,7 +1169,7 @@ const helpTip = document.getElementById("helpTip");
 // the same way, whether they came from the static markup (control-layer
 // labels, grabbed here by id) or are built later in JS (summary column
 // headers, the Cache Mix toggle -- each pushes itself in as it's created).
-const helpTriggers = ["hlpTtft50", "hlpTtft95", "hlpResp", "hlpReqs", "hlpErrors", "hlpTotals",
+const helpTriggers = ["hlpTtft50", "hlpTtft95", "hlpResp", "hlpReqs", "hlpErrors", "hlpTotals", "hlpOutputWorker",
     "hlpDlReqs", "hlpDlSummary", "hlpDlReqsModal", "hlpDlSummaryModal",
     "hlpPubRes", "hlpPubSmooth", "hlpDlPublic", "hlpDlPublicModal"]
   .map(id => document.getElementById(id)).filter(Boolean);
@@ -1154,7 +1183,7 @@ const helpTriggers = ["hlpTtft50", "hlpTtft95", "hlpResp", "hlpReqs", "hlpErrors
 // same hover/focus tooltip wiring as every other .help-label here.
 const totalsAxisLabel = document.createElement("span");
 totalsAxisLabel.id = "hlpTotalsAxis";
-totalsAxisLabel.className = "help-label totals-axis-label";
+totalsAxisLabel.className = "help-label right-axis-label";
 totalsAxisLabel.tabIndex = 0;
 totalsAxisLabel.ariaDescribedBy = "helpTip";
 totalsAxisLabel.dataset.tip = "Cumulative input tokens processed, stacked across visible arms. Right axis.";
@@ -1166,6 +1195,17 @@ totalsAxisLabel.style.display = "none";
 // controls row; drawTotalsAxis() places it by absolute viewport coordinates.
 document.querySelector(".controls").appendChild(totalsAxisLabel);
 helpTriggers.push(totalsAxisLabel);
+
+const outputWorkerAxisLabel = document.createElement("span");
+outputWorkerAxisLabel.id = "hlpOutputWorkerAxis";
+outputWorkerAxisLabel.className = "help-label right-axis-label";
+outputWorkerAxisLabel.tabIndex = 0;
+outputWorkerAxisLabel.ariaDescribedBy = "helpTip";
+outputWorkerAxisLabel.dataset.tip = "Completed output tokens per second per configured worker slot, including idle slots. Right axis.";
+outputWorkerAxisLabel.textContent = "output/s/worker";
+outputWorkerAxisLabel.style.display = "none";
+document.querySelector(".controls").appendChild(outputWorkerAxisLabel);
+helpTriggers.push(outputWorkerAxisLabel);
 
 const margin = { top: 30, right: 20, bottom: 50, left: 70 };
 
@@ -1214,6 +1254,7 @@ function calcBottomMargin() {
 // (sizing the margin) and drawTotalsAxis (drawing into it) -- one constant so
 // the two can never disagree about how many ticks the axis actually gets.
 const TOTALS_AXIS_TARGET_STEPS = 5;
+const OUTPUT_WORKER_AXIS_TARGET_STEPS = 5;
 
 // calcRightMargin mirrors calcBottomMargin above: the right axis (the Totals
 // ingest-token scale added by drawTotalsAxis) only claims plot width when
@@ -1225,14 +1266,56 @@ const TOTALS_AXIS_TARGET_STEPS = 5;
 // drawTotalsAxis uses) plus room for the tick mark, a small gap, and the
 // rotated title -- otherwise 20, the original always-on right gutter.
 function calcRightMargin() {
-  const geo = volumeGeometry();
-  if (!geo) return 20;
+  const axes = rightAxisLayout();
+  return axes.width || 20;
+}
+
+function outputWorkerGeometry() {
+  const cb = document.getElementById("showOutputWorker");
+  if (!cb || !cb.checked) return null;
+  const visible = DATA.map((s, si) => ({ si, points: s._outputWorker.filter(p => p.t >= viewTMin && p.t <= viewTMax) }))
+    .filter(s => !hiddenSeries.has(s.si) && s.points.length);
+  if (!visible.length) return null;
+  let max = 0;
+  visible.forEach(s => s.points.forEach(p => { max = Math.max(max, p.v); }));
+  return { visible: visible, ceiling: Math.max(max * 1.15, 1) };
+}
+
+function outputWorkerY(v, geo) {
+  const top = margin.top + mixReserveH;
+  const height = Math.max(1, plotH - mixReserveH);
+  return top + height * (1 - v / geo.ceiling);
+}
+
+function axisWidth(ticks, format) {
   ctx.font = "11px monospace";
   let maxW = 0;
-  niceSteps(geo.finalTotal, TOTALS_AXIS_TARGET_STEPS).forEach(v => {
-    maxW = Math.max(maxW, ctx.measureText(fmtTokens(v)).width);
-  });
-  return Math.ceil(maxW) + 4 /* tick mark */ + 8 /* label gap */ + 6 /* breathing room */ + 18 /* rotated title */;
+  ticks.forEach(v => { maxW = Math.max(maxW, ctx.measureText(format(v)).width); });
+  return Math.ceil(maxW) + 4 /* tick */ + 8 /* label gap */ + 6 /* breathing room */ + 18 /* title */;
+}
+
+function fmtOutputWorker(v) {
+  return v >= 100 ? v.toFixed(0) : v.toFixed(v >= 10 ? 1 : 2);
+}
+
+function rightAxisLayout() {
+  const totals = volumeGeometry();
+  const outputWorker = outputWorkerGeometry();
+  const layout = { totals: null, outputWorker: null, width: 0 };
+  if (totals) {
+    const ticks = niceSteps(totals.finalTotal, TOTALS_AXIS_TARGET_STEPS);
+    const width = axisWidth(ticks, fmtTokens);
+    layout.totals = { geo: totals, ticks: ticks, width: width, offset: layout.width };
+    layout.width += width;
+  }
+  if (outputWorker) {
+    if (layout.width) layout.width += 8;
+    const ticks = niceSteps(outputWorker.ceiling, OUTPUT_WORKER_AXIS_TARGET_STEPS);
+    const width = axisWidth(ticks, fmtOutputWorker);
+    layout.outputWorker = { geo: outputWorker, ticks: ticks, width: width, offset: layout.width };
+    layout.width += width;
+  }
+  return layout;
 }
 
 function resize() {
@@ -1267,7 +1350,7 @@ function resize() {
 DATA.forEach(s => {
   s.records.forEach(r => {
     if (r.t < globalTMin) globalTMin = r.t;
-    if (r.t > globalTMax) globalTMax = r.t;
+    if (r.t + Math.max(r.resp || 0, 0) > globalTMax) globalTMax = r.t + Math.max(r.resp || 0, 0);
   });
   // Cache-mix samples extend the time range (a final sample can land after
   // the last request completes) but never the latency axis.
@@ -1651,6 +1734,9 @@ function renderSummary(perSeries) {
       ? off(viewTMin) + " – " + off(viewTMax)
       : "full run (" + off(globalTMax) + ")";
   }
+  const zoomed = isZoomed();
+  document.getElementById("zoomResetHint").hidden = !zoomed;
+  document.getElementById("resetZoom").hidden = !zoomed;
 }
 
 // --- Recorded run parameters ---
@@ -1709,7 +1795,7 @@ wirePanelToggle("summaryToggle", "summaryPanel");
 // governs; see the ctxModal block below). "X-axis values" is an annotation
 // toggle, not a plotted layer, and is deliberately excluded. Cache Mix only
 // exists in the DOM when the dataset carries samples, hence the guard.
-const LAYER_CHECKBOX_IDS = ["showTTFT", "showTTFTP95", "showResp", "showDots", "showErrors", "showTotals"];
+const LAYER_CHECKBOX_IDS = ["showTTFT", "showTTFTP95", "showResp", "showDots", "showErrors", "showTotals", "showOutputWorker"];
 function setAllLayers(on) {
   LAYER_CHECKBOX_IDS.concat(HAS_CACHE_MIX ? ["showCacheMix"] : []).forEach(id => {
     const cb = document.getElementById(id);
@@ -2251,12 +2337,11 @@ function drawTotals() {
 // together. Deliberately does NOT draw new horizontal gridlines across the
 // plot (that would double the existing latency grid) -- just short tick
 // marks and labels on the right edge, styled to match the left latency axis.
-function drawTotalsAxis() {
-  const geo = volumeGeometry();
-  if (!geo) { totalsAxisLabel.style.display = "none"; return; }
-  const { finalTotal, ceilingY } = geo;
+function drawTotalsAxis(axis) {
+  if (!axis) { totalsAxisLabel.style.display = "none"; return; }
+  const { finalTotal, ceilingY } = axis.geo;
   const bottom = margin.top + plotH;
-  const xEdge = margin.left + plotW;
+  const xEdge = margin.left + plotW + axis.offset;
 
   ctx.save();
   ctx.strokeStyle = "#42464A";
@@ -2265,7 +2350,7 @@ function drawTotalsAxis() {
   ctx.font = "11px monospace";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
-  niceSteps(finalTotal, TOTALS_AXIS_TARGET_STEPS).forEach(v => {
+  axis.ticks.forEach(v => {
     const y = totalsY(v / finalTotal, margin.top, plotH, ceilingY);
     if (y < ceilingY - 0.5 || y > bottom + 0.5) return; // guard float slop only
     ctx.beginPath();
@@ -2289,12 +2374,42 @@ function drawTotalsAxis() {
   // before rotate(90deg) spins it about the same center, so the rotation
   // itself can't shift the label off the point.
   const rect = canvas.getBoundingClientRect();
-  const cx = W - 14;
+  const cx = xEdge + axis.width - 9;
   const cy = (ceilingY + bottom) / 2;
   totalsAxisLabel.style.display = "block";
   totalsAxisLabel.style.left = (rect.left + cx) + "px";
   totalsAxisLabel.style.top = (rect.top + cy) + "px";
   totalsAxisLabel.style.transform = "translate(-50%, -50%) rotate(90deg)";
+}
+
+function drawOutputWorkerAxis(axis) {
+  if (!axis) { outputWorkerAxisLabel.style.display = "none"; return; }
+  const { geo } = axis;
+  const xEdge = margin.left + plotW + axis.offset;
+  ctx.save();
+  ctx.strokeStyle = "#42464A";
+  ctx.lineWidth = 1;
+  ctx.fillStyle = "#8a9096";
+  ctx.font = "11px monospace";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  axis.ticks.forEach(v => {
+    const y = outputWorkerY(v, geo);
+    ctx.beginPath();
+    ctx.moveTo(xEdge, y);
+    ctx.lineTo(xEdge + 4, y);
+    ctx.stroke();
+    ctx.fillText(fmtOutputWorker(v), xEdge + 8, y);
+  });
+  ctx.restore();
+
+  const rect = canvas.getBoundingClientRect();
+  const cx = xEdge + axis.width - 9;
+  const cy = margin.top + mixReserveH + (plotH - mixReserveH) / 2;
+  outputWorkerAxisLabel.style.display = "block";
+  outputWorkerAxisLabel.style.left = (rect.left + cx) + "px";
+  outputWorkerAxisLabel.style.top = (rect.top + cy) + "px";
+  outputWorkerAxisLabel.style.transform = "translate(-50%, -50%) rotate(90deg)";
 }
 
 // cacheMixLayout computes the band geometry shared by drawCacheMix and the
@@ -2323,23 +2438,15 @@ function cacheMixLayout() {
     }
   }
   bands.forEach((b, bi) => { b.yTop = margin.top + bi * bandH; b.bandH = bandH; });
-  // Active-dataset scale is re-framed to the CURRENT view, not the whole run,
-  // and stays shared across bands so series remain comparable to each other
-  // within that view. Each band caches its own windowed points so drawCacheMix
-  // and the label don't re-walk the samples.
-  // Each band gets its OWN window range. Unlike the cache-mix stack (which
-  // shares MIX_TOTAL_MAX so a quiet arm renders visibly quiet), the bands are
-  // stacked rows with no common axis line drawn between them — you can't read
-  // relative height across them by eye anyway, so a shared scale bought no
-  // comparability while costing every band most of its height: two arms whose
-  // datasets sit at different levels each get squeezed into their own slice of
-  // the union. Per-band, each line spends the full band on its own variation,
-  // and the printed "scale lo-hi" carries the absolute levels.
+  // Dataset size uses one zero-anchored, report-wide ceiling. The white line
+  // therefore has the same height in every cache-mix band, even after zooming.
+  // This matches the absolute scaling used by the source-mix stacks.
+  let adtMax = 0;
   bands.forEach(b => {
     b.adtPts = adtWindow(b.s.adt, viewTMin, viewTMax);
-    b.adtRange = adtWindowRange([b.adtPts]);
+    (b.s.adt || []).forEach(p => { adtMax = Math.max(adtMax, p.v); });
   });
-  return { bands };
+  return { bands, adtMax: Math.max(adtMax, 1) };
 }
 
 // computeMixReserveH returns the vertical space (px, measured down from
@@ -2364,21 +2471,18 @@ function computeMixReserveH() {
   return last.yTop + last.bandH - margin.top;
 }
 
-// adtY maps a dataset size onto its band. A 2px inset keeps the extremes off
-// the band border, and a flat window (lo === hi, e.g. a single carried-in
-// sample) draws down the middle rather than dividing by zero.
-function adtY(v, range, yTop, bandH) {
+// adtY maps a dataset size onto its band against the report-wide maximum.
+function adtY(v, max, yTop, bandH) {
   const inset = 2;
   const h = Math.max(bandH - inset * 2, 1);
-  if (!range || range.hi <= range.lo) return yTop + bandH / 2;
-  const frac = (v - range.lo) / (range.hi - range.lo);
+  const frac = v / Math.max(max, 1);
   return yTop + inset + (1 - Math.min(Math.max(frac, 0), 1)) * h;
 }
 
 function drawCacheMix() {
   const layout = cacheMixLayout();
   if (!layout) return;
-  layout.bands.forEach(({ s, yTop, bandH, adtPts, adtRange }) => {
+  layout.bands.forEach(({ s, yTop, bandH, adtPts }) => {
     // Solid-black backdrop, band-area only: fills pop against it, and
     // unfilled (black) band space still reads as "low ingest".
     ctx.fillStyle = "#000";
@@ -2410,12 +2514,10 @@ function drawCacheMix() {
     });
     ctx.globalAlpha = 1;
 
-    // Active-dataset line, drawn against this band's own windowed range: the
-    // window minimum at the band floor, its maximum at the band top. Only the
-    // windowed points are drawn, and x is clamped to the band so the carry-in
-    // sample (which sits before viewTMin) anchors the line at the left edge
-    // instead of painting across the y-axis margin.
-    if (adtRange && adtPts && adtPts.length) {
+    // Active-dataset line uses the shared report-wide scale. Only the windowed
+    // points are drawn, and x is clamped to the band so a carry-in sample
+    // anchors the line at the left edge instead of painting over the y axis.
+    if (adtPts && adtPts.length) {
       ctx.strokeStyle = ADT_LINE_COLOR;
       ctx.lineWidth = 1;
       ctx.globalAlpha = 0.85;
@@ -2423,12 +2525,12 @@ function drawCacheMix() {
       let started = false;
       adtPts.forEach(p => {
         const x = Math.min(Math.max(mapX(p.t), margin.left), margin.left + plotW);
-        const y = adtY(p.v, adtRange, yTop, bandH);
+        const y = adtY(p.v, layout.adtMax, yTop, bandH);
         if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       });
       // A single windowed sample is a flat level across the view, not a dot.
       if (adtPts.length === 1) {
-        ctx.lineTo(margin.left + plotW, adtY(adtPts[0].v, adtRange, yTop, bandH));
+        ctx.lineTo(margin.left + plotW, adtY(adtPts[0].v, layout.adtMax, yTop, bandH));
       }
       ctx.stroke();
       ctx.globalAlpha = 1;
@@ -2443,15 +2545,13 @@ function drawCacheMix() {
     ctx.textBaseline = "top";
     ctx.fillStyle = "#C79FF1"; // purple-accented label per brand guidance
     ctx.fillText(s.name + " cache mix (peak " + fmtTokens(MIX_TOTAL_MAX) + " tok/min)", margin.left + 4, yTop + 3);
-    // Label reports the LAST dataset size within the view and the view's own
-    // scale — both re-framed by zoom, so the band always describes what is
-    // actually on screen rather than the end state of the whole run.
+    // Label reports the visible endpoint against the shared report-wide scale.
     if (adtPts && adtPts.length) {
       const last = adtPts[adtPts.length - 1];
       ctx.fillStyle = ADT_LINE_COLOR;
       ctx.textAlign = "right";
       ctx.fillText("last dataset size (tokens): " + fmtTokens(last.v) +
-        " | " + last.s + " series | scale " + fmtTokens(adtRange.lo) + "-" + fmtTokens(adtRange.hi),
+        " | " + last.s + " series | scale 0-" + fmtTokens(layout.adtMax),
         margin.left + plotW - 4, yTop + 3);
       ctx.textAlign = "left";
     }
@@ -2594,6 +2694,25 @@ function drawRequestRibbon(s, color) {
   ctx.globalAlpha = 1;
 }
 
+function drawOutputWorker() {
+  const geo = outputWorkerGeometry();
+  if (!geo) return;
+  ctx.save();
+  geo.visible.forEach(s => {
+    ctx.strokeStyle = seriesColors[s.si];
+    ctx.lineWidth = 2;
+    ctx.setLineDash([10, 4, 2, 4]);
+    ctx.beginPath();
+    s.points.forEach((p, i) => {
+      if (i === 0) ctx.moveTo(mapX(p.t), outputWorkerY(p.v, geo));
+      else ctx.lineTo(mapX(p.t), outputWorkerY(p.v, geo));
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+  });
+  ctx.restore();
+}
+
 function draw() {
   // Recalc the right margin: whether the Totals layer's ingest-token axis is
   // currently contributing pixels (see calcRightMargin) can change between
@@ -2670,10 +2789,11 @@ function draw() {
   ctx.fillText("Latency", 0, 0);
   ctx.restore();
 
-  // Right axis (Totals/ingest layer, absolute tokens) -- no-ops and hides
-  // its title when the layer isn't contributing pixels. Drawn here,
-  // unclipped, alongside the rest of the axis chrome -- see drawTotalsAxis.
-  drawTotalsAxis();
+  // Right axes are drawn outside the plot clip. Each layer owns a scale so
+  // latency, completed-token totals, and output rate stay independently legible.
+  const rightAxes = rightAxisLayout();
+  drawTotalsAxis(rightAxes.totals);
+  drawOutputWorkerAxis(rightAxes.outputWorker);
 
   // X axis label
   ctx.fillStyle = "#C9C9C9";
@@ -2776,6 +2896,7 @@ function draw() {
     });
   }
 
+  drawOutputWorker();
   ctx.restore(); // remove clip
 
   // Draw drag selection overlay
@@ -3097,6 +3218,7 @@ window.addEventListener("mouseup", () => {
 canvas.addEventListener("dblclick", resetZoomView);
 
 // Reset button
+document.getElementById("resetZoom").addEventListener("click", resetZoomView);
 
 // Wire up controls. The four latency-plotting layers can change which
 // series is now tallest, so they recompute the y-axis; the annotation-only
@@ -3105,7 +3227,7 @@ canvas.addEventListener("dblclick", resetZoomView);
 ["showTTFT", "showTTFTP95", "showResp", "showDots"].forEach(id => {
   document.getElementById(id).addEventListener("change", () => { recalcYMax(); draw(); });
 });
-["showErrors", "showTotals"].forEach(id => {
+["showErrors", "showTotals", "showOutputWorker"].forEach(id => {
   document.getElementById(id).addEventListener("change", draw);
 });
 
