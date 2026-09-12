@@ -132,7 +132,7 @@ replay:
   # timeout anywhere is how a job is meant to finish on its own.
   reuseSessions: true
   # admitEvery is how fast the count climbs under realtime: one session, then
-  # one more this often while the fleet keeps up. Concurrency is then whatever
+  # admitCount more this often while the fleet keeps up. Concurrency is then whatever
   # the fleet's latency implies rather than a number set here. Ignored unless
   # realtime is on.
   #
@@ -141,6 +141,9 @@ replay:
   # 52.8 req/s at 36% prefill utilisation while five-per-second finds 140.7 at
   # 97%. Run two rates and check the answer stopped moving before believing it.
   admitEvery: "1s"
+  # Empty preserves the binary's default of one and supports older images.
+  # Set 32 with admitEvery: "2m" to add 32 sessions every two minutes.
+  admitCount: ""
   # ttftLimit pauses admission while the windowed mean TTFT is at or above it,
   # and resumes below. This is the definition of "sustained" for the run — max
   # sessions at 5s and at 1s are different capacity numbers for one fleet — so

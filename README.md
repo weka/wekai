@@ -145,6 +145,18 @@ wekai benchmark auto \
   --save-request-data ./results
 ```
 
+To start with 32 series and add 32 more every two minutes, replace
+`--series 256` with `--start-series=32 --max-series=256 --admit-count=32
+--admit-every=2m`. The first increase happens after two minutes; each batch
+is capped only when `--max-series` is set. Omit it for an unlimited ramp.
+With `--replay-realtime`, admission pauses while the TTFT gate is closed
+and resumes with one batch per tick, without catching up on skipped ticks.
+Without real-time replay, admission depends only on the interval.
+Omitting `--admit-count` preserves one series per tick. Add `--replay-realtime`
+to preserve captured think times; without it, sessions run back-to-back.
+Helm equivalents: `replay.realtime=true`, `replay.admitCount=32`, and
+`replay.admitEvery=2m` (the chart starts with one series).
+
 **Where the replay file comes from.** `wekai router serve` proxies live
 LLM traffic and captures it (redacted); `wekai router replay-prepare`
 compiles those captures into a single replay-v3 JSONL file — one header
@@ -203,6 +215,12 @@ load.
 `report.html` scatter-plot (TTFT / response time / cache hits over time)
 there at the end of the run. Regenerate or combine runs later with
 `wekai benchmark visualize <dir>` and `wekai benchmark visualize-merge`.
+The **output/s/worker** toggle adds a labeled line to the main graph: output
+tokens from requests completed in the trailing 60 seconds, divided by the
+window duration and configured concurrency (including idle slots). Startup
+uses the elapsed duration. Each arm uses its recorded concurrency, falling
+back to the visualization's `--concurrency`; unknown concurrency produces no
+line. The rate has its own scale, independent of latency.
 
 **Server-side cache-source sampling.** When `--save-request-data` is on and
 the model spec points at an OpenAI-compatible (chat/completions) endpoint,

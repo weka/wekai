@@ -115,6 +115,7 @@ type AutoBenchmarkConfig struct {
 	// setting a concurrency number.
 	ReplayRealtime bool
 	AdmitEvery     time.Duration // 0 = off, no session admission governor
+	AdmitCount     int           // sessions per admission tick; 0 = 1
 	TTFTLimit      time.Duration // gate closes at or above this windowed mean
 	TTFTWindow     time.Duration // how far back the gate looks; default 30s
 	// TTFTLimitStat is which statistic over that window the gate compares
@@ -1839,15 +1840,7 @@ func runSingleModelBenchmark(
 	startTime := time.Now()
 
 	// Apply defaults.
-	if cfg.MaxSeries <= 0 {
-		cfg.MaxSeries = 64
-	}
-	if cfg.StartSeries <= 0 {
-		cfg.StartSeries = 1
-	}
-	if cfg.StartSeries > cfg.MaxSeries {
-		cfg.StartSeries = cfg.MaxSeries
-	}
+	cfg.setSeriesDefaults()
 	if cfg.MinEvalRequests <= 0 {
 		cfg.MinEvalRequests = 10
 	}
@@ -2604,41 +2597,23 @@ func runSingleModelBenchmark(
 	}
 
 	if cfg.AdmitEvery > 0 {
-		go func() {
-			t := time.NewTicker(cfg.AdmitEvery)
-			defer t.Stop()
-			next := cfg.StartSeries
-			for {
-				select {
-				case <-benchCtx.Done():
-					return
-				case <-t.C:
-				}
-				if cfg.MaxSeries > 0 && next >= cfg.MaxSeries {
-					// The safety cap, not the fleet. Say so: a run that stops
-					// here has measured the cap and nothing else.
-					st.mu.Lock()
-					if !st.seriesDone {
-						st.seriesDone = true
-						fmt.Fprintf(os.Stderr, "[admit] stopped at --max-series=%d; this is the cap, "+
-							"not the fleet's ceiling — raise it or the result is the cap's\n", cfg.MaxSeries)
-					}
-					st.mu.Unlock()
-					return
-				}
-				if !st.ttft.Open(time.Now(), cfg.TTFTLimit, cfg.TTFTLimitStat) {
-					continue // over the limit: hold, and re-check next tick
-				}
-				next++
-				st.mu.Lock()
-				st.series = next
-				if next > st.allTimePeakSeries {
-					st.allTimePeakSeries = next
-				}
-				st.mu.Unlock()
-				spawnSeries(uuid.New().String(), next)
+		go admitSeries(benchCtx, cfg, st.ttft, func(next int) {
+			st.mu.Lock()
+			st.series = next
+			if next > st.allTimePeakSeries {
+				st.allTimePeakSeries = next
 			}
-		}()
+			st.mu.Unlock()
+			spawnSeries(uuid.New().String(), next)
+		}, func() {
+			st.mu.Lock()
+			defer st.mu.Unlock()
+			if !st.seriesDone {
+				st.seriesDone = true
+				fmt.Fprintf(os.Stderr, "[admit] stopped at --max-series=%d; this is the cap, "+
+					"not the fleet's ceiling — raise it or the result is the cap's\n", cfg.MaxSeries)
+			}
+		})
 	}
 
 	// Replay-mode drain watcher: when every worker has exited (queue drained
@@ -3267,15 +3242,7 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 	}
 
 	// Apply defaults once (passed through to runSingleModelBenchmark via per-model cfg copy).
-	if cfg.MaxSeries <= 0 {
-		cfg.MaxSeries = 64
-	}
-	if cfg.StartSeries <= 0 {
-		cfg.StartSeries = 1
-	}
-	if cfg.StartSeries > cfg.MaxSeries {
-		cfg.StartSeries = cfg.MaxSeries
-	}
+	cfg.setSeriesDefaults()
 	if cfg.MinEvalRequests <= 0 {
 		cfg.MinEvalRequests = 10
 	}

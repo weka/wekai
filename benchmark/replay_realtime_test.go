@@ -6,8 +6,123 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
+
+func TestAdmissionAddsBatchesOnlyAtTicksAndClampsToCap(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := AutoBenchmarkConfig{StartSeries: 1, MaxSeries: 70, AdmitCount: 32, AdmitEvery: 2 * time.Minute}
+		var admitted atomic.Int64
+		var capped atomic.Bool
+		go admitSeries(ctx, cfg, newTTFTWindow(0), func(n int) {
+			if want := int(admitted.Add(1)) + 1; n != want {
+				t.Errorf("series index = %d, want %d", n, want)
+			}
+		}, func() { capped.Store(true) })
+		synctest.Wait()
+		time.Sleep(2*time.Minute - time.Nanosecond)
+		synctest.Wait()
+		if int(admitted.Load()) != 0 {
+			t.Fatal("series admitted before the first interval elapsed")
+		}
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		for tick, want := range []int{32, 64, 69} {
+			if tick > 0 {
+				time.Sleep(2 * time.Minute)
+				synctest.Wait()
+			}
+			if int(admitted.Load()) != want {
+				t.Fatalf("tick %d: admitted %d, want %d", tick+1, int(admitted.Load()), want)
+			}
+		}
+		time.Sleep(2 * time.Minute)
+		synctest.Wait()
+		if !capped.Load() || int(admitted.Load()) != 69 {
+			t.Fatal("admission did not stop at the series cap")
+		}
+	})
+}
+
+func TestAdmissionDefaultAddsOnePerTick(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := AutoBenchmarkConfig{StartSeries: 1, AdmitEvery: time.Second}
+		var count atomic.Int64
+		go admitSeries(ctx, cfg, newTTFTWindow(0), func(int) { count.Add(1) }, func() {})
+		synctest.Wait()
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		if count.Load() != 3 {
+			t.Fatalf("admitted %d series over three ticks, want 3", count.Load())
+		}
+	})
+}
+
+func TestAdmissionWithoutRealtimeIgnoresTTFTAndHasNoDefaultCap(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := AutoBenchmarkConfig{StartSeries: 32, AdmitCount: 32, AdmitEvery: 2 * time.Minute, TTFTLimit: time.Second}
+		cfg.setSeriesDefaults()
+		window := newTTFTWindow(time.Hour)
+		window.Observe(time.Now(), time.Minute)
+		var last atomic.Int64
+		go admitSeries(ctx, cfg, window, func(n int) { last.Store(int64(n)) }, func() { t.Error("unexpected series cap") })
+		synctest.Wait()
+		time.Sleep(6 * time.Minute)
+		synctest.Wait()
+		if last.Load() != 128 {
+			t.Fatalf("series=%d, want 128 despite high TTFT and the legacy 64-series default", last.Load())
+		}
+	})
+}
+
+func TestSeriesDefaultsPreserveLegacyCapAndExplicitCaps(t *testing.T) {
+	legacy := AutoBenchmarkConfig{}
+	legacy.setSeriesDefaults()
+	if legacy.StartSeries != 1 || legacy.MaxSeries != 64 {
+		t.Fatalf("legacy defaults: start=%d max=%d", legacy.StartSeries, legacy.MaxSeries)
+	}
+	capped := AutoBenchmarkConfig{StartSeries: 128, MaxSeries: 64, AdmitEvery: time.Second}
+	capped.setSeriesDefaults()
+	if capped.StartSeries != 64 || capped.MaxSeries != 64 {
+		t.Fatalf("explicit cap: start=%d max=%d", capped.StartSeries, capped.MaxSeries)
+	}
+}
+
+func TestAdmissionPausesWithoutAccumulatingMissedBatches(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := AutoBenchmarkConfig{StartSeries: 1, AdmitCount: 32, AdmitEvery: time.Second, TTFTLimit: time.Second, ReplayRealtime: true}
+		window := newTTFTWindow(1500 * time.Millisecond)
+		window.Observe(time.Now(), 2*time.Second)
+		var count atomic.Int64
+		go admitSeries(ctx, cfg, window, func(int) { count.Add(1) }, func() {})
+		synctest.Wait()
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if count.Load() != 0 {
+			t.Fatal("admitted a batch while TTFT gate was closed")
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if count.Load() != 32 {
+			t.Fatalf("reopened gate admitted %d, want one batch of 32", count.Load())
+		}
+		cancel()
+		synctest.Wait()
+		time.Sleep(time.Second)
+		if count.Load() != 32 {
+			t.Fatal("admission continued after cancellation")
+		}
+	})
+}
 
 // The governor's two moving parts, tested where they can be wrong: the window
 // the gate reads, and the pacing that makes a replayed session keep its own

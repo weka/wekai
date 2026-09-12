@@ -42,11 +42,14 @@ type runParamsRecord struct {
 	RunID string `json:"run_id,omitempty"`
 
 	// Workload shape — the parameters that make two runs comparable.
-	Concurrency          int `json:"concurrency"`
-	HotSeriesConcurrency int `json:"hot_series_concurrency"`
-	MaxSeries            int `json:"max_series"`
-	StartSeries          int `json:"start_series"`
-	MaxConcurrency       int `json:"max_concurrency"`
+	Concurrency          int    `json:"concurrency"`
+	HotSeriesConcurrency int    `json:"hot_series_concurrency"`
+	MaxSeries            int    `json:"max_series"`
+	StartSeries          int    `json:"start_series"`
+	MaxConcurrency       int    `json:"max_concurrency"`
+	AdmitCount           int    `json:"admit_count,omitempty"`
+	AdmitEvery           string `json:"admit_every,omitempty"`
+	ReplayRealtime       bool   `json:"replay_realtime,omitempty"`
 
 	// Budgets
 	TimeoutSec        float64 `json:"timeout_sec,omitempty"`
@@ -97,6 +100,7 @@ func buildRunParams(cfg AutoBenchmarkConfig, now time.Time) runParamsRecord {
 		MaxSeries:            cfg.MaxSeries,
 		StartSeries:          cfg.StartSeries,
 		MaxConcurrency:       cfg.MaxConcurrency,
+		ReplayRealtime:       cfg.ReplayRealtime,
 
 		TotalRequests:   cfg.Total,
 		MaxOutputTokens: cfg.MaxOutputTokens,
@@ -119,6 +123,10 @@ func buildRunParams(cfg AutoBenchmarkConfig, now time.Time) runParamsRecord {
 		FIFOGateOrder:             cfg.FIFOGateOrder,
 		ExhaustSessions:           cfg.ExhaustSessions,
 		DryRun:                    cfg.DryRun,
+	}
+	if cfg.AdmitEvery > 0 {
+		p.AdmitEvery = cfg.AdmitEvery.String()
+		p.AdmitCount = max(1, cfg.AdmitCount)
 	}
 	if cfg.Timeout > 0 {
 		p.TimeoutSec = cfg.Timeout.Seconds()

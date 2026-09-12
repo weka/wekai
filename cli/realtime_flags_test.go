@@ -5,7 +5,41 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jessevdk/go-flags"
 )
+
+func TestAdmissionBatchFlags(t *testing.T) {
+	t.Setenv("BENCHMARK_ADMIT_COUNT", "0")
+	t.Setenv("BENCHMARK_ADMIT_EVERY", "0s")
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		count   int
+		every   time.Duration
+		wantErr bool
+	}{
+		{"default batch", []string{"--admit-every=2m"}, 0, 2 * time.Minute, false},
+		{"32 every two minutes", []string{"--admit-count=32", "--admit-every=2m"}, 32, 2 * time.Minute, false},
+		{"missing interval", []string{"--admit-count=32"}, 32, 0, true},
+		{"negative batch", []string{"--admit-count=-1", "--admit-every=2m"}, -1, 2 * time.Minute, true},
+		{"negative interval", []string{"--admit-every=-2m"}, 0, -2 * time.Minute, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var opts BenchmarkAutoOptions
+			if _, err := flags.ParseArgs(&opts, tc.args); err != nil {
+				t.Fatal(err)
+			}
+			c := BenchmarkAutoCommand{BenchmarkAutoOptions: &opts}
+			if err := c.validateRealtime(&bytes.Buffer{}); (err != nil) != tc.wantErr {
+				t.Fatalf("validation error = %v, want error %v", err, tc.wantErr)
+			}
+			if opts.AdmitCount != tc.count || opts.AdmitEvery != tc.every {
+				t.Fatalf("got %d every %v, want %d every %v", opts.AdmitCount, opts.AdmitEvery, tc.count, tc.every)
+			}
+		})
+	}
+}
 
 // The real-time flags check each other, because the failure they guard against
 // is silent: a pinned pool caps the session count, the run halts there, and the
@@ -45,7 +79,6 @@ func TestGovernorFlagsWithoutRealtimeWarn(t *testing.T) {
 		set  func(*BenchmarkAutoCommand)
 		want string
 	}{
-		{"admit-every", func(c *BenchmarkAutoCommand) { c.AdmitEvery = time.Second }, "--admit-every"},
 		{"skip-idle", func(c *BenchmarkAutoCommand) { c.ReplaySkipIdle = true }, "--replay-skip-idle"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

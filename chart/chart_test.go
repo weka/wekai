@@ -563,8 +563,8 @@ func TestSkipIdleRequiresRealtime(t *testing.T) {
 // on a fleet that answers fast it, not the fleet, becomes the limit — so it has
 // to be reachable without editing the template.
 func TestAdmitEveryIsTunableUnderRealtime(t *testing.T) {
-	out := render(t, "--set", "replay.realtime=true", "--set", "replay.admitEvery=200ms")
-	if !strings.Contains(out, "--admit-every=200ms") {
+	out := render(t, "--set", "replay.realtime=true", "--set", "replay.admitEvery=2m", "--set", "replay.admitCount=32")
+	if !strings.Contains(out, "--admit-every=2m") || !strings.Contains(out, "--admit-count=32") {
 		t.Error("admitEvery did not reach the rendered command; the second run at a faster ramp " +
 			"is how a result is shown to have converged")
 	}

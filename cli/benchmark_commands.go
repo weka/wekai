@@ -198,7 +198,7 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 	// in flight at once — concurrency is bounded by --concurrency anyway, so
 	// extra series slots just wait idle on the gate. Saves the user from
 	// repeating the number three times.
-	if c.FromDataset != "" && c.ReplaySeries > 0 && c.Series == 0 {
+	if c.FromDataset != "" && c.ReplaySeries > 0 && c.Series == 0 && c.AdmitEvery <= 0 {
 		if startSeries <= 0 {
 			startSeries = c.ReplaySeries
 		}
@@ -277,6 +277,7 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		ReplayAllowUnderfill:          c.ReplayAllowUnderfill,
 		ReplayRealtime:                c.ReplayRealtime,
 		AdmitEvery:                    c.AdmitEvery,
+		AdmitCount:                    c.AdmitCount,
 		TTFTLimit:                     c.TTFTLimit,
 		TTFTWindow:                    c.TTFTWindowDur,
 		ReplaySkipIdle:                c.ReplaySkipIdle,
@@ -707,13 +708,18 @@ func (c *BenchmarkThroughputCommand) Execute(args []string) error {
 // The other two are warnings: they describe a run that does less than the
 // operator asked for, not one that reports something false.
 func (c *BenchmarkAutoCommand) validateRealtime(w io.Writer) error {
+	if c.AdmitCount < 0 {
+		return fmt.Errorf("--admit-count must be non-negative (0 means one session)")
+	}
+	if c.AdmitEvery < 0 {
+		return fmt.Errorf("--admit-every must be non-negative")
+	}
+	if c.AdmitCount > 0 && c.AdmitEvery == 0 {
+		return fmt.Errorf("--admit-count requires a positive --admit-every")
+	}
 	if c.ReplayRealtime && c.Series > 0 {
 		return fmt.Errorf("--series pins the session count, which --replay-realtime grows on its own; "+
 			"drop --series (use --max-series for a safety cap, currently %d)", c.MaxSeries)
-	}
-	if c.AdmitEvery > 0 && !c.ReplayRealtime {
-		fmt.Fprintln(w, "warning: --admit-every governs how fast sessions are ADDED, but without "+
-			"--replay-realtime each session still fires back-to-back rather than at its captured pace")
 	}
 	if c.ReplaySkipIdle && !c.ReplayRealtime {
 		fmt.Fprintln(w, "warning: --replay-skip-idle has nothing to skip without --replay-realtime; "+

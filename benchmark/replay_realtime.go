@@ -21,8 +21,54 @@ import (
 // Load grows by adding SESSIONS, not by raising a concurrency limit. A session
 // is a conversation with its own think time, so N sessions produce whatever
 // concurrency the fleet's own latency implies rather than a number set in
-// advance. The governor adds one per tick while windowed TTFT stays under the
+// advance. The governor adds a batch per tick while windowed TTFT stays under the
 // limit and pauses above it, so the fleet's latency is the only throttle.
+
+func (cfg *AutoBenchmarkConfig) setSeriesDefaults() {
+	if cfg.MaxSeries <= 0 && cfg.AdmitEvery <= 0 {
+		cfg.MaxSeries = 64
+	}
+	if cfg.StartSeries <= 0 {
+		cfg.StartSeries = 1
+	}
+	if cfg.MaxSeries > 0 && cfg.StartSeries > cfg.MaxSeries {
+		cfg.StartSeries = cfg.MaxSeries
+	}
+}
+
+func admitSeries(ctx context.Context, cfg AutoBenchmarkConfig, window *ttftWindow, spawn func(int), capped func()) {
+	if cfg.AdmitEvery <= 0 {
+		return
+	}
+	ticker := time.NewTicker(cfg.AdmitEvery)
+	defer ticker.Stop()
+	next := cfg.StartSeries
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if cfg.MaxSeries > 0 && next >= cfg.MaxSeries {
+			capped()
+			return
+		}
+		if cfg.ReplayRealtime && !window.Open(time.Now(), cfg.TTFTLimit, cfg.TTFTLimitStat) {
+			continue
+		}
+		count := max(1, cfg.AdmitCount)
+		if cfg.MaxSeries > 0 {
+			count = min(count, cfg.MaxSeries-next)
+		}
+		for range count {
+			if ctx.Err() != nil {
+				return
+			}
+			next++
+			spawn(next)
+		}
+	}
+}
 
 // ttftWindow is the ARITHMETIC MEAN TTFT over a trailing wall-clock window.
 //

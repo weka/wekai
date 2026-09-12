@@ -72,6 +72,9 @@ spec:
                 --start-series=1 \
                 --max-series={{ .Values.replay.maxSessions | int64 }} \
                 --admit-every={{ .Values.replay.admitEvery }} \
+                {{- if .Values.replay.admitCount }}
+                --admit-count={{ .Values.replay.admitCount | int64 }} \
+                {{- end }}
                 --ttft-limit={{ .Values.replay.ttftLimit }} \
                 --ttft-window={{ .Values.replay.ttftWindow }} \
                 {{- /* Guarded, and defaulted empty, so the chart can still deploy
