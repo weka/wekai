@@ -2121,9 +2121,7 @@ func runSingleModelBenchmark(
 				break
 			}
 			pp.outputRatio = cfg.ReplayOutputRatio
-			// Package-level floor: set once, identical for every poster, read-only
-			// for the rest of the run (see replayMinOutputTokens).
-			replayMinOutputTokens = cfg.ReplayMinOutputTokens
+			pp.minOutputTokens = cfg.ReplayMinOutputTokens
 			pp.limitContext = cfg.LimitContext
 			pp.replayCharsPerToken = cfg.ReplayCharsPerToken
 			pp.forceVolume = cfg.forceVolume()

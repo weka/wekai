@@ -76,12 +76,14 @@ type replayPoster struct {
 		outputTPS int
 	}
 
-	// outputRatio and forceVolume implement --output-ratio /
-	// --force-output-volume. Set directly on the poster after construction
-	// (see runRouterReplayInstance) rather than threaded through
-	// newReplayPoster, to avoid touching its many existing call sites.
-	outputRatio float64
-	forceVolume bool
+	// outputRatio, minOutputTokens and forceVolume implement --output-ratio /
+	// --replay-min-output-tokens / --force-output-volume. Set directly on the
+	// poster after construction (see runRouterReplayInstance) rather than
+	// threaded through newReplayPoster, to avoid touching its many existing
+	// call sites.
+	outputRatio     float64
+	minOutputTokens int
+	forceVolume     bool
 	// limitContext: skip requests whose capture-recorded prompt tokens exceed it
 	// (chars~=tokens*4 convention). 0 = off.
 	limitContext int
@@ -165,7 +167,7 @@ func (p *replayPoster) buildInjection(req RouterReplayRequest, su *sessionUUIDs)
 	//               spent on the strongest probe available.
 	//   capacity n  the first turn, plus the n-1 most recent EXCLUDING the
 	//               current one, up to reciteMaxRecent.
-	capacity := reciteCapacity(pickMaxTokens(req, p.outputRatio))
+	capacity := reciteCapacity(pickMaxTokens(req, p.outputRatio, p.minOutputTokens))
 	if capacity < 1 {
 		// Still returned, with no recite ask: the inline markers stay in the
 		// prompt so the turn keeps its identity in KV for later requests that
@@ -589,16 +591,16 @@ func (p *replayPoster) do(
 
 	sessionIdx := seriesNum - 1
 	inj := p.buildInjection(req, su)
-	outputTarget := pickMaxTokens(req, p.outputRatio)
+	outputTarget := pickMaxTokens(req, p.outputRatio, p.minOutputTokens)
 
 	var bodyBytes []byte
 	var canonical string
 	var err error
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj, p.reasoningEffort, p.thinking)
+		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.minOutputTokens, p.forceVolume, p.replayCharsPerToken, inj, p.reasoningEffort, p.thinking)
 	default:
-		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj)
+		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.minOutputTokens, p.forceVolume, p.replayCharsPerToken, inj)
 	}
 	// --limit-context uses the capture's production-measured token counts
 	// (usage.input_tokens + cache read/creation), not a chars heuristic:
@@ -1296,9 +1298,9 @@ func (p *replayPoster) dryDo(
 	var canonical string
 	switch p.apiType {
 	case "openai", "openai_vllm":
-		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj, p.reasoningEffort, p.thinking)
+		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.minOutputTokens, p.forceVolume, p.replayCharsPerToken, inj, p.reasoningEffort, p.thinking)
 	default:
-		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.forceVolume, p.replayCharsPerToken, inj)
+		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.minOutputTokens, p.forceVolume, p.replayCharsPerToken, inj)
 	}
 	var ratio float64
 	if p.estimator != nil {

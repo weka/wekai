@@ -26,7 +26,7 @@ func TestBuildAnthropicMessagesBodyRunGUIDStamp(t *testing.T) {
 
 	// --- runID set ---
 	runID := "test-run-id"
-	body, _, err := buildAnthropicMessagesBody(req, docs, modelName, runID, 0, false, 0, nil)
+	body, _, err := buildAnthropicMessagesBody(req, docs, modelName, runID, 0, 0, false, 0, nil)
 	if err != nil {
 		t.Fatalf("buildAnthropicMessagesBody with runID: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestBuildAnthropicMessagesBodyRunGUIDStamp(t *testing.T) {
 	}
 
 	// --- runID empty ---
-	body, _, err = buildAnthropicMessagesBody(req, docs, modelName, "", 0, false, 0, nil)
+	body, _, err = buildAnthropicMessagesBody(req, docs, modelName, "", 0, 0, false, 0, nil)
 	if err != nil {
 		t.Fatalf("buildAnthropicMessagesBody empty runID: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestBuildAnthropicMessagesBodyRunGUIDStamp(t *testing.T) {
 
 	// --- runID set, 0 system blocks ---
 	reqNoSys := RouterReplayRequest{} // no SystemBlocks
-	body, _, err = buildAnthropicMessagesBody(reqNoSys, docs, modelName, runID, 0, false, 0, nil)
+	body, _, err = buildAnthropicMessagesBody(reqNoSys, docs, modelName, runID, 0, 0, false, 0, nil)
 	if err != nil {
 		t.Fatalf("buildAnthropicMessagesBody no system blocks: %v", err)
 	}
@@ -107,8 +107,8 @@ func TestBuildAnthropicMessagesBodyCanonicalDeterminism(t *testing.T) {
 			{Hash: "m1", Role: "user", BlockTypes: []string{"text"}, Bytes: 30},
 		},
 	}
-	_, c1, err1 := buildAnthropicMessagesBody(req, docs, "model", "run1", 0, false, 0, nil)
-	_, c2, err2 := buildAnthropicMessagesBody(req, docs, "model", "run1", 0, false, 0, nil)
+	_, c1, err1 := buildAnthropicMessagesBody(req, docs, "model", "run1", 0, 0, false, 0, nil)
+	_, c2, err2 := buildAnthropicMessagesBody(req, docs, "model", "run1", 0, 0, false, 0, nil)
 	if err1 != nil || err2 != nil {
 		t.Fatalf("errors: %v %v", err1, err2)
 	}
@@ -131,7 +131,7 @@ func TestBuildAnthropicMessagesBodyCanonicalContainsAllBlocks(t *testing.T) {
 			{Hash: "msg1", Role: "user", BlockTypes: []string{"text"}, Bytes: 100},
 		},
 	}
-	_, canonical, err := buildAnthropicMessagesBody(req, docs, "model", "runX", 0, false, 0, nil)
+	_, canonical, err := buildAnthropicMessagesBody(req, docs, "model", "runX", 0, 0, false, 0, nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -174,14 +174,14 @@ func TestEffectiveSystemBlocksSkipsHeader(t *testing.T) {
 	hdrText := synthText("uniq-header-per-req", 106, "")
 	for _, builder := range []struct {
 		name string
-		fn   func(RouterReplayRequest, string, string, string, float64, bool, float64, *uuidInjection) ([]byte, string, error)
+		fn   func(RouterReplayRequest, string, string, string, float64, int, bool, float64, *uuidInjection) ([]byte, string, error)
 	}{
-		{"openai", func(req RouterReplayRequest, docs, modelName, runID string, outputRatio float64, forceVolume bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
-			return buildOpenAIChatCompletionsBody(req, docs, modelName, runID, outputRatio, forceVolume, charsPerToken, inj, "", "")
+		{"openai", func(req RouterReplayRequest, docs, modelName, runID string, outputRatio float64, minOutputTokens int, forceVolume bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
+			return buildOpenAIChatCompletionsBody(req, docs, modelName, runID, outputRatio, minOutputTokens, forceVolume, charsPerToken, inj, "", "")
 		}},
 		{"anthropic", buildAnthropicMessagesBody},
 	} {
-		body, canonical, err := builder.fn(req, "", "m", "", 0, false, 0, nil)
+		body, canonical, err := builder.fn(req, "", "m", "", 0, 0, false, 0, nil)
 		if err != nil {
 			t.Fatalf("%s build: %v", builder.name, err)
 		}
@@ -256,7 +256,7 @@ func TestPickMaxTokensOutputRatio(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		if got := pickMaxTokens(c.req, c.outputRatio); got != c.want {
+		if got := pickMaxTokens(c.req, c.outputRatio, 0); got != c.want {
 			t.Errorf("%s: pickMaxTokens() = %d, want %d", c.name, got, c.want)
 		}
 	}
@@ -279,7 +279,7 @@ func TestBuildAnthropicMessagesBodyForceOutput(t *testing.T) {
 	// The instruction rides in BOTH modes so the two send byte-identical
 	// prompts and differ only by ignore_eos: --replay-natural-output measures
 	// whether the instruction alone can hold output at the captured budget.
-	body, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, 0, nil)
+	body, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, 0, false, 0, nil)
 	if err != nil {
 		t.Fatalf("build (force-output off): %v", err)
 	}
@@ -289,7 +289,7 @@ func TestBuildAnthropicMessagesBodyForceOutput(t *testing.T) {
 	}
 
 	// --- force-output on (default) ---
-	body, _, err = buildAnthropicMessagesBody(req, docs, "model", "", 0, true, 0, nil)
+	body, _, err = buildAnthropicMessagesBody(req, docs, "model", "", 0, 0, true, 0, nil)
 	if err != nil {
 		t.Fatalf("build (force-output on): %v", err)
 	}
@@ -311,7 +311,7 @@ func TestBuildAnthropicMessagesBodyForceOutput(t *testing.T) {
 
 	// --- force-output on, no system blocks at all: instruction must still be injected ---
 	reqNoSys := RouterReplayRequest{InputTokens: 100}
-	body, _, err = buildAnthropicMessagesBody(reqNoSys, docs, "model", "", 0, true, 0, nil)
+	body, _, err = buildAnthropicMessagesBody(reqNoSys, docs, "model", "", 0, 0, true, 0, nil)
 	if err != nil {
 		t.Fatalf("build (force-output on, no system blocks): %v", err)
 	}
@@ -335,7 +335,7 @@ func TestBuildOpenAIChatCompletionsBodyForceOutput(t *testing.T) {
 
 	// force-output off: no ignore_eos, but the instruction still rides — the
 	// modes differ ONLY by engine enforcement.
-	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, 0, nil, "", "")
+	body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, 0, false, 0, nil, "", "")
 	if err != nil {
 		t.Fatalf("build (force-output off): %v", err)
 	}
@@ -351,7 +351,7 @@ func TestBuildOpenAIChatCompletionsBodyForceOutput(t *testing.T) {
 	}
 
 	// force-output on (default): ignore_eos=true AND the instruction is present.
-	body, _, err = buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, true, 0, nil, "", "")
+	body, _, err = buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, 0, true, 0, nil, "", "")
 	if err != nil {
 		t.Fatalf("build (force-output on): %v", err)
 	}
@@ -393,7 +393,7 @@ func TestBuildOpenAIChatCompletionsBodyReasoningEffortThinking(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, false, 0, nil, c.reasoningEffort, c.thinking)
+			body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, 0, false, 0, nil, c.reasoningEffort, c.thinking)
 			if err != nil {
 				t.Fatalf("build: %v", err)
 			}
@@ -430,7 +430,7 @@ func TestBuildAnthropicMessagesBodyOutputRatioMaxTokens(t *testing.T) {
 	docs := strings.Repeat("doc content ", 50)
 	req := RouterReplayRequest{InputTokens: 2000, OutputTokens: 10}
 
-	anthBody, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0.25, false, 0, nil)
+	anthBody, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0.25, 0, false, 0, nil)
 	if err != nil {
 		t.Fatalf("anthropic build: %v", err)
 	}
@@ -442,7 +442,7 @@ func TestBuildAnthropicMessagesBodyOutputRatioMaxTokens(t *testing.T) {
 		t.Errorf("anthropic max_tokens = %v, want %v", got, want)
 	}
 
-	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0.25, false, 0, nil, "", "")
+	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0.25, 0, false, 0, nil, "", "")
 	if err != nil {
 		t.Fatalf("openai build: %v", err)
 	}
@@ -455,7 +455,7 @@ func TestBuildAnthropicMessagesBodyOutputRatioMaxTokens(t *testing.T) {
 	}
 
 	// Without a ratio, max_tokens falls back to the original output_tokens.
-	anthBodyNoRatio, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, false, 0, nil)
+	anthBodyNoRatio, _, err := buildAnthropicMessagesBody(req, docs, "model", "", 0, 0, false, 0, nil)
 	if err != nil {
 		t.Fatalf("anthropic build (no ratio): %v", err)
 	}
@@ -471,30 +471,56 @@ func TestBuildAnthropicMessagesBodyOutputRatioMaxTokens(t *testing.T) {
 // that would otherwise be too small for a model to finish reasoning and then
 // answer, and never lowers one that is already larger.
 func TestPickMaxTokensFloor(t *testing.T) {
-	defer func() { replayMinOutputTokens = 0 }()
-
 	req := RouterReplayRequest{InputTokens: 4000, OutputTokens: 19}
 
-	replayMinOutputTokens = 0
-	if got := pickMaxTokens(req, 0); got != 19 {
+	if got := pickMaxTokens(req, 0, 0); got != 19 {
 		t.Errorf("floor off: pickMaxTokens() = %d, want the recorded 19", got)
 	}
 
-	replayMinOutputTokens = 512
-	if got := pickMaxTokens(req, 0); got != 512 {
+	if got := pickMaxTokens(req, 0, 512); got != 512 {
 		t.Errorf("floor on: pickMaxTokens() = %d, want 512", got)
 	}
 
 	// A budget already above the floor is untouched.
 	big := RouterReplayRequest{InputTokens: 4000, OutputTokens: 4096}
-	if got := pickMaxTokens(big, 0); got != 4096 {
+	if got := pickMaxTokens(big, 0, 512); got != 4096 {
 		t.Errorf("floor must not lower a larger budget: got %d, want 4096", got)
 	}
 
 	// The floor also applies over --replay-output-ratio, which scales with
 	// input and so still yields tiny budgets on short turns.
 	short := RouterReplayRequest{InputTokens: 100}
-	if got := pickMaxTokens(short, 0.02); got != 512 {
+	if got := pickMaxTokens(short, 0.02, 512); got != 512 {
 		t.Errorf("floor over ratio: got %d, want 512", got)
+	}
+}
+
+// TestMinOutputTokensReachesWire pins that the floor a poster carries is the
+// one the body builders emit: on both dialects max_tokens is raised to the
+// floor when the recorded budget is below it.
+func TestMinOutputTokensReachesWire(t *testing.T) {
+	req := RouterReplayRequest{InputTokens: 4000, OutputTokens: 19}
+
+	anthBody, _, err := buildAnthropicMessagesBody(req, "", "model", "", 0, 512, false, 0, nil)
+	if err != nil {
+		t.Fatalf("anthropic build: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(anthBody, &parsed); err != nil {
+		t.Fatalf("anthropic unmarshal: %v", err)
+	}
+	if got, want := parsed["max_tokens"].(float64), 512.0; got != want {
+		t.Errorf("anthropic max_tokens = %v, want the %v floor", got, want)
+	}
+
+	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, "", "model", "", 0, 512, false, 0, nil, "", "")
+	if err != nil {
+		t.Fatalf("openai build: %v", err)
+	}
+	if err := json.Unmarshal(openaiBody, &parsed); err != nil {
+		t.Fatalf("openai unmarshal: %v", err)
+	}
+	if got, want := parsed["max_tokens"].(float64), 512.0; got != want {
+		t.Errorf("openai max_tokens = %v, want the %v floor", got, want)
 	}
 }

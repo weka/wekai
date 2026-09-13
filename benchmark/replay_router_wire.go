@@ -76,14 +76,14 @@ func replayLengthAsk(maxTokens int) string {
 // inj carries the UUID cache-coherency injection (--verify,
 // router path — see replay_router_uuid.go); nil means "no injection",
 // leaving the body byte-for-byte identical to before this feature existed.
-func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceVolume bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
+func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, minOutputTokens int, forceVolume bool, charsPerToken float64, inj *uuidInjection) ([]byte, string, error) {
 	var stampByHash map[string]turnStamp
 	if inj != nil {
 		stampByHash = inj.StampByHash
 	}
 	body := map[string]interface{}{
 		"model":      modelName,
-		"max_tokens": pickMaxTokens(req, outputRatio),
+		"max_tokens": pickMaxTokens(req, outputRatio, minOutputTokens),
 		"stream":     req.Stream,
 	}
 	if req.Temperature != nil {
@@ -130,7 +130,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 	if inj != nil {
 		tail = replayReciteWindowInstruction(inj.ReciteLabels)
 	}
-	tail += replayLengthAsk(pickMaxTokens(req, outputRatio))
+	tail += replayLengthAsk(pickMaxTokens(req, outputRatio, minOutputTokens))
 	if tail != "" {
 		msgs = appendTailMessageAnthropic(msgs, tail)
 	}
@@ -203,10 +203,11 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 // which otherwise pins max_tokens to what the model produced in the original
 // capture (making the model stop early on replay). Otherwise falls back to the
 // original precedence: output_tokens, then max_tokens, then 1 as a guard.
-// replayMinOutputTokens is a FLOOR under every replayed request's max_tokens,
-// set once from --replay-min-output-tokens before any request is sent and
-// read-only thereafter (same shape as the reciteReserveTokens family of tuning
-// values above).
+// minOutputTokens is a FLOOR under every replayed request's max_tokens
+// (--replay-min-output-tokens; 0 = no floor). It travels with outputRatio, on
+// the poster and through the body builders, rather than in package state:
+// posters are built per instance on concurrent session goroutines, so a
+// package variable set there would race with every other session's reads.
 //
 // A ratio cannot express this. --replay-output-ratio scales with InputTokens, so
 // short early turns still get single-digit budgets, and the recorded
@@ -216,12 +217,10 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 // budget thinking, gets cut off at finish_reason=length, and is scored as having
 // failed to recite. The floor gives every request room to finish reasoning AND
 // answer, so the score measures recall rather than output budget.
-var replayMinOutputTokens int
-
-func pickMaxTokens(req RouterReplayRequest, outputRatio float64) int {
+func pickMaxTokens(req RouterReplayRequest, outputRatio float64, minOutputTokens int) int {
 	n := pickMaxTokensRaw(req, outputRatio)
-	if replayMinOutputTokens > 0 && n < replayMinOutputTokens {
-		return replayMinOutputTokens
+	if minOutputTokens > 0 && n < minOutputTokens {
+		return minOutputTokens
 	}
 	return n
 }
@@ -635,14 +634,14 @@ func buildOpenAITools(spec *RouterReplayToolsSpec, docs string, charsPerToken fl
 // thinking is a plain passthrough with no default, mirroring how the
 // non-replay OpenAI client (llm/openai.go) forwards it: added to the body
 // only when non-empty.
-func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, forceVolume bool, charsPerToken float64, inj *uuidInjection, reasoningEffort string, thinking string) ([]byte, string, error) {
+func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, minOutputTokens int, forceVolume bool, charsPerToken float64, inj *uuidInjection, reasoningEffort string, thinking string) ([]byte, string, error) {
 	var stampByHash map[string]turnStamp
 	if inj != nil {
 		stampByHash = inj.StampByHash
 	}
 	body := map[string]interface{}{
 		"model":      modelName,
-		"max_tokens": pickMaxTokens(req, outputRatio),
+		"max_tokens": pickMaxTokens(req, outputRatio, minOutputTokens),
 		"stream":     req.Stream,
 	}
 	if req.Temperature != nil {
@@ -720,7 +719,7 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 	if inj != nil {
 		tailAsk = replayReciteWindowInstruction(inj.ReciteLabels)
 	}
-	tailAsk += replayLengthAsk(pickMaxTokens(req, outputRatio))
+	tailAsk += replayLengthAsk(pickMaxTokens(req, outputRatio, minOutputTokens))
 	if tailAsk != "" {
 		messages = appendTailMessageOpenAI(messages, tailAsk)
 	}
