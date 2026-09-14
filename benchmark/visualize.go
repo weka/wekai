@@ -1556,20 +1556,46 @@ const SUMMARY_METRICS = [
     fmt: st => st.prompt > 0 ? (st.caTok / st.prompt * 100).toFixed(1) + "%" : "-" },
 ];
 
-// --- Ratio to the HBM baseline ---
-// These reports almost always compare an offload arm against a no-offload
-// "hbm" control, and the question asked of them is "how much better/worse than
-// hbm?" -- previously answered by dividing two numbers by hand. When the report
-// contains an hbm arm AND at least one other, every other row carries each
-// metric as a percentage of hbm's. classifyAlias already recognises hbm arms
-// (it is what sorts them first), so the naming rule stays in one place.
-const BASELINE_INDEX = (function () {
+// --- Ratio to a baseline arm ---
+// The question asked of these reports is almost always "how much
+// better/worse is arm X than arm Y?" -- previously answered by dividing two
+// numbers by hand. When the report has 2+ arms, every row but the baseline's
+// own carries each metric as a percentage of the baseline's.
+//
+// Picking the baseline, in order:
+//  1. Explicit override: an arm named/aliased "hbm" (classifyAlias's "gpu"
+//     class) -- these reports most often compare an offload arm against a
+//     no-offload control, and when one is present it is unambiguously the
+//     intended reference point. classifyAlias already recognises hbm arms
+//     (it is what sorts them first), so the naming rule stays in one place.
+//  2. Otherwise, the SLOWEST arm: fewest completed (non-error) requests over
+//     the run's full, unzoomed span (windowStats between globalTMin/
+//     globalTMax -- the same window seriesStats() falls back to before any
+//     zoom, so "baseline" and "what the summary shows on load" agree), ties
+//     broken by the lower mean req/s (ok / spanSec) over that same window.
+//     This covers comparisons with no no-offload control at all (e.g. two
+//     different offload configs against each other) -- without it those
+//     reports silently showed no ratio column rather than picking SOME
+//     reference point.
+// A single-arm report has nothing to compare against either way.
+function findBaselineIndex() {
   if (DATA.length < 2) return -1;
   for (let i = 0; i < DATA.length; i++) {
     if (classifyAlias(getAlias(DATA[i].name)) === "gpu") return i;
   }
-  return -1;
-})();
+  let slowest = -1, slowestOk = Infinity, slowestRps = Infinity;
+  DATA.forEach((s, i) => {
+    const st = windowStats(s.records, globalTMin, globalTMax);
+    const rps = st.spanSec > 0 ? st.ok / st.spanSec : 0;
+    if (st.ok < slowestOk || (st.ok === slowestOk && rps < slowestRps)) {
+      slowest = i;
+      slowestOk = st.ok;
+      slowestRps = rps;
+    }
+  });
+  return slowest;
+}
+const BASELINE_INDEX = findBaselineIndex();
 
 // fmtRatio renders v as a percentage of base. "" when there is nothing to
 // compare against -- a zero baseline (no requests in the window, or a metric
@@ -1687,7 +1713,7 @@ function renderSummary(perSeries) {
       // sumCells holds the VALUE span (see buildSummary), not the <td>.
       const valEl = sumCells[si][mi];
       valEl.textContent = st ? m.fmt(st) : "-";
-      // Ratio to the hbm baseline, on every row but the baseline's own.
+      // Ratio to the baseline arm, on every row but the baseline's own.
       const rEl = sumRatios[si][mi];
       let rText = "";
       if (baseStats && st && si !== BASELINE_INDEX) {
@@ -1703,7 +1729,7 @@ function renderSummary(perSeries) {
         rEl.className = "sum-ratio help-label " + (ratio === 1 ? "" : (good ? "up" : "down"));
         rEl.tabIndex = 0;
         rEl.ariaDescribedBy = "helpTip";
-        rEl.dataset.tip = "Share of the HBM baseline. Green is better, orange is worse. " +
+        rEl.dataset.tip = "Share of the baseline arm. Green is better, orange is worse. " +
           m.short + " is " + rText + " of " + DATA[BASELINE_INDEX].name;
       } else {
         rEl.className = "sum-ratio";

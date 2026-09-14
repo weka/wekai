@@ -1549,28 +1549,35 @@ console.log("ALL_OK");
 	}
 }
 
-// TestNoBaselineNoRatiosJS: without an hbm arm — or with only one variant —
-// there is nothing to be a percentage OF, and the report must not invent one.
-func TestNoBaselineNoRatiosJS(t *testing.T) {
+// TestSingleArmNoBaselineJS: with only one variant there is nothing to be a
+// percentage OF, and the report must not invent one. (Two arms with neither
+// named "hbm" DOES get a baseline now -- the slowest arm by completed-request
+// count -- see findBaselineIndex() in visualize.go and the dedicated
+// TestBaseline*Js coverage in visualize_baseline_test.go; this test covers
+// only the single-arm case, which findBaselineIndex still short-circuits to
+// -1 regardless of arm naming.)
+func TestSingleArmNoBaselineJS(t *testing.T) {
 	nodeBin, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed; JS no-baseline test skipped")
 	}
 	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
 
-	check := func(t *testing.T, dir string) {
-		t.Helper()
-		htmlPath, err := GenerateVisualization(dir, 4)
-		if err != nil {
-			t.Fatal(err)
-		}
-		b, err := os.ReadFile(htmlPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		html := string(b)
-		s, e := strings.Index(html, "<script>"), strings.Index(html, "</script>")
-		probe := `
+	dir := t.TempDir()
+	rec, _ := benchFixtureData("hbm-solo", base)
+	writeMixedJSONL(t, dir, "hbm-solo", rec, nil)
+
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	s, e := strings.Index(html, "<script>"), strings.Index(html, "</script>")
+	probe := `
 function assert(c, m) { if (!c) { console.error("FAIL: " + m); process.exit(1); } }
 assert(BASELINE_INDEX === -1, "no baseline, got index " + BASELINE_INDEX);
 sumRatios.forEach((row, si) => row.forEach((el, mi) =>
@@ -1581,31 +1588,14 @@ assert(document.getElementById("summaryTable").className.indexOf("has-ratios") <
   "no baseline => no reserved ratio line, got " + document.getElementById("summaryTable").className);
 console.log("ALL_OK");
 `
-		jsPath := filepath.Join(dir, "nobaseline_test.js")
-		if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+html[s+len("<script>"):e]+"\n"+probe), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
-		if err != nil || !strings.Contains(string(out), "ALL_OK") {
-			t.Fatalf("node no-baseline test failed: %v\n%s", err, out)
-		}
+	jsPath := filepath.Join(dir, "nobaseline_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+html[s+len("<script>"):e]+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
 	}
-
-	t.Run("two arms, neither is hbm", func(t *testing.T) {
-		dir := t.TempDir()
-		for _, a := range []string{"weka-rdma", "dram1t"} {
-			rec, _ := benchFixtureData(a, base)
-			writeMixedJSONL(t, dir, a, rec, nil)
-		}
-		check(t, dir)
-	})
-
-	t.Run("single hbm arm has nothing to compare", func(t *testing.T) {
-		dir := t.TempDir()
-		rec, _ := benchFixtureData("hbm-solo", base)
-		writeMixedJSONL(t, dir, "hbm-solo", rec, nil)
-		check(t, dir)
-	})
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node no-baseline test failed: %v\n%s", err, out)
+	}
 }
 
 // TestRequestHoverTokensJS pins the per-request token breakdown. Toggling "Show
