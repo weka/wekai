@@ -13,13 +13,15 @@ import (
 
 // ---------------------------------------------------------------------------
 // Baseline-arm selection for the merged/interactive report's summary %
-// comparison (findBaselineIndex() in visualize.go). Three rules, in order:
-//   1. An arm named/aliased "hbm" (classifyAlias's "gpu" class) always wins,
-//      even when it is not the slowest arm present.
+// comparison (findBaselineIndex() in visualize.go). Rules, in order:
+//   1. --baseline=<label> (visualize-merge only, threaded through as
+//      generateVisualization's baselineLabel -> BASELINE_LABEL), matched
+//      exactly against an arm's DISPLAYED name, always wins -- even over an
+//      arm that would otherwise be the slowest. An unmatched --baseline is a
+//      Go-side error from generateVisualization, not a silent fallback.
 //   2. Otherwise the SLOWEST arm (fewest completed requests over the run's
-//      full window) is the baseline, so a comparison between two arms that
-//      are BOTH offload configs (neither a no-offload control) still gets a
-//      ratio column instead of none.
+//      full window) is the baseline -- the DEFAULT for every multi-arm
+//      report, regardless of arm naming (classifyAlias is sort/color only).
 //   3. A single-arm report has no baseline (nothing to compare against).
 //
 // These tests drive the actual generated report.html under node (same
@@ -66,15 +68,22 @@ type baselineProbeResult struct {
 	Ratios [][]string `json:"ratios"`
 }
 
-// runBaselineProbe loads dir's generated interactive report.html under node
-// and reads back the summary panel's own JS state -- BASELINE_INDEX/DATA
-// (the selection) and the already-rendered sumRatios cells (proof the
+// runBaselineProbe generates dir's interactive report.html (calling
+// generateVisualization directly, same as GenerateVisualization does,
+// but exposing baselineLabel -- the plain public entry point always passes
+// "", so a --baseline test needs the unexported function), loads it under
+// node, and reads back the summary panel's own JS state -- BASELINE_INDEX/
+// DATA (the selection) and the already-rendered sumRatios cells (proof the
 // selection actually drives the on-screen % comparison, not just an
 // internal index).
-func runBaselineProbe(t *testing.T, dir string, concurrency int) baselineProbeResult {
+func runBaselineProbe(t *testing.T, dir string, concurrency int, baselineLabel string) baselineProbeResult {
 	t.Helper()
 	nodeBin := nodeOrSkip(t)
-	script := generateInteractiveScript(t, dir, concurrency)
+	htmlPath, err := generateVisualization(dir, concurrency, false, 0, baselineLabel)
+	if err != nil {
+		t.Fatalf("generateVisualization: %v", err)
+	}
+	script := extractOuterScript(t, htmlPath)
 	probe := `
 const __names = DATA.map(d => d.name);
 const __hasRatios = document.getElementById("summaryTable").className.indexOf("has-ratios") >= 0;
@@ -113,10 +122,10 @@ console.log("===BASELINE_PROBE_END===");
 	return result
 }
 
-// TestBaselineSlowestArmIsFallback: with no hbm-named arm present, the arm
-// with fewer completed requests over the run's full window is the baseline
-// -- covers a comparison between two offload configs, neither a no-offload
-// control, which previously got no ratio column at all.
+// TestBaselineSlowestArmIsFallback: with no --baseline override, the arm
+// with fewer completed requests over the run's full window is the default
+// baseline -- covers a comparison between two offload configs, neither a
+// no-offload control, which previously got no ratio column at all.
 func TestBaselineSlowestArmIsFallback(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 9, 14, 9, 0, 0, 0, time.UTC)
@@ -125,9 +134,9 @@ func TestBaselineSlowestArmIsFallback(t *testing.T) {
 	writePublicFixtureFile(t, dir, "a", fastRecs, fastSamples, pubSecretRunID+"-fast")
 	writePublicFixtureFile(t, dir, "b", slowRecs, slowSamples, pubSecretRunID+"-slow")
 
-	res := runBaselineProbe(t, dir, 8)
+	res := runBaselineProbe(t, dir, 8, "")
 	if res.BaselineIndex < 0 {
-		t.Fatalf("expected a baseline to be selected (no hbm arm, but 2 arms present), got BASELINE_INDEX=-1; names=%v", res.Names)
+		t.Fatalf("expected a baseline to be selected (2 arms present, no --baseline), got BASELINE_INDEX=-1; names=%v", res.Names)
 	}
 	if res.BaselineName != "SlowArm" {
 		t.Errorf("baseline = %q, want %q (the arm with fewer completed requests)", res.BaselineName, "SlowArm")
@@ -152,23 +161,47 @@ func TestBaselineSlowestArmIsFallback(t *testing.T) {
 	}
 }
 
-// TestBaselineExplicitHBMOverrideWins: an hbm-named arm is the baseline even
-// when it is NOT the slowest arm present -- the explicit naming override
-// takes precedence over the slowest-arm fallback.
-func TestBaselineExplicitHBMOverrideWins(t *testing.T) {
+// TestBaselineExplicitFlagOverrideWins: --baseline=<label> picks that arm as
+// the baseline even when it is NOT the slowest arm present -- the explicit
+// override takes precedence over the default slowest-arm rule. Arm naming
+// (e.g. "hbm") plays no part any more -- classifyAlias is sort/color only.
+func TestBaselineExplicitFlagOverrideWins(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 9, 14, 9, 0, 0, 0, time.UTC)
-	// hbm-ctrl completes MORE requests than candidate, so it would lose to
-	// candidate under the slowest-arm rule alone -- the override must still
-	// pick hbm-ctrl.
-	hbmRecs, hbmSamples := buildPublicFixtureArm("hbm-ctrl", base, 20, 0)
-	candRecs, candSamples := buildPublicFixtureArm("candidate", base, 5, 0)
-	writePublicFixtureFile(t, dir, "a", hbmRecs, hbmSamples, pubSecretRunID+"-hbm")
-	writePublicFixtureFile(t, dir, "b", candRecs, candSamples, pubSecretRunID+"-cand")
+	// FastArm completes MORE requests than SlowArm, so it would lose to
+	// SlowArm under the default slowest-arm rule alone -- --baseline=FastArm
+	// must still pick FastArm.
+	fastRecs, fastSamples := buildPublicFixtureArm("FastArm", base, 20, 0)
+	slowRecs, slowSamples := buildPublicFixtureArm("SlowArm", base, 5, 0)
+	writePublicFixtureFile(t, dir, "a", fastRecs, fastSamples, pubSecretRunID+"-fast")
+	writePublicFixtureFile(t, dir, "b", slowRecs, slowSamples, pubSecretRunID+"-slow")
 
-	res := runBaselineProbe(t, dir, 8)
-	if res.BaselineName != "hbm-ctrl" {
-		t.Errorf("baseline = %q, want %q (explicit hbm override must win over the slowest-arm fallback)", res.BaselineName, "hbm-ctrl")
+	res := runBaselineProbe(t, dir, 8, "FastArm")
+	if res.BaselineName != "FastArm" {
+		t.Errorf("baseline = %q, want %q (--baseline must win over the default slowest-arm rule)", res.BaselineName, "FastArm")
+	}
+	if !res.HasRatios {
+		t.Errorf("summaryTable missing has-ratios class despite an explicit --baseline")
+	}
+}
+
+// TestBaselineFlagUnmatchedNameErrors: --baseline naming an arm that isn't
+// present must fail the CLI command (generateVisualization returns an
+// error), not silently render without the override.
+func TestBaselineFlagUnmatchedNameErrors(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 14, 9, 0, 0, 0, time.UTC)
+	fastRecs, fastSamples := buildPublicFixtureArm("FastArm", base, 20, 0)
+	slowRecs, slowSamples := buildPublicFixtureArm("SlowArm", base, 5, 0)
+	writePublicFixtureFile(t, dir, "a", fastRecs, fastSamples, pubSecretRunID+"-fast2")
+	writePublicFixtureFile(t, dir, "b", slowRecs, slowSamples, pubSecretRunID+"-slow2")
+
+	_, err := generateVisualization(dir, 8, false, 0, "NoSuchArm")
+	if err == nil {
+		t.Fatal("expected an error for a --baseline value matching no arm, got nil")
+	}
+	if !strings.Contains(err.Error(), "NoSuchArm") {
+		t.Errorf("error %q does not name the unmatched --baseline value", err.Error())
 	}
 }
 
@@ -185,7 +218,7 @@ func TestBaselineTieBreaksOnMeanRps(t *testing.T) {
 	writePublicFixtureFile(t, dir, "a", briskRecs, nil, pubSecretRunID+"-brisk")
 	writePublicFixtureFile(t, dir, "b", leisurelyRecs, nil, pubSecretRunID+"-leisurely")
 
-	res := runBaselineProbe(t, dir, 8)
+	res := runBaselineProbe(t, dir, 8, "")
 	if res.BaselineName != "Leisurely" {
 		t.Errorf("baseline = %q, want %q (equal completed-request counts, tie must break on lower mean req/s)", res.BaselineName, "Leisurely")
 	}
@@ -199,7 +232,7 @@ func TestBaselineSingleArmNoComparison(t *testing.T) {
 	recs, samples := buildPublicFixtureArm("OnlyArm", base, 10, 0)
 	writePublicFixtureFile(t, dir, "a", recs, samples, pubSecretRunID+"-only")
 
-	res := runBaselineProbe(t, dir, 8)
+	res := runBaselineProbe(t, dir, 8, "")
 	if res.BaselineIndex != -1 {
 		t.Errorf("BASELINE_INDEX = %d, want -1 for a single-arm report (name=%q)", res.BaselineIndex, res.BaselineName)
 	}

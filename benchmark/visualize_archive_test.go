@@ -277,7 +277,7 @@ func TestRequestCSVColumnContract(t *testing.T) {
 	// disk, not just the in-memory csvHeader var. ---
 	t.Run("merged_csv_on_disk", func(t *testing.T) {
 		outDir := filepath.Join(dir, "merged")
-		if _, err := GenerateVisualizationMerged([]string{dir}, []string{"arm-a"}, outDir, 4, 0); err != nil {
+		if _, err := GenerateVisualizationMerged([]string{dir}, []string{"arm-a"}, outDir, 4, 0, ""); err != nil {
 			t.Fatalf("merge: %v", err)
 		}
 		f, err := os.Open(filepath.Join(outDir, "full_csv", "merged.csv"))

@@ -627,7 +627,7 @@ func TestMergedLabelsWinDisplayNames(t *testing.T) {
 	writeMixedJSONL(t, dirB, "reqs", recB, smpB)
 
 	outDir := filepath.Join(root, "merged")
-	htmlPath, err := GenerateVisualizationMerged([]string{dirA, dirB}, []string{"label-arm-a", "label-arm-b"}, outDir, 4, 0)
+	htmlPath, err := GenerateVisualizationMerged([]string{dirA, dirB}, []string{"label-arm-a", "label-arm-b"}, outDir, 4, 0, "")
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
@@ -649,7 +649,7 @@ func TestMergedLabelsWinDisplayNames(t *testing.T) {
 	// dirs derive the same alias and collide into SHARED_alias/_2 filenames,
 	// but display names come from the records' alias.
 	outDir2 := filepath.Join(root, "merged-nolabels")
-	htmlPath2, err := GenerateVisualizationMerged([]string{dirA, dirB}, nil, outDir2, 4, 0)
+	htmlPath2, err := GenerateVisualizationMerged([]string{dirA, dirB}, nil, outDir2, 4, 0, "")
 	if err != nil {
 		t.Fatalf("merge without labels: %v", err)
 	}
@@ -721,7 +721,7 @@ func TestMaxElapsedTruncation(t *testing.T) {
 		mk(dirB, "trunc_b", time.Date(2026, 7, 22, 11, 0, 0, 0, time.UTC))
 
 		outDir := filepath.Join(root, "merged")
-		if _, err := GenerateVisualizationMerged([]string{dirA, dirB}, []string{"arm-a", "arm-b"}, outDir, 0, 30*time.Minute); err != nil {
+		if _, err := GenerateVisualizationMerged([]string{dirA, dirB}, []string{"arm-a", "arm-b"}, outDir, 0, 30*time.Minute, ""); err != nil {
 			t.Fatalf("merge: %v", err)
 		}
 		for _, name := range []string{"arm-a", "arm-b"} {
@@ -749,7 +749,7 @@ func TestGenerateVisualizationMergedCarriesSamples(t *testing.T) {
 	writeMixedJSONL(t, dirB, "reqs", recB, smpB)
 
 	outDir := filepath.Join(root, "merged")
-	htmlPath, err := GenerateVisualizationMerged([]string{dirA, dirB}, nil, outDir, 4, 0)
+	htmlPath, err := GenerateVisualizationMerged([]string{dirA, dirB}, nil, outDir, 4, 0, "")
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
@@ -1424,13 +1424,17 @@ assert(document.getElementById("runparams").textContent.indexOf("differ per vari
 	})
 }
 
-// TestBaselineRatiosJS pins the ratio-to-hbm column behaviour. These reports
-// almost always compare an offload arm against a no-offload "hbm" control, and
-// the question asked of them -- how much better or worse than hbm? -- was
-// previously answered by dividing two numbers by hand.
+// TestBaselineRatiosJS pins the ratio-to-baseline column behaviour. The
+// question these reports usually get asked -- how much better or worse is
+// arm X than arm Y? -- was previously answered by dividing two numbers by
+// hand.
 //
-// Baseline detection reuses classifyAlias, the same rule that sorts hbm arms
-// first, so the naming convention lives in one place.
+// The fixture's "hbm-c28" arm completes fewer requests (4) than "weka-c28"
+// (12) over the same span, so it becomes the baseline under the default
+// rule (findBaselineIndex in visualize.go: fewest completed requests wins,
+// no --baseline override given here) -- its name is otherwise irrelevant to
+// selection; see TestBaselineSlowestArmIsFallback/TestBaselineExplicitFlagOverrideWins
+// in visualize_baseline_test.go for that in isolation.
 func TestBaselineRatiosJS(t *testing.T) {
 	nodeBin, err := exec.LookPath("node")
 	if err != nil {
@@ -1482,10 +1486,15 @@ func TestBaselineRatiosJS(t *testing.T) {
 
 	probe := `
 function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
-// classifyAlias sorts hbm first, so the baseline is row 0 here -- but the
-// index is resolved by classification, not by position.
-assert(BASELINE_INDEX === 0, "hbm arm is the baseline, got index " + BASELINE_INDEX);
-assert(classifyAlias(getAlias(DATA[BASELINE_INDEX].name)) === "gpu", "baseline classifies as an hbm/gpu arm");
+// hbm-c28 also sorts first (classifyAlias/sortKey, unrelated to baseline
+// selection), so BASELINE_INDEX === 0 here -- but the SELECTION itself is by
+// completed-request count, not by name/position: prove that directly by
+// checking it is the arm with fewer completed requests over the full window.
+assert(BASELINE_INDEX === 0, "hbm-c28 (fewer completed requests) is the baseline, got index " + BASELINE_INDEX);
+assert(DATA[BASELINE_INDEX].name === "hbm-c28", "baseline is hbm-c28, got " + DATA[BASELINE_INDEX].name);
+const baseOk = windowStats(DATA[BASELINE_INDEX].records, globalTMin, globalTMax).ok;
+const otherOk = windowStats(DATA[1 - BASELINE_INDEX].records, globalTMin, globalTMax).ok;
+assert(baseOk < otherOk, "baseline arm must have FEWER completed requests than the other arm, got " + baseOk + " vs " + otherOk);
 
 const other = 1 - BASELINE_INDEX;
 function ratio(si, key) {

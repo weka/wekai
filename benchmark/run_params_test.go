@@ -308,7 +308,7 @@ func TestMergeCarriesRunParams(t *testing.T) {
 	dirB := writeArm("armB", 60, 0)
 
 	outDir := filepath.Join(root, "merged")
-	htmlPath, err := GenerateVisualizationMerged([]string{dirA, dirB}, []string{"a28", "b60"}, outDir, 0, 0)
+	htmlPath, err := GenerateVisualizationMerged([]string{dirA, dirB}, []string{"a28", "b60"}, outDir, 0, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}

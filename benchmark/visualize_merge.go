@@ -68,7 +68,14 @@ func deriveSourceLabel(dir string, records []requestDataRecord) string {
 // per-arm t0 = min(start_time) of that directory's records, so arms with
 // different wall-clock starts each cut at their own elapsed cutoff (see
 // truncateToElapsed). Merged JSONL and CSVs carry only the kept rows.
-func GenerateVisualizationMerged(dirs []string, labels []string, outputDir string, concurrency int, maxElapsed time.Duration) (string, error) {
+//
+// baselineLabel, when non-empty, overrides the report's default baseline
+// (the slowest arm by completed requests -- see findBaselineIndex in
+// visualize.go): it must exactly match one arm's DISPLAYED name (a --labels
+// value when given, else the resolved alias/directory label), checked in
+// generateVisualization once names are final -- an unmatched value fails
+// this call rather than silently rendering without the override.
+func GenerateVisualizationMerged(dirs []string, labels []string, outputDir string, concurrency int, maxElapsed time.Duration, baselineLabel string) (string, error) {
 	outDir, err := prepareMergedSources(dirs, labels, outputDir, maxElapsed)
 	if err != nil {
 		return "", err
@@ -77,7 +84,7 @@ func GenerateVisualizationMerged(dirs []string, labels []string, outputDir strin
 	// the merged filenames: pin display names to the label-derived basenames
 	// so a record alias shared by both arms can't collapse them into one name.
 	// maxElapsed 0: the sources were already truncated per-arm above.
-	return generateVisualization(outDir, concurrency, len(labels) > 0, 0)
+	return generateVisualization(outDir, concurrency, len(labels) > 0, 0, baselineLabel)
 }
 
 // prepareMergedSources is the file-merging half of GenerateVisualizationMerged:

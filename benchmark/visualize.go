@@ -44,7 +44,7 @@ func extractAlias(modelStr string) string {
 // interactive HTML scatter-plot in the same directory. Returns the path
 // to the generated HTML file.
 func GenerateVisualization(dir string, concurrency int) (string, error) {
-	return generateVisualization(dir, concurrency, false, 0)
+	return generateVisualization(dir, concurrency, false, 0, "")
 }
 
 // GenerateVisualizationWithOptions is GenerateVisualization with a
@@ -52,7 +52,7 @@ func GenerateVisualization(dir string, concurrency int) (string, error) {
 // samples) past that elapsed time from each FILE's own run start are
 // dropped — see truncateToElapsed.
 func GenerateVisualizationWithOptions(dir string, concurrency int, maxElapsed time.Duration) (string, error) {
-	return generateVisualization(dir, concurrency, false, maxElapsed)
+	return generateVisualization(dir, concurrency, false, maxElapsed, "")
 }
 
 // truncateToElapsed drops request records and metrics samples whose elapsed
@@ -347,7 +347,12 @@ func buildVizRunParams(p runParamsRecord) *vizRunParams {
 // sharing one alias would otherwise render indistinguishably. maxElapsed > 0
 // truncates each file to its own elapsed window (per-file t0) — the merged
 // path passes 0 here because it truncates per source directory instead.
-func generateVisualization(dir string, concurrency int, keepFileNames bool, maxElapsed time.Duration) (string, error) {
+// baselineLabel, when non-empty, must exactly match one resolved series name
+// (checked below once names are final) — it becomes the report's
+// BASELINE_LABEL override (see findBaselineIndex in the template), so an
+// unmatched --baseline fails the CLI command rather than silently falling
+// back to the default slowest-arm baseline at render time.
+func generateVisualization(dir string, concurrency int, keepFileNames bool, maxElapsed time.Duration, baselineLabel string) (string, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 	if err != nil {
 		return "", fmt.Errorf("glob jsonl files: %w", err)
@@ -423,6 +428,20 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 		allSeries = append(allSeries, sd)
 	}
 
+	if baselineLabel != "" {
+		var names []string
+		found := false
+		for _, sd := range allSeries {
+			names = append(names, sd.Name)
+			if sd.Name == baselineLabel {
+				found = true
+			}
+		}
+		if !found {
+			return "", fmt.Errorf("--baseline %q matches no arm; arms are: %s", baselineLabel, strings.Join(names, ", "))
+		}
+	}
+
 	seriesJSON, err := json.Marshal(allSeries)
 	if err != nil {
 		return "", fmt.Errorf("marshal series data: %w", err)
@@ -442,6 +461,15 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 		return "", fmt.Errorf("marshal public report template: %w", err)
 	}
 
+	// baselineLabelJSON embeds the (already-validated, or empty) --baseline
+	// value as a JS string literal, same reasoning as pubTplJSON above:
+	// json.Marshal handles quoting/escaping mechanically so it lands safely
+	// inside the template's <script> block via template.JS.
+	baselineLabelJSON, err := json.Marshal(baselineLabel)
+	if err != nil {
+		return "", fmt.Errorf("marshal baseline label: %w", err)
+	}
+
 	concStr := "0"
 	if concurrency > 0 {
 		concStr = fmt.Sprintf("%d", concurrency)
@@ -458,6 +486,7 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 		"Data":           template.JS(seriesJSON),
 		"Concurrency":    template.JS(concStr),
 		"PublicTemplate": template.JS(pubTplJSON),
+		"BaselineLabel":  template.JS(baselineLabelJSON),
 	}); err != nil {
 		return "", fmt.Errorf("execute template: %w", err)
 	}
@@ -829,6 +858,10 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 
 <script>
 const RAW_DATA = {{.Data}};
+// BASELINE_LABEL is the --baseline flag's value (visualize-merge only), or
+// "" when absent -- see findBaselineIndex() below RAW_DATA's normalization
+// for how it overrides the default slowest-arm baseline selection.
+const BASELINE_LABEL = {{.BaselineLabel}};
 
 // --- Rehydrate positional records back into the object shape the rest of
 // this script expects (everything below reads r.t, r.ttft, r.resp, r.err,
@@ -1563,25 +1596,34 @@ const SUMMARY_METRICS = [
 // own carries each metric as a percentage of the baseline's.
 //
 // Picking the baseline, in order:
-//  1. Explicit override: an arm named/aliased "hbm" (classifyAlias's "gpu"
-//     class) -- these reports most often compare an offload arm against a
-//     no-offload control, and when one is present it is unambiguously the
-//     intended reference point. classifyAlias already recognises hbm arms
-//     (it is what sorts them first), so the naming rule stays in one place.
+//  1. Explicit override: --baseline=<label> on visualize-merge, threaded
+//     through as BASELINE_LABEL (see the const below RAW_DATA) and matched
+//     exactly against an arm's DISPLAYED name. generateVisualization already
+//     rejects an unmatched --baseline before the report is ever written (an
+//     arm-name typo fails the CLI command, not silently at render time), so
+//     BASELINE_LABEL here is either "" (no override) or a name guaranteed to
+//     be present in DATA.
 //  2. Otherwise, the SLOWEST arm: fewest completed (non-error) requests over
 //     the run's full, unzoomed span (windowStats between globalTMin/
 //     globalTMax -- the same window seriesStats() falls back to before any
 //     zoom, so "baseline" and "what the summary shows on load" agree), ties
 //     broken by the lower mean req/s (ok / spanSec) over that same window.
-//     This covers comparisons with no no-offload control at all (e.g. two
-//     different offload configs against each other) -- without it those
-//     reports silently showed no ratio column rather than picking SOME
-//     reference point.
+//     This is the DEFAULT for every multi-arm report, not just a fallback
+//     for reports with no obvious no-offload control -- naming (classifyAlias,
+//     used for sort order/color only, see sortKey above) plays no part in
+//     baseline selection.
 // A single-arm report has nothing to compare against either way.
 function findBaselineIndex() {
   if (DATA.length < 2) return -1;
-  for (let i = 0; i < DATA.length; i++) {
-    if (classifyAlias(getAlias(DATA[i].name)) === "gpu") return i;
+  if (BASELINE_LABEL) {
+    for (let i = 0; i < DATA.length; i++) {
+      if (DATA[i].name === BASELINE_LABEL) return i;
+    }
+    // Unreached in practice -- generateVisualization validates BASELINE_LABEL
+    // against the resolved arm names before this template is ever rendered.
+    // Falling through to the slowest-arm rule rather than returning -1 keeps
+    // the report from silently losing its ratio column if that validation
+    // and this lookup were ever to disagree.
   }
   let slowest = -1, slowestOk = Infinity, slowestRps = Infinity;
   DATA.forEach((s, i) => {
@@ -1729,7 +1771,7 @@ function renderSummary(perSeries) {
         rEl.className = "sum-ratio help-label " + (ratio === 1 ? "" : (good ? "up" : "down"));
         rEl.tabIndex = 0;
         rEl.ariaDescribedBy = "helpTip";
-        rEl.dataset.tip = "Share of the baseline arm. Green is better, orange is worse. " +
+        rEl.dataset.tip = "Share of the baseline arm (the slowest arm by completed requests, or --baseline). Green is better, orange is worse. " +
           m.short + " is " + rText + " of " + DATA[BASELINE_INDEX].name;
       } else {
         rEl.className = "sum-ratio";
@@ -3599,7 +3641,7 @@ function provenanceHeader(kind, extraLines) {
     if (m) lines.push("# model [" + DATA[i].name + "]: " + m);
   });
   if (BASELINE_INDEX >= 0) {
-    lines.push("# baseline arm (ratio columns are % of this arm): " + DATA[BASELINE_INDEX].name +
+    lines.push("# baseline arm (slowest arm by completed requests, or --baseline; ratio columns are % of this arm): " + DATA[BASELINE_INDEX].name +
       (hiddenSeries.has(BASELINE_INDEX)
         ? " (hidden/excluded above, but ratios below still use its recorded numbers, same as the on-screen panel)"
         : ""));
@@ -4075,7 +4117,7 @@ function pubSummaryBodyHtml(rows, baseStats) {
     const cells = SUMMARY_METRICS.map(m => {
       const c = pubSummaryCell(m, row.stats, baseStats, row.isBaseline);
       const ratioSpan = c.ratio
-        ? '<span class="sum-ratio help-label ' + c.tint + '" tabindex="0" data-tip="Share of the baseline arm. Green is better, orange is worse.">' + pubEsc(c.ratio) + '</span>'
+        ? '<span class="sum-ratio help-label ' + c.tint + '" tabindex="0" data-tip="Share of the baseline arm (the slowest arm by completed requests, or --baseline). Green is better, orange is worse.">' + pubEsc(c.ratio) + '</span>'
         : '<span class="sum-ratio"></span>';
       return '<td><span class="sum-val">' + pubEsc(c.val) + '</span>' + ratioSpan + '</td>';
     }).join("");

@@ -472,7 +472,7 @@ func (c *BenchmarkVisualizeMergeCommand) Execute(args []string) error {
 	if err != nil {
 		return err
 	}
-	htmlPath, err := benchmark.GenerateVisualizationMerged(dirs, labels, c.Output, c.Concurrency, maxElapsed)
+	htmlPath, err := benchmark.GenerateVisualizationMerged(dirs, labels, c.Output, c.Concurrency, maxElapsed, c.Baseline)
 	if err != nil {
 		return fmt.Errorf("generate merged visualization: %w", err)
 	}

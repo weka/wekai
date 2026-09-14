@@ -479,7 +479,7 @@ func TestPublicExportLabelsSuppressAlias(t *testing.T) {
 		baseDir, wekaDir := buildDirs(t)
 		outDir := filepath.Join(filepath.Dir(baseDir), "merged-labeled")
 		htmlPath, err := GenerateVisualizationMerged(
-			[]string{baseDir, wekaDir}, []string{"Baseline", "Weka-Offload"}, outDir, 8, 0)
+			[]string{baseDir, wekaDir}, []string{"Baseline", "Weka-Offload"}, outDir, 8, 0, "")
 		if err != nil {
 			t.Fatalf("generate merged interactive report with labels: %v", err)
 		}
@@ -498,7 +498,7 @@ func TestPublicExportLabelsSuppressAlias(t *testing.T) {
 	t.Run("without --labels: the internal alias comes through as the arm name (documented, not fixed)", func(t *testing.T) {
 		baseDir, wekaDir := buildDirs(t)
 		outDir := filepath.Join(filepath.Dir(baseDir), "merged-unlabeled")
-		htmlPath, err := GenerateVisualizationMerged([]string{baseDir, wekaDir}, nil, outDir, 8, 0)
+		htmlPath, err := GenerateVisualizationMerged([]string{baseDir, wekaDir}, nil, outDir, 8, 0, "")
 		if err != nil {
 			t.Fatalf("generate merged interactive report without labels: %v", err)
 		}
