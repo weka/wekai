@@ -127,6 +127,7 @@ func (c *BenchmarkAutoOptions) FIFOGateOrder() bool { return !flagOn(c.RandomGat
 type BenchmarkVisualizeOptions struct {
 	Concurrency int    `long:"concurrency" description:"Override the concurrency used for the moving-average window (window = concurrency*3). Normally unnecessary: runs record their own concurrency in the reqdata JSONL and each arm is sized from its own. Use only for data recorded before run params were saved, or to force a different smoothing window." default:"0"`
 	MaxElapsed  string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
+	Overwrite   bool   `long:"overwrite" description:"Write report.html in place (overwriting an existing one) instead of creating a new report_vN.html; use for live-refreshed reports so versions do not accumulate"`
 	Args        struct {
 		Dir string `positional-arg-name:"directory" description:"Directory containing .jsonl request data files" required:"yes"`
 	} `positional-args:"yes"`
@@ -140,6 +141,7 @@ type BenchmarkVisualizeMergeOptions struct {
 	Labels      string `long:"labels" description:"Comma-separated labels for each input directory, in positional order (overrides auto-detected model aliases / directory names). Count must exactly match the number of directories (post --all expansion)."`
 	MaxElapsed  string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
 	Baseline    string `long:"baseline" description:"Displayed name of the arm the summary's % comparison should be relative to (exact match; a --labels value when given). Overrides the default, which is the slowest arm by completed requests. Errors if no arm matches."`
+	Overwrite   bool   `long:"overwrite" description:"Write report.html in place (overwriting an existing one) instead of creating a new report_vN.html; use for live-refreshed reports so versions do not accumulate"`
 	Args        struct {
 		Dirs []string `positional-arg-name:"directories" description:"Directories containing .jsonl request data files"`
 	} `positional-args:"yes"`

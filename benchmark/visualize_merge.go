@@ -75,7 +75,22 @@ func deriveSourceLabel(dir string, records []requestDataRecord) string {
 // value when given, else the resolved alias/directory label), checked in
 // generateVisualization once names are final -- an unmatched value fails
 // this call rather than silently rendering without the override.
+//
+// The report is written with today's versioned naming (dir/report.html,
+// dir/report_v2.html, ...) -- see GenerateVisualizationMergedWithOverwrite
+// for an in-place variant.
 func GenerateVisualizationMerged(dirs []string, labels []string, outputDir string, concurrency int, maxElapsed time.Duration, baselineLabel string) (string, error) {
+	return GenerateVisualizationMergedWithOverwrite(dirs, labels, outputDir, concurrency, maxElapsed, baselineLabel, false)
+}
+
+// GenerateVisualizationMergedWithOverwrite is GenerateVisualizationMerged
+// with control over the report's on-disk naming: overwrite=false is
+// byte-for-byte GenerateVisualizationMerged's behavior (versioned
+// report_vN.html naming); overwrite=true writes dir/report.html in place
+// every time -- for a live-refreshed merged report (e.g. re-rendered every
+// few minutes) that would otherwise accumulate one report_vN.html copy per
+// render.
+func GenerateVisualizationMergedWithOverwrite(dirs []string, labels []string, outputDir string, concurrency int, maxElapsed time.Duration, baselineLabel string, overwrite bool) (string, error) {
 	outDir, err := prepareMergedSources(dirs, labels, outputDir, maxElapsed)
 	if err != nil {
 		return "", err
@@ -84,7 +99,7 @@ func GenerateVisualizationMerged(dirs []string, labels []string, outputDir strin
 	// the merged filenames: pin display names to the label-derived basenames
 	// so a record alias shared by both arms can't collapse them into one name.
 	// maxElapsed 0: the sources were already truncated per-arm above.
-	return generateVisualization(outDir, concurrency, len(labels) > 0, 0, baselineLabel)
+	return generateVisualization(outDir, concurrency, len(labels) > 0, 0, baselineLabel, overwrite)
 }
 
 // prepareMergedSources is the file-merging half of GenerateVisualizationMerged:

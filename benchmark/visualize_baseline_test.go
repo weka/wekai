@@ -79,7 +79,7 @@ type baselineProbeResult struct {
 func runBaselineProbe(t *testing.T, dir string, concurrency int, baselineLabel string) baselineProbeResult {
 	t.Helper()
 	nodeBin := nodeOrSkip(t)
-	htmlPath, err := generateVisualization(dir, concurrency, false, 0, baselineLabel)
+	htmlPath, err := generateVisualization(dir, concurrency, false, 0, baselineLabel, false)
 	if err != nil {
 		t.Fatalf("generateVisualization: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestBaselineFlagUnmatchedNameErrors(t *testing.T) {
 	writePublicFixtureFile(t, dir, "a", fastRecs, fastSamples, pubSecretRunID+"-fast2")
 	writePublicFixtureFile(t, dir, "b", slowRecs, slowSamples, pubSecretRunID+"-slow2")
 
-	_, err := generateVisualization(dir, 8, false, 0, "NoSuchArm")
+	_, err := generateVisualization(dir, 8, false, 0, "NoSuchArm", false)
 	if err == nil {
 		t.Fatal("expected an error for a --baseline value matching no arm, got nil")
 	}

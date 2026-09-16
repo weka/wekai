@@ -415,7 +415,7 @@ func (c *BenchmarkVisualizeCommand) Execute(args []string) error {
 	if err != nil {
 		return err
 	}
-	htmlPath, err := benchmark.GenerateVisualizationWithOptions(dir, c.Concurrency, maxElapsed)
+	htmlPath, err := benchmark.GenerateVisualizationWithOverwrite(dir, c.Concurrency, maxElapsed, c.Overwrite)
 	if err != nil {
 		return fmt.Errorf("generate visualization: %w", err)
 	}
@@ -472,7 +472,7 @@ func (c *BenchmarkVisualizeMergeCommand) Execute(args []string) error {
 	if err != nil {
 		return err
 	}
-	htmlPath, err := benchmark.GenerateVisualizationMerged(dirs, labels, c.Output, c.Concurrency, maxElapsed, c.Baseline)
+	htmlPath, err := benchmark.GenerateVisualizationMergedWithOverwrite(dirs, labels, c.Output, c.Concurrency, maxElapsed, c.Baseline, c.Overwrite)
 	if err != nil {
 		return fmt.Errorf("generate merged visualization: %w", err)
 	}

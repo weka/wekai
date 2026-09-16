@@ -44,7 +44,7 @@ func extractAlias(modelStr string) string {
 // interactive HTML scatter-plot in the same directory. Returns the path
 // to the generated HTML file.
 func GenerateVisualization(dir string, concurrency int) (string, error) {
-	return generateVisualization(dir, concurrency, false, 0, "")
+	return generateVisualization(dir, concurrency, false, 0, "", false)
 }
 
 // GenerateVisualizationWithOptions is GenerateVisualization with a
@@ -52,7 +52,18 @@ func GenerateVisualization(dir string, concurrency int) (string, error) {
 // samples) past that elapsed time from each FILE's own run start are
 // dropped — see truncateToElapsed.
 func GenerateVisualizationWithOptions(dir string, concurrency int, maxElapsed time.Duration) (string, error) {
-	return generateVisualization(dir, concurrency, false, maxElapsed, "")
+	return generateVisualization(dir, concurrency, false, maxElapsed, "", false)
+}
+
+// GenerateVisualizationWithOverwrite is GenerateVisualizationWithOptions with
+// control over the report's on-disk naming: overwrite=false (what
+// GenerateVisualization/GenerateVisualizationWithOptions always pass)
+// preserves today's versioned dir/report.html, dir/report_v2.html, ...
+// naming (see nextVersionedPath); overwrite=true writes dir/report.html in
+// place every time, for a live-refreshed report re-rendered on an interval
+// that would otherwise accumulate one report_vN.html per render.
+func GenerateVisualizationWithOverwrite(dir string, concurrency int, maxElapsed time.Duration, overwrite bool) (string, error) {
+	return generateVisualization(dir, concurrency, false, maxElapsed, "", overwrite)
 }
 
 // truncateToElapsed drops request records and metrics samples whose elapsed
@@ -352,7 +363,8 @@ func buildVizRunParams(p runParamsRecord) *vizRunParams {
 // BASELINE_LABEL override (see findBaselineIndex in the template), so an
 // unmatched --baseline fails the CLI command rather than silently falling
 // back to the default slowest-arm baseline at render time.
-func generateVisualization(dir string, concurrency int, keepFileNames bool, maxElapsed time.Duration, baselineLabel string) (string, error) {
+// overwrite selects the HTML report's destination path — see reportHTMLPath.
+func generateVisualization(dir string, concurrency int, keepFileNames bool, maxElapsed time.Duration, baselineLabel string, overwrite bool) (string, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 	if err != nil {
 		return "", fmt.Errorf("glob jsonl files: %w", err)
@@ -475,7 +487,7 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 		concStr = fmt.Sprintf("%d", concurrency)
 	}
 
-	htmlPath := nextVersionedPath(dir, "report", ".html")
+	htmlPath := reportHTMLPath(dir, overwrite)
 	out, err := os.Create(htmlPath)
 	if err != nil {
 		return "", fmt.Errorf("create html file: %w", err)
@@ -574,6 +586,19 @@ func readJSONLFileWithParams(path string) ([]requestDataRecord, []vllmMetricsSam
 		}
 	}
 	return records, samples, params, hasParams, sc.Err()
+}
+
+// reportHTMLPath returns the destination for the rendered HTML report.
+// overwrite=true writes dir/report.html in place (clobbering any existing
+// file) — for a report re-rendered on an interval (e.g. a live-refreshed
+// merged report), so repeated renders don't accumulate one report_vN.html
+// per render. overwrite=false (the default) preserves today's versioned
+// naming via nextVersionedPath.
+func reportHTMLPath(dir string, overwrite bool) string {
+	if overwrite {
+		return filepath.Join(dir, "report.html")
+	}
+	return nextVersionedPath(dir, "report", ".html")
 }
 
 // nextVersionedPath returns a path like dir/report.html, dir/report_v2.html, etc.
