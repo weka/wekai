@@ -259,8 +259,9 @@ func (p *Proxy) Serve(
 
 		refusalsLeft := failovers < maxFailovers
 		canRetry := (attempt+1 < p.cfg.MaxAttempts || refusalsLeft) && len(remaining) > 1
-		out := p.attempt(w, r, b, d, body, &committed, canRetry, accepted, outcome, auth)
-		b.CB.Record(circuit.Classify(out.status, out.err), token)
+		out := runAttempt(b.CB, token, func() attemptOut {
+			return p.attempt(w, r, b, d, body, &committed, canRetry, accepted, outcome, auth)
+		})
 		if out.err != nil {
 			metrics.UpstreamErrors.WithLabelValues(b.URL, kindOf(out.err)).Inc()
 			b.Failed.Add(1)
@@ -340,6 +341,38 @@ type attemptOut struct {
 	status    int
 	err       error
 	retryable bool
+}
+
+// runAttempt pairs do's outcome with Record exactly once, whether do returns
+// normally or panics.
+//
+// do is p.attempt, and httputil.ReverseProxy raises http.ErrAbortHandler as a
+// real panic when the client goes away mid-stream — routinely, and often for
+// many concurrent streams at once, when a load driver aborts. Serve has no
+// other defer between Allow and Record, so a panic reaching here unguarded
+// would skip Record and leak the matching half-open token forever: the next
+// backend probe, and every one after it, would be denied with no path back to
+// Closed. Recovering here, resolving the breaker, and re-panicking keeps that
+// bookkeeping exception-safe without changing what recoverMiddleware sees.
+//
+// A client abort says nothing about the backend, so it is classified Ignored,
+// the same as a 429. Any other panic is classified Failure: it never reached
+// a real (status, err) pair for Classify, and unlike an abort there is no
+// reason to believe the backend is blameless.
+func runAttempt(cb *circuit.Breaker, token bool, do func() attemptOut) (out attemptOut) {
+	defer func() {
+		if v := recover(); v != nil {
+			cls := circuit.Failure
+			if err, ok := v.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+				cls = circuit.Ignored
+			}
+			cb.Record(cls, token)
+			panic(v)
+		}
+	}()
+	out = do()
+	cb.Record(circuit.Classify(out.status, out.err), token)
+	return out
 }
 
 // attempt performs one upstream round trip.
