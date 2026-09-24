@@ -393,7 +393,7 @@ func TestBuildOpenAIChatCompletionsBodyReasoningEffortThinking(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, 0, false, 0, nil, c.reasoningEffort, c.thinking)
+			body, _, err := buildOpenAIChatCompletionsBody(req, docs, "model", "", 0, 0, false, 0, nil, c.reasoningEffort, c.thinking, false)
 			if err != nil {
 				t.Fatalf("build: %v", err)
 			}
@@ -513,7 +513,7 @@ func TestMinOutputTokensReachesWire(t *testing.T) {
 		t.Errorf("anthropic max_tokens = %v, want the %v floor", got, want)
 	}
 
-	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, "", "model", "", 0, 512, false, 0, nil, "", "")
+	openaiBody, _, err := buildOpenAIChatCompletionsBody(req, "", "model", "", 0, 512, false, 0, nil, "", "", false)
 	if err != nil {
 		t.Fatalf("openai build: %v", err)
 	}
