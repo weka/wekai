@@ -151,15 +151,17 @@ func prepareMergedSources(dirs []string, labels []string, outputDir string, maxE
 
 		var dirRecords []requestDataRecord
 		var dirSamples []vllmMetricsSample
+		var dirSGLangSamples []sglangMetricsSample
 		var dirParams runParamsRecord
 		var dirHasParams bool
 		for _, f := range files {
-			records, samples, params, hasParams, err := readJSONLFileWithParams(f)
+			records, samples, sglangSamples, params, hasParams, err := readJSONLFileWithParams(f)
 			if err != nil {
 				return "", fmt.Errorf("read %s: %w", f, err)
 			}
 			dirRecords = append(dirRecords, records...)
 			dirSamples = append(dirSamples, samples...)
+			dirSGLangSamples = append(dirSGLangSamples, sglangSamples...)
 			// First header in the directory wins — an arm is one run, and a
 			// dir holding several files is that run split across models.
 			if hasParams && !dirHasParams {
@@ -168,6 +170,7 @@ func prepareMergedSources(dirs []string, labels []string, outputDir string, maxE
 		}
 		// Per-arm truncation: this directory's own t0, not global wall-clock.
 		dirRecords, dirSamples = truncateToElapsed(dirRecords, dirSamples, maxElapsed)
+		dirSGLangSamples = truncateSGLangToElapsed(dirRecords, dirSGLangSamples, maxElapsed)
 
 		var alias string
 		if len(labels) > 0 {
@@ -225,6 +228,12 @@ func prepareMergedSources(dirs []string, labels []string, outputDir string, maxE
 			if err := enc.Encode(s); err != nil {
 				out.Close()
 				return "", fmt.Errorf("write metrics sample to %s: %w", outFile, err)
+			}
+		}
+		for _, s := range dirSGLangSamples {
+			if err := enc.Encode(s); err != nil {
+				out.Close()
+				return "", fmt.Errorf("write sglang metrics sample to %s: %w", outFile, err)
 			}
 		}
 		out.Close()

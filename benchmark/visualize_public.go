@@ -142,7 +142,11 @@ PUBLIC_DATA.forEach(s => {
   s.ttftP50 = (s.ttftP50 || []).map(p => ({ t: p[0], v: p[1] }));
   s.ttftP95 = (s.ttftP95 || []).map(p => ({ t: p[0], v: p[1] }));
   s.errBars = (s.errBars || []).map(p => ({ t: p[0], errRate: p[1], errs: p[2], total: p[3], respAvg: p[4] }));
-  s.mix = (s.mix || []).map(p => ({ t0: p[0], t1: p[1], c: p[2], lc: p[3], ec: p[4] }));
+  // mix tuples carry band VALUES ONLY, from index 2 on, in s.bandOrder's
+  // fixed order (see visualize.go's payload builder) -- zip them back into
+  // {n, v} pairs here so the rest of this script works with the same
+  // {t0, t1, bands} shape visualize.go's own report uses.
+  s.mix = (s.mix || []).map(p => ({ t0: p[0], t1: p[1], bands: (s.bandOrder || []).map((n, i) => ({ n: n, v: p[2 + i] })) }));
   s.adt = (s.adt || []).map(p => ({ t: p[0], v: p[1], s: p[2] }));
   s.cum = (s.cum || []).map(p => ({ t: p[0], cumIn: p[1], cumOut: p[2] }));
 });
@@ -234,7 +238,7 @@ function adtWindowRange(ptsPerBand) {
 function mixRate(seg) {
   const secs = (seg.t1 - seg.t0) / 1000;
   if (secs <= 0) return 0;
-  return (seg.c + seg.lc + seg.ec) / secs;
+  return mixSegTotal(seg) / secs;
 }
 // mixTotalMax returns the maximum per-minute ingest RATE (compute+local+
 // external, scaled by mixRate to tokens/min) across every series in the
@@ -261,7 +265,7 @@ function mixTotalMax(seriesArr) {
 // absolute c/lc/ec totals (that ratio is unaffected by dividing all three by
 // the same interval width).
 function mixStackHeight(seg, globalMaxRatePerMin, bandH) {
-  const total = seg.c + seg.lc + seg.ec;
+  const total = mixSegTotal(seg);
   if (total <= 0 || globalMaxRatePerMin <= 0) return 0;
   const ratePerMin = mixRate(seg) * 60;
   return bandH * (ratePerMin / globalMaxRatePerMin);
@@ -338,9 +342,27 @@ function cumAt(cum, t) {
 const MIX_COMPUTE_COLOR = "#a86853";
 const MIX_LOCAL_COLOR = "#756a99";
 const MIX_EXTERNAL_COLOR = "#7C03EC";
+// See visualize.go's MIX_HOST_COLOR doc -- kept in lockstep.
+const MIX_HOST_COLOR = "#4a9d8f";
 const ADT_LINE_COLOR = "#F2F2EB";
 const MIX_BAND_H = 64;
 const MIX_FILL_ALPHA = 0.78;
+// MIX_BAND_STYLE: see visualize.go's version -- kept in lockstep.
+const MIX_BAND_STYLE = {
+  local_compute:        { color: MIX_COMPUTE_COLOR,  label: "compute",     alpha: MIX_FILL_ALPHA },
+  compute:              { color: MIX_COMPUTE_COLOR,  label: "compute",     alpha: MIX_FILL_ALPHA },
+  local_cache_hit:      { color: MIX_LOCAL_COLOR,    label: "local cache", alpha: MIX_FILL_ALPHA },
+  device:               { color: MIX_LOCAL_COLOR,    label: "device",      alpha: MIX_FILL_ALPHA },
+  host:                 { color: MIX_HOST_COLOR,     label: "host",        alpha: MIX_FILL_ALPHA },
+  external_kv_transfer: { color: MIX_EXTERNAL_COLOR, label: "external KV", alpha: 0.95 },
+  storage:              { color: MIX_EXTERNAL_COLOR, label: "storage",     alpha: 0.95 },
+};
+// mixSegTotal: see visualize.go's version -- kept in lockstep.
+function mixSegTotal(seg) {
+  let sum = 0;
+  (seg.bands || []).forEach(b => { sum += b.v; });
+  return sum;
+}
 // MIX_TOTAL_MAX is computed once against DATA's already-downsampled mix
 // bands -- see mixTotalMax below for why it is a RATE, not a raw per-bucket
 // total.
@@ -410,18 +432,17 @@ function drawCacheMix() {
     ctx.fillRect(margin.left, yTop, plotW, bandH);
     (mix || []).forEach(seg => {
       if (seg.t1 < viewTMin || seg.t0 > viewTMax) return;
-      const total = seg.c + seg.lc + seg.ec;
+      const total = mixSegTotal(seg);
       const stackH = mixStackHeight(seg, MIX_TOTAL_MAX, bandH);
       if (stackH <= 0) return;
       const x1 = mapX(seg.t0), x2 = mapX(seg.t1);
       let y = yTop + bandH - stackH;
-      [[seg.c, MIX_COMPUTE_COLOR, MIX_FILL_ALPHA],
-       [seg.lc, MIX_LOCAL_COLOR, MIX_FILL_ALPHA],
-       [seg.ec, MIX_EXTERNAL_COLOR, 0.95]].forEach(([v, col, alpha]) => {
-        if (v <= 0) return;
-        const h = stackH * (v / total);
-        ctx.globalAlpha = alpha;
-        ctx.fillStyle = col;
+      (seg.bands || []).forEach(b => {
+        if (b.v <= 0) return;
+        const style = MIX_BAND_STYLE[b.n] || { color: MIX_COMPUTE_COLOR, alpha: MIX_FILL_ALPHA };
+        const h = stackH * (b.v / total);
+        ctx.globalAlpha = style.alpha;
+        ctx.fillStyle = style.color;
         ctx.fillRect(x1, y, x2 - x1, h);
         y += h;
       });
@@ -829,11 +850,12 @@ canvas.addEventListener("mousemove", e => {
     const p = adtAt(mixHover.band.adt, mixHover.t);
     const lines = [];
     if (seg) {
-      const total = seg.c + seg.lc + seg.ec;
+      const total = mixSegTotal(seg);
       const pct = v => total > 0 ? " (" + (100 * v / total).toFixed(0) + "%)" : "";
-      lines.push("<span style='color:" + MIX_COMPUTE_COLOR + "'>compute: " + fmtTokens(seg.c) + pct(seg.c) + "</span>");
-      lines.push("<span style='color:" + MIX_LOCAL_COLOR + "'>local cache: " + fmtTokens(seg.lc) + pct(seg.lc) + "</span>");
-      lines.push("<span style='color:" + MIX_EXTERNAL_COLOR + "'>external KV: " + fmtTokens(seg.ec) + pct(seg.ec) + "</span>");
+      (seg.bands || []).forEach(b => {
+        const style = MIX_BAND_STYLE[b.n] || { color: MIX_COMPUTE_COLOR, label: b.n };
+        lines.push("<span style='color:" + style.color + "'>" + style.label + ": " + fmtTokens(b.v) + pct(b.v) + "</span>");
+      });
     }
     if (p) lines.push("<span style='color:" + ADT_LINE_COLOR + "'>active dataset: " + fmtTokens(p.v) + " tok, " + Math.round(p.s) + " series</span>");
     tooltip.innerHTML = "<b>" + mixHover.band.s.name + "</b> — cache mix<br>" + lines.join("<br>");

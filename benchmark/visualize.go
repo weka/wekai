@@ -107,6 +107,39 @@ func truncateToElapsed(records []requestDataRecord, samples []vllmMetricsSample,
 	return outR, outS
 }
 
+// truncateSGLangToElapsed mirrors truncateToElapsed for sglangMetricsSample —
+// kept as a separate function rather than folded into it (or a shared
+// generic) because the two sample types are otherwise unrelated and a series
+// carries samples from at most one of them. t0 is derived from records (or,
+// absent those, this same sample set) exactly as truncateToElapsed does, so
+// the two truncations agree on the same cutoff for one series.
+func truncateSGLangToElapsed(records []requestDataRecord, samples []sglangMetricsSample, maxElapsed time.Duration) []sglangMetricsSample {
+	if maxElapsed <= 0 || len(samples) == 0 {
+		return samples
+	}
+	var t0 time.Time
+	for _, r := range records {
+		if t0.IsZero() || r.StartTime.Before(t0) {
+			t0 = r.StartTime
+		}
+	}
+	if t0.IsZero() {
+		for _, s := range samples {
+			if t0.IsZero() || s.TS.Before(t0) {
+				t0 = s.TS
+			}
+		}
+	}
+	cutoff := t0.Add(maxElapsed)
+	var out []sglangMetricsSample
+	for _, s := range samples {
+		if !s.TS.After(cutoff) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // vizRecord is one request's data as embedded in a report.html's RAW_DATA.
 type vizRecord struct {
 	// T is delta-encoded against the owning seriesData's T0 (min StartTime
@@ -255,6 +288,12 @@ type seriesData struct {
 	Records []vizRecord        `json:"records"`
 	Mix     []vizSampleSegment `json:"mix,omitempty"`
 	Adt     []vizAdtPoint      `json:"adt,omitempty"`
+	// BandOrder names Mix's bands, in the order each vizSampleSegment.Bands
+	// entry appears (vllmBandOrder or sglangBandOrder — see vllm_metrics.go/
+	// sglang_metrics.go), so the report JS knows which color/label lookup and
+	// legend to render for this series without guessing from Mix's shape.
+	// Omitted when Mix is empty.
+	BandOrder []string `json:"bandOrder,omitempty"`
 	// Conc is the request concurrency this arm ran at, taken from its
 	// run_params header. 0 for a file written before run_params existed (or a
 	// hill-climber run that never pinned one), in which case the report falls
@@ -377,11 +416,12 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 	var allSeries []seriesData
 	for _, f := range files {
 		name := strings.TrimSuffix(filepath.Base(f), ".jsonl")
-		records, samples, params, hasParams, err := readJSONLFileWithParams(f)
+		records, samples, sglangSamples, params, hasParams, err := readJSONLFileWithParams(f)
 		if err != nil {
 			return "", fmt.Errorf("read %s: %w", f, err)
 		}
 		records, samples = truncateToElapsed(records, samples, maxElapsed)
+		sglangSamples = truncateSGLangToElapsed(records, sglangSamples, maxElapsed)
 		// Prefer the clean model alias (e.g. "DS3H_weka-64r8w") over the raw
 		// sanitized filename (e.g. "dynamic_http___..._alias_DS3H_weka-64r8w")
 		// when the file's records unambiguously identify one model — unless
@@ -431,8 +471,22 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 				LeakedUUIDsRaw:       r.LeakedUUIDsRaw,
 			})
 		}
-		mix, adt := buildSampleViz(samples)
-		sd := seriesData{Name: name, T0: t0, Records: vr, Mix: mix, Adt: adt, GuidTable: guidTable}
+		// A series carries samples from at most one sampler (vLLM and sglang
+		// eligibility are mutually exclusive per model spec type=), so vLLM
+		// samples win if somehow both are present rather than silently
+		// dropping either.
+		var mix []vizSampleSegment
+		var adt []vizAdtPoint
+		var bandOrder []string
+		switch {
+		case len(samples) > 0:
+			mix, adt = buildSampleVizVLLM(samples)
+			bandOrder = vllmBandOrder
+		case len(sglangSamples) > 0:
+			mix, adt = buildSampleVizSGLang(sglangSamples)
+			bandOrder = sglangBandOrder
+		}
+		sd := seriesData{Name: name, T0: t0, Records: vr, Mix: mix, Adt: adt, BandOrder: bandOrder, GuidTable: guidTable}
 		if hasParams {
 			sd.Conc = params.effectiveConcurrency()
 			sd.Params = buildVizRunParams(params)
@@ -528,30 +582,37 @@ func resolveRecordsAlias(records []requestDataRecord) string {
 // header. Callers that can make use of the recorded run parameters should use
 // readJSONLFileWithParams instead.
 func readJSONLFile(path string) ([]requestDataRecord, []vllmMetricsSample, error) {
-	records, samples, _, _, err := readJSONLFileWithParams(path)
+	records, samples, _, _, _, err := readJSONLFileWithParams(path)
 	return records, samples, err
 }
 
 // readJSONLFileWithParams reads a request-data JSONL file, routing lines by
 // their record_type: absent/empty = a request row (legacy files predate the
-// field), "vllm_metrics_sample" = a metrics sample, "run_params" = the header
-// describing the run. Unknown record types and malformed lines are skipped — a
-// new record type must never corrupt request parsing (unmarshalling a sample
-// into requestDataRecord would otherwise "succeed" as an all-zero phantom
+// field), "vllm_metrics_sample" = a vLLM metrics sample, "sglang_metrics_sample"
+// = an sglang metrics sample, "run_params" = the header describing the run.
+// Unknown record types and malformed lines are skipped — a new record type
+// must never corrupt request parsing (unmarshalling a sample into
+// requestDataRecord would otherwise "succeed" as an all-zero phantom
 // request), which is also what lets a file written by a NEWER wekai stay
 // readable by an older one.
+//
+// A series carries samples from at most one of the two metrics samplers
+// (vLLM and sglang sampling are mutually exclusive per model spec type — see
+// vllmMetricsEndpoints/sglangMetricsEndpoints), so callers pick whichever of
+// sglangSamples is non-empty to decide which buildSampleViz* to call.
 //
 // hasParams is false for every file written before run_params existed; callers
 // must keep working in that case rather than treating the zero record as a run
 // that was configured with zeroes.
-func readJSONLFileWithParams(path string) ([]requestDataRecord, []vllmMetricsSample, runParamsRecord, bool, error) {
+func readJSONLFileWithParams(path string) ([]requestDataRecord, []vllmMetricsSample, []sglangMetricsSample, runParamsRecord, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, runParamsRecord{}, false, err
+		return nil, nil, nil, runParamsRecord{}, false, err
 	}
 	defer f.Close()
 	var records []requestDataRecord
 	var samples []vllmMetricsSample
+	var sglangSamples []sglangMetricsSample
 	var params runParamsRecord
 	var hasParams bool
 	sc := bufio.NewScanner(f)
@@ -577,6 +638,12 @@ func readJSONLFileWithParams(path string) ([]requestDataRecord, []vllmMetricsSam
 				continue
 			}
 			samples = append(samples, s)
+		case recordTypeSGLangMetricsSample:
+			var s sglangMetricsSample
+			if err := json.Unmarshal(sc.Bytes(), &s); err != nil {
+				continue
+			}
+			sglangSamples = append(sglangSamples, s)
 		case recordTypeRunParams:
 			// First header wins: a merged per-source JSONL can concatenate
 			// files, and the first one describes the run the rows came from.
@@ -585,7 +652,7 @@ func readJSONLFileWithParams(path string) ([]requestDataRecord, []vllmMetricsSam
 			}
 		}
 	}
-	return records, samples, params, hasParams, sc.Err()
+	return records, samples, sglangSamples, params, hasParams, sc.Err()
 }
 
 // reportHTMLPath returns the destination for the rendered HTML report.
@@ -2024,12 +2091,41 @@ function tickStats(tickTime) {
 const MIX_COMPUTE_COLOR = "#a86853";
 const MIX_LOCAL_COLOR = "#756a99";
 const MIX_EXTERNAL_COLOR = "#7C03EC"; // official primary purple — the single high-chroma accent
+// MIX_HOST_COLOR is sglang-only: its 4-way breakdown splits vLLM's implicit
+// "local" into device (GPU radix cache, reuses MIX_LOCAL_COLOR) and host
+// (CPU/DRAM HiCache L2), which needs a color of its own. Muted teal-green
+// sits clearly apart from the compute/local/external triad above and from
+// GPU_VARIANTS' cooler slate-blue and DRAM_VARIANTS' own green family below.
+const MIX_HOST_COLOR = "#4a9d8f";
 const ADT_LINE_COLOR = "#F2F2EB";
 const MIX_BAND_H = 64;
 // Band fills sit on a solid-black backdrop; slightly translucent so the
 // (muted) band mass sits visually behind the latency lines — the plot reads
 // first, the band second.
 const MIX_FILL_ALPHA = 0.78;
+
+// MIX_BAND_STYLE maps a band name (see vllmBandOrder/sglangBandOrder in
+// vllm_metrics.go/sglang_metrics.go) to its report color, legend/tooltip
+// label, and fill alpha, so the drawing and tooltip code can iterate any
+// series' seg.bands without knowing ahead of time whether it's a vLLM or
+// sglang series. sglang's outermost tier is labeled "storage" (its own
+// terminology for a 4-way breakdown) where vLLM's is labeled "external KV"
+// (a 2-way local/external split) — both share MIX_EXTERNAL_COLOR and the
+// near-opaque accent alpha, since each is that series' single vivid class.
+const MIX_BAND_STYLE = {
+  local_compute:        { color: MIX_COMPUTE_COLOR,  label: "compute",     alpha: MIX_FILL_ALPHA },
+  compute:              { color: MIX_COMPUTE_COLOR,  label: "compute",     alpha: MIX_FILL_ALPHA },
+  local_cache_hit:      { color: MIX_LOCAL_COLOR,    label: "local cache", alpha: MIX_FILL_ALPHA },
+  device:               { color: MIX_LOCAL_COLOR,    label: "device",      alpha: MIX_FILL_ALPHA },
+  host:                 { color: MIX_HOST_COLOR,     label: "host",        alpha: MIX_FILL_ALPHA },
+  external_kv_transfer: { color: MIX_EXTERNAL_COLOR, label: "external KV", alpha: 0.95 },
+  storage:              { color: MIX_EXTERNAL_COLOR, label: "storage",     alpha: 0.95 },
+};
+// MIX_LEGEND_ORDER fixes the swatch order when building the shared Cache Mix
+// legend (drawn once for the whole report, not per series — see the
+// showCacheMix construction below), which only shows swatches for bands that
+// at least one visible series actually carries.
+const MIX_LEGEND_ORDER = ["local_compute", "compute", "local_cache_hit", "device", "host", "external_kv_transfer", "storage"];
 
 // DOM-free helpers (fmtTokens/mixAt/adtAt/mixTotalMax/mixStackHeight/
 // mixRate/placeTooltip): unit-tested under node by
@@ -2281,14 +2377,22 @@ function adtWindowRange(ptsPerBand) {
   return { lo, hi };
 }
 
+// mixSegTotal sums a segment's band deltas — the interval's total ingested
+// tokens across whichever band set that series' sampler produced.
+function mixSegTotal(seg) {
+  let sum = 0;
+  (seg.bands || []).forEach(b => { sum += b.v; });
+  return sum;
+}
+
 // mixTotalMax returns the maximum per-interval TOTAL ingested delta
-// (compute+local+external) across every series in the report — the single
+// (summed across all bands) across every series in the report — the single
 // shared scale for all bands, deliberately NOT per-series: a series peaking
 // at 50k tok/min next to one peaking at 1M renders mostly unfilled.
 function mixTotalMax(seriesArr) {
   let mx = 0;
   (seriesArr || []).forEach(s => (s.mix || []).forEach(m => {
-    const t = m.c + m.lc + m.ec;
+    const t = mixSegTotal(m);
     if (t > mx) mx = t;
   }));
   return mx;
@@ -2297,7 +2401,7 @@ function mixTotalMax(seriesArr) {
 // mixStackHeight: absolute stack height for one interval — this interval's
 // total delta as a fraction of the global max, of the band height.
 function mixStackHeight(seg, globalMax, bandH) {
-  const total = seg.c + seg.lc + seg.ec;
+  const total = mixSegTotal(seg);
   if (total <= 0 || globalMax <= 0) return 0;
   return bandH * (total / globalMax);
 }
@@ -2307,7 +2411,7 @@ function mixStackHeight(seg, globalMax, bandH) {
 function mixRate(seg) {
   const secs = (seg.t1 - seg.t0) / 1000;
   if (secs <= 0) return 0;
-  return (seg.c + seg.lc + seg.ec) / secs;
+  return mixSegTotal(seg) / secs;
 }
 
 // placeTooltip: viewport-aware tooltip position for a cursor at (cx,cy).
@@ -2585,22 +2689,23 @@ function drawCacheMix() {
     // ingested delta against the report-wide MIX_TOTAL_MAX (shared across
     // all series), anchored at the band bottom so quiet minutes render
     // mostly empty. Within the stack the split stays proportional by
-    // source. The muted fills stay translucent; the external-KV accent —
-    // the one vivid class — renders near-opaque so it keeps its punch.
+    // band, in the order the sampler emitted them (see vllmBandOrder/
+    // sglangBandOrder). The muted fills stay translucent; each series' one
+    // vivid class (external KV / storage) renders near-opaque so it keeps
+    // its punch — see MIX_BAND_STYLE.
     (s.mix || []).forEach(seg => {
       if (seg.t1 < viewTMin || seg.t0 > viewTMax) return;
-      const total = seg.c + seg.lc + seg.ec;
+      const total = mixSegTotal(seg);
       const stackH = mixStackHeight(seg, MIX_TOTAL_MAX, bandH);
       if (stackH <= 0) return;
       const x1 = mapX(seg.t0), x2 = mapX(seg.t1);
       let y = yTop + bandH - stackH;
-      [[seg.c, MIX_COMPUTE_COLOR, MIX_FILL_ALPHA],
-       [seg.lc, MIX_LOCAL_COLOR, MIX_FILL_ALPHA],
-       [seg.ec, MIX_EXTERNAL_COLOR, 0.95]].forEach(([v, col, alpha]) => {
-        if (v <= 0) return;
-        const h = stackH * (v / total);
-        ctx.globalAlpha = alpha;
-        ctx.fillStyle = col;
+      (seg.bands || []).forEach(b => {
+        if (b.v <= 0) return;
+        const style = MIX_BAND_STYLE[b.n] || { color: MIX_COMPUTE_COLOR, alpha: MIX_FILL_ALPHA };
+        const h = stackH * (b.v / total);
+        ctx.globalAlpha = style.alpha;
+        ctx.fillStyle = style.color;
         ctx.fillRect(x1, y, x2 - x1, h);
         y += h;
       });
@@ -3044,11 +3149,12 @@ function mixTooltipHTML(s, t) {
   if (!seg && !p) return "";
   const lines = [];
   if (seg) {
-    const total = seg.c + seg.lc + seg.ec;
+    const total = mixSegTotal(seg);
     const pct = v => total > 0 ? " (" + (100 * v / total).toFixed(0) + "%)" : "";
-    lines.push("<span style='color:" + MIX_COMPUTE_COLOR + "'>compute: " + fmtTokens(seg.c) + pct(seg.c) + "</span>");
-    lines.push("<span style='color:" + MIX_LOCAL_COLOR + "'>local cache: " + fmtTokens(seg.lc) + pct(seg.lc) + "</span>");
-    lines.push("<span style='color:" + MIX_EXTERNAL_COLOR + "'>external KV: " + fmtTokens(seg.ec) + pct(seg.ec) + "</span>");
+    (seg.bands || []).forEach(b => {
+      const style = MIX_BAND_STYLE[b.n] || { color: MIX_COMPUTE_COLOR, label: b.n };
+      lines.push("<span style='color:" + style.color + "'>" + style.label + ": " + fmtTokens(b.v) + pct(b.v) + "</span>");
+    });
     lines.push("<span style='color:#8a9096'>ingest: " + fmtTokens(mixRate(seg)) + " tok/s (" +
       fmtTokens(total) + " tok / " + Math.round((seg.t1 - seg.t0) / 1000) + "s)</span>");
   }
@@ -3337,12 +3443,22 @@ const CACHE_MIX_DEFAULT_MAX_SERIES = 4;
 function cacheMixDefaultOn(seriesCount) { return seriesCount <= CACHE_MIX_DEFAULT_MAX_SERIES; }
 if (HAS_CACHE_MIX) {
   const lbl = document.createElement("label");
+  // Swatches cover the UNION of band names actually present across DATA
+  // (each series carries its own bandOrder — vllmBandOrder or
+  // sglangBandOrder), so a vLLM-only report shows 3, an sglang-only report
+  // shows 4, and a mixed comparison shows both engines' bands.
+  const presentBands = new Set();
+  DATA.forEach(s => (s.bandOrder || []).forEach(n => presentBands.add(n)));
+  let swatches = "";
+  MIX_LEGEND_ORDER.forEach(n => {
+    if (!presentBands.has(n)) return;
+    const style = MIX_BAND_STYLE[n];
+    swatches += '<span style="color:' + style.color + '">&#9632;</span>' + style.label + " ";
+  });
   lbl.innerHTML = '<input type="checkbox" id="showCacheMix"> ' +
     '<span class="help-label" id="hlpCacheMix" tabindex="0" aria-describedby="helpTip" ' +
-    'data-tip="Where prompt tokens came from: recompute, local cache, or external KV.">Cache Mix</span> ' +
-    '<span style="color:' + MIX_COMPUTE_COLOR + '">&#9632;</span>compute ' +
-    '<span style="color:' + MIX_LOCAL_COLOR + '">&#9632;</span>local cache ' +
-    '<span style="color:' + MIX_EXTERNAL_COLOR + '">&#9632;</span>external KV ' +
+    'data-tip="Where prompt tokens came from: recompute, local cache/device, host, or external/storage.">Cache Mix</span> ' +
+    swatches +
     '<span style="color:' + ADT_LINE_COLOR + '">&#8213;</span>active dataset (tokens)';
   document.querySelector(".controls").appendChild(lbl);
   helpTriggers.push(document.getElementById("hlpCacheMix"));
@@ -3970,11 +4086,13 @@ function pubDownsamplePts(pts, intervalMs) {
 }
 
 // pubDownsampleMix coalesces raw cache-mix segments into buckets whose
-// START is at least intervalMs apart, summing each source's token delta and
+// START is at least intervalMs apart, summing each band's token delta and
 // extending the bucket's end -- exact arithmetic (every raw token counted
 // exactly once), not an approximation. t0/t1 land on the arm's shared
 // origin (see pubArmOrigin) instead of this page's own per-arm-relative
-// axis.
+// axis. Bands are summed by position (bands[i] to bands[i]), which is safe
+// because every segment for one series carries the same fixed band set in
+// the same order (see vllmBandOrder/sglangBandOrder).
 function pubDownsampleMix(mix, origin, intervalMs) {
   if (!mix || !mix.length) return [];
   const sorted = mix.slice().sort((a, b) => a.t0 - b.t0);
@@ -3984,10 +4102,13 @@ function pubDownsampleMix(mix, origin, intervalMs) {
     const rt0 = seg.t0 - origin, rt1 = seg.t1 - origin;
     if (!cur || (intervalMs > 0 && rt0 - cur.t0 >= intervalMs)) {
       if (cur) out.push(cur);
-      cur = { t0: rt0, t1: rt1, c: seg.c, lc: seg.lc, ec: seg.ec };
+      cur = { t0: rt0, t1: rt1, bands: (seg.bands || []).map(b => ({ n: b.n, v: b.v })) };
     } else {
       cur.t1 = rt1;
-      cur.c += seg.c; cur.lc += seg.lc; cur.ec += seg.ec;
+      (seg.bands || []).forEach((b, i) => {
+        if (cur.bands[i]) cur.bands[i].v += b.v;
+        else cur.bands[i] = { n: b.n, v: b.v };
+      });
     }
   });
   if (cur) out.push(cur);
@@ -4261,14 +4382,19 @@ function buildPublicReportHtml(resolutionMs) {
     ttftP50: a.ttftP50.map(p => [p.t, p.v]),
     ttftP95: a.ttftP95.map(p => [p.t, p.v]),
     errBars: a.errBars.map(b => [b.t, b.errRate, b.errs, b.total, b.respAvg]),
-    mix: a.mix.map(m => [m.t0, m.t1, m.c, m.lc, m.ec]),
+    // Bands are encoded as values only, in a.s.bandOrder's fixed order (see
+    // seriesData.BandOrder), rather than repeating each band's name per
+    // segment -- the decoder on the public template's side zips them back
+    // together using bandOrder below.
+    bandOrder: a.s.bandOrder || [],
+    mix: a.mix.map(m => [m.t0, m.t1].concat((m.bands || []).map(b => b.v))),
     adt: a.adt.map(p => [p.t, p.v, p.s]),
     cum: a.cum.map(p => [p.t, p.cumIn, p.cumOut]),
   }));
 
   const map = {
     "@@PUB_CACHEMIX_CHECKBOX@@": hasCacheMix
-      ? '<label><input type="checkbox" id="showCacheMix"> <span class="help-label" data-tip="Where prompt tokens came from: recompute, local cache, or external KV.">Cache Mix</span></label>'
+      ? '<label><input type="checkbox" id="showCacheMix"> <span class="help-label" data-tip="Where prompt tokens came from: recompute, local cache/device, host, or external/storage.">Cache Mix</span></label>'
       : "",
     "@@PUB_SUMMARY_LABEL@@": pubEsc("full run (" + formatTickLabel(Math.round(runLengthSec)) + ")"),
     "@@PUB_HASRATIOS_CLASS@@": baselineIdx >= 0 ? ' class="has-ratios"' : "",

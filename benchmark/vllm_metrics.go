@@ -578,20 +578,31 @@ func (s *vllmMetricsSampler) fetchOne(ctx context.Context, url string) (map[stri
 // what does not move under a reader. Quote that, or quote the share with its
 // elapsed time attached.
 //
-// vizSampleSegment is one inter-sample interval with per-source token DELTAS
+// vizBand is one named token-source band's delta within a vizSampleSegment.
+// Different samplers emit different band sets (vllmBandOrder, sglangBandOrder
+// below) — n/v stay terse because this is embedded, per-segment, in a large
+// JSON blob.
+type vizBand struct {
+	Name   string  `json:"n"`
+	Tokens float64 `json:"v"`
+}
+
+// vizSampleSegment is one inter-sample interval with per-band token DELTAS
 // (cumulative counter diffs, clamped at 0 so counter resets don't render as
-// negative), embedded into the visualization data.
+// negative), embedded into the visualization data. Bands is ordered and its
+// names are one of vllmBandOrder or sglangBandOrder depending on which
+// sampler produced the underlying samples — see seriesData.BandOrder, which
+// tells the report JS which one applies without it having to guess from
+// shape or count alone.
 type vizSampleSegment struct {
 	T0 float64 `json:"t0"` // interval start, unix ms
 	T1 float64 `json:"t1"` // interval end, unix ms
 	// EndpointsOK/Total for the sample that CLOSED this interval. A segment
 	// whose deltas are zero means the fleet was idle only if the endpoints
 	// answered; with none answering it means nobody looked.
-	EndpointsOK    int     `json:"endpoints_ok"`
-	EndpointsTotal int     `json:"endpoints_total"`
-	Compute        float64 `json:"c"`
-	LocalCache     float64 `json:"lc"`
-	ExternalCache  float64 `json:"ec"`
+	EndpointsOK    int       `json:"endpoints_ok"`
+	EndpointsTotal int       `json:"endpoints_total"`
+	Bands          []vizBand `json:"bands"`
 }
 
 // vizAdtPoint is one active-dataset observation for the overlay line.
@@ -601,9 +612,16 @@ type vizAdtPoint struct {
 	Series int     `json:"s"`
 }
 
-// buildSampleViz converts raw cumulative samples into per-interval source
-// deltas (mix) and active-dataset points (adt) for the embedded report JS.
-func buildSampleViz(samples []vllmMetricsSample) (mix []vizSampleSegment, adt []vizAdtPoint) {
+// vllmBandOrder is the band order buildSampleVizVLLM emits, and the value
+// seriesData.BandOrder carries for a vLLM-sampled series.
+var vllmBandOrder = []string{"local_compute", "local_cache_hit", "external_kv_transfer"}
+
+// buildSampleVizVLLM converts raw cumulative vLLM samples into per-interval
+// band deltas (mix) and active-dataset points (adt) for the embedded report
+// JS. See buildSampleVizSGLang (sglang_metrics.go) for the sglang equivalent
+// — the two sample types carry different band sets, so each gets its own
+// builder rather than sharing one over an interface.
+func buildSampleVizVLLM(samples []vllmMetricsSample) (mix []vizSampleSegment, adt []vizAdtPoint) {
 	if len(samples) == 0 {
 		return nil, nil
 	}
@@ -635,11 +653,13 @@ func buildSampleViz(samples []vllmMetricsSample) (mix []vizSampleSegment, adt []
 		mix = append(mix, vizSampleSegment{
 			T0:             float64(prev.TS.UnixMilli()),
 			T1:             float64(smp.TS.UnixMilli()),
-			Compute:        clamp(smp.Sources.Compute, prev.Sources.Compute),
-			LocalCache:     clamp(smp.Sources.LocalCache, prev.Sources.LocalCache),
-			ExternalCache:  clamp(smp.Sources.ExternalCache, prev.Sources.ExternalCache),
 			EndpointsOK:    smp.EndpointsOK,
 			EndpointsTotal: smp.EndpointsTotal,
+			Bands: []vizBand{
+				{Name: "local_compute", Tokens: clamp(smp.Sources.Compute, prev.Sources.Compute)},
+				{Name: "local_cache_hit", Tokens: clamp(smp.Sources.LocalCache, prev.Sources.LocalCache)},
+				{Name: "external_kv_transfer", Tokens: clamp(smp.Sources.ExternalCache, prev.Sources.ExternalCache)},
+			},
 		})
 	}
 	return mix, adt
