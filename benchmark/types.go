@@ -29,8 +29,18 @@ type RequestMetrics struct {
 	TimeToFirstToken  time.Duration
 	TotalResponseTime time.Duration // Total time for request
 	UsageData         tools.ExecutionUsageData
-	Error             error
-	Response          string // The actual response content
+	// UsageObserved is true when the response actually carried a usage
+	// object (set by consumeOpenAISSE/consumeOpenAIPlain when present).
+	// wekai tolerates a response that omits usage entirely — UsageData then
+	// stays all-zero rather than erroring — which is exactly what silently
+	// renders a flat/zero "Totals (ingest)" chart for an SGLang run missing
+	// stream_options.include_usage support or a required server flag. This
+	// field lets the run summary tell "no ingest happened" apart from
+	// "ingest was never reported" (see the openai_sglang no-usage warning in
+	// auto.go).
+	UsageObserved bool
+	Error         error
+	Response      string // The actual response content
 	// ContentOnly is the assistant's content stream WITHOUT the reasoning
 	// trace. Response merges reasoning in, so a UUID recalled inside a
 	// reasoning trace still counts as PRESENT; that merge is wrong for any

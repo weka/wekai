@@ -144,6 +144,41 @@ func TestCacheWarningMessage(t *testing.T) {
 	}
 }
 
+// TestIsOpenAISGLangSpec locks down the exact gate the no-usage-ever warning
+// (noUsageWarningMessage) uses: it must fire only for type=openai_sglang,
+// never for vLLM, plain openai, or a non-dynamic model spec.
+func TestIsOpenAISGLangSpec(t *testing.T) {
+	cases := []struct {
+		spec string
+		want bool
+	}{
+		{"dynamic/http://h:1/v1,type=openai_sglang,model=m", true},
+		{"dynamic/http://h:1/v1,type=openai_vllm,model=m", false},
+		{"dynamic/http://h:1/v1,type=openai,model=m", false},
+		{"dynamic/http://h:1/v1,model=m", false}, // default type
+		{"gpt-4", false},
+	}
+	for _, c := range cases {
+		t.Run(c.spec, func(t *testing.T) {
+			if got := isOpenAISGLangSpec(c.spec); got != c.want {
+				t.Errorf("isOpenAISGLangSpec(%q) = %v, want %v", c.spec, got, c.want)
+			}
+		})
+	}
+}
+
+// TestNoUsageWarningMessage is a light smoke test — the exact wording isn't
+// load-bearing, but it must name the actual symptom (the ingest chart) and
+// the actual mitigating flag, mirroring TestCacheWarningMessage's rationale.
+func TestNoUsageWarningMessage(t *testing.T) {
+	got := noUsageWarningMessage()
+	for _, want := range []string{"usage", "ingest", "--enable-cache-report"} {
+		if !strings.Contains(strings.ToLower(got), strings.ToLower(want)) {
+			t.Errorf("noUsageWarningMessage() = %q, want it to mention %q", got, want)
+		}
+	}
+}
+
 // TestWarmTokensIncludeServerCache reproduces the multi-backend anomaly where an
 // aggressively-caching backend reported near-zero "warm" tokens despite serving
 // more requests. Providers subtract server-cached tokens out of prompt_tokens, so

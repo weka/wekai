@@ -48,7 +48,7 @@ type replayPoster struct {
 	epMu       sync.Mutex
 	epResolved string // latched endpoint; "" until the first success
 	epFellBack bool
-	apiType string // "anthropic", "openai", "openai_vllm", or "openai_sglang"
+	apiType    string // "anthropic", "openai", "openai_vllm", or "openai_sglang"
 	// reasoningEffort and thinking come straight from the model spec's
 	// reasoning_effort=/thinking= parameters (llm.DynamicModelConfig, parsed
 	// once in newReplayPoster). Only wired into the OpenAI/vLLM chat-
@@ -1121,6 +1121,7 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 
 		// Capture usage from the final chunk.
 		if chunk.Usage != nil {
+			m.UsageObserved = true
 			cached := 0
 			if chunk.Usage.PromptTokensDetails != nil {
 				cached = chunk.Usage.PromptTokensDetails.CachedTokens
@@ -1183,14 +1184,18 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 				Reasoning        string `json:"reasoning"` // vLLM uses "reasoning"
 			} `json:"message"`
 		} `json:"choices"`
-		Usage struct {
+		// Usage is a pointer (unlike a naive plain-struct field) so a response
+		// that omits it entirely — some sglang configurations — is
+		// distinguishable from one that reports it as all-zero; see
+		// RequestMetrics.UsageObserved.
+		Usage *struct {
 			PromptTokens        int `json:"prompt_tokens"`
 			CompletionTokens    int `json:"completion_tokens"`
 			TotalTokens         int `json:"total_tokens"`
 			PromptTokensDetails *struct {
 				CachedTokens int `json:"cached_tokens"`
 			} `json:"prompt_tokens_details,omitempty"`
-		} `json:"usage"`
+		} `json:"usage,omitempty"`
 	}
 	if err := json.Unmarshal(b, &resp); err != nil {
 		m.Error = err
@@ -1206,11 +1211,19 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 		m.ContentOnly = msg.Content
 		m.ReasoningOnly = reasoning
 	}
-	cached := 0
-	if resp.Usage.PromptTokensDetails != nil {
-		cached = resp.Usage.PromptTokensDetails.CachedTokens
+	if resp.Usage != nil {
+		m.UsageObserved = true
+		cached := 0
+		if resp.Usage.PromptTokensDetails != nil {
+			cached = resp.Usage.PromptTokensDetails.CachedTokens
+		}
+		m.UsageData = buildReplayUsage(resp.Usage.PromptTokens, cached, resp.Usage.CompletionTokens)
+	} else {
+		// Unchanged prior behavior: absent usage renders as all-zero, not an
+		// error — only UsageObserved distinguishes this from a genuinely
+		// zero-token response.
+		m.UsageData = buildReplayUsage(0, 0, 0)
 	}
-	m.UsageData = buildReplayUsage(resp.Usage.PromptTokens, cached, resp.Usage.CompletionTokens)
 }
 
 // consumePlain reads a non-streaming Anthropic response. Like consumeSSE,

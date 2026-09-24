@@ -887,6 +887,141 @@ func TestConsumeOpenAIPlainMergesReasoningVLLMField(t *testing.T) {
 	}
 }
 
+// TestRecordReplayRequestTracksUsageObserved exercises the actual wiring the
+// openai_sglang no-usage warning depends on end-to-end: recordReplayRequest
+// (shared by both replay.go and router-replay's dispatch loop) must latch
+// autoState.sawResponseEver on any completed, non-skipped request, and
+// sawUsageEver only when that request's RequestMetrics.UsageObserved was
+// true — mirroring consumeOpenAISSE/consumeOpenAIPlain's signal.
+func TestRecordReplayRequestTracksUsageObserved(t *testing.T) {
+	cfg := AutoBenchmarkConfig{Model: "dynamic/http://h:1/v1,type=openai_sglang,model=m"}
+
+	t.Run("usage never observed across any completed request", func(t *testing.T) {
+		st := newTestAutoState(4)
+		var cold time.Duration
+		recordReplayRequest(cfg, st, nil, RequestMetrics{UsageObserved: false}, true, &cold)
+		recordReplayRequest(cfg, st, nil, RequestMetrics{UsageObserved: false}, false, &cold)
+		if !st.sawResponseEver.Load() {
+			t.Error("sawResponseEver = false, want true: two requests completed without error")
+		}
+		if st.sawUsageEver.Load() {
+			t.Error("sawUsageEver = true, want false: no request ever set UsageObserved")
+		}
+	})
+
+	t.Run("usage observed on at least one request", func(t *testing.T) {
+		st := newTestAutoState(4)
+		var cold time.Duration
+		recordReplayRequest(cfg, st, nil, RequestMetrics{UsageObserved: false}, true, &cold)
+		recordReplayRequest(cfg, st, nil, RequestMetrics{UsageObserved: true}, false, &cold)
+		if !st.sawUsageEver.Load() {
+			t.Error("sawUsageEver = false, want true: one request set UsageObserved")
+		}
+	})
+
+	t.Run("an error response does not count either way", func(t *testing.T) {
+		st := newTestAutoState(4)
+		var cold time.Duration
+		recordReplayRequest(cfg, st, nil, RequestMetrics{Error: fmt.Errorf("boom")}, true, &cold)
+		if st.sawResponseEver.Load() {
+			t.Error("sawResponseEver = true, want false: the only request errored")
+		}
+	})
+
+	t.Run("a skipped request does not count either way", func(t *testing.T) {
+		st := newTestAutoState(4)
+		var cold time.Duration
+		recordReplayRequest(cfg, st, nil, RequestMetrics{Skipped: true}, true, &cold)
+		if st.sawResponseEver.Load() {
+			t.Error("sawResponseEver = true, want false: the only request was skipped (--limit-context)")
+		}
+	})
+}
+
+// TestConsumeOpenAIPlainUsageObserved locks down the presence signal that
+// the openai_sglang "no usage ever observed" warning depends on: a response
+// carrying a usage object (even an all-zero one) must set UsageObserved,
+// and one omitting it entirely must not — while UsageData itself stays
+// all-zero in both cases (unchanged prior behavior).
+func TestConsumeOpenAIPlainUsageObserved(t *testing.T) {
+	t.Run("usage present", func(t *testing.T) {
+		body := strings.NewReader(`{
+			"choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+			"usage": {"prompt_tokens": 10, "completion_tokens": 5}
+		}`)
+		var m RequestMetrics
+		consumeOpenAIPlain(body, time.Now(), &m)
+		if !m.UsageObserved {
+			t.Error("UsageObserved = false, want true: the response carried a usage object")
+		}
+		if m.UsageData.InputTokens.Count != 10 || m.UsageData.OutputTokens.Count != 5 {
+			t.Errorf("UsageData = %+v, want input=10 output=5", m.UsageData)
+		}
+	})
+	t.Run("usage absent entirely", func(t *testing.T) {
+		body := strings.NewReader(`{
+			"choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}]
+		}`)
+		var m RequestMetrics
+		consumeOpenAIPlain(body, time.Now(), &m)
+		if m.UsageObserved {
+			t.Error("UsageObserved = true, want false: no usage field was present")
+		}
+		if m.UsageData.InputTokens.Count != 0 || m.UsageData.OutputTokens.Count != 0 || m.UsageData.CachedTokens.Count != 0 {
+			t.Errorf("UsageData = %+v, want all-zero (unchanged prior behavior)", m.UsageData)
+		}
+	})
+	t.Run("usage present but all-zero", func(t *testing.T) {
+		// Distinguishes "reported as zero" from "never reported" — a
+		// genuinely empty exchange must still set UsageObserved.
+		body := strings.NewReader(`{
+			"choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+			"usage": {"prompt_tokens": 0, "completion_tokens": 0}
+		}`)
+		var m RequestMetrics
+		consumeOpenAIPlain(body, time.Now(), &m)
+		if !m.UsageObserved {
+			t.Error("UsageObserved = false, want true: usage was present, just zero-valued")
+		}
+	})
+}
+
+// TestConsumeOpenAISSEUsageObserved is the streaming counterpart: usage
+// arrives (or doesn't) on the final SSE chunk.
+func TestConsumeOpenAISSEUsageObserved(t *testing.T) {
+	t.Run("final chunk carries usage", func(t *testing.T) {
+		sse := strings.Join([]string{
+			`data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}`,
+			`data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`,
+			`data: [DONE]`,
+			"",
+		}, "\n")
+		var m RequestMetrics
+		consumeOpenAISSE(strings.NewReader(sse), time.Now(), &m)
+		if !m.UsageObserved {
+			t.Error("UsageObserved = false, want true: the final chunk carried usage")
+		}
+	})
+	t.Run("usage never appears on any chunk", func(t *testing.T) {
+		// The documented sglang gap: stream_options.include_usage was sent
+		// but the server never answers with a usage-bearing chunk.
+		sse := strings.Join([]string{
+			`data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}`,
+			`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`data: [DONE]`,
+			"",
+		}, "\n")
+		var m RequestMetrics
+		consumeOpenAISSE(strings.NewReader(sse), time.Now(), &m)
+		if m.UsageObserved {
+			t.Error("UsageObserved = true, want false: no chunk ever carried usage")
+		}
+		if m.UsageData.InputTokens.Count != 0 || m.UsageData.OutputTokens.Count != 0 || m.UsageData.CachedTokens.Count != 0 {
+			t.Errorf("UsageData = %+v, want all-zero", m.UsageData)
+		}
+	})
+}
+
 // TestConsumePlainMergesThinking covers the M2 fix: a non-streaming
 // Anthropic response's "thinking" content block must be merged into
 // m.Response alongside "text" blocks, matching consumeSSE's streaming
