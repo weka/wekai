@@ -662,6 +662,30 @@ func cacheWarningMessage(modelSpec string) string {
 	}
 }
 
+// isOpenAISGLangSpec reports whether modelSpec names type=openai_sglang —
+// the same dynamic-model-spec parse cacheWarningMessage does, factored out
+// because the no-usage warning below needs the plain bool rather than a
+// tailored message.
+func isOpenAISGLangSpec(modelSpec string) bool {
+	if !llm.IsDynamicModel(modelSpec) {
+		return false
+	}
+	dyn, err := llm.ParseDynamicModel(modelSpec)
+	return err == nil && dyn.Type == "openai_sglang"
+}
+
+// noUsageWarningMessage fires when an openai_sglang run completed at least
+// one response but NONE of them ever carried a usage object — see
+// RequestMetrics.UsageObserved and autoState.sawResponseEver/sawUsageEver.
+// wekai tolerates this (UsageData stays all-zero rather than erroring —
+// see consumeOpenAISSE/consumeOpenAIPlain), which otherwise silently renders
+// a flat/zero "Totals (ingest)" chart in the report with no indication why.
+func noUsageWarningMessage() string {
+	return "No response ever reported token usage — the report's \"Totals (ingest)\" chart will be " +
+		"flat/zero. Confirm the server actually emits usage on every response (SGLang: independent of " +
+		"--enable-cache-report, which only gates the cached_tokens breakdown, not usage itself)."
+}
+
 // GlobalLocalCacheRate returns the all-time fraction of warm input tokens among all input tokens.
 // O(1): reads two running counters maintained in Add(), never scans history.
 // Purely local: a request is "cached" when its series already submitted this prefix before.
@@ -1092,6 +1116,15 @@ type autoState struct {
 	seriesDone   bool
 	cacheWarning bool // server doesn't appear to support caching
 
+	// sawResponseEver/sawUsageEver track whether ANY completed (non-error,
+	// non-skipped) response ever carried a usage object, over the whole run —
+	// see recordReplayRequest and the openai_sglang "no usage ever observed"
+	// warning in printAutoSummary. Atomics: recordReplayRequest runs on every
+	// series' own goroutine, and this is a monotonic latch, not a counter
+	// needing st.mu's broader critical section.
+	sawResponseEver atomic.Bool
+	sawUsageEver    atomic.Bool
+
 	// Real-time replay governor. ttft is what the admission gate reads; skipClk
 	// is the shared clock the pacers wait against; lag records how far behind
 	// their captured schedule requests are actually going out.
@@ -1291,6 +1324,11 @@ type autoBenchmarkResult struct {
 	allTimePeakSeries int
 	cacheHitRate      float64
 	cacheWarning      bool
+	// noUsageObserved is true when the run completed at least one
+	// non-error, non-skipped request but NONE of them ever carried a usage
+	// object — see autoState.sawResponseEver/sawUsageEver and the
+	// openai_sglang warning in printAutoSummary.
+	noUsageObserved   bool
 	totalCompleted    int64
 	totalErrors       int64
 	totalRetries429   int64
@@ -1482,6 +1520,9 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 	fmt.Printf(" Tok/s in/out       : %s / %s\n", formatKilo(res.inputTokPerSec), formatKilo(res.outputTokPerSec))
 	if res.cacheWarning {
 		fmt.Printf(" ⚠  %s\n", cacheWarningMessage(cfg.Model))
+	}
+	if res.noUsageObserved && isOpenAISGLangSpec(cfg.Model) {
+		fmt.Printf(" ⚠  %s\n", noUsageWarningMessage())
 	}
 	fmt.Println(strings.Repeat("-", 62))
 	totalInput := res.totalInputCold + res.totalInputWarm
@@ -3106,6 +3147,7 @@ func runSingleModelBenchmark(
 	st.mu.Unlock()
 
 	res.elapsed = time.Since(startTime)
+	res.noUsageObserved = st.sawResponseEver.Load() && !st.sawUsageEver.Load()
 	res.totalCompleted = st.totalCompleted.Load()
 	if st.routerReplay != nil {
 		if sessions, requests := st.routerReplay.Truncated(); sessions > 0 {
