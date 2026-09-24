@@ -153,6 +153,132 @@ func TestGenerateVisualizationWithCacheMixSamples(t *testing.T) {
 	}
 }
 
+// sglangBenchFixtureData mirrors benchFixtureData for an openai_sglang arm:
+// same record shape, but samples are sglangMetricsSample with the 4-way
+// compute/device/host/storage breakdown instead of vLLM's 3-way sources.
+func sglangBenchFixtureData(alias string, base time.Time) ([]requestDataRecord, []sglangMetricsSample) {
+	model := "dynamic/http://localhost:8000/v1,type=openai_sglang,alias=" + alias
+	var records []requestDataRecord
+	for i := 0; i < 5; i++ {
+		st := base.Add(time.Duration(i) * 20 * time.Second)
+		records = append(records, requestDataRecord{
+			StartTime:    st,
+			EndTime:      st.Add(2 * time.Second),
+			TTFT:         150,
+			ResponseMs:   2000,
+			Model:        model,
+			SeriesNum:    1,
+			RequestNum:   i + 1,
+			InputTokens:  100,
+			CachedTokens: 400,
+			OutputTokens: 50,
+		})
+	}
+	var samples []sglangMetricsSample
+	for i := 0; i < 3; i++ {
+		samples = append(samples, sglangMetricsSample{
+			RecordType: recordTypeSGLangMetricsSample,
+			TS:         base.Add(time.Duration(i) * 60 * time.Second),
+			Model:      model,
+			Sources: sglangSourceCounters{
+				Compute: int64(1000 * (i + 1)),
+				Device:  int64(300 * i),
+				Host:    int64(150 * i),
+				Storage: int64(100 * i),
+			},
+			ActiveDatasetTokens: int64(4000 * (i + 1)),
+			ActiveSeries:        i + 1,
+		})
+	}
+	return records, samples
+}
+
+// TestGenerateVisualizationWithSGLangCacheMixSamples confirms an
+// openai_sglang-typed series with sglang_metrics_sample data produces a
+// seriesData carrying non-nil mix/adt AND the sglang band order (compute/
+// device/host/storage) rather than vLLM's — the report JS needs bandOrder to
+// pick the right legend/colors without guessing from Mix's shape.
+func TestGenerateVisualizationWithSGLangCacheMixSamples(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	rec, smp := sglangBenchFixtureData("sglangA", base)
+	writeSGLangMixedJSONL(t, dir, "a", rec, smp)
+
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	for _, want := range []string{
+		`"mix":`, `"adt":`,
+		`"bandOrder":["compute","device","host","storage"]`,
+		"MIX_HOST_COLOR", "MIX_BAND_STYLE", // generalized band styling present
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("generated HTML missing %q", want)
+		}
+	}
+}
+
+// TestGenerateVisualizationMixedVLLMAndSGLang confirms a report comparing one
+// vLLM arm and one sglang arm carries EACH series' own band order rather than
+// collapsing to one, and both band sets appear once each (not merged or
+// dropped).
+func TestGenerateVisualizationMixedVLLMAndSGLang(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	vRec, vSmp := benchFixtureData("vllmArm", base)
+	sRec, sSmp := sglangBenchFixtureData("sglangArm", base)
+	writeMixedJSONL(t, dir, "a_vllm", vRec, vSmp)
+	writeSGLangMixedJSONL(t, dir, "b_sglang", sRec, sSmp)
+
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	if !strings.Contains(html, `"bandOrder":["local_compute","local_cache_hit","external_kv_transfer"]`) {
+		t.Errorf("missing vLLM arm's band order")
+	}
+	if !strings.Contains(html, `"bandOrder":["compute","device","host","storage"]`) {
+		t.Errorf("missing sglang arm's band order")
+	}
+}
+
+// writeSGLangMixedJSONL mirrors writeMixedJSONL for sglangMetricsSample rows.
+func writeSGLangMixedJSONL(t *testing.T, dir, name string, records []requestDataRecord, samples []sglangMetricsSample) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name+".jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	for _, r := range records {
+		if err := enc.Encode(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, s := range samples {
+		if err := enc.Encode(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return path
+}
+
 func TestGenerateVisualizationWithoutSamplesUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
@@ -210,9 +336,15 @@ func TestCacheMixLookupHelpersJS(t *testing.T) {
 
 	script := helpers + `
 function assert(cond, msg) { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } }
+// bandVal is a TEST-ONLY helper (not part of the shipped script) for reading
+// one named band's value out of a {t0,t1,bands:[{n,v}...]} segment.
+function bandVal(seg, n) {
+  const b = (seg.bands || []).find(x => x.n === n);
+  return b ? b.v : undefined;
+}
 const mix = [
-  {t0: 0,     t1: 60000,  c: 10, lc: 20, ec: 30},
-  {t0: 60000, t1: 120000, c: 1,  lc: 2,  ec: 3},
+  {t0: 0,     t1: 60000,  bands: [{n:"local_compute",v:10}, {n:"local_cache_hit",v:20}, {n:"external_kv_transfer",v:30}]},
+  {t0: 60000, t1: 120000, bands: [{n:"local_compute",v:1},  {n:"local_cache_hit",v:2},  {n:"external_kv_transfer",v:3}]},
 ];
 const adt = [
   {t: 0,      v: 100, s: 1},
@@ -222,12 +354,12 @@ const adt = [
 assert(mixAt(mix, -1) === null, "before first interval => null");
 assert(mixAt([], 5) === null, "empty mix => null");
 assert(mixAt(null, 5) === null, "missing mix => null");
-assert(mixAt(mix, 0).c === 10, "start boundary covered");
-assert(mixAt(mix, 59999).c === 10, "interior covered");
-assert(mixAt(mix, 60000).c === 10, "shared boundary belongs to earlier interval");
-assert(mixAt(mix, 90000).c === 1, "second interval covered");
-assert(mixAt(mix, 120000).c === 1, "end boundary covered");
-assert(mixAt(mix, 999999).c === 1, "after last => latest at-or-before");
+assert(bandVal(mixAt(mix, 0), "local_compute") === 10, "start boundary covered");
+assert(bandVal(mixAt(mix, 59999), "local_compute") === 10, "interior covered");
+assert(bandVal(mixAt(mix, 60000), "local_compute") === 10, "shared boundary belongs to earlier interval");
+assert(bandVal(mixAt(mix, 90000), "local_compute") === 1, "second interval covered");
+assert(bandVal(mixAt(mix, 120000), "local_compute") === 1, "end boundary covered");
+assert(bandVal(mixAt(mix, 999999), "local_compute") === 1, "after last => latest at-or-before");
 assert(adtAt(adt, -5) === null, "before first sample => null");
 assert(adtAt(null, 5) === null, "missing adt => null");
 assert(adtAt(adt, 0).v === 100, "exact first sample");
@@ -305,8 +437,8 @@ assert(adtWindowRange([]) === null && adtWindowRange([[]]) === null, "no points 
 // Absolute band scaling: the max is shared ACROSS series in a report (a
 // 50k-peak series next to a 1M-peak series must NOT be per-series
 // normalized).
-const strong = { mix: [ {t0:0, t1:60000, c:900000, lc:80000, ec:20000} ] };  // total 1M
-const weak   = { mix: [ {t0:0, t1:60000, c:10000,  lc:30000, ec:10000} ] };  // total 50k
+const strong = { mix: [ {t0:0, t1:60000, bands:[{n:"local_compute",v:900000},{n:"local_cache_hit",v:80000},{n:"external_kv_transfer",v:20000}]} ] };  // total 1M
+const weak   = { mix: [ {t0:0, t1:60000, bands:[{n:"local_compute",v:10000}, {n:"local_cache_hit",v:30000},{n:"external_kv_transfer",v:10000}]} ] };  // total 50k
 const gm = mixTotalMax([strong, weak]);
 assert(gm === 1000000, "cross-series shared max = 1M, got " + gm);
 assert(mixTotalMax([weak]) === 50000, "single-series max");
@@ -315,14 +447,14 @@ assert(mixTotalMax([]) === 0 && mixTotalMax(null) === 0, "empty/missing series =
 const h = mixStackHeight(weak.mix[0], gm, 64);
 assert(Math.abs(h - 3.2) < 1e-9, "50k vs 1M => 5% of 64px = 3.2, got " + h);
 assert(mixStackHeight(strong.mix[0], gm, 64) === 64, "max interval fills the band");
-assert(mixStackHeight({t0:0,t1:60000,c:0,lc:0,ec:0}, gm, 64) === 0, "zero total => empty");
+assert(mixStackHeight({t0:0,t1:60000,bands:[{n:"local_compute",v:0},{n:"local_cache_hit",v:0},{n:"external_kv_transfer",v:0}]}, gm, 64) === 0, "zero total => empty");
 assert(mixStackHeight(weak.mix[0], 0, 64) === 0, "zero global max => empty");
 
 // Ingest rate uses the ACTUAL interval, not a hardcoded 60s.
 assert(mixRate(weak.mix[0]) === 50000 / 60, "60s interval rate");
-const wide = {t0:0, t1:120000, c:60000, lc:0, ec:0}; // missed tick: 120s interval
+const wide = {t0:0, t1:120000, bands:[{n:"local_compute",v:60000},{n:"local_cache_hit",v:0},{n:"external_kv_transfer",v:0}]}; // missed tick: 120s interval
 assert(mixRate(wide) === 500, "120s interval => total/120, got " + mixRate(wide));
-assert(mixRate({t0:5, t1:5, c:9, lc:0, ec:0}) === 0, "zero-width interval => 0");
+assert(mixRate({t0:5, t1:5, bands:[{n:"local_compute",v:9}]}) === 0, "zero-width interval => 0");
 
 // Totals volume layer math — INGEST TOKENS (input+cached), not requests.
 const ta = [0, 10, 20, 30];          // series A completion times

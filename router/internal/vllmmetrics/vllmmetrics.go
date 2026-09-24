@@ -98,8 +98,9 @@ const (
 // "sglang:cache_hit_rate": it is a GAUGE already expressed as a ratio, not a
 // monotonic counter, and running it through delta-on-restart accumulation
 // would silently produce a meaningless number. A gauge must be sampled as a
-// current value (see benchmark/sglang_metrics.go for that shape), never
-// summed here.
+// current value, never summed here. (benchmark/sglang_metrics.go samples
+// SGLang's actual counter families — cached_tokens_total/prompt_tokens_total
+// — through this same delta scheme, just not via this router aggregator.)
 var DefaultNames = []string{"vllm:prompt_tokens_by_source_total"}
 
 // Config configures the aggregator.

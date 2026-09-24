@@ -133,6 +133,20 @@ func TestActiveDatasetTracker(t *testing.T) {
 	}
 }
 
+// bandTokens looks up one named band's delta within a segment, failing the
+// test if the band is absent — every segment buildSampleVizVLLM/
+// buildSampleVizSGLang emit is expected to carry its full fixed band set.
+func bandTokens(t *testing.T, seg vizSampleSegment, name string) float64 {
+	t.Helper()
+	for _, b := range seg.Bands {
+		if b.Name == name {
+			return b.Tokens
+		}
+	}
+	t.Fatalf("segment %+v has no band %q", seg, name)
+	return 0
+}
+
 func TestBuildSampleVizDeltasAndClamp(t *testing.T) {
 	t0 := time.Unix(1000, 0)
 	mk := func(offsetSec int, c, lc, ec, adt int64, as int) vllmMetricsSample {
@@ -151,20 +165,20 @@ func TestBuildSampleVizDeltasAndClamp(t *testing.T) {
 		mk(120, 100, 50, 5, 3000, 3), // reset: deltas must clamp to 0
 		mk(180, 200, 80, 6, 2500, 2),
 	}
-	mix, adt := buildSampleViz(samples)
+	mix, adt := buildSampleVizVLLM(samples)
 	if len(mix) != 3 {
 		t.Fatalf("got %d segments, want 3", len(mix))
 	}
 	// Segment 1: 0s -> 60s.
-	if mix[0].Compute != 500 || mix[0].LocalCache != 100 || mix[0].ExternalCache != 2 {
+	if bandTokens(t, mix[0], "local_compute") != 500 || bandTokens(t, mix[0], "local_cache_hit") != 100 || bandTokens(t, mix[0], "external_kv_transfer") != 2 {
 		t.Errorf("seg0 deltas = %+v, want c=500 lc=100 ec=2", mix[0])
 	}
 	// Segment 2 spans the counter reset: all deltas clamp at 0.
-	if mix[1].Compute != 0 || mix[1].LocalCache != 0 || mix[1].ExternalCache != 0 {
+	if bandTokens(t, mix[1], "local_compute") != 0 || bandTokens(t, mix[1], "local_cache_hit") != 0 || bandTokens(t, mix[1], "external_kv_transfer") != 0 {
 		t.Errorf("seg1 (reset) deltas = %+v, want all 0", mix[1])
 	}
 	// Segment 3 resumes from the post-reset baseline.
-	if mix[2].Compute != 100 || mix[2].LocalCache != 30 || mix[2].ExternalCache != 1 {
+	if bandTokens(t, mix[2], "local_compute") != 100 || bandTokens(t, mix[2], "local_cache_hit") != 30 || bandTokens(t, mix[2], "external_kv_transfer") != 1 {
 		t.Errorf("seg2 deltas = %+v, want c=100 lc=30 ec=1", mix[2])
 	}
 	if mix[0].T0 != float64(t0.UnixMilli()) || mix[0].T1 != float64(t0.Add(60*time.Second).UnixMilli()) {
@@ -176,7 +190,7 @@ func TestBuildSampleVizDeltasAndClamp(t *testing.T) {
 }
 
 func TestBuildSampleVizEmpty(t *testing.T) {
-	mix, adt := buildSampleViz(nil)
+	mix, adt := buildSampleVizVLLM(nil)
 	if mix != nil || adt != nil {
 		t.Fatalf("expected nil/nil, got %v %v", mix, adt)
 	}
