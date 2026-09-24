@@ -524,3 +524,84 @@ func TestMinOutputTokensReachesWire(t *testing.T) {
 		t.Errorf("openai max_tokens = %v, want the %v floor", got, want)
 	}
 }
+
+// The run stamp must ALSO ride inside the tool list: chat templates such as
+// DeepSeek-V4's render tool schemas before the first system message, which
+// otherwise leaves the whole (run-independent) tool section as a KV prefix
+// shared across runs. Both wire formats put the marker at index 0 and drop
+// it when there is no run id.
+func TestRunGUIDStampToolPrependedWhenToolsPresent(t *testing.T) {
+	docs := strings.Repeat("abcdefghijklmnopqrstuvwxyz0123456789", 20)
+	req := RouterReplayRequest{
+		SystemBlocks: []RouterReplaySystemBlock{{Hash: "hash-1", Bytes: 250}},
+		Tools:        &RouterReplayToolsSpec{Hash: "tools-1", Count: 3, Bytes: 900},
+	}
+	wantDesc := "<ignore>RUN_GUID: test-run-id</ignore> Marker only. Never call this tool."
+
+	// Anthropic shape.
+	body, _, err := buildAnthropicMessagesBody(req, docs, "m", "test-run-id", 0, 0, false, 0, nil)
+	if err != nil {
+		t.Fatalf("anthropic with runID: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	tools := parsed["tools"].([]interface{})
+	if len(tools) != 4 {
+		t.Fatalf("anthropic: expected marker + 3 tools, got %d", len(tools))
+	}
+	t0 := tools[0].(map[string]interface{})
+	if t0["name"] != runStampToolName || t0["description"] != wantDesc {
+		t.Errorf("anthropic marker = %v", t0)
+	}
+	if _, ok := t0["input_schema"]; !ok {
+		t.Error("anthropic marker lacks input_schema")
+	}
+
+	// OpenAI shape.
+	body, _, err = buildOpenAIChatCompletionsBody(req, docs, "m", "test-run-id", 0, 0, false, 0, nil, "", "")
+	if err != nil {
+		t.Fatalf("openai with runID: %v", err)
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	tools = parsed["tools"].([]interface{})
+	if len(tools) != 4 {
+		t.Fatalf("openai: expected marker + 3 tools, got %d", len(tools))
+	}
+	fn := tools[0].(map[string]interface{})["function"].(map[string]interface{})
+	if fn["name"] != runStampToolName || fn["description"] != wantDesc {
+		t.Errorf("openai marker = %v", fn)
+	}
+	if _, ok := fn["parameters"]; !ok {
+		t.Error("openai marker lacks parameters")
+	}
+
+	// No run id: no marker, tool list untouched, in both shapes.
+	for name, build := range map[string]func() ([]byte, error){
+		"anthropic": func() ([]byte, error) {
+			b, _, e := buildAnthropicMessagesBody(req, docs, "m", "", 0, 0, false, 0, nil)
+			return b, e
+		},
+		"openai": func() ([]byte, error) {
+			b, _, e := buildOpenAIChatCompletionsBody(req, docs, "m", "", 0, 0, false, 0, nil, "", "")
+			return b, e
+		},
+	} {
+		body, err := build()
+		if err != nil {
+			t.Fatalf("%s empty runID: %v", name, err)
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			t.Fatal(err)
+		}
+		if n := len(parsed["tools"].([]interface{})); n != 3 {
+			t.Errorf("%s empty runID: expected 3 tools, got %d", name, n)
+		}
+		if strings.Contains(string(body), runStampToolName) {
+			t.Errorf("%s empty runID: marker tool must be absent", name)
+		}
+	}
+}
