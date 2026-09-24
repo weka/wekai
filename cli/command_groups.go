@@ -19,12 +19,13 @@ func (b *BenchmarkCommands) Init() {
 
 // RouterCommands groups the `router` subcommand tree.
 type RouterCommands struct {
-	Serve         RouterServeCommand         `command:"serve" description:"Run the model-aware HTTP reverse proxy"`
-	Redact        RouterRedactCommand        `command:"redact" description:"Convert raw router capture JSONL into redacted JSONL"`
-	Analyze       RouterAnalyzeCommand       `command:"analyze" description:"Analyze router capture files and emit per-model analytics"`
-	Tree          RouterTreeCommand          `command:"tree" description:"Reconstruct the agent tree (sessions, instances, parent->child edges, parallelism) from redacted captures"`
-	ReplayPrepare RouterReplayPrepareCommand `command:"replay-prepare" description:"Convert a directory of redacted captures into one replay-friendly JSON file"`
-	AnalyzeReplay RouterAnalyzeReplayCommand `command:"analyze-replay" description:"Simulate a replay or source capture offline and report expected cache hit ratio"`
+	Serve                  RouterServeCommand                  `command:"serve" description:"Run the model-aware HTTP reverse proxy"`
+	Redact                 RouterRedactCommand                 `command:"redact" description:"Convert raw router capture JSONL into redacted JSONL"`
+	Analyze                RouterAnalyzeCommand                `command:"analyze" description:"Analyze router capture files and emit per-model analytics"`
+	Tree                   RouterTreeCommand                   `command:"tree" description:"Reconstruct the agent tree (sessions, instances, parent->child edges, parallelism) from redacted captures"`
+	ReplayPrepare          RouterReplayPrepareCommand          `command:"replay-prepare" description:"Convert a directory of redacted captures into one replay-friendly JSON file"`
+	AnalyzeReplay          RouterAnalyzeReplayCommand          `command:"analyze-replay" description:"Simulate a replay or source capture offline and report expected cache hit ratio"`
+	ConvertAIPerfWekaTrace RouterConvertAIPerfWekaTraceCommand `command:"convert-aiperf-weka-trace" description:"Convert a replay-v3 file into one JSON file per session in AIPerf's weka_trace format"`
 }
 
 func (r *RouterCommands) Init() {}
