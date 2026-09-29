@@ -271,7 +271,7 @@ func TestNoEndpointsAnsweringIsRecordedAsUnobserved(t *testing.T) {
 // see them.
 func TestCoverageReachesTheReport(t *testing.T) {
 	base := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
-	mix, _ := buildSampleViz([]vllmMetricsSample{
+	mix, _ := buildSampleVizVLLM([]vllmMetricsSample{
 		{TS: base, Sources: vllmSourceCounters{Compute: 0}, EndpointsOK: 8, EndpointsTotal: 8},
 		{TS: base.Add(time.Minute), Sources: vllmSourceCounters{Compute: 100}, EndpointsOK: 3, EndpointsTotal: 8},
 	})

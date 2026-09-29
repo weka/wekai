@@ -85,7 +85,7 @@ func TestReadJSONLCompatibility(t *testing.T) {
 	t.Run("legacy file without params", func(t *testing.T) {
 		dir := t.TempDir()
 		path := writeMixedJSONL(t, dir, "legacy", rec, smp)
-		records, samples, params, hasParams, err := readJSONLFileWithParams(path)
+		records, samples, _, params, hasParams, err := readJSONLFileWithParams(path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -125,7 +125,7 @@ func TestReadJSONLCompatibility(t *testing.T) {
 		}
 		f.Close()
 
-		records, samples, params, hasParams, err := readJSONLFileWithParams(path)
+		records, samples, _, params, hasParams, err := readJSONLFileWithParams(path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -171,7 +171,7 @@ func TestReadJSONLCompatibility(t *testing.T) {
 		}
 		f.Close()
 
-		records, _, params, hasParams, err := readJSONLFileWithParams(path)
+		records, _, _, params, hasParams, err := readJSONLFileWithParams(path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -315,7 +315,7 @@ func TestMergeCarriesRunParams(t *testing.T) {
 
 	// Each merged per-source JSONL leads with its own header.
 	for name, wantConc := range map[string]int{"a28": 28, "b60": 60} {
-		_, _, params, hasParams, err := readJSONLFileWithParams(filepath.Join(outDir, name+".jsonl"))
+		_, _, _, params, hasParams, err := readJSONLFileWithParams(filepath.Join(outDir, name+".jsonl"))
 		if err != nil {
 			t.Fatal(err)
 		}

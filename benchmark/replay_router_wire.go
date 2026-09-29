@@ -687,7 +687,17 @@ func buildOpenAITools(spec *RouterReplayToolsSpec, docs string, charsPerToken fl
 // thinking is a plain passthrough with no default, mirroring how the
 // non-replay OpenAI client (llm/openai.go) forwards it: added to the body
 // only when non-empty.
-func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, minOutputTokens int, forceVolume bool, charsPerToken float64, inj *uuidInjection, reasoningEffort string, thinking string) ([]byte, string, error) {
+//
+// sglang requests cached-token reporting per-request via
+// return_cached_tokens_details. That is necessary but not sufficient: the
+// server must ALSO be launched with --enable-cache-report
+// (sglang/srt/entrypoints/openai/serving_chat.py checks both the request
+// field and tokenizer_manager.server_args.enable_cache_report) — the same
+// two-sided requirement as vLLM's --enable-prompt-tokens-details flag.
+// Without either half, usage.prompt_tokens_details is simply absent from
+// every SGLang response, and cache hit rate always reads as 0 — see
+// cacheWarningMessage in auto.go, which surfaces this in the run summary.
+func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelName string, runID string, outputRatio float64, minOutputTokens int, forceVolume bool, charsPerToken float64, inj *uuidInjection, reasoningEffort string, thinking string, sglang bool) ([]byte, string, error) {
 	var stampByHash map[string]turnStamp
 	if inj != nil {
 		stampByHash = inj.StampByHash
@@ -696,6 +706,9 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		"model":      modelName,
 		"max_tokens": pickMaxTokens(req, outputRatio, minOutputTokens),
 		"stream":     req.Stream,
+	}
+	if sglang {
+		body["return_cached_tokens_details"] = true
 	}
 	if req.Temperature != nil {
 		body["temperature"] = *req.Temperature

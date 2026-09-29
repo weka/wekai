@@ -622,6 +622,70 @@ func (m cacheMetrics) DisplayHitRate() float64 {
 	return m.hitRate
 }
 
+// noCacheDataObserved reports whether, over a large-enough window, neither
+// cache signal has ever fired: the TTFT heuristic saw no warm request AND the
+// server never reported cached_tokens. In that case DisplayHitRate's 0% is a
+// real absence of data — the server may not support prompt caching, or (for
+// vLLM/SGLang) may simply not be configured to report it — rather than a
+// rounding artifact of an otherwise-working cache. Requiring minCount records
+// avoids flagging a run that just hasn't warmed up yet.
+func noCacheDataObserved(m cacheMetrics, minCount int) bool {
+	return m.count >= minCount && m.hitRate == 0 && !m.serverReported
+}
+
+// cacheWarningMessage tailors the cacheWarning explanation to what the model
+// spec's type= actually names, when it names one of the two backends known
+// to gate cached_tokens reporting behind a server-launch flag: vLLM's
+// --enable-prompt-tokens-details and SGLang's --enable-cache-report. Both
+// require the client to ask per-request (already done for type=openai_sglang,
+// see llm/chat_clients.go and replay_router_wire.go) AND the server to be
+// launched with the matching flag; wekai controls only the former; a
+// deployment missing the latter looks from here exactly like a server that
+// genuinely never caches — the message says both are possible rather than
+// asserting whichever cause a client can never observe from the API alone.
+func cacheWarningMessage(modelSpec string) string {
+	generic := "Server may not support prompt caching, or is not configured to report it"
+	if !llm.IsDynamicModel(modelSpec) {
+		return generic
+	}
+	dyn, err := llm.ParseDynamicModel(modelSpec)
+	if err != nil {
+		return generic
+	}
+	switch dyn.Type {
+	case "openai_vllm":
+		return generic + " (vLLM must be launched with --enable-prompt-tokens-details)"
+	case "openai_sglang":
+		return generic + " (SGLang must be launched with --enable-cache-report)"
+	default:
+		return generic
+	}
+}
+
+// isOpenAISGLangSpec reports whether modelSpec names type=openai_sglang —
+// the same dynamic-model-spec parse cacheWarningMessage does, factored out
+// because the no-usage warning below needs the plain bool rather than a
+// tailored message.
+func isOpenAISGLangSpec(modelSpec string) bool {
+	if !llm.IsDynamicModel(modelSpec) {
+		return false
+	}
+	dyn, err := llm.ParseDynamicModel(modelSpec)
+	return err == nil && dyn.Type == "openai_sglang"
+}
+
+// noUsageWarningMessage fires when an openai_sglang run completed at least
+// one response but NONE of them ever carried a usage object — see
+// RequestMetrics.UsageObserved and autoState.sawResponseEver/sawUsageEver.
+// wekai tolerates this (UsageData stays all-zero rather than erroring —
+// see consumeOpenAISSE/consumeOpenAIPlain), which otherwise silently renders
+// a flat/zero "Totals (ingest)" chart in the report with no indication why.
+func noUsageWarningMessage() string {
+	return "No response ever reported token usage — the report's \"Totals (ingest)\" chart will be " +
+		"flat/zero. Confirm the server actually emits usage on every response (SGLang: independent of " +
+		"--enable-cache-report, which only gates the cached_tokens breakdown, not usage itself)."
+}
+
 // GlobalLocalCacheRate returns the all-time fraction of warm input tokens among all input tokens.
 // O(1): reads two running counters maintained in Add(), never scans history.
 // Purely local: a request is "cached" when its series already submitted this prefix before.
@@ -1052,6 +1116,15 @@ type autoState struct {
 	seriesDone   bool
 	cacheWarning bool // server doesn't appear to support caching
 
+	// sawResponseEver/sawUsageEver track whether ANY completed (non-error,
+	// non-skipped) response ever carried a usage object, over the whole run —
+	// see recordReplayRequest and the openai_sglang "no usage ever observed"
+	// warning in printAutoSummary. Atomics: recordReplayRequest runs on every
+	// series' own goroutine, and this is a monotonic latch, not a counter
+	// needing st.mu's broader critical section.
+	sawResponseEver atomic.Bool
+	sawUsageEver    atomic.Bool
+
 	// Real-time replay governor. ttft is what the admission gate reads; skipClk
 	// is the shared clock the pacers wait against; lag records how far behind
 	// their captured schedule requests are actually going out.
@@ -1251,6 +1324,11 @@ type autoBenchmarkResult struct {
 	allTimePeakSeries int
 	cacheHitRate      float64
 	cacheWarning      bool
+	// noUsageObserved is true when the run completed at least one
+	// non-error, non-skipped request but NONE of them ever carried a usage
+	// object — see autoState.sawResponseEver/sawUsageEver and the
+	// openai_sglang warning in printAutoSummary.
+	noUsageObserved   bool
 	totalCompleted    int64
 	totalErrors       int64
 	totalRetries429   int64
@@ -1441,7 +1519,10 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 	fmt.Printf(" Cache hit rate     : %.1f%%\n", res.cacheHitRate*100)
 	fmt.Printf(" Tok/s in/out       : %s / %s\n", formatKilo(res.inputTokPerSec), formatKilo(res.outputTokPerSec))
 	if res.cacheWarning {
-		fmt.Println(" ⚠  Server may not support prompt caching")
+		fmt.Printf(" ⚠  %s\n", cacheWarningMessage(cfg.Model))
+	}
+	if res.noUsageObserved && isOpenAISGLangSpec(cfg.Model) {
+		fmt.Printf(" ⚠  %s\n", noUsageWarningMessage())
 	}
 	fmt.Println(strings.Repeat("-", 62))
 	totalInput := res.totalInputCold + res.totalInputWarm
@@ -2073,6 +2154,9 @@ func runSingleModelBenchmark(
 	if sampler := startVLLMMetricsSampler(benchCtx, cfg.Model, cfg.VLLMMetricsURLs, st.datasetTracker, rdw); sampler != nil {
 		// stop() is deferred after rdw's close, so it runs first (LIFO) and
 		// waits for the goroutine — no sample write can race the file close.
+		defer sampler.stop()
+	}
+	if sampler := startSGLangMetricsSampler(benchCtx, cfg.Model, st.datasetTracker, rdw); sampler != nil {
 		defer sampler.stop()
 	}
 	if cfg.HotSeriesConcurrency > 0 {
@@ -2824,6 +2908,14 @@ func runSingleModelBenchmark(
 		cm2 := st.stream.CacheMetrics(cfg.CacheWindowSize, cfg.MinStabilization)
 		hitRate := cm2.hitRate
 
+		// Latch cacheWarning once neither signal has ever shown a hit over a
+		// large-enough window — see noCacheDataObserved.
+		if noCacheDataObserved(cm2, cfg.MinStabilization) {
+			st.mu.Lock()
+			st.cacheWarning = true
+			st.mu.Unlock()
+		}
+
 		if cfg.VerboseCache && cm2.count > 0 && math.Abs(hitRate-lastVerboseHitRate) >= 0.03 {
 			lastVerboseHitRate = hitRate
 			frozenBaseline := st.earlyColdStartTTFT()
@@ -3055,6 +3147,7 @@ func runSingleModelBenchmark(
 	st.mu.Unlock()
 
 	res.elapsed = time.Since(startTime)
+	res.noUsageObserved = st.sawResponseEver.Load() && !st.sawUsageEver.Load()
 	res.totalCompleted = st.totalCompleted.Load()
 	if st.routerReplay != nil {
 		if sessions, requests := st.routerReplay.Truncated(); sessions > 0 {
