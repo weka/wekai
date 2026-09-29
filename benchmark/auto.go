@@ -637,8 +637,8 @@ func noCacheDataObserved(m cacheMetrics, minCount int) bool {
 // spec's type= actually names, when it names one of the two backends known
 // to gate cached_tokens reporting behind a server-launch flag: vLLM's
 // --enable-prompt-tokens-details and SGLang's --enable-cache-report. Both
-// require the client to ask per-request (already done for type=openai_sglang
-// — see llm/chat_clients.go and replay_router_wire.go) AND the server to be
+// require the client to ask per-request (already done for type=openai_sglang,
+// see llm/chat_clients.go and replay_router_wire.go) AND the server to be
 // launched with the matching flag; wekai controls only the former; a
 // deployment missing the latter looks from here exactly like a server that
 // genuinely never caches — the message says both are possible rather than
