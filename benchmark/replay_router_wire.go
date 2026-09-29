@@ -120,7 +120,7 @@ func buildAnthropicMessagesBody(req RouterReplayRequest, docs string, modelName 
 		body["system"] = systemArr
 	}
 	if req.Tools != nil && req.Tools.Count > 0 {
-		body["tools"] = buildTools(req.Tools, docs, charsPerToken)
+		body["tools"] = prependRunStampTool(buildTools(req.Tools, docs, charsPerToken), runID)
 	}
 	var msgs []map[string]interface{}
 	if len(req.Messages) > 0 {
@@ -281,6 +281,59 @@ func buildSystem(blocks []RouterReplaySystemBlock, docs string, charsPerToken fl
 // charsPerToken > 0, sized off the captured Tokens instead). Each tool has
 // a stable name derived from the tools.hash + its index, and a description
 // padded with docs to round out the total size.
+// runStampToolName / runStampToolDescription are the marker tool that carries
+// the run stamp INSIDE the tool list. Some chat templates (DeepSeek-V4's
+// deepseek_v4 tokenizer mode, measured 2026-09-24) render the tool schemas
+// BEFORE the first system message, so a session with 100 synthesized tools
+// (~45k tokens) had its `<ignore>RUN_GUID</ignore>` system stamp land at token
+// ~45,400 and shared its first ~176 KV blocks with every other run and every
+// other series carrying those tools. Putting the same stamp into the FIRST tool
+// makes the tool section itself run-unique regardless of template order.
+// The name/description are shared by both wire formats so the canonical
+// fingerprint stays format-independent.
+const runStampToolName = "run_guid_marker"
+
+func runStampToolDescription(runID string) string {
+	return fmt.Sprintf("<ignore>RUN_GUID: %s</ignore> Marker only. Never call this tool.", runID)
+}
+
+// prependRunStampTool returns tools with the run-stamp marker at index 0 when
+// runID is set (anthropic shape: name/description/input_schema).
+func prependRunStampTool(tools []map[string]interface{}, runID string) []map[string]interface{} {
+	if runID == "" {
+		return tools
+	}
+	marker := map[string]interface{}{
+		"name":        runStampToolName,
+		"description": runStampToolDescription(runID),
+		"input_schema": map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		},
+	}
+	return append([]map[string]interface{}{marker}, tools...)
+}
+
+// prependRunStampToolOpenAI is prependRunStampTool for the OpenAI
+// {"type":"function","function":{...}} shape.
+func prependRunStampToolOpenAI(tools []map[string]interface{}, runID string) []map[string]interface{} {
+	if runID == "" {
+		return tools
+	}
+	marker := map[string]interface{}{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":        runStampToolName,
+			"description": runStampToolDescription(runID),
+			"parameters": map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+		},
+	}
+	return append([]map[string]interface{}{marker}, tools...)
+}
+
 func buildTools(spec *RouterReplayToolsSpec, docs string, charsPerToken float64) []map[string]interface{} {
 	n := spec.Count
 	if n <= 0 {
@@ -739,7 +792,7 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 
 	body["messages"] = messages
 	if req.Tools != nil && req.Tools.Count > 0 {
-		body["tools"] = buildOpenAITools(req.Tools, docs, charsPerToken)
+		body["tools"] = prependRunStampToolOpenAI(buildOpenAITools(req.Tools, docs, charsPerToken), runID)
 	}
 
 	// Collect canonical text for the cache estimator (system blocks +
