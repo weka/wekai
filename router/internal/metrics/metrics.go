@@ -40,11 +40,9 @@ var (
 	}, []string{"route"})
 
 	// Backends.
-	BackendInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "router_backend_inflight",
-		Help: "In-flight requests per backend, from the lease primitive — the only trusted load signal.",
-	}, []string{"backend"})
-
+	// router_backend_inflight and router_backend_requests_total are not
+	// declared here: they are exported by BackendSeriesCollector, which owns
+	// their lifetime (see backend_series.go).
 	BackendHealth = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "router_backend_health",
 		Help: "Backend health: 0 unknown, 1 healthy, 2 unhealthy.",
@@ -111,7 +109,7 @@ var (
 	}, []string{"pool", "decision"})
 
 	// Fleet load. Cache policies already expose per-backend inflight via
-	// BackendInflight; these three summarize it so a dashboard doesn't need a
+	// router_backend_inflight; these three summarize it so a dashboard doesn't need a
 	// PromQL aggregation just to see whether the fleet is balanced. Computed
 	// over Available() backends only — the same set policies actually choose
 	// among — so one dead/draining backend holding stale load can't skew it
@@ -473,7 +471,7 @@ var poolBuckets = []float64{1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64}
 func All() []prometheus.Collector {
 	return []prometheus.Collector{
 		RequestsTotal, RequestDuration, TimeToFirstByte,
-		BackendInflight, BackendHealth, BackendsTotal,
+		BackendSeriesCollector, BackendHealth, BackendsTotal,
 		CircuitState, CircuitTransitions,
 		RoutingDecisionDuration, PolicySelections, PolicyFallbacks, RouteDecisions,
 		WorkerLoadAvg, WorkerLoadMax, WorkerLoadMin,

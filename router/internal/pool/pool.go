@@ -71,10 +71,6 @@ type Config struct {
 
 	DrainDeadline time.Duration
 
-	// NewGauge resolves a backend's in-flight gauge once, at add time, rather
-	// than per request (R5).
-	NewGauge func(url string) registry.Gauge
-
 	// OnCircuitTransition, when set, is attached to every backend as it joins,
 	// so an operator can tell an overload from an outage.
 	OnCircuitTransition func(url string) func(from, to any, ok, fail int)
@@ -104,7 +100,6 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Pool, error) {
 	opts := registry.Options{
 		Clock:         clk,
 		DrainDeadline: cfg.DrainDeadline,
-		NewGauge:      cfg.NewGauge,
 		// Per-backend prefix state follows backend lifecycle, so a backend that
 		// is discovered and later removed does not leak its marks, and its
 		// prefixes are never reassigned to whoever takes its place

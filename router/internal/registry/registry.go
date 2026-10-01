@@ -83,7 +83,6 @@ type Registry struct {
 	version uint64
 
 	drainDeadline time.Duration
-	newGauge      func(url string) Gauge
 	onAdd, onDrop func(*Backend)
 }
 
@@ -91,8 +90,6 @@ type Options struct {
 	Clock         clock.Clock
 	Circuit       circuit.Config
 	DrainDeadline time.Duration
-	// NewGauge resolves a backend's in-flight gauge once, at registration (R5).
-	NewGauge func(url string) Gauge
 	// OnAdd / OnDrop drive per-backend resource lifecycle — notably the cache
 	// model, which must be created on add and dropped on removal with its
 	// prefixes never reassigned to another backend (CACHE-10, CU-4, CU-12).
@@ -110,12 +107,9 @@ func New(o Options) *Registry {
 	if o.DrainDeadline == 0 {
 		o.DrainDeadline = 60 * time.Second
 	}
-	if o.NewGauge == nil {
-		o.NewGauge = func(string) Gauge { return nopGauge{} }
-	}
 	r := &Registry{
 		clk: o.Clock, cbc: o.Circuit, drainDeadline: o.DrainDeadline,
-		newGauge: o.NewGauge, onAdd: o.OnAdd, onDrop: o.OnDrop,
+		onAdd: o.OnAdd, onDrop: o.OnDrop,
 	}
 	r.cur.Store(&Snapshot{byURL: map[string]*Backend{}})
 	return r
@@ -157,8 +151,7 @@ func (r *Registry) Add(spec Spec) (*Backend, error) {
 	b := &Backend{
 		URL: canon, DialectID: spec.DialectID,
 		HealthMod: spec.Health, Prov: spec.Prov,
-		CB:            circuit.New(r.cbc, r.clk),
-		InflightGauge: r.newGauge(canon),
+		CB: circuit.New(r.cbc, r.clk),
 	}
 	b.SetKind(spec.Kind)
 	b.SetModel(spec.Model)

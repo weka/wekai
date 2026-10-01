@@ -376,7 +376,7 @@ independently.
 Existing router metrics that are relevant starting points (see
 `router/internal/metrics/metrics.go`): `router_route_decisions_total`,
 `router_cache_predicted_fraction`, `router_worker_load_{avg,max,min}`,
-`router_backend_inflight`. New metrics will likely be needed for: splits
+`router_backend_inflight` (0 while the backend is unhealthy/removed), `router_backend_requests_total` (requests routed per backend). Both per-backend series are dropped after `metrics.BackendSeriesRetention` (15 min) of continuous unhealthy-or-removed; a backend returning after that may restart its counter from 0. New metrics will likely be needed for: splits
 (count, and which node was split onto), 429s split by
 justified-vs-premature (mirroring the simulator's `rejHard`/`rejPremature`),
 and tail-set size / eviction count if §4.5 lands.

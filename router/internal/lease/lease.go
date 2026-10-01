@@ -49,11 +49,12 @@ type Lease struct {
 }
 
 // Acquire is the ONLY place in the program that increments in-flight load
-// (LB-1). It is called immediately after a backend is selected and before the
+// (LB-1), and the only place a routed request is counted: one acquire, one
+// increment of router_backend_requests_total. It is called immediately after a backend is selected and before the
 // upstream request is issued, for every policy without exception.
 func Acquire(b *registry.Backend) *Lease {
 	b.AddInflight(+1)
-	b.InflightGauge.Inc()
+	b.CountRequest()
 	return &Lease{b: b}
 }
 
@@ -92,7 +93,6 @@ func (l *Lease) Release() {
 				"backend", l.b.URL, "value", n)
 			l.b.StoreInflight(0)
 		}
-		l.b.InflightGauge.Dec()
 	})
 }
 

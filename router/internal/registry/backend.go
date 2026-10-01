@@ -81,23 +81,6 @@ func (h Health) String() string {
 	return "unknown"
 }
 
-// Gauge is the minimal metrics surface a Backend needs. Satisfied by
-// prometheus.Gauge. Kept as an interface so this package stays dependency-free
-// and so tests need no metrics registry.
-//
-// Resolving the child gauge once, here, rather than calling WithLabelValues on
-// the request path, is R5: that call takes a lock and a map lookup, which at
-// target load would be ~40k resolutions/second for a label that never changes.
-type Gauge interface {
-	Inc()
-	Dec()
-}
-
-type nopGauge struct{}
-
-func (nopGauge) Inc() {}
-func (nopGauge) Dec() {}
-
 // Spec is the desired configuration of a backend. It is the input to Add and to
 // discovery reconciliation; Backend is the live object.
 type Spec struct {
@@ -136,13 +119,17 @@ type Backend struct {
 	model    atomic.Pointer[string]
 	locality atomic.Pointer[string]
 
-	CB            *circuit.Breaker
-	InflightGauge Gauge
+	CB *circuit.Breaker
 
 	capacity atomic.Int64
 	inflight atomic.Int64
 	draining atomic.Bool
 	health   atomic.Int32
+
+	// requests counts leases ever acquired on this backend: one per routed
+	// attempt, a retry elsewhere counting on the backend it went to. Written
+	// only by internal/lease, like inflight.
+	requests atomic.Uint64
 
 	Served, Failed atomic.Uint64
 }
@@ -192,6 +179,18 @@ func (b *Backend) Health() Health     { return Health(b.health.Load()) }
 func (b *Backend) SetHealth(h Health) { b.health.Store(int32(h)) }
 func (b *Backend) Draining() bool     { return b.draining.Load() }
 
+// Requests is the number of leases ever acquired on this backend.
+func (b *Backend) Requests() uint64 { return b.requests.Load() }
+
+// Down reports a backend that is unhealthy or being removed. Unknown is not
+// down: a backend that has not been checked yet has not failed, and its
+// counters are real. Used to decide when per-backend series stop being
+// reported (see metrics.BackendSeries).
+func (b *Backend) Down() bool { return b.Health() == Unhealthy || b.Draining() }
+
+// Label is the backend's metric label: its canonical URL.
+func (b *Backend) Label() string { return b.URL }
+
 // Available reports whether this backend may receive new traffic.
 //
 // Note it reads CB.State(), which is read-only, and never CB.Allow(), which
@@ -211,6 +210,10 @@ func (b *Backend) Available() bool {
 // every counter every ten cycles" is the exact defect that motivated the
 // rewrite (LB-N1, LB-N2, HLT-N5).
 func (b *Backend) AddInflight(d int64) int64 { return b.inflight.Add(d) }
+
+// CountRequest bumps the routed-request counter. Lease-only, for the same
+// reason as AddInflight: one acquire, one count.
+func (b *Backend) CountRequest() { b.requests.Add(1) }
 
 // StoreInflight is likewise lease-only; it exists to clamp a detected
 // underflow rather than let the counter wrap (LB-5).

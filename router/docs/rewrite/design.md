@@ -211,9 +211,9 @@ type Backend struct {
     health    atomic.Int32  // Unknown|Healthy|Unhealthy (HLT-3/HLT-5)
     CB        *circuit.Breaker
 
-    // R5: resolved once at registration; WithLabelValues on the request path
-    // costs a lock + map lookup, i.e. 40k resolutions/s at NFR-1 load.
-    InflightGauge prometheus.Gauge
+    // (Superseded: router_backend_inflight / router_backend_requests_total are
+    // now derived at scrape time from inflight and requests by
+    // metrics.BackendSeries; the request path resolves no label.)
 
     Served, Failed atomic.Uint64  // cumulative (WRK-5)
     LastTransition atomic.Int64   // unix nanos, from clock.Clock
@@ -270,7 +270,7 @@ type Lease struct {
 
 func Acquire(b *registry.Backend) *Lease {
     b.AddInflight(+1)                 // package-internal accessor
-    b.InflightGauge.Inc()             // R5: child gauge resolved at registration
+    b.CountRequest()                  // router_backend_requests_total source
     return &Lease{b: b}
 }
 
@@ -287,7 +287,6 @@ func (l *Lease) Release() {
                 "worker", l.b.URL, "value", n)
             l.b.StoreInflight(0)                       // clamp; never wrap
         }
-        l.b.InflightGauge.Dec()                        // R5
     })
 }
 ```

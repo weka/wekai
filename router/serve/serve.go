@@ -398,9 +398,6 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			DefaultCapacity: 1,
 			DefaultDialect:  d.ID(),
 			DrainDeadline:   opts.DrainDeadline,
-			NewGauge: func(url string) registry.Gauge {
-				return metrics.BackendInflight.WithLabelValues(url)
-			},
 		}, clk, log)
 		if err != nil {
 			return nil, err
@@ -508,6 +505,23 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 	gw := gateway.New(gwCfg, tbl, px, d)
 
 	handler := captureMiddleware(opts.Capture, gw)
+
+	// Per-backend series (in-flight, requests) are derived from the live pool
+	// snapshots at scrape time and dropped after a backend has been down for
+	// metrics.BackendSeriesRetention.
+	var seriesSrcs []func() []metrics.SeriesBackend
+	for _, p := range pools {
+		reg := p.Registry
+		seriesSrcs = append(seriesSrcs, func() []metrics.SeriesBackend {
+			bs := reg.Snapshot().Backends
+			out := make([]metrics.SeriesBackend, len(bs))
+			for i, b := range bs {
+				out[i] = b
+			}
+			return out
+		})
+	}
+	metrics.BackendSeriesCollector.SetSources(seriesSrcs...)
 
 	for _, p := range pools {
 		p.Run(ctx)
