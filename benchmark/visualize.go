@@ -960,8 +960,12 @@ function classifyAlias(a) {
   if (a === "gpu") return "gpu";
   if (/(?:^|[-_])hbm(?:$|[-_])/.test(a) || /^hbm/.test(a)) return "gpu"; // no-offload arms are named "hbm"
   if (/(?:^|[-_])gds(?:$|[-_])/.test(a)) return "weka";
-  if (/^weka/.test(a)) return "weka";
-  if (/(?:^|[-_])dram(?:$|[-_])/.test(a)) return "dram";
+  // Token anywhere, like hbm: campaign aliases carry model/hardware prefixes
+  // ("v41flash-h200-2xtp4-weka-rdma-..."), so a start anchor alone misses them.
+  if (/^weka/.test(a) || /(?:^|[-_])weka(?:$|[-_])/.test(a)) return "weka";
+  // dram as a token ("vllm-dram", "lmcache-dram") or fused with its variant
+  // prefix / size ("simpledram700", "sdram").
+  if (/(?:^|[-_])(?:simple|s)?dram\d*(?:$|[-_])/.test(a)) return "dram";
   return "other";
 }
 function sortKey(name) {

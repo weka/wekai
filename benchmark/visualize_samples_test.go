@@ -1705,3 +1705,53 @@ console.log("ALL_OK");
 		t.Fatalf("node request-hover test failed: %v\n%s", err, out)
 	}
 }
+
+// TestClassifyAliasPrefixedJS pins arm colouring for campaign aliases that carry
+// a model/hardware prefix: weka and dram must be recognised as a token anywhere,
+// not only at the start, or they fall into the neutral "other" palette.
+func TestClassifyAliasPrefixedJS(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS alias-classify test skipped")
+	}
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+
+	dir := t.TempDir()
+	rec, _ := benchFixtureData("hbm-solo", base)
+	writeMixedJSONL(t, dir, "hbm-solo", rec, nil)
+
+	htmlPath, err := GenerateVisualization(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	s, e := strings.Index(html, "<script>"), strings.Index(html, "</script>")
+	probe := `
+function assert(c, m) { if (!c) { console.error("FAIL: " + m); process.exit(1); } }
+const cases = {
+  "weka": "weka", "weka-c28": "weka", "gds-arm": "weka",
+  "v41flash-h200-2xtp4-weka-rdma-nvlink-devrouter-s32m48-c48-8h": "weka",
+  "hbm": "gpu", "gpu": "gpu", "v41flash-h200-2xtp4-hbm-devrouter-s32m48-c48-8h": "gpu",
+  "vllm-dram": "dram", "lmcache-dram": "dram", "sdram-c28": "dram",
+  "v41flash-h200-2xtp4-simpledram700-devrouter-s32m48-c48-8h": "dram",
+  "v41flash-h200-2xtp4-vllm-fs": "other", "wekalike": "weka", "dramatic-arm": "other",
+};
+for (const [alias, want] of Object.entries(cases)) {
+  const got = classifyAlias(alias);
+  assert(got === want, alias + " => " + got + ", want " + want);
+}
+console.log("ALL_OK");
+`
+	jsPath := filepath.Join(dir, "classify_alias_test.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+html[s+len("<script>"):e]+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ALL_OK") {
+		t.Fatalf("node alias-classify test failed: %v\n%s", err, out)
+	}
+}
