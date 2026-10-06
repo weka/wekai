@@ -68,26 +68,30 @@ type RouterServeCommand struct {
 	RefusalTTL        time.Duration `long:"cache-refusal-ttl" default:"2s" description:"How long a backend's own 429 keeps it out of its prefixes. Cleared early by any success from it, and by its in-flight dropping below the level it refused at."`
 
 	// --- Listener behaviour.
-	APIKeyFile       string        `long:"api-key-file" description:"Read the inbound API key from this file. PREFER this to --api-key: a key given as a flag is visible in a process listing and in the pod spec that launched it."`
-	APIKey           string        `long:"api-key" description:"Require this key on inference and admin requests. Empty leaves the listener unauthenticated, which is logged loudly at startup."`
-	CORSOrigins      []string      `long:"cors-origins" description:"Origins permitted to call the inference listener. '*' cannot be combined with --api-key."`
-	PathAllowlist    []string      `long:"path-allowlist" description:"Restrict which upstream paths may be proxied. Empty allows every path."`
-	MaxBodyBytes     int64         `long:"max-body-bytes" default:"67108864" description:"Maximum request body. Bodies are buffered whole so a retry can replay them, so this is the real per-request memory bound."`
-	MaxConcurrent    int           `long:"max-concurrent-requests" description:"Router-wide in-flight cap, OFF by default. Set it and the router sheds 503 router_at_capacity above that many requests in flight. Leave it unset and capacity is decided end to end: a vLLM answers 429 when it is full, the flow tries this prefix's other holders, and the router answers 429 only once nothing can take the request. An arbitrary router-side ceiling refuses work the fleet could still do, and does it without knowing anything about the fleet."`
-	MaxAttempts      int           `long:"max-attempts" default:"2" description:"Upstream attempts including the first, after a FAILURE. A 429 does not spend this budget: refusals draw on their own, bounded by the number of endpoints."`
-	RequestTimeout   time.Duration `long:"request-timeout" default:"600s" description:"Overall upstream request deadline."`
-	IdleTimeout      time.Duration `long:"idle-timeout" default:"300s" description:"Abort a stream that has produced nothing for this long."`
-	UpstreamCred     string        `long:"upstream-credential" description:"Credential presented to upstreams, replacing the client's."`
-	HealthInterval   time.Duration `long:"health-interval" default:"15s" description:"How often a HEALTHY backend is re-probed. Can be slow: a healthy backend that breaks is caught by real traffic failing, since an upstream 5xx trips its circuit and removes it from selection."`
-	HealthUnhealthy  time.Duration `long:"health-unhealthy-interval" default:"1s" description:"How often a backend that is NOT healthy is re-probed. Much shorter on purpose: a recovered backend stays out of rotation for this long, and every request that could have used its warm cache goes somewhere colder."`
-	HealthTimeout    time.Duration `long:"health-timeout" default:"5s" description:"Health probe timeout. Must be below the interval, or probes fall behind forever."`
-	HealthPath       string        `long:"health-path" default:"/health" description:"Path probed on each backend."`
-	VLLMMetrics      bool          `long:"vllm-metrics" description:"No-op, kept so existing deployments keep starting: aggregation is now on by default. Use --no-vllm-metrics to turn it off."`
-	NoVLLMMetrics    bool          `long:"no-vllm-metrics" description:"Turn OFF aggregation of upstream vLLM counters into router-level totals. Aggregation is on by default and is not conditional on the API key — the key governs only WHERE /metrics is exposed. Only endpoints discovered to be vLLM are scraped, so a hosted API in the same router is never asked. Totals accumulate DELTAS, so they never go backwards when a pod restarts or the fleet scales down, and an unreachable backend simply stops contributing rather than failing the cycle — which is why this needs no opt-in. Watch router_vllm_metrics_endpoints to tell an idle fleet from an unreachable one."`
-	VLLMMetricsEvery time.Duration `long:"vllm-metrics-interval" default:"30s" description:"How often each discovered vLLM endpoint is scraped."`
-	VLLMMetricsNames []string      `long:"vllm-metrics-name" description:"Upstream counter to aggregate; repeatable. Default: vllm:prompt_tokens_by_source_total. Re-exporting every series would multiply cardinality by the fleet size."`
-	LogLevel         string        `long:"log-level" default:"info" description:"debug, info, warn or error."`
-	LogFormat        string        `long:"log-format" choice:"json" choice:"text" default:"json" description:"Log output format."`
+	APIKeyFile          string        `long:"api-key-file" description:"Read the inbound API key from this file. PREFER this to --api-key: a key given as a flag is visible in a process listing and in the pod spec that launched it."`
+	APIKey              string        `long:"api-key" description:"Require this key on inference and admin requests. Empty leaves the listener unauthenticated, which is logged loudly at startup."`
+	CORSOrigins         []string      `long:"cors-origins" description:"Origins permitted to call the inference listener. '*' cannot be combined with --api-key."`
+	PathAllowlist       []string      `long:"path-allowlist" description:"Restrict which upstream paths may be proxied. Empty allows every path."`
+	MaxBodyBytes        int64         `long:"max-body-bytes" default:"67108864" description:"Maximum request body. Bodies are buffered whole so a retry can replay them, so this is the real per-request memory bound."`
+	MaxConcurrent       int           `long:"max-concurrent-requests" description:"Router-wide in-flight cap, OFF by default. Set it and the router sheds 503 router_at_capacity above that many requests in flight. Leave it unset and capacity is decided end to end: a vLLM answers 429 when it is full, the flow tries this prefix's other holders, and the router answers 429 only once nothing can take the request. An arbitrary router-side ceiling refuses work the fleet could still do, and does it without knowing anything about the fleet."`
+	MaxAttempts         int           `long:"max-attempts" default:"2" description:"Upstream attempts including the first, after a FAILURE. A 429 does not spend this budget: refusals draw on their own, bounded by the number of endpoints."`
+	RequestTimeout      time.Duration `long:"request-timeout" default:"600s" description:"Overall upstream request deadline."`
+	IdleTimeout         time.Duration `long:"idle-timeout" default:"300s" description:"Abort a stream that has produced nothing for this long."`
+	UpstreamCred        string        `long:"upstream-credential" description:"Credential presented to upstreams, replacing the client's."`
+	HealthInterval      time.Duration `long:"health-interval" default:"15s" description:"How often a HEALTHY backend is re-probed. Can be slow: a healthy backend that breaks is caught by real traffic failing, since an upstream 5xx trips its circuit and removes it from selection."`
+	HealthUnhealthy     time.Duration `long:"health-unhealthy-interval" default:"1s" description:"How often a backend that is NOT healthy is re-probed. Much shorter on purpose: a recovered backend stays out of rotation for this long, and every request that could have used its warm cache goes somewhere colder."`
+	HealthTimeout       time.Duration `long:"health-timeout" default:"5s" description:"Health probe timeout. Must be below the interval, or probes fall behind forever."`
+	HealthPath          string        `long:"health-path" default:"/health" description:"Path probed on each backend."`
+	VLLMMetrics         bool          `long:"vllm-metrics" description:"No-op, kept so existing deployments keep starting: aggregation is now on by default. Use --no-vllm-metrics to turn it off."`
+	NoVLLMMetrics       bool          `long:"no-vllm-metrics" description:"Turn OFF aggregation of upstream vLLM counters into router-level totals. Aggregation is on by default and is not conditional on the API key — the key governs only WHERE /metrics is exposed. Only endpoints discovered to be vLLM are scraped, so a hosted API in the same router is never asked. Totals accumulate DELTAS, so they never go backwards when a pod restarts or the fleet scales down, and an unreachable backend simply stops contributing rather than failing the cycle — which is why this needs no opt-in. Watch router_vllm_metrics_endpoints to tell an idle fleet from an unreachable one."`
+	VLLMMetricsEvery    time.Duration `long:"vllm-metrics-interval" default:"30s" description:"How often each discovered vLLM endpoint is scraped."`
+	VLLMMetricsNames    []string      `long:"vllm-metrics-name" description:"Upstream counter to aggregate; repeatable. Default: vllm:prompt_tokens_by_source_total, sglang:cached_tokens_total and sglang:prompt_tokens_total. Re-exporting every series would multiply cardinality by the fleet size."`
+	BackendMetrics      bool          `long:"backend-metrics" description:"Engine-neutral alias of --vllm-metrics (no-op: aggregation is on by default)."`
+	NoBackendMetrics    bool          `long:"no-backend-metrics" description:"Engine-neutral alias of --no-vllm-metrics. The aggregator covers vLLM and SGLang backends alike; either flag turns it off."`
+	BackendMetricsEvery time.Duration `long:"backend-metrics-interval" description:"Engine-neutral alias of --vllm-metrics-interval; when set it wins."`
+	BackendMetricsNames []string      `long:"backend-metrics-name" description:"Engine-neutral alias of --vllm-metrics-name; repeatable, and combined with it. Default: vllm:prompt_tokens_by_source_total, sglang:cached_tokens_total and sglang:prompt_tokens_total (request-level counters only — never add per-rank gauges)."`
+	LogLevel            string        `long:"log-level" default:"info" description:"debug, info, warn or error."`
+	LogFormat           string        `long:"log-format" choice:"json" choice:"text" default:"json" description:"Log output format."`
 }
 
 type routeRule struct {
@@ -241,9 +245,9 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		HealthUnhealthy:       c.HealthUnhealthy,
 		HealthTimeout:         c.HealthTimeout,
 		HealthPath:            c.HealthPath,
-		DisableVLLMMetrics:    c.NoVLLMMetrics,
-		VLLMMetricsInterval:   c.VLLMMetricsEvery,
-		VLLMMetricsNames:      c.VLLMMetricsNames,
+		DisableVLLMMetrics:    c.NoVLLMMetrics || c.NoBackendMetrics,
+		VLLMMetricsInterval:   c.metricsInterval(),
+		VLLMMetricsNames:      append(append([]string(nil), c.VLLMMetricsNames...), c.BackendMetricsNames...),
 		MaxAttempts:           c.MaxAttempts,
 		RequestTimeout:        c.RequestTimeout,
 		IdleTimeout:           c.IdleTimeout,
@@ -807,4 +811,13 @@ func rawBodyBytes(body json.RawMessage) []byte {
 		return []byte(s)
 	}
 	return body
+}
+
+// metricsInterval resolves the engine-neutral interval alias over the
+// vLLM-named flag.
+func (c *RouterServeCommand) metricsInterval() time.Duration {
+	if c.BackendMetricsEvery > 0 {
+		return c.BackendMetricsEvery
+	}
+	return c.VLLMMetricsEvery
 }

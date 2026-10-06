@@ -2,6 +2,9 @@ package serve
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -106,6 +109,41 @@ func TestIsRedundantV1(t *testing.T) {
 	} {
 		if got := isRedundantV1(tc.url); got != tc.want {
 			t.Errorf("isRedundantV1(%q) = %v, want %v", tc.url, got, tc.want)
+		}
+	}
+}
+
+// probeIsEngine accepts either engine by its own metric family, and falls back
+// to the model listing for anything else that serves one.
+func TestProbeIsEngineAcceptsSGLangAndVLLM(t *testing.T) {
+	mk := func(metrics string, models bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/metrics" && metrics != "":
+				fmt.Fprint(w, metrics)
+			case r.URL.Path == "/v1/models" && models:
+				fmt.Fprint(w, `{"data":[]}`)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cases := []struct {
+		name string
+		srv  *httptest.Server
+		want bool
+	}{
+		{"vllm metrics", mk("vllm:num_requests_running 0\n", false), true},
+		{"sglang metrics", mk("sglang:cache_hit_rate{model_name=\"m\"} 0.1\n", false), true},
+		{"sglang metrics and models", mk("sglang:num_running_reqs 0\n", true), true},
+		{"models only", mk("", true), true},
+		{"neither", mk("", false), false},
+	}
+	for _, c := range cases {
+		defer c.srv.Close()
+		if got := probeIsEngine(context.Background(), c.srv.URL, log); got != c.want {
+			t.Errorf("%s: probeIsEngine = %v, want %v", c.name, got, c.want)
 		}
 	}
 }

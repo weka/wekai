@@ -335,7 +335,7 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 	// often. The aggregator is told about these so it never asks them for
 	// counters they do not have; everything else it works out by scraping,
 	// which is what lets a pod added by discovery contribute at all.
-	var notVLLM []string
+	var notEngine []string
 
 	for i, rt := range opts.Routes {
 		name := rt.Name
@@ -361,10 +361,10 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			}
 			passive := rt.Passive
 			if !passive {
-				isVLLM := probeIsVLLM(ctx, ep, log)
-				passive = !isVLLM
-				if !isVLLM {
-					notVLLM = append(notVLLM, ep)
+				isEngine := probeIsEngine(ctx, ep, log)
+				passive = !isEngine
+				if !isEngine {
+					notEngine = append(notEngine, ep)
 				}
 			}
 			if passive {
@@ -552,7 +552,7 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		// hosted API in the same router is never asked for counters it does not
 		// have. Everything else is discovered by scraping and latched off after
 		// two barren cycles.
-		for _, ep := range notVLLM {
+		for _, ep := range notEngine {
 			agg.Retire(ep)
 		}
 		// THE LIVE REGISTRY, not a list frozen at startup.
@@ -730,8 +730,9 @@ func isRedundantV1(raw string) bool {
 	return strings.TrimRight(u.Path, "/") == "/v1"
 }
 
-// probeIsVLLM asks an endpoint, ONCE, whether it looks like a vLLM-style
-// OpenAI backend: it answers GET /v1/models.
+// probeIsEngine asks an endpoint, ONCE, whether it looks like a self-hosted
+// inference engine (vLLM or SGLang): it exports that engine's own metrics, or
+// failing that answers GET /v1/models.
 //
 // Once, and never again. A failed probe is latched by simply not being
 // repeated — there is no retry loop and no ticker. An endpoint that is not
@@ -790,7 +791,7 @@ func IsKnownHostedProvider(endpoint string) bool {
 	return false
 }
 
-func probeIsVLLM(ctx context.Context, endpoint string, log *slog.Logger) bool {
+func probeIsEngine(ctx context.Context, endpoint string, log *slog.Logger) bool {
 	if IsKnownHostedProvider(endpoint) {
 		log.Info("known hosted provider: passive health, no probe",
 			"endpoint", endpoint)
@@ -805,7 +806,7 @@ func probeIsVLLM(ctx context.Context, endpoint string, log *slog.Logger) bool {
 	// which request schema it accepts would therefore get exactly that
 	// deployment wrong — it would be classed a hosted API and its metrics left
 	// unread. What identifies the engine is the engine's own metric names.
-	if body, ok := probeGet(ctx, registry.ResolveURL(endpoint, "/metrics"), log); ok && strings.Contains(body, "vllm:") {
+	if body, ok := probeGet(ctx, registry.ResolveURL(endpoint, "/metrics"), log); ok && (strings.Contains(body, "vllm:") || strings.Contains(body, "sglang:")) {
 		return true
 	}
 	// Otherwise fall back to the OpenAI model listing. This is a weaker signal —
@@ -820,7 +821,7 @@ func probeIsVLLM(ctx context.Context, endpoint string, log *slog.Logger) bool {
 }
 
 // probeGet performs one bounded GET and returns a prefix of the body. It never
-// retries: see probeIsVLLM.
+// retries: see probeIsEngine.
 func probeGet(ctx context.Context, url string, log *slog.Logger) (string, bool) {
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()

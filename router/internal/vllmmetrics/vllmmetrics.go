@@ -88,20 +88,30 @@ const (
 )
 
 // DefaultNames are the upstream counters aggregated unless told otherwise.
-// Anything else in a scrape is ignored: a router that re-exported every vLLM
-// series would multiply cardinality by the fleet size for no one's benefit.
+// Anything else in a scrape is ignored: a router that re-exported every
+// engine series would multiply cardinality by the fleet size for no one's
+// benefit.
 //
-// A caller fronting SGLang backends can add SGLang's counter-shaped series
-// (e.g. "sglang:prompt_tokens_total", "sglang:generation_tokens_total") to
-// Names — this aggregator is generic over counter names and the delta scheme
-// applies to them just as it does to vLLM's. Do NOT add
-// "sglang:cache_hit_rate": it is a GAUGE already expressed as a ratio, not a
+// Both engines' request-level cache counters are tracked. An engine only ever
+// serves its own family, so a vLLM backend contributes the vllm: series and an
+// SGLang backend the sglang: ones, and a mixed fleet simply carries both.
+// SGLang's sglang:cached_tokens_total (labelled cache_source =
+// device/host/storage, plus an untiered "total" fallback) and
+// sglang:prompt_tokens_total are plain monotonic counters, so summing their
+// per-endpoint deltas across backends is exact. They are re-emitted under the
+// same names and labels, which is what lets a benchmark's --sglang-metrics-url
+// point at the router's aggregate listener.
+//
+// Do NOT add SGLang's per-rank GAUGES (e.g. "sglang:cache_hit_rate",
+// "sglang:hicache_host_*"): a ratio or a current-occupancy value is not a
 // monotonic counter, and running it through delta-on-restart accumulation
-// would silently produce a meaningless number. A gauge must be sampled as a
-// current value, never summed here. (benchmark/sglang_metrics.go samples
-// SGLang's actual counter families — cached_tokens_total/prompt_tokens_total
-// — through this same delta scheme, just not via this router aggregator.)
-var DefaultNames = []string{"vllm:prompt_tokens_by_source_total"}
+// would produce a meaningless number. A gauge must be sampled as a current
+// value, never summed here.
+var DefaultNames = []string{
+	"vllm:prompt_tokens_by_source_total",
+	"sglang:cached_tokens_total",
+	"sglang:prompt_tokens_total",
+}
 
 // Config configures the aggregator.
 type Config struct {

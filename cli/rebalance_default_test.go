@@ -2,6 +2,7 @@ package cli
 
 import (
 	"testing"
+	"time"
 
 	"github.com/jessevdk/go-flags"
 )
@@ -35,5 +36,30 @@ func TestRebalanceRatioDefaultsToOff(t *testing.T) {
 	}
 	if on.RebalanceRatio != 0.5 {
 		t.Errorf("RebalanceRatio = %v with --rebalance-ratio 0.5, want 0.5", on.RebalanceRatio)
+	}
+}
+
+// The engine-neutral metrics flags are aliases of the vLLM-named ones: the
+// disable flag and the interval work either way, and names combine.
+func TestRouterBackendMetricsFlagAliases(t *testing.T) {
+	var c RouterServeCommand
+	p := flags.NewParser(&c, flags.Default)
+	if _, err := p.ParseArgs([]string{"--backends", "http://a:8000", "--no-backend-metrics",
+		"--backend-metrics-interval", "5s", "--backend-metrics-name", "sglang:x_total", "--vllm-metrics-name", "vllm:y_total"}); err != nil {
+		t.Fatal(err)
+	}
+	if !c.NoBackendMetrics || c.metricsInterval() != 5*time.Second {
+		t.Errorf("alias flags not honoured: no=%v interval=%v", c.NoBackendMetrics, c.metricsInterval())
+	}
+	if len(c.VLLMMetricsNames) != 1 || len(c.BackendMetricsNames) != 1 {
+		t.Errorf("names = %v / %v", c.VLLMMetricsNames, c.BackendMetricsNames)
+	}
+	var d RouterServeCommand
+	p2 := flags.NewParser(&d, flags.Default)
+	if _, err := p2.ParseArgs([]string{"--backends", "http://a:8000"}); err != nil {
+		t.Fatal(err)
+	}
+	if d.metricsInterval() != 30*time.Second {
+		t.Errorf("default interval = %v, want 30s", d.metricsInterval())
 	}
 }
