@@ -400,10 +400,10 @@ func sglangCompute(totals map[string]float64) float64 {
 }
 
 // write persists the accumulated totals with this round's coverage. compute
-// is recomputed fresh each time from the two accumulated totals it's derived
-// from (prompt_tokens_total and the "total" cache_source label) rather than
-// being folded as its own key, and clamped at 0 as a floor against transient
-// scrape skew between the two independently-updated counters.
+// is recomputed fresh each time by sglangCompute from the accumulated prompt
+// and per-tier cached totals rather than being folded as its own key, and is
+// clamped at 0 as a floor against transient scrape skew between the
+// independently-updated counters.
 func (s *sglangMetricsSampler) write(endpointsOK int) {
 	if s.rdw == nil || s.tracker == nil {
 		return
