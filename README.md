@@ -240,6 +240,20 @@ appears on the `# HELP`/`# TYPE` lines. Each sample is one JSONL row with
 `sources.compute` / `sources.local_cache` / `sources.external_cache`, plus
 the locally-computed `active_dataset_tokens` and `active_series`.
 
+**SGLang.** For `type=openai_sglang` the sampler reads
+`sglang:cached_tokens_total` (`cache_source` = `device` / `host` / `storage`,
+plus SGLang's untiered `total` fallback) and `sglang:prompt_tokens_total`, and
+writes `record_type: "sglang_metrics_sample"` rows with
+`sources.{device,host,storage,compute}`, where
+`compute = max(0, prompt - (device + host + storage + total))`. Point it
+elsewhere with `--sglang-metrics-url` (repeatable; e.g. the router's
+aggregate metrics listener), the SGLang counterpart of `--vllm-metrics-url`.
+SGLang requests also carry `return_cached_tokens_details`; the per-request
+tier split (`sglext.cached_tokens_details`) is stored in each request row as
+`cached_device` / `cached_host` / `cached_storage` (+ `cached_storage_backend`)
+and the run summary ends with a `sglang cache tiers: device=… host=…
+storage=… computed=…` line.
+
 Collection is best-effort and never affects the benchmark: an unreachable
 or non-Prometheus endpoint just skips samples. Since any chat/completions
 endpoint is probed — it may well be vLLM — a spec that didn't say

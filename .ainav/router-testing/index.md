@@ -127,8 +127,12 @@ on consecutive ports:
   Discovery keys on metric names, NOT wire format, so a vLLM fronted with an
   Anthropic API is still recognised.
 - **`--vllm-metrics`** aggregates upstream counters into router-level totals on
-  the metrics listener. Only discovered vLLM endpoints are scraped, and totals
-  accumulate deltas so they never rewind when a pod restarts.
+  the metrics listener. Only discovered vLLM/SGLang endpoints are scraped
+  (`sglang:cached_tokens_total` and `sglang:prompt_tokens_total` are tracked
+  alongside the vLLM counter; engine-neutral aliases `--backend-metrics-*`
+  exist), and totals accumulate deltas so they never rewind when a pod
+  restarts. Benchmark side: `--sglang-metrics-url` / `--vllm-metrics-url` point
+  the sampler at this listener.
 
 - Metrics (`/metrics`), the live KV map (`/router-viz`, `/router-viz/data`), backend
   listing (`/workers`), and readiness (`/readiness`) all live on `--metrics-listen` /

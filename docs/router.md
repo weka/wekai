@@ -668,8 +668,15 @@ from the same handler value.
 
 Upstream vLLM counters are aggregated **by default**, independently of the API
 key — the key decides where `/metrics` is exposed, not whether the counters
-exist. `--no-vllm-metrics` turns it off. Only endpoints discovered to be vLLM
-are scraped, so a hosted API in the same router is never asked.
+exist. `--no-vllm-metrics` (alias `--no-backend-metrics`) turns it off. Only
+endpoints discovered to be vLLM or SGLang are scraped, so a hosted API in the
+same router is never asked. The tracked counters are
+`vllm:prompt_tokens_by_source_total`, `sglang:cached_tokens_total` and
+`sglang:prompt_tokens_total`, re-emitted under the same names (so a benchmark's
+`--sglang-metrics-url` can point at the router's metrics listener); per-rank
+SGLang gauges are deliberately not aggregated. `--backend-metrics-name` /
+`--backend-metrics-interval` are engine-neutral aliases of the `--vllm-metrics-*`
+flags.
 
 Totals accumulate **deltas**, so they never rewind when a pod restarts or the
 fleet scales down, and a backend that cannot be reached simply stops
