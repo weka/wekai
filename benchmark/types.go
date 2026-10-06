@@ -3,6 +3,7 @@ package benchmark
 import (
 	"time"
 
+	"github.com/weka/wekai/llm"
 	"github.com/weka/wekai/tools"
 )
 
@@ -39,6 +40,9 @@ type RequestMetrics struct {
 	// "ingest was never reported" (see the openai_sglang no-usage warning in
 	// auto.go).
 	UsageObserved bool
+	// CachedDetails is SGLang's per-tier cached-token split for this request
+	// (sglext.cached_tokens_details); nil when the server reported none.
+	CachedDetails *llm.CachedTokensDetails
 	Error         error
 	Response      string // The actual response content
 	// ContentOnly is the assistant's content stream WITHOUT the reasoning

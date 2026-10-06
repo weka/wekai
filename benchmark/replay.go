@@ -546,6 +546,10 @@ func recordReplayRequest(
 	}
 	serverCacheConfirmed := explicitCache
 
+	if !isErr {
+		st.sglangTiers.add(metrics.CachedDetails, metrics.UsageData.InputTokens.Count)
+	}
+
 	if rdw != nil {
 		reqEnd := time.Now()
 		reqStart := reqEnd.Add(-metrics.TotalResponseTime)
@@ -579,6 +583,7 @@ func recordReplayRequest(
 			UUIDLeaked:           uuidLeakedCount,
 			UUIDExactMatch:       metrics.ExactMatch,
 		}
+		rec.applyCachedDetails(metrics.CachedDetails)
 		// Raw detail lists only on a miss or a leak — mirrors the
 		// failed-request-only policy on PromptText/ResponseText/RawResponseTail
 		// above (avoid bloating every row with data that matters only when

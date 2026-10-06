@@ -293,6 +293,7 @@ func runSingleRequest(ctx context.Context, model, cachedPrompt, question string,
 		// already logged as Warn above
 	} else {
 		// Copy usage data from response
+		metrics.CachedDetails = response.Usage.CachedDetails
 		metrics.UsageData = tools.ExecutionUsageData{
 			InputTokens: tools.TokenUsage{
 				Count: response.Usage.PromptTokens,

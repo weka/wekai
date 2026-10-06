@@ -66,6 +66,20 @@ type UsageData struct {
 	CachedTokens     int `json:"cached_tokens"`
 	ReasoningTokens  int `json:"reasoning_tokens"`
 	CacheTokens5Min  int `json:"cache_tokens_5min"` // Anthropic-specific: tokens written to 5-minute cache
+	// CachedDetails is SGLang's per-tier cached-token breakdown
+	// (sglext.cached_tokens_details); nil when the server did not report one.
+	CachedDetails *CachedTokensDetails `json:"cached_tokens_details,omitempty"`
+}
+
+// CachedTokensDetails is SGLang's per-tier split of a request's cached prompt
+// tokens: device = GPU radix cache, host = CPU/DRAM HiCache, storage = the
+// storage backend (L3). Storage and StorageBackend are absent when no storage
+// tier is configured.
+type CachedTokensDetails struct {
+	Device         int    `json:"device"`
+	Host           int    `json:"host"`
+	Storage        int    `json:"storage,omitempty"`
+	StorageBackend string `json:"storage_backend,omitempty"`
 }
 
 // Response represents an LLM response with tool calls and content

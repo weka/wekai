@@ -345,6 +345,15 @@ type OpenAIStreamResponse struct {
 	SystemFingerprint string               `json:"system_fingerprint"`
 	Choices           []OpenAIStreamChoice `json:"choices"`
 	Usage             *OpenAIUsage         `json:"usage,omitempty"`
+	// SGLExt carries SGLang's extension block. With return_cached_tokens_details
+	// set, the per-tier cached-token breakdown arrives here, in a chunk of its
+	// own (possibly with empty choices) or alongside the final usage chunk.
+	SGLExt *SGLExt `json:"sglext,omitempty"`
+}
+
+// SGLExt is the "sglext" object SGLang adds to chat completion responses.
+type SGLExt struct {
+	CachedTokensDetails *CachedTokensDetails `json:"cached_tokens_details,omitempty"`
 }
 
 // OpenAIUsage represents the usage data from OpenAI API responses
@@ -423,6 +432,10 @@ func (l *OpenAiChat) processStreamingResponse(ctx context.Context, resp *http.Re
 			if streamResp.Usage.CompletionDetails != nil {
 				usageData.ReasoningTokens = streamResp.Usage.CompletionDetails.ReasoningTokens
 			}
+		}
+
+		if streamResp.SGLExt != nil && streamResp.SGLExt.CachedTokensDetails != nil {
+			usageData.CachedDetails = streamResp.SGLExt.CachedTokensDetails
 		}
 
 		// If there are no choices, this might be a usage-only chunk, so continue processing

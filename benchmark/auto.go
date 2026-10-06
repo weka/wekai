@@ -321,6 +321,13 @@ type requestDataRecord struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	CachedTokens int `json:"cached_tokens"`
+	// SGLang per-tier split of the cached tokens (sglext.cached_tokens_details,
+	// requested via return_cached_tokens_details). Absent for other engines and
+	// for responses that carried no breakdown.
+	CachedDevice         *int   `json:"cached_device,omitempty"`
+	CachedHost           *int   `json:"cached_host,omitempty"`
+	CachedStorage        *int   `json:"cached_storage,omitempty"`
+	CachedStorageBackend string `json:"cached_storage_backend,omitempty"`
 
 	// Status
 	IsError      bool   `json:"is_error"`
@@ -1129,6 +1136,10 @@ type autoState struct {
 	sawResponseEver atomic.Bool
 	sawUsageEver    atomic.Bool
 
+	// SGLang per-tier cached-token totals over every request that reported a
+	// breakdown, and the uncached remainder (computed) of those same requests.
+	sglangTiers sglangTierTotals
+
 	// Real-time replay governor. ttft is what the admission gate reads; skipClk
 	// is the shared clock the pacers wait against; lag records how far behind
 	// their captured schedule requests are actually going out.
@@ -1333,6 +1344,7 @@ type autoBenchmarkResult struct {
 	// object — see autoState.sawResponseEver/sawUsageEver and the
 	// openai_sglang warning in printAutoSummary.
 	noUsageObserved   bool
+	sglangTiers       sglangTierSnapshot
 	totalCompleted    int64
 	totalErrors       int64
 	totalRetries429   int64
@@ -1527,6 +1539,9 @@ func printAutoSummary(res autoBenchmarkResult, cfg AutoBenchmarkConfig) {
 	}
 	if res.noUsageObserved && isOpenAISGLangSpec(cfg.Model) {
 		fmt.Printf(" ⚠  %s\n", noUsageWarningMessage())
+	}
+	if line := res.sglangTiers.summaryLine(); line != "" {
+		fmt.Printf(" %s\n", line)
 	}
 	fmt.Println(strings.Repeat("-", 62))
 	totalInput := res.totalInputCold + res.totalInputWarm
@@ -2550,6 +2565,10 @@ func runSingleModelBenchmark(
 				}
 				serverCacheConfirmed := explicitCache
 
+				if !isErr {
+					st.sglangTiers.add(metrics.CachedDetails, metrics.UsageData.InputTokens.Count)
+				}
+
 				// Write per-request data if configured.
 				if rdw != nil {
 					reqEnd := time.Now()
@@ -2580,6 +2599,7 @@ func runSingleModelBenchmark(
 						IsEmpty:              metrics.IsEmpty,
 						LocalCacheRatio:      ratio,
 					}
+					rec.applyCachedDetails(metrics.CachedDetails)
 					if rec.IsError || rec.IsEmpty {
 						rec.PromptText = metrics.CachedPrompt
 						rec.Question = metrics.Question
@@ -3152,6 +3172,7 @@ func runSingleModelBenchmark(
 
 	res.elapsed = time.Since(startTime)
 	res.noUsageObserved = st.sawResponseEver.Load() && !st.sawUsageEver.Load()
+	res.sglangTiers = st.sglangTiers.snapshot()
 	res.totalCompleted = st.totalCompleted.Load()
 	if st.routerReplay != nil {
 		if sessions, requests := st.routerReplay.Truncated(); sessions > 0 {

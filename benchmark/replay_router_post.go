@@ -1114,9 +1114,16 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 					CachedTokens int `json:"cached_tokens"`
 				} `json:"prompt_tokens_details,omitempty"`
 			} `json:"usage,omitempty"`
+			SGLExt *llm.SGLExt `json:"sglext,omitempty"`
 		}
 		if err := json.Unmarshal(data, &chunk); err != nil {
 			continue
+		}
+
+		// SGLang's per-tier breakdown can ride a chunk of its own (empty
+		// choices, no usage) or the final usage chunk.
+		if chunk.SGLExt != nil && chunk.SGLExt.CachedTokensDetails != nil {
+			m.CachedDetails = chunk.SGLExt.CachedTokensDetails
 		}
 
 		// Capture usage from the final chunk.
@@ -1196,10 +1203,14 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 				CachedTokens int `json:"cached_tokens"`
 			} `json:"prompt_tokens_details,omitempty"`
 		} `json:"usage,omitempty"`
+		SGLExt *llm.SGLExt `json:"sglext,omitempty"`
 	}
 	if err := json.Unmarshal(b, &resp); err != nil {
 		m.Error = err
 		return
+	}
+	if resp.SGLExt != nil {
+		m.CachedDetails = resp.SGLExt.CachedTokensDetails
 	}
 	if len(resp.Choices) > 0 {
 		msg := resp.Choices[0].Message
