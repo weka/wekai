@@ -23,8 +23,9 @@ package benchmark
 //   - host    = Δcached_tokens_total{cache_source="host"}    (CPU/DRAM
 //     HiCache L2 hit)
 //   - storage = Δcached_tokens_total{cache_source="storage"} (WekaFS L3 hit)
-//   - compute = Δprompt_tokens_total − Δcached_tokens_total{cache_source="total"}
-//     (recomputed from scratch; not itself a cache_source label)
+//   - compute = max(0, Δprompt_tokens_total − (device+host+storage+total))
+//     (recomputed from scratch; not itself a cache_source label; "total" is
+//     SGLang's untiered fallback series, see sglangCompute)
 //
 // Unlike vLLM eligibility (which speculatively samples any chat/completions
 // endpoint on the theory that it might be vLLM behind the scenes — see
@@ -233,11 +234,19 @@ type sglangMetricsSampler struct {
 // startVLLMMetricsSampler (it is engine-agnostic — see vllm_metrics.go) so the
 // active-dataset-tokens overlay populates for SGLang runs the same way it
 // does for vLLM.
-func startSGLangMetricsSampler(ctx context.Context, model string, tracker *activeDatasetTracker, rdw *requestDataWriter) *sglangMetricsSampler {
+//
+// override (--sglang-metrics-url) replaces the derived endpoints, e.g. to scrape
+// the router's aggregate metrics listener instead of the serving address.
+func startSGLangMetricsSampler(ctx context.Context, model string, override []string, tracker *activeDatasetTracker, rdw *requestDataWriter) *sglangMetricsSampler {
 	if rdw == nil || tracker == nil {
 		return nil
 	}
 	urls := sglangMetricsEndpoints(model)
+	if len(override) > 0 {
+		// An explicit URL is operator intent: sample even when the spec is not
+		// type=openai_sglang.
+		urls = normalizeMetricsURLs(override)
+	}
 	if len(urls) == 0 {
 		return nil
 	}
@@ -372,6 +381,24 @@ func (s *sglangMetricsSampler) fold(url string, vals map[string]float64) {
 	}
 }
 
+// sglangCompute derives the recomputed-from-scratch token count from the
+// accumulated counter totals: prompt_tokens_total minus every cached token,
+// clamped at 0. SGLang emits cached_tokens_total per tier (device/host/storage,
+// each series appearing only once it is >0) and emits cache_source="total"
+// only as a fallback when no per-tier details exist — so "total" is treated as
+// untiered cached tokens and ADDED to the tiers rather than used alone (using
+// "total" alone reads as ~0 cached whenever tiers are present). In the
+// fallback case the tiers are absent and the sum is just "total", so the two
+// shapes never double count.
+func sglangCompute(totals map[string]float64) float64 {
+	cached := totals["device"] + totals["host"] + totals["storage"] + totals["total"]
+	compute := totals[sglangPromptTokensKey] - cached
+	if compute < 0 {
+		compute = 0
+	}
+	return compute
+}
+
 // write persists the accumulated totals with this round's coverage. compute
 // is recomputed fresh each time from the two accumulated totals it's derived
 // from (prompt_tokens_total and the "total" cache_source label) rather than
@@ -382,10 +409,7 @@ func (s *sglangMetricsSampler) write(endpointsOK int) {
 		return
 	}
 	adt, active := s.tracker.Sum()
-	compute := s.totals[sglangPromptTokensKey] - s.totals["total"]
-	if compute < 0 {
-		compute = 0
-	}
+	compute := sglangCompute(s.totals)
 	rec := sglangMetricsSample{
 		RecordType: recordTypeSGLangMetricsSample,
 		TS:         s.now(),

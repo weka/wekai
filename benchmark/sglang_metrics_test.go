@@ -155,13 +155,13 @@ func TestSGLangMetricsSamplerDoesNotStartForNonSGLang(t *testing.T) {
 		"dynamic/http://localhost:8000/v1,type=openai_vllm",
 		"dynamic/http://localhost:8000/v1",
 	} {
-		if s := startSGLangMetricsSampler(context.Background(), spec, newActiveDatasetTracker(), rdw); s != nil {
+		if s := startSGLangMetricsSampler(context.Background(), spec, nil, newActiveDatasetTracker(), rdw); s != nil {
 			s.stop()
 			t.Errorf("spec %q: expected no sampler, got one", spec)
 		}
 	}
 	// A valid spec but no tracker must also stay inert.
-	if s := startSGLangMetricsSampler(context.Background(), "dynamic/http://localhost:8000/v1,type=openai_sglang", nil, rdw); s != nil {
+	if s := startSGLangMetricsSampler(context.Background(), "dynamic/http://localhost:8000/v1,type=openai_sglang", nil, nil, rdw); s != nil {
 		s.stop()
 		t.Error("expected no sampler without a tracker")
 	}
@@ -192,7 +192,7 @@ func TestStartSGLangMetricsSamplerLifecycle(t *testing.T) {
 	tracker.Update(2, 1000)
 
 	model := "dynamic/" + srv.URL + "/v1,type=openai_sglang"
-	s := startSGLangMetricsSampler(context.Background(), model, tracker, rdw)
+	s := startSGLangMetricsSampler(context.Background(), model, nil, tracker, rdw)
 	if s == nil {
 		t.Fatal("sampler did not start for an openai_sglang spec")
 	}
@@ -390,7 +390,8 @@ func TestSGLangRestartCountsFromZeroInsteadOfGoingBackwards(t *testing.T) {
 }
 
 // TestSGLangComputeDerivedFromPromptMinusCachedTotal verifies the one
-// non-direct band: compute = Δprompt_tokens_total − Δcached_tokens_total{total}.
+// non-direct band: compute = Δprompt − Δ(device+host+storage+total), where
+// "total" is the untiered fallback series.
 func TestSGLangComputeDerivedFromPromptMinusCachedTotal(t *testing.T) {
 	a := newFakeSGLang(t)
 	var cap sglangCapture
@@ -412,8 +413,8 @@ func TestSGLangComputeDerivedFromPromptMinusCachedTotal(t *testing.T) {
 	s.sampleOnce(ctx)
 
 	got := cap.all()[1].Sources
-	if got.Compute != 400 { // Δprompt(500) - Δtotal(100)
-		t.Errorf("compute = %d, want 400", got.Compute)
+	if got.Compute != 300 { // Δprompt(500) - (70+20+10 tiered + 100 untiered)
+		t.Errorf("compute = %d, want 300", got.Compute)
 	}
 	if got.Device != 70 || got.Host != 20 || got.Storage != 10 {
 		t.Errorf("sources = %+v, want device=70 host=20 storage=10", got)
@@ -528,5 +529,93 @@ func TestBuildSampleVizSGLangEmpty(t *testing.T) {
 	mix, adt := buildSampleVizSGLang(nil)
 	if mix != nil || adt != nil {
 		t.Fatalf("expected nil/nil, got %v %v", mix, adt)
+	}
+}
+
+// Live-like exposition from an SGLang server: labels engine_type/model_name
+// (no tp_rank), tier series present only when >0, and no cache_source="total"
+// because per-tier details exist.
+const sglangLiveDeviceOnly = `# HELP sglang:cached_tokens_total Number of cached prompt tokens.
+# TYPE sglang:cached_tokens_total counter
+sglang:cached_tokens_total{cache_source="device",engine_type="unified",model_name="Qwen/Qwen3-8B"} 7000.0
+# HELP sglang:prompt_tokens_total Number of prefill tokens processed.
+# TYPE sglang:prompt_tokens_total counter
+sglang:prompt_tokens_total{engine_type="unified",model_name="Qwen/Qwen3-8B"} 10000.0
+`
+
+const sglangLiveDeviceHost = `# TYPE sglang:cached_tokens_total counter
+sglang:cached_tokens_total{cache_source="device",engine_type="unified",model_name="m"} 6000.0
+sglang:cached_tokens_total{cache_source="host",engine_type="unified",model_name="m"} 1500.0
+# TYPE sglang:prompt_tokens_total counter
+sglang:prompt_tokens_total{engine_type="unified",model_name="m"} 10000.0
+`
+
+func TestSGLangComputeLiveExposition(t *testing.T) {
+	cases := []struct {
+		name, in string
+		want     map[string]float64
+		compute  float64
+	}{
+		{"device only", sglangLiveDeviceOnly, map[string]float64{"device": 7000, sglangPromptTokensKey: 10000}, 3000},
+		{"device+host", sglangLiveDeviceHost, map[string]float64{"device": 6000, "host": 1500, sglangPromptTokensKey: 10000}, 2500},
+		{"total fallback only", `sglang:cached_tokens_total{cache_source="total",model_name="m"} 4000
+sglang:prompt_tokens_total{model_name="m"} 10000
+`, map[string]float64{"total": 4000, sglangPromptTokensKey: 10000}, 6000},
+		{"missing prompt family", `sglang:cached_tokens_total{cache_source="device",x="y"} 5
+`, map[string]float64{"device": 5}, 0},
+		{"nothing", "# nothing here\n", map[string]float64{}, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := parseSGLangCounters(strings.NewReader(c.in))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(c.want) {
+				t.Fatalf("parsed = %v, want %v", got, c.want)
+			}
+			for k, v := range c.want {
+				if got[k] != v {
+					t.Errorf("%s = %v, want %v", k, got[k], v)
+				}
+			}
+			if cmp := sglangCompute(got); cmp != c.compute {
+				t.Errorf("compute = %v, want %v", cmp, c.compute)
+			}
+		})
+	}
+}
+
+func TestSGLangComputeClampsAtZero(t *testing.T) {
+	if got := sglangCompute(map[string]float64{"device": 10, sglangPromptTokensKey: 5}); got != 0 {
+		t.Errorf("compute = %v, want 0", got)
+	}
+}
+
+func TestSGLangMetricsURLOverride(t *testing.T) {
+	var cap sglangCapture
+	_ = cap
+	tracker := newActiveDatasetTracker()
+	f, err := os.Create(filepath.Join(t.TempDir(), "o.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	rdw := &requestDataWriter{f: f, enc: json.NewEncoder(f)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// A non-sglang spec samples nothing without an override...
+	if s := startSGLangMetricsSampler(ctx, "dynamic/http://h:1/v1,type=openai", nil, tracker, rdw); s != nil {
+		s.stop()
+		t.Fatal("sampler started without override")
+	}
+	// ...and with one it targets exactly the normalized override URLs.
+	s := startSGLangMetricsSampler(ctx, "dynamic/http://h:1/v1,type=openai", []string{"http://127.0.0.1:1", "http://r:9/metrics/"}, tracker, rdw)
+	if s == nil {
+		t.Fatal("override did not start a sampler")
+	}
+	defer s.stop()
+	if len(s.urls) != 2 || s.urls[0] != "http://127.0.0.1:1/metrics" || s.urls[1] != "http://r:9/metrics" {
+		t.Errorf("urls = %v", s.urls)
 	}
 }

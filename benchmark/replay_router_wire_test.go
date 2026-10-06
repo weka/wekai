@@ -560,7 +560,7 @@ func TestRunGUIDStampToolPrependedWhenToolsPresent(t *testing.T) {
 	}
 
 	// OpenAI shape.
-	body, _, err = buildOpenAIChatCompletionsBody(req, docs, "m", "test-run-id", 0, 0, false, 0, nil, "", "")
+	body, _, err = buildOpenAIChatCompletionsBody(req, docs, "m", "test-run-id", 0, 0, false, 0, nil, "", "", false)
 	if err != nil {
 		t.Fatalf("openai with runID: %v", err)
 	}
@@ -586,7 +586,7 @@ func TestRunGUIDStampToolPrependedWhenToolsPresent(t *testing.T) {
 			return b, e
 		},
 		"openai": func() ([]byte, error) {
-			b, _, e := buildOpenAIChatCompletionsBody(req, docs, "m", "", 0, 0, false, 0, nil, "", "")
+			b, _, e := buildOpenAIChatCompletionsBody(req, docs, "m", "", 0, 0, false, 0, nil, "", "", false)
 			return b, e
 		},
 	} {

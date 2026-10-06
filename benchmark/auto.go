@@ -109,6 +109,10 @@ type AutoBenchmarkConfig struct {
 	// every backend directly, in which case the per-endpoint delta accumulator
 	// sums them correctly across restarts and departures.
 	VLLMMetricsURLs []string
+	// SGLangMetricsURLs is the SGLang equivalent of VLLMMetricsURLs: overrides
+	// where sglang:cached_tokens_total / sglang:prompt_tokens_total are scraped
+	// (e.g. the router's aggregate metrics listener). Same URL forms.
+	SGLangMetricsURLs []string
 
 	// Real-time replay: sessions keep the think time they were captured with,
 	// and load grows by admitting sessions under a TTFT governor rather than by
@@ -2156,7 +2160,7 @@ func runSingleModelBenchmark(
 		// waits for the goroutine — no sample write can race the file close.
 		defer sampler.stop()
 	}
-	if sampler := startSGLangMetricsSampler(benchCtx, cfg.Model, st.datasetTracker, rdw); sampler != nil {
+	if sampler := startSGLangMetricsSampler(benchCtx, cfg.Model, cfg.SGLangMetricsURLs, st.datasetTracker, rdw); sampler != nil {
 		defer sampler.stop()
 	}
 	if cfg.HotSeriesConcurrency > 0 {
