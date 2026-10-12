@@ -19,15 +19,24 @@ import (
 type RouterReplayPrepareCommand struct {
 	Out  string `short:"o" long:"out" description:"Output file path. Default: <src>/../replays/replay-<earliest>-to-<latest>.json"`
 	Name string `long:"name" description:"Embed this name in the file (default: derived from output path)"`
-	Args struct {
+	// Since/Until bound the capture by request timestamp (RFC3339, inclusive),
+	// so a corpus can be rebuilt from a directory that has grown since.
+	Since string `long:"since" description:"Only records with ts >= this RFC3339 instant"`
+	Until string `long:"until" description:"Only records with ts <= this RFC3339 instant"`
+	Args  struct {
 		Src string `positional-arg-name:"src" description:"Directory of redacted *.jsonl files (or one .jsonl). Default: ~/.wekai/router/capture/redacted/"`
 	} `positional-args:"yes"`
 }
 
-// ReplayHeader is the first line of a replay-v3 JSONL file. The remaining
+// ReplayHeader is the first line of a replay JSONL file (schema replay-v4;
+// readers also accept replay-v3, which has no think_ms / think_ref). The remaining
 // lines are one ReplaySession per line — this lets producers stream output
 // and consumers stream input with a bounded queue, instead of holding the
 // full file (and its decoded objects) in memory.
+//
+// v4 (vs v3) adds per-request think_ms / think_ref and a header timing
+// summary: see replay_think.go. upstream_latency_ms and total_ms are now
+// filled from the capture (v3 files carry them as 0).
 //
 // v3 (vs v2) embeds per-request structured spec — system_blocks, tools,
 // messages — so the replayer can reconstruct a byte/token-faithful HTTP
@@ -35,7 +44,7 @@ type RouterReplayPrepareCommand struct {
 // from each block's hash (same hash → same content → server prefix-cache
 // hits the same way the original capture did).
 type ReplayHeader struct {
-	Schema      string        `json:"_schema"` // "replay-v3"
+	Schema      string        `json:"_schema"` // "replay-v4"
 	Name        string        `json:"name"`
 	GeneratedAt string        `json:"generated_at"`
 	Source      string        `json:"source"`
@@ -54,6 +63,8 @@ type ReplaySummary struct {
 	CyclesBroken       int    `json:"cycles_broken"`
 	StartTs            string `json:"start_ts"`
 	EndTs              string `json:"end_ts"`
+
+	Timing *ReplayTimingSummary `json:"timing,omitempty"`
 }
 
 type ReplaySession struct {
@@ -108,6 +119,12 @@ type ReplayRequest struct {
 	StopReason        string `json:"stop_reason,omitempty"`
 	UpstreamLatencyMs int64  `json:"upstream_latency_ms"`
 	TotalMs           int64  `json:"total_ms"`
+
+	// ThinkMs is the captured gap between the end of the reference named by
+	// ThinkRef and the start of this request, clamped at 0. Absent when it
+	// could not be computed. See replay_think.go.
+	ThinkMs  *int64 `json:"think_ms,omitempty"`
+	ThinkRef string `json:"think_ref,omitempty"`
 }
 
 // ReplaySystemBlock mirrors redactedSystemBlock so the replayer can rebuild
@@ -166,6 +183,10 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 		recs, err := parseTreeFile(f)
 		if err != nil {
 			return fmt.Errorf("parse %s: %w", f, err)
+		}
+		recs, err = filterRecordsByTime(recs, c.Since, c.Until)
+		if err != nil {
+			return err
 		}
 		records = append(records, recs...)
 	}
@@ -251,7 +272,7 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 	defer bw.Flush()
 
 	header := ReplayHeader{
-		Schema:      "replay-v3",
+		Schema:      "replay-v4",
 		Name:        name,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		// Base name only: replay files get published as artifacts, and a full
@@ -331,6 +352,7 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 	emittedInstances := 0
 	totalRepaired := 0
 	totalCyclesBroken := 0
+	think := newThinkAccumulator()
 	// Two-pass write: build all sessions first to fill in Summary.Requests,
 	// then write header + sessions. Sessions go through a slice but each
 	// session is small relative to the file (median 2.7 KB) — we only ever
@@ -395,6 +417,7 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 		if cyclesBroken > 0 {
 			fmt.Fprintf(os.Stderr, "replay-prepare: broke %d parent-dependency cycle(s) (instances promoted to roots)\n", cyclesBroken)
 		}
+		annotateThink(&rs, think)
 		emittedSessions++
 		// Compact JSON encoding (no indent) so each session sits on one
 		// line. The header line uses the same encoding for consistency.
@@ -407,6 +430,7 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 	header.Summary.Requests = totalReqs
 	header.Summary.RepairedParents = totalRepaired
 	header.Summary.CyclesBroken = totalCyclesBroken
+	header.Summary.Timing = think.summary()
 	// Write header on line 1.
 	hb, err := json.Marshal(&header)
 	if err != nil {
@@ -437,6 +461,37 @@ func parseTreeFile(path string) ([]treeRecord, error) {
 	c := &RouterTreeCommand{}
 	recs, _, _, _, err := c.parseFile(path)
 	return recs, err
+}
+
+// filterRecordsByTime keeps records with since <= ts <= until; an empty bound
+// is open.
+func filterRecordsByTime(recs []treeRecord, since, until string) ([]treeRecord, error) {
+	if since == "" && until == "" {
+		return recs, nil
+	}
+	var lo, hi time.Time
+	var err error
+	if since != "" {
+		if lo, err = time.Parse(time.RFC3339Nano, since); err != nil {
+			return nil, fmt.Errorf("--since: %w", err)
+		}
+	}
+	if until != "" {
+		if hi, err = time.Parse(time.RFC3339Nano, until); err != nil {
+			return nil, fmt.Errorf("--until: %w", err)
+		}
+	}
+	out := recs[:0]
+	for _, r := range recs {
+		if since != "" && r.Ts.Before(lo) {
+			continue
+		}
+		if until != "" && r.Ts.After(hi) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 // canonicalInstanceKey resolves a non-canonical (sid, sig, fp) triple to the
@@ -471,6 +526,9 @@ func buildReplayRequest(r *treeRecord) *ReplayRequest {
 		TopK:        r.Req.TopK,
 		Thinking:    r.Req.Thinking,
 		StopReason:  r.Resp.StopReason,
+
+		UpstreamLatencyMs: r.UpstreamLatencyMs,
+		TotalMs:           r.TotalMs,
 	}
 	if r.Resp.Usage != nil {
 		rr.InputTokens = r.Resp.Usage.InputTokens +

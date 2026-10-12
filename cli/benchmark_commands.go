@@ -281,6 +281,7 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		ReplayReuseSessions:           c.ReuseSessions(),
 		ReplayAllowUnderfill:          c.ReplayAllowUnderfill,
 		ReplayRealtime:                c.ReplayRealtime,
+		ReplayTiming:                  c.ReplayTiming,
 		AdmitEvery:                    c.AdmitEvery,
 		AdmitCount:                    c.AdmitCount,
 		TTFTLimit:                     c.TTFTLimit,

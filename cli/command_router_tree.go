@@ -42,9 +42,14 @@ type treeRecord struct {
 	Sid     string
 	User    string
 	ModelIn string
-	Req     redactedRequest
-	Resp    redactedResponse
-	IsPlain bool
+	// UpstreamLatencyMs and TotalMs are the router's own timings for the
+	// request: time to the upstream's first byte, and receipt to last byte
+	// of the response. Zero when the capture predates them.
+	UpstreamLatencyMs int64
+	TotalMs           int64
+	Req               redactedRequest
+	Resp              redactedResponse
+	IsPlain           bool
 }
 
 // OrphanSessionID is the synthetic session id assigned to every record that
@@ -69,14 +74,18 @@ func (r treeRecord) SessionID() string {
 // captureRecordTreeRaw mirrors the on-disk record shape but typed loosely so
 // we can decode either raw or redacted without two parsers.
 type captureRecordTreeRaw struct {
-	ID       uint64      `json:"id"`
-	Ts       string      `json:"ts"`
-	Method   string      `json:"method"`
-	Path     string      `json:"path"`
-	Status   int         `json:"status,omitempty"`
-	ModelIn  string      `json:"model_in,omitempty"`
-	ModelOut string      `json:"model_out,omitempty"`
-	User     string      `json:"user,omitempty"`
+	ID       uint64 `json:"id"`
+	Ts       string `json:"ts"`
+	Method   string `json:"method"`
+	Path     string `json:"path"`
+	Status   int    `json:"status,omitempty"`
+	ModelIn  string `json:"model_in,omitempty"`
+	ModelOut string `json:"model_out,omitempty"`
+	User     string `json:"user,omitempty"`
+
+	UpstreamLatencyMs int64 `json:"upstream_latency_ms,omitempty"`
+	TotalMs           int64 `json:"total_ms,omitempty"`
+
 	Request  captureBody `json:"request"`
 	Response captureBody `json:"response"`
 }
@@ -242,6 +251,7 @@ func (c *RouterTreeCommand) parseLine(line []byte, out *[]treeRecord, rawCount, 
 	}
 	*out = append(*out, treeRecord{
 		ID: rec.ID, Ts: ts, Sid: sid, User: rec.User, ModelIn: model,
+		UpstreamLatencyMs: rec.UpstreamLatencyMs, TotalMs: rec.TotalMs,
 		Req: req, Resp: resp,
 		IsPlain: resp.PlainJSON != nil,
 	})
