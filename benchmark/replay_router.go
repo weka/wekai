@@ -49,6 +49,14 @@ import (
 // preserving the original wire shape and the original tool-use / tool-
 // result reference graph across turns.
 
+// Values of RouterReplayRequest.ThinkRef; see the converter's replay_think.go
+// for what each reference is.
+const (
+	ThinkRefPrev         = "prev"
+	ThinkRefSpawn        = "spawn"
+	ThinkRefSessionStart = "session_start"
+)
+
 // RouterReplayHeader is the first-line metadata of a replay-v3 file.
 type RouterReplayHeader struct {
 	Schema      string              `json:"_schema"` // "replay-v3"
@@ -68,6 +76,16 @@ type RouterReplaySummary struct {
 	MaxFanOutInOneTurn int    `json:"max_fan_out_in_one_turn"`
 	StartTs            string `json:"start_ts"`
 	EndTs              string `json:"end_ts"`
+
+	// Timing is present in replay-v4 files only.
+	Timing *RouterReplayTiming `json:"timing,omitempty"`
+}
+
+// RouterReplayTiming is the part of the header's timing summary the replayer
+// acts on: whether the file carries think_ms at all.
+type RouterReplayTiming struct {
+	RequestsWithTiming int `json:"requests_with_timing"`
+	RequestsWithThink  int `json:"requests_with_think"`
 }
 
 type RouterReplaySession struct {
@@ -123,6 +141,12 @@ type RouterReplayRequest struct {
 	StopReason        string `json:"stop_reason,omitempty"`
 	UpstreamLatencyMs int64  `json:"upstream_latency_ms"`
 	TotalMs           int64  `json:"total_ms"`
+
+	// ThinkMs is the captured gap between the end of the reference named by
+	// ThinkRef ("prev", "spawn" or "session_start") and the start of this
+	// request. Nil in replay-v3 files and wherever it could not be computed.
+	ThinkMs  *int64 `json:"think_ms,omitempty"`
+	ThinkRef string `json:"think_ref,omitempty"`
 }
 
 // RouterReplaySystemBlock mirrors the prep-side ReplaySystemBlock.
@@ -218,8 +242,8 @@ func readRouterReplayHeader(path string) (RouterReplayHeader, error) {
 	if err := json.Unmarshal(line, &hdr); err != nil {
 		return RouterReplayHeader{}, fmt.Errorf("parse header: %w", err)
 	}
-	if hdr.Schema != "replay-v3" {
-		return RouterReplayHeader{}, fmt.Errorf("unsupported replay schema %q (expected replay-v3)", hdr.Schema)
+	if hdr.Schema != "replay-v3" && hdr.Schema != "replay-v4" {
+		return RouterReplayHeader{}, fmt.Errorf("unsupported replay schema %q (expected replay-v3 or replay-v4)", hdr.Schema)
 	}
 	return hdr, nil
 }
@@ -766,6 +790,9 @@ func runRouterReplaySession(
 	// prepare time (see router replay-prepare), so the tree is complete:
 	// no virtual-time inference needed at replay time.
 	requestDone := map[uint64]chan struct{}{}
+	// requestEnd is when each request finished on THIS run's clock, written
+	// before its done-channel closes. Think-mode scheduling measures from it.
+	requestEnd := map[uint64]*atomic.Int64{}
 	for i := range sess.Instances {
 		if !includeRole(sess.Instances[i].Role) {
 			continue
@@ -773,6 +800,7 @@ func runRouterReplaySession(
 		for _, r := range sess.Instances[i].Requests {
 			if r.RequestID != 0 {
 				requestDone[r.RequestID] = make(chan struct{})
+				requestEnd[r.RequestID] = new(atomic.Int64)
 			}
 		}
 	}
@@ -806,7 +834,7 @@ func runRouterReplaySession(
 			}
 			runRouterReplayInstance(benchCtx, cfg, st, rdw,
 				sess.SessionID, sess.StartTs, sessionOrigin, &covered,
-				passStamp, seriesNum, inst, picker, reqTimeout, docs, requestDone, gate, su)
+				passStamp, seriesNum, inst, picker, reqTimeout, docs, requestDone, requestEnd, gate, su)
 		}()
 	}
 	wg.Wait()
@@ -861,6 +889,7 @@ func runRouterReplayInstance(
 	reqTimeout time.Duration,
 	docs string,
 	requestDone map[uint64]chan struct{},
+	requestEnd map[uint64]*atomic.Int64,
 	gate *concurrencyGate,
 	su *sessionUUIDs,
 ) {
@@ -944,6 +973,8 @@ func runRouterReplayInstance(
 	// so every instance of a fan-out shares one timeline and the sub-agents keep
 	// their offsets relative to the turn that spawned them.
 	pacer := newSessionPacer(sessionStartTs, sessionOrigin, cfg.ReplayRealtime, st.skipClk)
+	pacer.think = cfg.replayThink
+	var prevEnd time.Time // when this instance's previous request finished, on our clock
 
 	for ti, req := range inst.Requests {
 		if ctx.Err() != nil {
@@ -956,7 +987,31 @@ func runRouterReplayInstance(
 		// Hold until this turn is due. Already-late turns return at once, which
 		// is the normal case on a fleet slower than the capture: the session
 		// falls behind rather than firing a backlog.
-		st.lag.observe(pacer.Wait(ctx, req.Ts))
+		//
+		// In think mode the turn is due at the end of its reference plus the
+		// captured think time; the lateness is taken after the concurrency gate
+		// below so that a capped run counts the time spent queued for a slot.
+		var due, refEnd time.Time
+		thinkPaced := false
+		if pacer.think {
+			switch req.ThinkRef {
+			case ThinkRefPrev:
+				refEnd = prevEnd
+			case ThinkRefSpawn:
+				if e := requestEnd[inst.ParentSpawnRequestID]; e != nil && e.Load() != 0 {
+					refEnd = time.Unix(0, e.Load())
+				}
+			case ThinkRefSessionStart:
+				refEnd = sessionOrigin
+			}
+			due, thinkPaced = pacer.thinkDue(req, refEnd)
+			if thinkPaced {
+				pacer.waitUntil(ctx, due)
+			}
+		}
+		if !thinkPaced {
+			st.lag.observe(pacer.Wait(ctx, req.Ts))
+		}
 		// How far into its captured conversation this session has reached. The
 		// furthest offset any of its instances dispatched is the session's own
 		// progress through the capture, and summed across sessions it is what
@@ -982,6 +1037,11 @@ func runRouterReplayInstance(
 			if gerr := gate.Acquire(ctx); gerr != nil {
 				return
 			}
+		}
+
+		sendAt := pacer.clk.Now()
+		if thinkPaced {
+			st.lag.observeThink(sendAt.Sub(due), sendAt.Sub(refEnd), time.Duration(*req.ThinkMs)*time.Millisecond)
 		}
 
 		// Cap max_tokens if cfg.MaxOutputTokens is set; otherwise the
@@ -1023,6 +1083,7 @@ func runRouterReplayInstance(
 			metrics = reqPoster.do(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, su)
 		}
 		st.skipClk.AddInflight(-1)
+		endAt := pacer.clk.Now()
 		picker.release(epIdx)
 		reqCancel()
 		gate.Release()
@@ -1055,6 +1116,13 @@ func runRouterReplayInstance(
 			return
 		}
 
+		prevEnd = endAt
+		if cfg.ReplayRealtime && req.TotalMs > 0 {
+			st.lag.observeResponse(endAt.Sub(sendAt), time.Duration(req.TotalMs)*time.Millisecond)
+		}
+		if e := requestEnd[req.RequestID]; e != nil {
+			e.Store(endAt.UnixNano())
+		}
 		if ch, ok := requestDone[req.RequestID]; ok {
 			closeOnce(ch)
 		}

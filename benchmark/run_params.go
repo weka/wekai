@@ -50,6 +50,7 @@ type runParamsRecord struct {
 	AdmitCount           int    `json:"admit_count,omitempty"`
 	AdmitEvery           string `json:"admit_every,omitempty"`
 	ReplayRealtime       bool   `json:"replay_realtime,omitempty"`
+	ReplayTiming         string `json:"replay_timing,omitempty"`
 
 	// Budgets
 	TimeoutSec        float64 `json:"timeout_sec,omitempty"`
@@ -101,6 +102,7 @@ func buildRunParams(cfg AutoBenchmarkConfig, now time.Time) runParamsRecord {
 		StartSeries:          cfg.StartSeries,
 		MaxConcurrency:       cfg.MaxConcurrency,
 		ReplayRealtime:       cfg.ReplayRealtime,
+		ReplayTiming:         replayTimingLabel(cfg),
 
 		TotalRequests:   cfg.Total,
 		MaxOutputTokens: cfg.MaxOutputTokens,
@@ -200,4 +202,15 @@ func (p runParamsRecord) summaryLine() string {
 		parts = append(parts, "dry-run")
 	}
 	return strings.Join(parts, " ")
+}
+
+// replayTimingLabel is the schedule a realtime run actually used, resolved.
+func replayTimingLabel(cfg AutoBenchmarkConfig) string {
+	if !cfg.ReplayRealtime {
+		return ""
+	}
+	if cfg.replayThink {
+		return "think"
+	}
+	return "absolute"
 }

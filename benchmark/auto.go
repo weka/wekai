@@ -122,10 +122,17 @@ type AutoBenchmarkConfig struct {
 	// and load grows by admitting sessions under a TTFT governor rather than by
 	// setting a concurrency number.
 	ReplayRealtime bool
-	AdmitEvery     time.Duration // 0 = off, no session admission governor
-	AdmitCount     int           // sessions per admission tick; 0 = 1
-	TTFTLimit      time.Duration // gate closes at or above this windowed mean
-	TTFTWindow     time.Duration // how far back the gate looks; default 30s
+	// ReplayTiming picks the --replay-realtime schedule: "think" (each turn due
+	// at the end of its reference plus the captured think time), "absolute"
+	// (each turn due at its captured offset from the session start), or ""
+	// for think when the file carries think_ms and absolute otherwise.
+	ReplayTiming string
+	// replayThink is ReplayTiming resolved against the file at startup.
+	replayThink bool
+	AdmitEvery  time.Duration // 0 = off, no session admission governor
+	AdmitCount  int           // sessions per admission tick; 0 = 1
+	TTFTLimit   time.Duration // gate closes at or above this windowed mean
+	TTFTWindow  time.Duration // how far back the gate looks; default 30s
 	// TTFTLimitStat is which statistic over that window the gate compares
 	// against TTFTLimit: mean (default), p50, p95 or p99.
 	//
@@ -3481,6 +3488,14 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 			return fmt.Errorf("read router replay header %q: %w", cfg.RouterReplayFile, err)
 		}
 		cfg.routerReplayHeader = hdr
+		if cfg.ReplayRealtime {
+			think, err := resolveReplayTiming(cfg.ReplayTiming, hdr)
+			if err != nil {
+				return err
+			}
+			cfg.replayThink = think
+			fmt.Fprintf(os.Stderr, "[realtime] timing mode: %s\n", describeReplayTiming(think, cfg.ReplayTiming, hdr))
+		}
 		fmt.Printf("Router-replay mode: file=%s run-id=%s\n",
 			cfg.RouterReplayFile, cfg.RunID)
 		fmt.Printf("Header: %d sessions / %d instances / %d requests / %d fan-out turns / max fan-out %d\n\n",

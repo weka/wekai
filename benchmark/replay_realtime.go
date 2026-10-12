@@ -24,6 +24,37 @@ import (
 // advance. The governor adds a batch per tick while windowed TTFT stays under the
 // limit and pauses above it, so the fleet's latency is the only throttle.
 
+// resolveReplayTiming decides whether a run schedules by think time.
+func resolveReplayTiming(mode string, hdr RouterReplayHeader) (bool, error) {
+	has := hdr.Summary.Timing != nil && hdr.Summary.Timing.RequestsWithThink > 0
+	switch mode {
+	case "", "auto":
+		return has, nil
+	case "absolute":
+		return false, nil
+	case "think":
+		if !has {
+			return false, fmt.Errorf("--replay-timing=think needs a replay-v4 file with think_ms; this file (%s) has none -- use --replay-timing=absolute or regenerate it with 'wekai router replay-prepare'", hdr.Schema)
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("--replay-timing: unknown mode %q (think, absolute)", mode)
+}
+
+func describeReplayTiming(think bool, requested string, hdr RouterReplayHeader) string {
+	how := "default"
+	if requested == "think" || requested == "absolute" {
+		how = "requested"
+	}
+	if think {
+		return fmt.Sprintf("think (%s; each turn due at its reference's end on this run's clock + captured think_ms; file %s)", how, hdr.Schema)
+	}
+	if hdr.Summary.Timing == nil || hdr.Summary.Timing.RequestsWithThink == 0 {
+		return fmt.Sprintf("absolute (%s; file %s has no think_ms; each turn due at its captured offset from session start)", how, hdr.Schema)
+	}
+	return fmt.Sprintf("absolute (%s; each turn due at its captured offset from session start)", how)
+}
+
 func (cfg *AutoBenchmarkConfig) setSeriesDefaults() {
 	if cfg.MaxSeries <= 0 && cfg.AdmitEvery <= 0 {
 		cfg.MaxSeries = 64
@@ -223,7 +254,15 @@ func (w *ttftWindow) Open(now time.Time, limit time.Duration, stat string) bool 
 // is the honest reading: a session cannot issue turn i+1 before it has the
 // answer to turn i, and if this fleet is slower than the original the session
 // simply falls behind rather than firing a backlog.
+//
+// Two schedules exist. The absolute one (above) targets offsets on the captured
+// clock. The think one, used when think is set and a request carries think_ms,
+// targets the END of the request's reference on THIS run's clock plus the
+// captured think time: the user's pause after an answer is preserved whether
+// our answer arrived sooner or later than the original, which is what a replay
+// against a different fleet has to hold fixed.
 type sessionPacer struct {
+	think   bool // schedule by think_ms where the request has one
 	enabled bool
 	origin  time.Time // wall clock when the session was admitted
 	base    time.Time // recorded timestamp of the session's first request
@@ -259,6 +298,17 @@ func (p *sessionPacer) dueAt(ts string) (time.Time, bool) {
 	return p.origin.Add(off), true
 }
 
+// thinkDue is the instant a request is due under the think schedule: ref plus
+// the request's captured think time. ok is false when the request has to fall
+// back to the absolute schedule -- think mode off, no think_ms on the request
+// (a replay-v3 file), or no reference (the referenced request never completed).
+func (p *sessionPacer) thinkDue(req RouterReplayRequest, ref time.Time) (time.Time, bool) {
+	if !p.enabled || !p.think || req.ThinkMs == nil || ref.IsZero() {
+		return time.Time{}, false
+	}
+	return ref.Add(time.Duration(*req.ThinkMs) * time.Millisecond), true
+}
+
 // offsetOf is how far into the captured conversation a turn sits, measured from
 // the session's own start.
 func (p *sessionPacer) offsetOf(ts string) (time.Duration, bool) {
@@ -283,6 +333,11 @@ func (p *sessionPacer) Wait(ctx context.Context, ts string) time.Duration {
 	if !ok {
 		return 0
 	}
+	return p.waitUntil(ctx, due)
+}
+
+// waitUntil blocks until due and reports how late it already was on entry.
+func (p *sessionPacer) waitUntil(ctx context.Context, due time.Time) time.Duration {
 	if late := p.clk.Now().Sub(due); late > 0 {
 		return late
 	}
@@ -498,6 +553,48 @@ type pacingLag struct {
 	// can fall by a third between two samples without the fleet changing at all.
 	live   map[int64]*liveSession
 	nextID int64
+
+	// Think-schedule accounting. A request paced by think_ms is due at the end
+	// of its reference plus the captured think time, so it is "late" by however
+	// long the concurrency gate (if one is set) held it past that moment; the
+	// realized think (send time minus reference end) is reported against the
+	// captured one. Response time is ours against the capture's total_ms.
+	thinkN       int64
+	thinkLate    int64
+	thinkLateSum time.Duration
+	thinkLateMax time.Duration
+	thinkReal    time.Duration
+	thinkOrig    time.Duration
+	respN        int64
+	respOurs     time.Duration
+	respOrig     time.Duration
+}
+
+// observeThink records one think-paced request: lateness past its due time
+// (gate wait included), the think it actually got, and the captured one.
+func (l *pacingLag) observeThink(late, realized, original time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.thinkN++
+	l.thinkReal += realized
+	l.thinkOrig += original
+	if late > 0 {
+		l.thinkLate++
+		l.thinkLateSum += late
+		if late > l.thinkLateMax {
+			l.thinkLateMax = late
+		}
+	}
+}
+
+// observeResponse records how long this run's fleet took to answer a request
+// against how long the capture's did.
+func (l *pacingLag) observeResponse(ours, orig time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.respN++
+	l.respOurs += ours
+	l.respOrig += orig
 }
 
 // liveSession is a session in progress: how far into its capture it has reached
@@ -552,17 +649,40 @@ func (l *pacingLag) observe(d time.Duration) {
 func (l *pacingLag) summary(now time.Time) string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.n == 0 {
+	if l.n == 0 && l.thinkN == 0 {
 		return ""
 	}
 	var mean time.Duration
 	if l.late > 0 {
 		mean = l.sum / time.Duration(l.late)
 	}
-	out := fmt.Sprintf(
-		"paced=%d late=%d (%.1f%%) mean_late=%s max_late=%s >1s=%d >10s=%d >1m=%d >10m=%d",
-		l.n, l.late, 100*float64(l.late)/float64(l.n), mean.Round(time.Millisecond),
-		l.max.Round(time.Millisecond), l.overs[0], l.overs[1], l.overs[2], l.overs[3])
+	out := ""
+	if l.thinkN > 0 {
+		var lm time.Duration
+		if l.thinkLate > 0 {
+			lm = l.thinkLateSum / time.Duration(l.thinkLate)
+		}
+		out = fmt.Sprintf("think-paced=%d think_real=%s think_orig=%s late=%d (%.1f%%, gate/queue wait) mean_late=%s max_late=%s",
+			l.thinkN, (l.thinkReal / time.Duration(l.thinkN)).Round(time.Millisecond),
+			(l.thinkOrig / time.Duration(l.thinkN)).Round(time.Millisecond),
+			l.thinkLate, 100*float64(l.thinkLate)/float64(l.thinkN),
+			lm.Round(time.Millisecond), l.thinkLateMax.Round(time.Millisecond))
+	}
+	if l.respN > 0 && l.respOrig > 0 {
+		out += fmt.Sprintf(" resp_ratio=%.2f (ours %s / orig %s mean, n=%d)",
+			float64(l.respOurs)/float64(l.respOrig),
+			(l.respOurs / time.Duration(l.respN)).Round(time.Millisecond),
+			(l.respOrig / time.Duration(l.respN)).Round(time.Millisecond), l.respN)
+	}
+	if l.n > 0 {
+		if out != "" {
+			out += " | abs: "
+		}
+		out += fmt.Sprintf(
+			"paced=%d late=%d (%.1f%%) mean_late=%s max_late=%s >1s=%d >10s=%d >1m=%d >10m=%d",
+			l.n, l.late, 100*float64(l.late)/float64(l.n), mean.Round(time.Millisecond),
+			l.max.Round(time.Millisecond), l.overs[0], l.overs[1], l.overs[2], l.overs[3])
+	}
 	// Live sessions count too. Their coverage so far against the time they have
 	// so far been alive is exactly as meaningful as a finished session's, and
 	// leaving them out is what made the ratio a statement about which sessions

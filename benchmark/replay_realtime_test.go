@@ -2,8 +2,15 @@ package benchmark
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -701,5 +708,234 @@ func TestGateSeesFailedWaits(t *testing.T) {
 	if withFailures.Open(now, limit, "mean") {
 		t.Error("the gate still admits with half its traffic failing after 40s; a request that " +
 			"waited and got nothing is an SLO violation, not an absence")
+	}
+}
+
+// TestThinkScheduleFollowsOurCompletion is the contract of think mode: the pause
+// the user left after an answer is kept whether our answer comes sooner or later
+// than the original. Original: request 1 starts T0 and ends T10, request 2
+// starts T20, so think is 10s.
+func TestThinkScheduleFollowsOurCompletion(t *testing.T) {
+	t0 := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	think := int64(10_000)
+	req2 := RouterReplayRequest{Ts: "2026-05-12T08:50:26Z", ThinkMs: &think, ThinkRef: ThinkRefPrev}
+	p := newSessionPacer("2026-05-12T08:50:06Z", t0, true, nil)
+	p.think = true
+
+	for _, tc := range []struct {
+		name string
+		end  time.Duration
+		want time.Duration
+	}{
+		{"slower than the original (T15)", 15 * time.Second, 25 * time.Second},
+		{"faster than the original (T5)", 5 * time.Second, 15 * time.Second},
+		{"exactly the original (T10)", 10 * time.Second, 20 * time.Second},
+	} {
+		due, ok := p.thinkDue(req2, t0.Add(tc.end))
+		if !ok {
+			t.Fatalf("%s: not think-paced", tc.name)
+		}
+		if got := due.Sub(t0); got != tc.want {
+			t.Errorf("%s: due at T+%v, want T+%v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestThinkScheduleFallsBackToAbsolute: no think_ms (a replay-v3 file), no
+// reference, or think mode off all leave the request on the absolute schedule.
+func TestThinkScheduleFallsBackToAbsolute(t *testing.T) {
+	t0 := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	think := int64(10_000)
+	with := RouterReplayRequest{Ts: "2026-05-12T08:50:26Z", ThinkMs: &think}
+	without := RouterReplayRequest{Ts: "2026-05-12T08:50:26Z"}
+
+	p := newSessionPacer("2026-05-12T08:50:06Z", t0, true, nil)
+	p.think = true
+	if _, ok := p.thinkDue(without, t0); ok {
+		t.Error("a request with no think_ms was think-paced")
+	}
+	if _, ok := p.thinkDue(with, time.Time{}); ok {
+		t.Error("a request with no reference end was think-paced")
+	}
+	p.think = false
+	if _, ok := p.thinkDue(with, t0); ok {
+		t.Error("think scheduling happened with think mode off")
+	}
+	// The absolute schedule is untouched by any of it.
+	if due, _ := p.dueAt(with.Ts); due.Sub(t0) != 20*time.Second {
+		t.Errorf("absolute due = T+%v, want T+20s", due.Sub(t0))
+	}
+}
+
+func TestResolveReplayTiming(t *testing.T) {
+	v4 := RouterReplayHeader{Schema: "replay-v4", Summary: RouterReplaySummary{Timing: &RouterReplayTiming{RequestsWithThink: 5}}}
+	v3 := RouterReplayHeader{Schema: "replay-v3"}
+	for _, tc := range []struct {
+		mode    string
+		hdr     RouterReplayHeader
+		want    bool
+		wantErr bool
+	}{
+		{"", v4, true, false},
+		{"", v3, false, false},
+		{"absolute", v4, false, false},
+		{"think", v4, true, false},
+		{"think", v3, false, true},
+		{"bogus", v4, false, true},
+	} {
+		got, err := resolveReplayTiming(tc.mode, tc.hdr)
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("mode=%q schema=%s: got (%v, %v), want (%v, err=%v)", tc.mode, tc.hdr.Schema, got, err, tc.want, tc.wantErr)
+		}
+	}
+}
+
+func TestReadHeaderAcceptsV3AndV4(t *testing.T) {
+	dir := t.TempDir()
+	for _, schema := range []string{"replay-v3", "replay-v4"} {
+		path := filepath.Join(dir, schema+".jsonl")
+		if err := os.WriteFile(path, []byte(`{"_schema":"`+schema+`","name":"t","summary":{}}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readRouterReplayHeader(path); err != nil {
+			t.Errorf("%s rejected: %v", schema, err)
+		}
+	}
+	bad := filepath.Join(dir, "bad.jsonl")
+	_ = os.WriteFile(bad, []byte(`{"_schema":"replay-v9"}`+"\n"), 0o644)
+	if _, err := readRouterReplayHeader(bad); err == nil {
+		t.Error("an unknown schema was accepted")
+	}
+}
+
+// thinkSessionTimes replays a two-request instance against a server that takes
+// respond to answer, and returns the gap between the two requests' arrivals.
+// The capture: request 1 took 50ms, then 200ms of think, so request 2 started
+// 250ms after request 1.
+func thinkSessionTimes(t *testing.T, think bool, respond time.Duration) time.Duration {
+	t.Helper()
+	var mu sync.Mutex
+	var arrivals []time.Time
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		arrivals = append(arrivals, time.Now())
+		mu.Unlock()
+		time.Sleep(respond)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}`)
+	}))
+	defer ts.Close()
+
+	cfg := AutoBenchmarkConfig{
+		Model:          fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL),
+		ReplayNoStamp:  true,
+		ReplayRealtime: true,
+		replayThink:    think,
+	}
+	th := int64(200)
+	sess := RouterReplaySession{
+		SessionID: "s",
+		StartTs:   "2026-05-12T08:50:06Z",
+		Instances: []RouterReplayInstance{{
+			InstanceID: "i1", Role: "main",
+			Requests: []RouterReplayRequest{
+				{RequestID: 1, Ts: "2026-05-12T08:50:06Z", TotalMs: 50, OutputTokens: 10,
+					Messages: []RouterReplayMessage{userText("a", 40)}},
+				{RequestID: 2, Ts: "2026-05-12T08:50:06.250Z", TotalMs: 50, OutputTokens: 10,
+					ThinkMs: &th, ThinkRef: ThinkRefPrev,
+					Messages: []RouterReplayMessage{userText("a", 40), userText("b", 40)}},
+			},
+		}},
+	}
+	st := newTestAutoState(4)
+	runRouterReplaySession(context.Background(), cfg, st, nil, sess, 1,
+		endpointPicker{}, 30*time.Second, strings.Repeat("docs ", 100), newConcurrencyGate(4, false))
+	mu.Lock()
+	defer mu.Unlock()
+	if len(arrivals) != 2 {
+		t.Fatalf("server saw %d requests, want 2", len(arrivals))
+	}
+	return arrivals[1].Sub(arrivals[0])
+}
+
+// TestRealtimeThinkModeEndToEnd: with a slow fleet (400ms answers against a
+// captured 50ms) the second request must start one think (200ms) after OUR first
+// answer, ~600ms, where the absolute schedule fires it as soon as the first
+// returns (its 250ms target has passed), ~400ms.
+func TestRealtimeThinkModeEndToEnd(t *testing.T) {
+	slow := 400 * time.Millisecond
+	got := thinkSessionTimes(t, true, slow)
+	if got < slow+180*time.Millisecond {
+		t.Errorf("think mode: second request arrived %v after the first, want >= %v (our answer + 200ms think)", got, slow+200*time.Millisecond)
+	}
+	abs := thinkSessionTimes(t, false, slow)
+	if abs > slow+120*time.Millisecond {
+		t.Errorf("absolute mode: second request arrived %v after the first, want ~%v (already late, sent at once)", abs, slow)
+	}
+	// A fast fleet (10ms): think keeps the 200ms pause after the answer.
+	fast := thinkSessionTimes(t, true, 10*time.Millisecond)
+	if fast < 190*time.Millisecond+10*time.Millisecond-20*time.Millisecond {
+		t.Errorf("think mode, fast fleet: gap %v, want >= ~210ms", fast)
+	}
+}
+
+// TestRealtimeThinkSpawnReference: a sub-agent's first turn is due one think
+// after OUR completion of the parent request that spawned it.
+func TestRealtimeThinkSpawnReference(t *testing.T) {
+	var mu sync.Mutex
+	arrivals := map[string]time.Time{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		key := "child"
+		if strings.Contains(string(body), "parent-msg") {
+			key = "parent"
+		}
+		mu.Lock()
+		arrivals[key] = time.Now()
+		mu.Unlock()
+		if key == "parent" {
+			time.Sleep(300 * time.Millisecond)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}`)
+	}))
+	defer ts.Close()
+	cfg := AutoBenchmarkConfig{
+		Model:          fmt.Sprintf("dynamic/%s,type=openai,model=test-model", ts.URL),
+		ReplayNoStamp:  true,
+		ReplayRealtime: true,
+		replayThink:    true,
+	}
+	th := int64(200)
+	sess := RouterReplaySession{
+		SessionID: "s", StartTs: "2026-05-12T08:50:06Z",
+		Instances: []RouterReplayInstance{
+			{InstanceID: "p", Role: "main", Requests: []RouterReplayRequest{
+				{RequestID: 1, Ts: "2026-05-12T08:50:06Z", TotalMs: 50, OutputTokens: 10,
+					Messages: []RouterReplayMessage{userText("parent-msg", 40)}}}},
+			{InstanceID: "c", Role: "sub-agent", ParentSpawnRequestID: 1, Requests: []RouterReplayRequest{
+				{RequestID: 2, Ts: "2026-05-12T08:50:06.250Z", TotalMs: 50, OutputTokens: 10,
+					ThinkMs: &th, ThinkRef: ThinkRefSpawn,
+					Messages: []RouterReplayMessage{userText("child-msg", 40)}}}},
+		},
+	}
+	st := newTestAutoState(4)
+	runRouterReplaySession(context.Background(), cfg, st, nil, sess, 1,
+		endpointPicker{}, 30*time.Second, strings.Repeat("docs ", 100), newConcurrencyGate(4, false))
+	mu.Lock()
+	defer mu.Unlock()
+	gap := arrivals["child"].Sub(arrivals["parent"])
+	if gap < 300*time.Millisecond+180*time.Millisecond {
+		t.Errorf("child arrived %v after the parent, want >= ~500ms (our 300ms answer + 200ms think)", gap)
+	}
+}
+
+func TestV3RequestLoadsWithoutThink(t *testing.T) {
+	var r RouterReplayRequest
+	if err := json.Unmarshal([]byte(`{"request_id":1,"ts":"2026-05-12T08:50:06Z","upstream_latency_ms":0,"total_ms":0}`), &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.ThinkMs != nil || r.ThinkRef != "" {
+		t.Errorf("a v3 request loaded with think %v/%q", r.ThinkMs, r.ThinkRef)
 	}
 }
