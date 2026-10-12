@@ -24,6 +24,9 @@ func TestLiveDemoServer(t *testing.T) {
 	}
 	defer s.Close()
 	a := s.arms[0]
+	a.setSources(func() (int, int) { return 24, 64 }, func() *liveGate {
+		return &liveGate{Enabled: true, Stat: "mean", ValueMs: 2350, LimitMs: 10000, WindowS: 30, N: 412, Open: true, AdmitCount: 16, EveryS: 60, NextInS: 23}
+	})
 	for slot := 1; slot <= 24; slot++ {
 		go func(slot int) {
 			rng := rand.New(rand.NewSource(int64(slot)))
@@ -34,6 +37,10 @@ func TestLiveDemoServer(t *testing.T) {
 					turn = 1
 				}
 				sl := slotInfo{N: slot, Hot: slot <= 2}
+				pause := time.Duration(rng.Intn(1500)) * time.Millisecond
+				thinking := a.thinkUntil(sl, time.Now(), time.Now().Add(pause))
+				time.Sleep(pause)
+				a.thinkDone(sl, thinking)
 				ready := time.Now()
 				tok := a.begin(sess, turn, fmt.Sprintf("s%d:main", sess), sl, ready)
 				time.Sleep(time.Duration(rng.Intn(1500)) * time.Millisecond) // waits for a free slot
@@ -44,7 +51,7 @@ func TestLiveDemoServer(t *testing.T) {
 				now := time.Now()
 				ext := rng.Intn(20000)
 				rec := requestDataRecord{StartTime: now.Add(-dur), EndTime: now, ResponseMs: float64(dur.Milliseconds()), TTFT: float64(dur.Milliseconds()) / 3,
-					ReadyMs: ready.UnixMilli(), SentMs: sent.UnixMilli(), SeriesNum: sess, Slot: slot, SlotHot: sl.Hot, Turn: turn, InputTokens: 3000, CachedTokens: ext + 5000, OutputTokens: 200}
+					ThinkPauseMs: pause.Milliseconds(), ReadyMs: ready.UnixMilli(), SentMs: sent.UnixMilli(), SeriesNum: sess, Slot: slot, SlotHot: sl.Hot, Turn: turn, InputTokens: 3000, CachedTokens: ext + 5000, OutputTokens: 200}
 				if rng.Intn(3) > 0 {
 					d := dur.Seconds()
 					rec.KV = goldenKV()

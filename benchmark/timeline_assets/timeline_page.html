@@ -60,6 +60,7 @@
         failures = 0;
         seqs[i] = d.seq;
         tl.setClock(d.now);
+        if (i === tl.currentArm()) tl.setState(d.state);
         tl.append(i, d.reqs || [], d.inflight || [], { reset: d.reset, t0: d.t0, span: d.span });
         sub.textContent = "live · updated " + new Date().toLocaleTimeString() + " · polling every " + (CFG.pollMs / 1000) + "s";
       })

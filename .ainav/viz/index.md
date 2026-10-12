@@ -76,6 +76,12 @@ One renderer, three surfaces: `benchmark/timeline_assets/timeline.js` (+ `.css`,
   opened). Client wait leads the bar (`cw`, included in `e`), then engine queue other,
   engine queue KV, unattributed (client e2e minus engine phases, never negative).
   Live in-flight requests show client wait growing until `liveArm.sent`.
+- State line: live counts from `liveArm.state()` (in flight > waiting > think > idle;
+  admitted-but-unstarted slots are idle) plus `admissionGate` (stat/window/limit/open/
+  next tick, from the same ttftWindow the governor uses), in `/api/data.state` and
+  `/api/state`; offline reconstructs it at the view's right edge. Think pauses are
+  `think_pause_ms` per request (`tp`), shaded just left of the bar. `lateTolerance`
+  (50ms) keeps timer jitter out of the realtime late counts.
 - Perf: completed bars are painted into 512px tiles cached per view (scroll = blits),
   narrow bars collapse into runs, per-group requests are start-sorted for window
   search, wheel zoom previews the scaled old tiles and repaints after 150ms, hover is

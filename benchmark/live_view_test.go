@@ -339,3 +339,54 @@ func TestLiveArmSlotRows(t *testing.T) {
 		t.Errorf("rows=%v boundaries=%d", rows, boundaries)
 	}
 }
+
+// Slots are counted by what they are doing: in flight beats waiting beats think
+// pause beats idle, and admitted slots that have not run anything yet are idle.
+func TestLiveStateCounts(t *testing.T) {
+	a := newLiveArm("a", 100)
+	a.setSources(func() (int, int) { return 8, 64 }, nil)
+	now := time.Now()
+	run := a.begin(1, 1, "", slotInfo{N: 1}, now) // slot 1: sent
+	a.sent(run, now)
+	a.begin(2, 1, "", slotInfo{N: 2}, now)                        // slot 2: due, no free gate slot
+	if !a.thinkUntil(slotInfo{N: 3}, now, now.Add(time.Minute)) { // slot 3: pausing
+		t.Fatal("thinkUntil refused a future due time")
+	}
+	a.complete(a.begin(4, 1, "", slotInfo{N: 4}, now), liveRec(a, 4, false)) // slot 4: finished, nothing pending
+	// Slot 3 needs a row to be counted: it appears with its first request.
+	a.complete(a.begin(3, 1, "", slotInfo{N: 3}, now), liveRec(a, 3, false))
+	if a.thinkUntil(slotInfo{N: 5}, now, now) {
+		t.Error("a pause that is already over must not register")
+	}
+	st := a.state()
+	if st.Slots != 8 || st.Max != 64 || st.InFlight != 1 || st.Waiting != 1 || st.Think != 1 || st.Requests != 1 {
+		t.Fatalf("state = %+v", st)
+	}
+	// 8 admitted: 4 have rows (1 in flight, 1 waiting, 1 think, 1 idle) + 4 never ran.
+	if st.Idle != 1+4 {
+		t.Errorf("idle = %d, want 5 (one finished + four never started)", st.Idle)
+	}
+	a.thinkDone(slotInfo{N: 3}, true)
+	if a.state().Think != 0 {
+		t.Error("thinkDone left the slot pausing")
+	}
+}
+
+func TestLiveStateEndpoint(t *testing.T) {
+	s, err := startLiveServer("127.0.0.1", 0, []string{"a"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.arms[0].setSources(func() (int, int) { return 3, 9 }, func() *liveGate { return &liveGate{Enabled: true, Open: false, Stat: "p95"} })
+	var st liveState
+	getJSON(t, "http://"+s.Addr()+"/api/state?arm=a", &st)
+	if st.Slots != 3 || st.Max != 9 || st.Gate == nil || st.Gate.Open || st.Gate.Stat != "p95" {
+		t.Errorf("state = %+v", st)
+	}
+	var d liveData
+	getJSON(t, "http://"+s.Addr()+"/api/data?arm=0&since=0", &d)
+	if d.State == nil || d.State.Slots != 3 {
+		t.Errorf("data.state = %+v", d.State)
+	}
+}

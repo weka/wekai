@@ -75,13 +75,44 @@ type liveArm struct {
 	inflight map[uint64]liveInflight
 	nextID   uint64
 	span     float64
+
+	thinking map[rowKey]int // slots currently pausing before a scheduled turn (count: fan-out)
+	slotsFn  func() (admitted, max int)
+	gateFn   func() *liveGate
+}
+
+// liveGate is the admission governor's state as of now.
+type liveGate struct {
+	Enabled    bool    `json:"enabled"`
+	Stat       string  `json:"stat"`
+	ValueMs    float64 `json:"value_ms"`
+	LimitMs    float64 `json:"limit_ms"`
+	WindowS    float64 `json:"window_s"`
+	N          int     `json:"n"`
+	Open       bool    `json:"open"`
+	Capped     bool    `json:"capped"`
+	AdmitCount int     `json:"admit_count"`
+	EveryS     float64 `json:"every_s"`
+	NextInS    float64 `json:"next_in_s"`
+}
+
+// liveState counts the admitted session slots by what each is doing now.
+type liveState struct {
+	Slots    int       `json:"slots"`     // admitted session slots
+	Max      int       `json:"max"`       // admission ceiling (--max-series); 0 = none
+	InFlight int       `json:"in_flight"` // slots with a request outstanding at the engine
+	Waiting  int       `json:"waiting"`   // slots whose next turn is due but waits for a free concurrency slot
+	Think    int       `json:"think"`     // slots pausing until their next turn is due
+	Idle     int       `json:"idle"`      // slots with no turn pending (between sessions)
+	Requests int       `json:"requests"`  // outstanding HTTP requests (a fan-out slot can hold several)
+	Gate     *liveGate `json:"gate,omitempty"`
 }
 
 func newLiveArm(name string, max int) *liveArm {
 	if max <= 0 {
 		max = DefaultLiveMaxRequests
 	}
-	return &liveArm{name: name, t0: time.Now(), max: max, lanes: map[rowKey]int{}, lastSess: map[rowKey]int{}, packers: map[rowKey]*subRowPacker{}, inflight: map[uint64]liveInflight{}}
+	return &liveArm{name: name, t0: time.Now(), max: max, lanes: map[rowKey]int{}, lastSess: map[rowKey]int{}, thinking: map[rowKey]int{}, packers: map[rowKey]*subRowPacker{}, inflight: map[uint64]liveInflight{}}
 }
 
 // lane returns the stable row group of a slot (or, without one, a series),
@@ -129,6 +160,85 @@ func (a *liveArm) begin(series, turn int, guid string, sl slotInfo, ready time.T
 	a.inflight[a.nextID] = liveInflight{series: series, turn: turn, lane: a.lane(k), sub: sub, start: ready, guid: guid,
 		slot: sl, newSession: a.newSession(k, series)}
 	return liveToken{arm: a, id: a.nextID}
+}
+
+// setSources wires the run's admission state into the live view.
+func (a *liveArm) setSources(slots func() (int, int), gate func() *liveGate) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.slotsFn, a.gateFn = slots, gate
+	a.mu.Unlock()
+}
+
+// thinkUntil marks the slot as pausing until due (on the pacer's clock `now`).
+// It reports whether a pause was registered; pair it with thinkDone.
+func (a *liveArm) thinkUntil(sl slotInfo, now, due time.Time) bool {
+	if a == nil || sl.N <= 0 || !due.After(now) {
+		return false
+	}
+	a.mu.Lock()
+	a.thinking[rowKeyOf(sl.N, 0)]++
+	a.mu.Unlock()
+	return true
+}
+
+// thinkDone ends a pause registered by thinkUntil.
+func (a *liveArm) thinkDone(sl slotInfo, registered bool) {
+	if a == nil || !registered {
+		return
+	}
+	a.mu.Lock()
+	k := rowKeyOf(sl.N, 0)
+	if a.thinking[k] <= 1 {
+		delete(a.thinking, k)
+	} else {
+		a.thinking[k]--
+	}
+	a.mu.Unlock()
+}
+
+// state counts slots by activity. In flight beats waiting beats think beats idle.
+func (a *liveArm) state() liveState {
+	a.mu.Lock()
+	var st liveState
+	sent, unsent := map[rowKey]bool{}, map[rowKey]bool{}
+	for _, f := range a.inflight {
+		k := rowKeyOf(f.slot.N, f.series)
+		if f.sentAt.IsZero() {
+			unsent[k] = true
+		} else {
+			sent[k] = true
+			st.Requests++
+		}
+	}
+	for k := range a.lanes {
+		switch {
+		case sent[k]:
+			st.InFlight++
+		case unsent[k]:
+			st.Waiting++
+		case a.thinking[k] > 0:
+			st.Think++
+		default:
+			st.Idle++
+		}
+	}
+	seen := len(a.lanes)
+	slotsFn, gateFn := a.slotsFn, a.gateFn
+	a.mu.Unlock()
+	st.Slots = seen
+	if slotsFn != nil {
+		st.Slots, st.Max = slotsFn()
+		if st.Slots > seen { // admitted but not yet running a request
+			st.Idle += st.Slots - seen
+		}
+	}
+	if gateFn != nil {
+		st.Gate = gateFn()
+	}
+	return st
 }
 
 // sent marks that the request has been issued (the concurrency gate opened).
@@ -208,6 +318,7 @@ type liveData struct {
 	Dropped  int           `json:"dropped,omitempty"`
 	Reqs     []timelineReq `json:"reqs"`
 	Inflight []timelineReq `json:"inflight"`
+	State    *liveState    `json:"state,omitempty"`
 }
 
 // snapshot returns the requests completed after since, plus every in-flight
@@ -340,7 +451,21 @@ func (s *liveServer) handler() http.Handler {
 				return
 			}
 		}
-		writeJSON(w, s.arms[i].snapshot(since))
+		d := s.arms[i].snapshot(since)
+		st := s.arms[i].state()
+		d.State = &st
+		writeJSON(w, d)
+	})
+	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
+		i := s.armIndex(r.URL.Query().Get("arm"))
+		if i < 0 {
+			i = 0
+		}
+		if len(s.arms) == 0 {
+			http.Error(w, "no arms", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, s.arms[i].state())
 	})
 	return mux
 }

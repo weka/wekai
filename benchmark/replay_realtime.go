@@ -570,6 +570,12 @@ type pacingLag struct {
 	respOrig     time.Duration
 }
 
+// lateTolerance is how far past its due time a turn has to go before it counts
+// as late. A think-paced turn is released by a timer, so scheduling jitter of a
+// millisecond or two lands on every one of them; counting that made the late
+// share 100% on a fleet that was keeping up.
+const lateTolerance = 50 * time.Millisecond
+
 // observeThink records one think-paced request: lateness past its due time
 // (gate wait included), the think it actually got, and the captured one.
 func (l *pacingLag) observeThink(late, realized, original time.Duration) {
@@ -578,7 +584,7 @@ func (l *pacingLag) observeThink(late, realized, original time.Duration) {
 	l.thinkN++
 	l.thinkReal += realized
 	l.thinkOrig += original
-	if late > 0 {
+	if late > lateTolerance {
 		l.thinkLate++
 		l.thinkLateSum += late
 		if late > l.thinkLateMax {
@@ -630,7 +636,7 @@ func (l *pacingLag) observe(d time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.n++
-	if d <= 0 {
+	if d <= lateTolerance {
 		return
 	}
 	l.late++
@@ -662,7 +668,7 @@ func (l *pacingLag) summary(now time.Time) string {
 		if l.thinkLate > 0 {
 			lm = l.thinkLateSum / time.Duration(l.thinkLate)
 		}
-		out = fmt.Sprintf("think-paced=%d think_real=%s think_orig=%s late=%d (%.1f%%, gate/queue wait) mean_late=%s max_late=%s",
+		out = fmt.Sprintf("think-paced=%d think_real=%s think_orig=%s late=%d (%.1f%%, >50ms gate/queue wait) mean_late=%s max_late=%s",
 			l.thinkN, (l.thinkReal / time.Duration(l.thinkN)).Round(time.Millisecond),
 			(l.thinkOrig / time.Duration(l.thinkN)).Round(time.Millisecond),
 			l.thinkLate, 100*float64(l.thinkLate)/float64(l.thinkN),
@@ -679,7 +685,7 @@ func (l *pacingLag) summary(now time.Time) string {
 			out += " | abs: "
 		}
 		out += fmt.Sprintf(
-			"paced=%d late=%d (%.1f%%) mean_late=%s max_late=%s >1s=%d >10s=%d >1m=%d >10m=%d",
+			"paced=%d late=%d (%.1f%%, >50ms) mean_late=%s max_late=%s >1s=%d >10s=%d >1m=%d >10m=%d",
 			l.n, l.late, 100*float64(l.late)/float64(l.n), mean.Round(time.Millisecond),
 			l.max.Round(time.Millisecond), l.overs[0], l.overs[1], l.overs[2], l.overs[3])
 	}
@@ -709,4 +715,33 @@ func (l *pacingLag) summary(now time.Time) string {
 			float64(covered)/float64(wall))
 	}
 	return out
+}
+
+// admissionGate describes the admission governor now: which statistic over
+// which window is compared with the limit, whether that opens the gate, and
+// when the next admission tick is. nil when no governor runs. admitStart is
+// when the admission ticker started.
+func admissionGate(cfg AutoBenchmarkConfig, st *autoState, admitStart time.Time) *liveGate {
+	if cfg.AdmitEvery <= 0 {
+		return nil
+	}
+	now := time.Now()
+	stat := cfg.TTFTLimitStat
+	if stat == "" {
+		stat = "mean"
+	}
+	g := &liveGate{
+		Enabled: cfg.ReplayRealtime, Stat: stat, LimitMs: float64(cfg.TTFTLimit.Milliseconds()),
+		WindowS: st.ttft.window.Seconds(), AdmitCount: max(1, cfg.AdmitCount), EveryS: cfg.AdmitEvery.Seconds(),
+	}
+	s := st.ttft.Stats(now)
+	g.N = s.N
+	g.ValueMs = float64(s.pick(stat).Milliseconds())
+	g.Open = !cfg.ReplayRealtime || s.N == 0 || s.pick(stat) < cfg.TTFTLimit
+	st.mu.Lock()
+	g.Capped = cfg.MaxSeries > 0 && st.series >= cfg.MaxSeries
+	st.mu.Unlock()
+	ticks := now.Sub(admitStart) / cfg.AdmitEvery
+	g.NextInS = (admitStart.Add((ticks + 1) * cfg.AdmitEvery)).Sub(now).Seconds()
+	return g
 }

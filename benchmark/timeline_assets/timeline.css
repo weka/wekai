@@ -8,6 +8,9 @@
 .wtl-bar button:hover { background: #2A3038; }
 .wtl-bar .wtl-info { color: #C79FF1; }
 .wtl-bar .wtl-hint { color: #8a9096; margin-left: auto; }
+.wtl-state { padding: 0 0 6px; color: #C9C9C9; line-height: 1.5; }
+.wtl-state b { color: #F2F2EB; font-weight: 500; }
+.wtl-dim { color: #8a9096; }
 .wtl-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 0 0 6px; }
 .wtl-legend span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 .wtl-legend i { display: inline-block; width: 14px; height: 8px; border-radius: 1px; }

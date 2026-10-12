@@ -55,8 +55,10 @@ type RequestMetrics struct {
 	// its predecessor had finished); SentAt is when it was actually issued after
 	// the concurrency gate opened. Their difference is client-side wait.
 	ReadyAt, SentAt time.Time
-	Error           error
-	Response        string // The actual response content
+	// ThinkPause is the deliberate pause before the request became eligible.
+	ThinkPause time.Duration
+	Error      error
+	Response   string // The actual response content
 	// ContentOnly is the assistant's content stream WITHOUT the reasoning
 	// trace. Response merges reasoning in, so a UUID recalled inside a
 	// reasoning trace still counts as PRESENT; that merge is wrong for any

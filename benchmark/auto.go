@@ -327,6 +327,10 @@ type requestDataRecord struct {
 	// written before they were recorded.
 	ReadyMs int64 `json:"ready_ms,omitempty"`
 	SentMs  int64 `json:"sent_ms,omitempty"`
+	// ThinkPauseMs is how long the session deliberately paused before this
+	// turn became eligible (real-time replay: previous turn's end to its due
+	// time). Idle by design, as opposed to idle for want of a session.
+	ThinkPauseMs int64 `json:"think_pause_ms,omitempty"`
 	// Turn is this request's 1-based position within its own instance, which
 	// RequestNum is not — that one counts the whole run. Carried because the
 	// summary locates a failure as series:turn:length, and without it that
@@ -2748,6 +2752,14 @@ func runSingleModelBenchmark(
 		}()
 	}
 
+	if st.live != nil {
+		admitStart := time.Now()
+		st.live.setSources(func() (int, int) {
+			st.mu.Lock()
+			defer st.mu.Unlock()
+			return st.series, cfg.MaxSeries
+		}, func() *liveGate { return admissionGate(cfg, st, admitStart) })
+	}
 	if cfg.AdmitEvery > 0 {
 		go admitSeries(benchCtx, cfg, st.ttft, func(next int) {
 			st.mu.Lock()

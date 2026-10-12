@@ -73,7 +73,7 @@ var WekaiTimeline = (function () {
       '<label class="wtl-followwrap" hidden><input type="checkbox" class="wtl-follow"> Follow latest</label>' +
       '<span class="wtl-info"></span>' +
       '<span class="wtl-hint">Drag to zoom &middot; double-click or Esc to reset &middot; Ctrl+wheel zooms, Shift+wheel pans</span>' +
-      '</div><div class="wtl-legend"></div>' +
+      '</div><div class="wtl-state"></div><div class="wtl-legend"></div>' +
       '<div class="wtl-scroll"><div class="wtl-content"><canvas class="wtl-canvas"></canvas><canvas class="wtl-overlay"></canvas></div><div class="wtl-empty" hidden>No requests yet</div></div>' +
       '<div class="wtl-tip"></div>';
     var $ = function (c) { return host.querySelector(c); };
@@ -81,6 +81,7 @@ var WekaiTimeline = (function () {
     var elInfo = $(".wtl-info"), elLegend = $(".wtl-legend"), elScroll = $(".wtl-scroll");
     var elContent = $(".wtl-content"), canvas = $(".wtl-canvas"), tip = $(".wtl-tip"), elEmpty = $(".wtl-empty");
     var ctx = canvas.getContext("2d");
+    var elState = $(".wtl-state");
     var elMerge = $(".wtl-merge"), overlay = $(".wtl-overlay"), octx = overlay.getContext("2d");
     var merge = /[?&]merge=1/.test(location.search);
     elMerge.checked = merge;
@@ -93,7 +94,7 @@ var WekaiTimeline = (function () {
         return true;
       }).map(function (k) {
         return '<span><i style="background:' + k.color + '"></i>' + esc(k.label) + "</span>";
-      }).join("");
+      }).join("") + '<span><i style="background:rgba(124,150,190,0.35)"></i>think pause (idle by design)</span>';
     }
     buildLegend();
     ROW_HEIGHTS.forEach(function (h) { var o = document.createElement("option"); o.value = h; o.textContent = h + "px"; elRowH.appendChild(o); });
@@ -128,7 +129,7 @@ var WekaiTimeline = (function () {
       var n = g.reqs.length;
       if (n && q.t < g.reqs[n - 1].t) g.unsorted = true;
       g.reqs.push(q);
-      if (q.e > g.maxE) g.maxE = q.e;
+      if (q.e + (q.tp || 0) > g.maxE) g.maxE = q.e + (q.tp || 0);
       if (q.x & FLAG_SESSION) { g.bounds.push(q.t); if (g.bounds.length > 1 && q.t < g.bounds[g.bounds.length - 2]) g.unsorted = true; }
       if ((q.u || 0) + 1 > g.subs) g.subs = (q.u || 0) + 1;
       a.dirty = true; a.ver = (a.ver || 0) + 1;
@@ -253,6 +254,51 @@ var WekaiTimeline = (function () {
       draw();
     }
 
+    // ---- slot state header ----
+    function setStateText(html) { if (elState.innerHTML !== html) elState.innerHTML = html; }
+    function fmtSec(s) { return s >= 100 ? Math.round(s) + "s" : s.toFixed(s >= 10 ? 1 : 2) + "s"; }
+    // Live: the server's counts and admission gate.
+    function renderState(st) {
+      if (!st) return;
+      var h = "series <b>" + st.slots + "</b> active" + (st.max ? " / <b>" + st.max + "</b> max" : "") +
+        " &middot; <span title='request outstanding at the engine'>in flight <b>" + st.in_flight + "</b></span>" +
+        " &middot; <span title='next turn due, waiting for a free concurrency slot'>waiting at gate <b>" + st.waiting + "</b></span>" +
+        " &middot; <span title='pausing until the next turn is due'>think pause <b>" + st.think + "</b></span>" +
+        " &middot; <span title='no turn pending: between sessions'>idle <b>" + st.idle + "</b></span>" +
+        " <span class='wtl-dim'>(" + st.requests + " requests outstanding)</span>";
+      var g = st.gate;
+      if (g) {
+        var v = g.value_ms / 1000, lim = g.limit_ms / 1000;
+        h += "<br>admission: ";
+        if (!g.enabled) h += "ungated, +" + g.admit_count + " every " + fmtSec(g.every_s);
+        else {
+          h += g.stat + " TTFT <b>" + fmtSec(v) + "</b> over " + fmtSec(g.window_s) + " (n=" + g.n + ") " + (g.open ? "&lt;" : "&ge;") + " " + fmtSec(lim) + " limit &rarr; <b>" + (g.open ? "open" : "CLOSED") + "</b>";
+          h += g.capped ? "; at the series cap, no more admissions" : (g.open ? "; next +" + g.admit_count + " in " + fmtSec(g.next_in_s) : "; admissions held, next check in " + fmtSec(g.next_in_s));
+        }
+      }
+      setStateText(h);
+    }
+    // Offline: reconstruct from the requests at the right edge of the view.
+    function renderOfflineState() {
+      var a = arm(); if (!a || opts.live) return;
+      var T = range()[1], c = { f: 0, w: 0, t: 0, i: 0 };
+      for (var g = 0; g < a.groups.length; g++) {
+        var grp = a.groups[g]; ensureSorted(grp);
+        var st = 3;   // 0 in flight, 1 waiting, 2 think, 3 idle
+        for (var k = firstAtOrAfter(grp.reqs, T - grp.maxE); k < grp.reqs.length && grp.reqs[k].t - (grp.reqs[k].tp || 0) <= T; k++) {
+          var q = grp.reqs[k], cw = q.cw || 0, s2;
+          if (T >= q.t + cw && T <= q.t + q.e) s2 = 0;
+          else if (T >= q.t && T < q.t + cw) s2 = 1;
+          else if (q.tp && T >= q.t - q.tp && T < q.t) s2 = 2;
+          else continue;
+          if (s2 < st) st = s2;
+        }
+        if (st === 0) c.f++; else if (st === 1) c.w++; else if (st === 2) c.t++; else c.i++;
+      }
+      setStateText("at <b>" + fmtElapsed(T, 1000) + "</b> (view end): <b>" + a.groups.length + "</b> slots &middot; in flight <b>" + c.f +
+        "</b> &middot; waiting at gate <b>" + c.w + "</b> &middot; think pause <b>" + c.t + "</b> &middot; idle <b>" + c.i + "</b>");
+    }
+
     // ---- tile cache ----
     var TILE_H = 512, MAX_TILES = 10;
     var tiles = { key: "", map: {}, order: [], r: null };
@@ -366,6 +412,7 @@ var WekaiTimeline = (function () {
         if (nx >= plotL && nx <= plotL + plotW) { ctx.strokeStyle = "#7C03EC"; ctx.beginPath(); ctx.moveTo(nx + 0.5, AXIS_H); ctx.lineTo(nx + 0.5, H); ctx.stroke(); }
       }
       drawOverlay();
+      if (!opts.live) renderOfflineState();
     }
 
     // The overlay is a second canvas holding what changes on every mouse move
@@ -433,6 +480,11 @@ var WekaiTimeline = (function () {
       var infl = (q.x & FLAG_INFL) !== 0;
       var end = infl ? Math.max(0, now - q.t) : q.e;
       var xs = mapX(q.t, r), xe = mapX(q.t + end, r);
+      if (q.tp) {
+        // The deliberate pause before this turn: idle by design, not for want of a session.
+        var tx0 = Math.max(mapX(q.t - q.tp, r), plotL), tx1 = Math.min(xs, plotL + plotW);
+        if (tx1 > tx0) { pc.fillStyle = "rgba(124,150,190,0.16)"; pc.fillRect(tx0, y, tx1 - tx0, rh); }
+      }
       if (xe < plotL || xs > plotL + plotW) return;
       var segs = segsFor(q, now);
       if (xe - xs < 6) {
@@ -503,6 +555,7 @@ var WekaiTimeline = (function () {
         ((q.x & FLAG_ERR) ? " <b style='color:#FF6B6B'>error</b>" : "") + ((q.x & FLAG_COLD) ? " cold start" : "") + ((q.x & FLAG_EMPTY) ? " empty" : "") + "<br>" +
         "start " + fmtClock(a.t0 + q.t, true) + " (+" + fmtDur(q.t) + ")<br>";
       var cw = q.cw || 0;
+      if (q.tp > 0) html += "think pause before this turn <b>" + fmtDur(q.tp) + "</b><br>";
       if (!infl) e2e -= cw;   // e includes the client wait; e2e below is sent -> done
       html += "e2e <b>" + fmtDur(e2e) + "</b>" + (q.f ? " &middot; ttft <b>" + fmtDur(q.f) + "</b>" : "") + "<br>";
       var total = (q.i || 0) + (q.c || 0);
@@ -665,6 +718,7 @@ var WekaiTimeline = (function () {
         if (armIdx === cur) { if (!userRowH) { rowH = defaultRowH(a); elRowH.value = rowH; } updateInfo(); resize(); }
       },
       arms: function () { return arms; },
+      setState: renderState,
       // perf runs a fixed interaction workload and returns per-operation timings
       // in ms (used by ?perf=1 on the standalone page to track regressions).
       perf: function () {

@@ -263,6 +263,11 @@ already ask for `stream_options.include_usage`, which is how vLLM delivers them.
   prefill split by token share into computed / external / host / GPU cache
   (kv_fetch counted in the external share), preempted, decode. Requests with no
   engine details use client timestamps with one "prefill (unknown source)" colour.
+  Under the toolbar a state line counts the admitted slots (live: from the run;
+  offline: reconstructed from reqdata at the view's right edge) as in flight /
+  waiting at gate / think pause / idle, and, live, the admission gate (stat over
+  window vs limit, open or closed, next admit). A slot's think pause is shaded
+  faintly (`think_pause_ms` in reqdata). Live `/api/state` serves the same counts.
   "Merge waits" collapses all wait kinds into one colour. Hovering anywhere on a
   row outlines that whole slot row.
 - `wekai benchmark timeline <dir> -o timeline.html` renders just that view.

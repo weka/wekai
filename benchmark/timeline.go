@@ -93,6 +93,7 @@ type timelineReq struct {
 	In     int       `json:"i,omitempty"` // net-of-cache input tokens
 	Cached int       `json:"c,omitempty"`
 	Out    int       `json:"o,omitempty"`
+	TP     float64   `json:"tp,omitempty"` // think pause (ms) immediately before the bar's start
 	CW     float64   `json:"cw,omitempty"` // client-side wait (ready -> sent) in ms; included in E2E
 	Flags  int       `json:"x,omitempty"`
 	Src    []int     `json:"src,omitempty"` // gpu, host, external, computed
@@ -253,6 +254,7 @@ func timelineFromRecord(r requestDataRecord, t0 int64) timelineReq {
 		e2e = float64(r.EndTime.Sub(r.StartTime).Milliseconds())
 	}
 	cw := clientWaitMs(r)
+	tp := float64(r.ThinkPauseMs)
 	segs, trunc := timelineSegments(cw, e2e, r.TTFT, r.IsError, r.KV)
 	tr := timelineReq{
 		Series: r.SeriesNum,
@@ -260,6 +262,7 @@ func timelineFromRecord(r requestDataRecord, t0 int64) timelineReq {
 		Start:  float64(r.StartTime.UnixMilli()-t0) - cw,
 		E2E:    e2e + cw,
 		CW:     cw,
+		TP:     tp,
 		TTFT:   r.TTFT,
 		In:     r.InputTokens,
 		Cached: r.CachedTokens,

@@ -969,3 +969,47 @@ func TestOpenRouterReplayStreamAcceptsV4(t *testing.T) {
 		t.Fatalf("session did not round-trip think_ms: %+v ok=%v", got, ok)
 	}
 }
+
+// A turn released by a timer is a millisecond or two past its due time every
+// time; that jitter is not lateness. Only turns more than lateTolerance late
+// count.
+func TestLateToleranceIgnoresSchedulingJitter(t *testing.T) {
+	l := &pacingLag{}
+	for _, d := range []time.Duration{0, time.Millisecond, 11 * time.Millisecond, lateTolerance, lateTolerance + time.Millisecond, 2 * time.Second} {
+		l.observeThink(d, time.Second, time.Second)
+		l.observe(d)
+	}
+	if l.thinkLate != 2 || l.late != 2 {
+		t.Errorf("late counts = think %d / abs %d, want 2 / 2", l.thinkLate, l.late)
+	}
+	if s := l.summary(time.Now()); !strings.Contains(s, ">50ms") {
+		t.Errorf("summary does not state the tolerance: %s", s)
+	}
+}
+
+func TestAdmissionGateState(t *testing.T) {
+	cfg := AutoBenchmarkConfig{ReplayRealtime: true, AdmitEvery: time.Minute, AdmitCount: 16, TTFTLimit: 10 * time.Second, MaxSeries: 100}
+	st := newTestAutoState(8)
+	st.ttft = newTTFTWindow(30 * time.Second)
+	st.series = 32
+	start := time.Now().Add(-70 * time.Second)
+	g := admissionGate(cfg, st, start)
+	if !g.Open || g.N != 0 || g.Stat != "mean" || g.AdmitCount != 16 || g.NextInS < 45 || g.NextInS > 55 {
+		t.Errorf("empty window gate = %+v (70s in, 60s ticks: next in ~50s)", g)
+	}
+	now := time.Now()
+	for i := 0; i < 5; i++ {
+		st.ttft.Observe(now, 14*time.Second)
+	}
+	if g = admissionGate(cfg, st, start); g.Open || g.N != 5 || g.ValueMs < 13000 || g.LimitMs != 10000 {
+		t.Errorf("slow window gate = %+v, want closed at ~14s over a 10s limit", g)
+	}
+	st.series = 100
+	if g = admissionGate(cfg, st, start); !g.Capped {
+		t.Error("gate at max-series must report capped")
+	}
+	cfg.AdmitEvery = 0
+	if admissionGate(cfg, st, start) != nil {
+		t.Error("no governor, no gate state")
+	}
+}

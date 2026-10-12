@@ -479,3 +479,14 @@ func TestEligibleAtDueVersusSent(t *testing.T) {
 		t.Errorf("unpaced: ready = %v", got)
 	}
 }
+
+func TestTimelineCarriesThinkPause(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	q := timelineFromRecord(requestDataRecord{StartTime: base.Add(time.Second), ResponseMs: 500, SeriesNum: 1, ThinkPauseMs: 4000}, base.UnixMilli())
+	if q.TP != 4000 {
+		t.Errorf("tp = %v, want 4000", q.TP)
+	}
+	if q = timelineFromRecord(requestDataRecord{StartTime: base, ResponseMs: 500}, base.UnixMilli()); q.TP != 0 {
+		t.Errorf("tp = %v without a pause", q.TP)
+	}
+}

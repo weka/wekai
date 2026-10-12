@@ -999,6 +999,7 @@ func runRouterReplayInstance(
 		var due, refEnd time.Time
 		var pacerLate time.Duration
 		thinkPaced := false
+		thinkSlot, thinking := slotOf(ctx), false
 		if pacer.think {
 			switch req.ThinkRef {
 			case ThinkRefPrev:
@@ -1012,17 +1013,23 @@ func runRouterReplayInstance(
 			}
 			due, thinkPaced = pacer.thinkDue(req, refEnd)
 			if thinkPaced {
+				thinking = st.live.thinkUntil(thinkSlot, pacer.clk.Now(), due)
 				pacerLate = pacer.waitUntil(ctx, due)
 			}
 		}
 		if !thinkPaced {
+			if absDue, ok := pacer.dueAt(req.Ts); ok {
+				thinking = st.live.thinkUntil(thinkSlot, pacer.clk.Now(), absDue)
+			}
 			pacerLate = pacer.Wait(ctx, req.Ts)
 			st.lag.observe(pacerLate)
 		}
+		st.live.thinkDone(thinkSlot, thinking)
 		// The turn became eligible at its due time (or, for a turn that is late
 		// or unpaced, when its predecessor finished). Everything from here to
 		// the concurrency gate opening is client-side wait.
 		readyAt := eligibleAt(loopTop, time.Now(), pacerLate)
+		thinkPause := readyAt.Sub(loopTop)
 		// How far into its captured conversation this session has reached. The
 		// furthest offset any of its instances dispatched is the session's own
 		// progress through the capture, and summed across sessions it is what
@@ -1105,6 +1112,9 @@ func runRouterReplayInstance(
 		metrics.live = liveTok
 		metrics.Slot = slot
 		metrics.ReadyAt, metrics.SentAt = readyAt, sentAt
+		if cfg.ReplayRealtime {
+			metrics.ThinkPause = thinkPause
+		}
 
 		if metrics.Error != nil && ctx.Err() != nil {
 			// Run shutdown aborted this in-flight request (timeout or
