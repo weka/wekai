@@ -268,6 +268,14 @@ already ask for `stream_options.include_usage`, which is how vLLM delivers them.
   waiting at gate / think pause / idle, and, live, the admission gate (stat over
   window vs limit, open or closed, next admit). A slot's think pause is shaded
   faintly (`think_pause_ms` in reqdata). Live `/api/state` serves the same counts.
+  Above the rows, strips show token throughput (input stacked by source,
+  output as a line) and the gate's TTFT (mean / p95 against the limit) on the
+  same time axis; the header shows tokens/s over 10 s and 60 s and the TTFT
+  window with the gating statistic highlighted (amber near the limit, red at
+  it). Prompt tokens count when prefill ends, output tokens spread over the
+  decode, and requests still running contribute what the client has seen.
+  Time spent backing off after a 429 is its own wait (`retries_429`,
+  `retry_wait_ms`). Live: `/api/series` serves the strips' history.
   "Merge waits" collapses all wait kinds into one colour. Hovering anywhere on a
   row outlines that whole slot row.
 - `wekai benchmark timeline <dir> -o timeline.html` renders just that view.

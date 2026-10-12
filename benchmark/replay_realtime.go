@@ -722,7 +722,7 @@ func (l *pacingLag) summary(now time.Time) string {
 // when the next admission tick is. nil when no governor runs. admitStart is
 // when the admission ticker started.
 func admissionGate(cfg AutoBenchmarkConfig, st *autoState, admitStart time.Time) *liveGate {
-	if cfg.AdmitEvery <= 0 {
+	if cfg.AdmitEvery <= 0 && !cfg.ReplayRealtime {
 		return nil
 	}
 	now := time.Now()
@@ -736,12 +736,16 @@ func admissionGate(cfg AutoBenchmarkConfig, st *autoState, admitStart time.Time)
 	}
 	s := st.ttft.Stats(now)
 	g.N = s.N
+	g.MeanMs, g.P50Ms = float64(s.Mean.Milliseconds()), float64(s.P50.Milliseconds())
+	g.P95Ms, g.P99Ms = float64(s.P95.Milliseconds()), float64(s.P99.Milliseconds())
 	g.ValueMs = float64(s.pick(stat).Milliseconds())
 	g.Open = !cfg.ReplayRealtime || s.N == 0 || s.pick(stat) < cfg.TTFTLimit
 	st.mu.Lock()
 	g.Capped = cfg.MaxSeries > 0 && st.series >= cfg.MaxSeries
 	st.mu.Unlock()
-	ticks := now.Sub(admitStart) / cfg.AdmitEvery
-	g.NextInS = (admitStart.Add((ticks + 1) * cfg.AdmitEvery)).Sub(now).Seconds()
+	if cfg.AdmitEvery > 0 {
+		ticks := now.Sub(admitStart) / cfg.AdmitEvery
+		g.NextInS = (admitStart.Add((ticks + 1) * cfg.AdmitEvery)).Sub(now).Seconds()
+	}
 	return g
 }

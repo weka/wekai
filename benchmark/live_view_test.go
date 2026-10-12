@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -388,5 +389,80 @@ func TestLiveStateEndpoint(t *testing.T) {
 	getJSON(t, "http://"+s.Addr()+"/api/data?arm=0&since=0", &d)
 	if d.State == nil || d.State.Slots != 3 {
 		t.Errorf("data.state = %+v", d.State)
+	}
+}
+
+// Retained live buffer cost per completed request stays small and bounded: the
+// per-request record is compact, and past the cap old ones are evicted while
+// the rate / TTFT aggregates (fixed size) keep covering the whole run.
+func TestLiveArmMemoryPerRequest(t *testing.T) {
+	const n = 50000
+	heap := func() uint64 {
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		return m.HeapAlloc
+	}
+	a := newLiveArm("a", n)
+	before := heap()
+	for i := 0; i < n; i++ {
+		rec := liveRec(a, i%256+1, true) // with engine details: the largest record
+		rec.Slot = i%256 + 1
+		a.complete(liveToken{}, rec)
+	}
+	per := float64(heap()-before) / n
+	t.Logf("live buffer: %.0f bytes per retained completed request (with engine details)", per)
+	if per > 1200 {
+		t.Errorf("%.0f bytes per request retained, want under 1200", per)
+	}
+	// Ten times the traffic through the same arm: the buffer does not grow.
+	retained := len(a.done)
+	for i := 0; i < 9*n; i++ {
+		a.complete(liveToken{}, liveRec(a, i%256+1, false))
+	}
+	if len(a.done) > retained+retained/10+1 {
+		t.Errorf("buffer grew from %d to %d completed requests past its cap", retained, len(a.done))
+	}
+	if len(a.rates.in) > liveRateBuckets {
+		t.Errorf("rate history has %d buckets, cap %d", len(a.rates.in), liveRateBuckets)
+	}
+}
+
+func TestLiveSeriesEndpoint(t *testing.T) {
+	s, err := startLiveServer("127.0.0.1", 0, []string{"a"}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	a := s.arms[0]
+	a.setSources(func() (int, int) { return 4, 8 }, func() *liveGate {
+		return &liveGate{Enabled: true, Stat: "mean", LimitMs: 10000, WindowS: 30, N: 5, MeanMs: 2500, P50Ms: 2000, P95Ms: 6000, P99Ms: 8000}
+	})
+	rec := liveRec(a, 1, true)
+	rec.Slot, rec.InputTokens, rec.CachedTokens, rec.OutputTokens = 1, 100, 900, 50
+	a.complete(liveToken{}, rec)
+	a.state() // takes a TTFT sample
+	var got liveSeries
+	getJSON(t, "http://"+s.Addr()+"/api/series?arm=a&points=100", &got)
+	if got.Rates == nil || len(got.Rates.In) == 0 || got.TTFT == nil || len(got.TTFT.T) != 1 {
+		t.Fatalf("series = %+v", got)
+	}
+	if got.TTFT.LimitMs != 10000 || got.TTFT.Mean[0] != 2500 || got.TTFT.P95[0] != 6000 || got.TTFT.Stat != "mean" {
+		t.Errorf("ttft = %+v", got.TTFT)
+	}
+	var tot int
+	for _, v := range got.Rates.In {
+		tot += v
+	}
+	if tot != 1000 {
+		t.Errorf("prompt tokens in rates = %d, want 1000", tot)
+	}
+	resp, err := http.Get("http://" + s.Addr() + "/api/series?arm=zzz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Errorf("unknown arm = %d", resp.StatusCode)
 	}
 }

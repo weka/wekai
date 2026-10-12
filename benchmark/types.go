@@ -49,6 +49,9 @@ type RequestMetrics struct {
 	// live identifies this request in the live view's in-flight table; the
 	// zero value means no live view is attached.
 	live liveToken
+	// progress reports a running request\'s first token and stream deltas to the
+	// live view; nil when no live view is attached.
+	progress *liveProgress
 	// Slot is the concurrency slot that issued the request (see slotInfo).
 	Slot slotInfo
 	// ReadyAt is when the request became eligible to send (its turn was due /

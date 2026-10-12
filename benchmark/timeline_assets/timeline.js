@@ -20,7 +20,7 @@ var WekaiTimeline = (function () {
 
   var FLAG_ERR = 1, FLAG_COLD = 2, FLAG_EMPTY = 4, FLAG_TIMINGS = 8, FLAG_SRC = 16, FLAG_INFL = 32, FLAG_TRUNC = 64, FLAG_SESSION = 128, FLAG_HOT = 256, FLAG_WAITING = 512;
   var INFLIGHT_KIND = 10, WAIT_CLIENT = 11, WAITED = 13;
-  var WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1 };   // kinds the "merge waits" toggle collapses into WAITED
+  var WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1, 14: 1 };   // kinds the "merge waits" toggle collapses into WAITED
   var AXIS_H = 34, RIGHT = 14, GAP = 2;
   var ROW_HEIGHTS = [1, 2, 3, 4, 6, 10, 14, 20];
 
@@ -74,6 +74,7 @@ var WekaiTimeline = (function () {
       '<span class="wtl-info"></span>' +
       '<span class="wtl-hint">Drag to zoom &middot; double-click or Esc to reset &middot; Ctrl+wheel zooms, Shift+wheel pans</span>' +
       '</div><div class="wtl-state"></div><div class="wtl-legend"></div>' +
+      '<canvas class="wtl-strip wtl-strip-rate" hidden></canvas><canvas class="wtl-strip wtl-strip-ttft" hidden></canvas>' +
       '<div class="wtl-scroll"><div class="wtl-content"><canvas class="wtl-canvas"></canvas><canvas class="wtl-overlay"></canvas></div><div class="wtl-empty" hidden>No requests yet</div></div>' +
       '<div class="wtl-tip"></div>';
     var $ = function (c) { return host.querySelector(c); };
@@ -82,6 +83,8 @@ var WekaiTimeline = (function () {
     var elContent = $(".wtl-content"), canvas = $(".wtl-canvas"), tip = $(".wtl-tip"), elEmpty = $(".wtl-empty");
     var ctx = canvas.getContext("2d");
     var elState = $(".wtl-state");
+    var stripRate = $(".wtl-strip-rate"), stripTTFT = $(".wtl-strip-ttft");
+    var STRIP_H = 56;
     var elMerge = $(".wtl-merge"), overlay = $(".wtl-overlay"), octx = overlay.getContext("2d");
     var merge = /[?&]merge=1/.test(location.search);
     elMerge.checked = merge;
@@ -249,10 +252,87 @@ var WekaiTimeline = (function () {
       overlay.style.marginBottom = (-h) + "px";
       overlay.width = canvas.width; overlay.height = canvas.height;
       octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      [stripRate, stripTTFT].forEach(function (c) {
+        c.style.width = w + "px"; c.style.height = STRIP_H + "px";
+        c.width = Math.round(w * dpr); c.height = Math.round(STRIP_H * dpr);
+        c.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+      });
       plotW = Math.max(50, W - plotL - RIGHT);
       elContent.style.height = Math.max(h, contentHeight(a)) + "px";
       draw();
     }
+
+    // ---- strips: token rates and TTFT over time, on the timeline's x axis ----
+    // tokens per second of series s over [t0, t1] ms (pro rata over buckets).
+    function rateAt(rs, key, t0, t1) {
+      var v = rs[key], bw = rs.bw, sum = 0;
+      for (var i = Math.max(0, Math.floor(t0 / bw)); i < v.length && i * bw < t1; i++) {
+        var lo = Math.max(t0, i * bw), hi = Math.min(t1, (i + 1) * bw);
+        if (hi > lo) sum += v[i] * (hi - lo) / bw;
+      }
+      return sum / ((t1 - t0) / 1000);
+    }
+    function fmtRate(v) { return v >= 1e6 ? (v / 1e6).toFixed(2) + "M" : v >= 1e3 ? (v / 1e3).toFixed(v >= 1e4 ? 1 : 2) + "k" : Math.round(v) + ""; }
+    function stripFrame(c, title, ymax, yfmt) {
+      var x = c.getContext("2d");
+      x.clearRect(0, 0, W, STRIP_H);
+      x.fillStyle = "#0D1013"; x.fillRect(0, 0, W, STRIP_H);
+      x.strokeStyle = "#1c2226"; x.lineWidth = 1;
+      x.beginPath(); x.moveTo(plotL, STRIP_H - 14.5); x.lineTo(plotL + plotW, STRIP_H - 14.5); x.stroke();
+      x.font = "10px monospace"; x.fillStyle = "#8a9096"; x.textAlign = "right";
+      x.fillText(yfmt(ymax), plotL - 4, 10); x.fillText("0", plotL - 4, STRIP_H - 16);
+      x.textAlign = "left"; x.fillStyle = "#6f767d"; x.fillText(title, plotL + 4, 10);
+      return x;
+    }
+    function drawRateStrip(a, r) {
+      var c = stripRate;
+      if (!a || !a.rates || !a.rates.in || !a.rates.in.length) { c.hidden = true; return; }
+      c.hidden = false;
+      var rs = a.rates, n = Math.max(1, Math.floor(plotW / 2)), step = (r[1] - r[0]) / n, cols = [], ymax = 1;
+      for (var i = 0; i < n; i++) {
+        var t0 = r[0] + i * step, t1 = t0 + step;
+        var tot = rateAt(rs, "in", t0, t1), comp = rateAt(rs, "ic", t0, t1), ext = rateAt(rs, "ie", t0, t1), gpu = rateAt(rs, "ig", t0, t1), out = rateAt(rs, "out", t0, t1);
+        cols.push([tot, comp, ext, gpu, out]);
+        if (tot > ymax) ymax = tot; if (out > ymax) ymax = out;
+      }
+      var x = stripFrame(c, "tokens/s  input (computed / external / GPU cache)  output", ymax, fmtRate);
+      var base = STRIP_H - 15, hgt = STRIP_H - 26, w = plotW / n;
+      for (i = 0; i < n; i++) {
+        var col = cols[i], px = plotL + i * w, y = base;
+        var parts = [[col[1], "#d9b73a"], [col[2], "#a678e8"], [col[3], "#8094b5"], [Math.max(0, col[0] - col[1] - col[2] - col[3]), "#9aa5b1"]];
+        for (var k = 0; k < 4; k++) {
+          var hh = parts[k][0] / ymax * hgt; if (hh < 0.01) continue;
+          x.fillStyle = parts[k][1]; x.globalAlpha = 0.75; x.fillRect(px, y - hh, w + 0.5, hh); y -= hh;
+        }
+      }
+      x.globalAlpha = 1; x.strokeStyle = "#6BE0A0"; x.lineWidth = 1.5; x.beginPath();
+      for (i = 0; i < n; i++) { var yy = base - cols[i][4] / ymax * hgt, xx = plotL + (i + 0.5) * w; if (i) x.lineTo(xx, yy); else x.moveTo(xx, yy); }
+      x.stroke();
+    }
+    function drawTTFTStrip(a, r) {
+      var c = stripTTFT, t = a && a.ttft;
+      if (!t || !t.t || !t.t.length) { c.hidden = true; return; }
+      c.hidden = false;
+      var lim = t.limit_ms || 0, ymax = lim * 1.15 || 1;
+      for (var i = 0; i < t.t.length; i++) if (t.t[i] >= r[0] && t.t[i] <= r[1]) { if (t.p95[i] * 1.1 > ymax) ymax = t.p95[i] * 1.1; if (t.mean[i] > ymax) ymax = t.mean[i]; }
+      var x = stripFrame(c, "TTFT over a " + fmtSec((t.window_s || 30)) + " window  mean / p95" + (lim ? " / limit" : ""), ymax, function (v) { return fmtSec(v / 1000); });
+      var base = STRIP_H - 15, hgt = STRIP_H - 26;
+      function line(arr, color, width) {
+        x.strokeStyle = color; x.lineWidth = width; x.beginPath(); var first = true;
+        for (var j = 0; j < t.t.length; j++) {
+          if (t.t[j] < r[0] - (r[1] - r[0]) * 0.02 || t.t[j] > r[1] + (r[1] - r[0]) * 0.02) continue;
+          var xx = mapX(t.t[j], r), yy = base - Math.min(arr[j], ymax) / ymax * hgt;
+          if (first) { x.moveTo(xx, yy); first = false; } else x.lineTo(xx, yy);
+        }
+        x.stroke();
+      }
+      line(t.p95, "#f08a3c", 1); line(t.mean, "#C79FF1", 1.6);
+      if (lim) {
+        var ly = base - lim / ymax * hgt;
+        x.strokeStyle = "#ff3b3b"; x.lineWidth = 1; x.setLineDash([4, 3]); x.beginPath(); x.moveTo(plotL, ly); x.lineTo(plotL + plotW, ly); x.stroke(); x.setLineDash([]);
+      }
+    }
+    function drawStrips(a, r) { drawRateStrip(a, r); drawTTFTStrip(a, r); }
 
     // ---- slot state header ----
     function setStateText(html) { if (elState.innerHTML !== html) elState.innerHTML = html; }
@@ -266,14 +346,24 @@ var WekaiTimeline = (function () {
         " &middot; <span title='pausing until the next turn is due'>think pause <b>" + st.think + "</b></span>" +
         " &middot; <span title='no turn pending: between sessions'>idle <b>" + st.idle + "</b></span>" +
         " <span class='wtl-dim'>(" + st.requests + " requests outstanding)</span>";
+      if (st.rates) {
+        var rt = st.rates;
+        h += "<br>tokens/s: input <b>" + fmtRate(rt.in10) + "</b> (10s) &middot; <b>" + fmtRate(rt.in60) + "</b> (60s) &nbsp;|&nbsp; output <b>" + fmtRate(rt.out10) + "</b> (10s) &middot; <b>" + fmtRate(rt.out60) + "</b> (60s)";
+      }
       var g = st.gate;
+      if (g && g.n > 0) {
+        var lim = g.limit_ms / 1000, near = g.limit_ms > 0 && g.value_ms >= 0.8 * g.limit_ms, bad = g.limit_ms > 0 && g.value_ms >= g.limit_ms;
+        function stat(name, ms) {
+          var gating = g.stat === name, cls = gating && g.enabled ? (bad ? "wtl-bad" : near ? "wtl-warn" : "wtl-gating") : "";
+          return name + " " + (cls ? "<b class='" + cls + "'>" : "<b>") + fmtSec(ms / 1000) + "</b>";
+        }
+        h += "<br>TTFT " + fmtSec(g.window_s) + " window (n=" + g.n + "): " + stat("mean", g.mean_ms) + " &middot; " + stat("p50", g.p50_ms) + " &middot; " + stat("p95", g.p95_ms) + " &middot; " + stat("p99", g.p99_ms);
+      }
       if (g) {
-        var v = g.value_ms / 1000, lim = g.limit_ms / 1000;
-        h += "<br>admission: ";
-        if (!g.enabled) h += "ungated, +" + g.admit_count + " every " + fmtSec(g.every_s);
+        if (!g.enabled) h += "<br>admission: ungated" + (g.admit_count ? ", +" + g.admit_count + " every " + fmtSec(g.every_s) : "");
         else {
-          h += g.stat + " TTFT <b>" + fmtSec(v) + "</b> over " + fmtSec(g.window_s) + " (n=" + g.n + ") " + (g.open ? "&lt;" : "&ge;") + " " + fmtSec(lim) + " limit &rarr; <b>" + (g.open ? "open" : "CLOSED") + "</b>";
-          h += g.capped ? "; at the series cap, no more admissions" : (g.open ? "; next +" + g.admit_count + " in " + fmtSec(g.next_in_s) : "; admissions held, next check in " + fmtSec(g.next_in_s));
+          h += " &mdash; gate: " + g.stat + " &lt; " + fmtSec(g.limit_ms / 1000) + " &rarr; <b class='" + (g.open ? "wtl-gating" : "wtl-bad") + "'>" + (g.open ? "OPEN" : "CLOSED") + "</b>";
+          h += g.capped ? " (at the series cap, no more admissions)" : g.every_s ? (g.open ? " (next +" + g.admit_count + " in " + fmtSec(g.next_in_s) + ")" : " (admissions held; next check in " + fmtSec(g.next_in_s) + ")") : "";
         }
       }
       setStateText(h);
@@ -295,8 +385,13 @@ var WekaiTimeline = (function () {
         }
         if (st === 0) c.f++; else if (st === 1) c.w++; else if (st === 2) c.t++; else c.i++;
       }
+      var rate = "";
+      if (a.rates && a.rates.in && a.rates.in.length) {
+        var rr = range();
+        rate = "<br>view average tokens/s: input <b>" + fmtRate(rateAt(a.rates, "in", rr[0], rr[1])) + "</b> &middot; output <b>" + fmtRate(rateAt(a.rates, "out", rr[0], rr[1])) + "</b>";
+      }
       setStateText("at <b>" + fmtElapsed(T, 1000) + "</b> (view end): <b>" + a.groups.length + "</b> slots &middot; in flight <b>" + c.f +
-        "</b> &middot; waiting at gate <b>" + c.w + "</b> &middot; think pause <b>" + c.t + "</b> &middot; idle <b>" + c.i + "</b>");
+        "</b> &middot; waiting at gate <b>" + c.w + "</b> &middot; think pause <b>" + c.t + "</b> &middot; idle <b>" + c.i + "</b>" + rate);
     }
 
     // ---- tile cache ----
@@ -412,6 +507,7 @@ var WekaiTimeline = (function () {
         if (nx >= plotL && nx <= plotL + plotW) { ctx.strokeStyle = "#7C03EC"; ctx.beginPath(); ctx.moveTo(nx + 0.5, AXIS_H); ctx.lineTo(nx + 0.5, H); ctx.stroke(); }
       }
       drawOverlay();
+      drawStrips(a, r);
       if (!opts.live) renderOfflineState();
     }
 
@@ -569,9 +665,10 @@ var WekaiTimeline = (function () {
       }
       // Every wait, by where it happened.
       var unattr = 0;
-      if (q.tm && !(q.x & FLAG_TRUNC)) unattr = Math.max(0, e2e - (q.tm[0] + q.tm[1] + q.tm[2] + q.tm[3] + q.tm[4] + q.tm[5]));
-      if (cw > 0 || (q.x & FLAG_WAITING) || (q.tm && (q.tm[0] > 0 || q.tm[1] > 0 || unattr > 1))) {
+      if (q.tm && !(q.x & FLAG_TRUNC)) unattr = Math.max(0, e2e - (q.rw || 0) - (q.tm[0] + q.tm[1] + q.tm[2] + q.tm[3] + q.tm[4] + q.tm[5]));
+      if (cw > 0 || q.rw > 0 || (q.x & FLAG_WAITING) || (q.tm && (q.tm[0] > 0 || q.tm[1] > 0 || unattr > 1))) {
         html += "<table>";
+        if (q.rw > 0) html += "<tr><td><i style='background:" + colors[14] + "'></i>429 shed / backoff (" + (q.r4 || 0) + " retries)</td><td>" + fmtDur(q.rw) + "</td></tr>";
         if ((q.x & FLAG_WAITING)) html += "<tr><td><i style='background:" + colors[WAIT_CLIENT] + "'></i>client wait (still waiting)</td><td>" + fmtDur(Math.max(0, now - q.t)) + "</td></tr>";
         else if (cw > 0) html += "<tr><td><i style='background:" + colors[WAIT_CLIENT] + "'></i>client wait (no free slot)</td><td>" + fmtDur(cw) + "</td></tr>";
         if (q.tm && q.tm[1] > 0) html += "<tr><td><i style='background:" + colors[0] + "'></i>engine queue: other</td><td>" + fmtDur(q.tm[1]) + "</td></tr>";
@@ -719,6 +816,12 @@ var WekaiTimeline = (function () {
       },
       arms: function () { return arms; },
       setState: renderState,
+      // setSeries installs the run's token-rate and TTFT history (live: /api/series).
+      setSeries: function (armIdx, s) {
+        var a = arms[armIdx]; if (!a || !s) return;
+        a.rates = s.rates; a.ttft = s.ttft;
+        if (armIdx === cur) scheduleDraw();
+      },
       // perf runs a fixed interaction workload and returns per-operation timings
       // in ms (used by ?perf=1 on the standalone page to track regressions).
       perf: function () {

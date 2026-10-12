@@ -1009,7 +1009,11 @@ func TestAdmissionGateState(t *testing.T) {
 		t.Error("gate at max-series must report capped")
 	}
 	cfg.AdmitEvery = 0
+	if g = admissionGate(cfg, st, start); g == nil || g.EveryS != 0 || g.NextInS != 0 || g.P95Ms < 13000 {
+		t.Errorf("realtime without a governor still reports the TTFT window: %+v", g)
+	}
+	cfg.ReplayRealtime = false
 	if admissionGate(cfg, st, start) != nil {
-		t.Error("no governor, no gate state")
+		t.Error("neither realtime nor a governor: no gate state")
 	}
 }

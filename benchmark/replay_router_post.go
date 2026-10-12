@@ -723,6 +723,7 @@ func (p *replayPoster) do(
 		CycleNum:     turnIdx,
 		SeriesGUID:   sessionID + ":" + instanceID,
 		OutputTarget: outputTarget,
+		progress:     progressFrom(ctx),
 	}
 
 	if resp.StatusCode/100 != 2 {
@@ -1153,7 +1154,9 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 			if content != "" || reasoning != "" {
 				firstToken.Do(func() {
 					m.TimeToFirstToken = time.Since(startTime)
+					m.progress.markFirst()
 				})
+				m.progress.addOut(1)
 			}
 			resp.WriteString(content)
 			resp.WriteString(reasoning)

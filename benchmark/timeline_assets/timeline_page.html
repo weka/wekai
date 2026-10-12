@@ -44,7 +44,7 @@
   // Live mode: poll the incremental endpoint for the selected arm.
   var tl = WekaiTimeline.create(host, {
     kinds: CFG.kinds, live: true, handleEsc: true, maxRequests: CFG.maxRequests,
-    onArm: function (i) { seqs[i] = seqs[i] || 0; poll(); },
+    onArm: function (i) { seqs[i] = seqs[i] || 0; poll(); pollSeries(); },
   });
   var seqs = [], busy = false, failures = 0;
   function mkArms(list) {
@@ -67,10 +67,23 @@
       .catch(function (e) { failures++; sub.textContent = "connection lost (" + e.message + ") — retrying"; })
       .then(function () { busy = false; });
   }
+  var seriesBusy = false;
+  function pollSeries() {
+    if (seriesBusy) return;
+    seriesBusy = true;
+    var i = tl.currentArm();
+    fetch((CFG.base || "") + "api/series?arm=" + i + "&points=1500", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (s) { tl.setSeries(i, s); })
+      .catch(function () {})
+      .then(function () { seriesBusy = false; });
+  }
   fetch((CFG.base || "") + "api/arms", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (m) {
     tl.setArms(mkArms(m.arms));
     poll();
     setInterval(poll, CFG.pollMs);
+    pollSeries();
+    setInterval(pollSeries, 5000);
     // In-flight bars grow between polls: repaint on a light timer.
     setInterval(function () { tl.redraw(); }, 500);
   });

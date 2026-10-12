@@ -34,15 +34,25 @@ const (
 	DefaultLiveBind = "127.0.0.1"
 
 	liveMaxInflight = 5000
-	livePollMs      = 2000
+	// liveRateBuckets bounds the run-long token-rate history (5 float64 series).
+	liveRateBuckets = 20000
+	// liveMaxTTFTSamples bounds the TTFT-over-time history; past it every other
+	// sample is dropped so the whole run stays covered at half the resolution.
+	liveMaxTTFTSamples = 20000
+	livePollMs         = 2000
 )
 
 // liveToken identifies an in-flight request. The zero value (no live view
 // attached) is inert.
 type liveToken struct {
-	arm *liveArm
-	id  uint64
+	arm  *liveArm
+	id   uint64
+	prog *liveProgress
 }
+
+// progress is the tracker the response consumers report the first token and
+// stream deltas to (nil for the zero token).
+func (t liveToken) progressTracker() *liveProgress { return t.prog }
 
 type liveDone struct {
 	seq uint64
@@ -56,6 +66,7 @@ type liveInflight struct {
 	guid                    string
 	slot                    slotInfo
 	newSession              bool
+	prog                    *liveProgress
 }
 
 // liveArm is the live state of one model/arm. All methods are safe on a nil
@@ -76,10 +87,16 @@ type liveArm struct {
 	nextID   uint64
 	span     float64
 
-	thinking map[rowKey]int // slots currently pausing before a scheduled turn (count: fan-out)
-	slotsFn  func() (admitted, max int)
-	gateFn   func() *liveGate
+	rates       *rateAccum // tokens over time for the whole run, bounded (coarsens)
+	ttftSamples []ttftSample
+	lastSample  time.Time
+	thinking    map[rowKey]int // slots currently pausing before a scheduled turn (count: fan-out)
+	slotsFn     func() (admitted, max int)
+	gateFn      func() *liveGate
 }
+
+// ttftSample is the governor's TTFT window statistics at one instant (ms).
+type ttftSample struct{ T, Mean, P50, P95, P99 float64 }
 
 // liveGate is the admission governor's state as of now.
 type liveGate struct {
@@ -89,6 +106,10 @@ type liveGate struct {
 	LimitMs    float64 `json:"limit_ms"`
 	WindowS    float64 `json:"window_s"`
 	N          int     `json:"n"`
+	MeanMs     float64 `json:"mean_ms"`
+	P50Ms      float64 `json:"p50_ms"`
+	P95Ms      float64 `json:"p95_ms"`
+	P99Ms      float64 `json:"p99_ms"`
 	Open       bool    `json:"open"`
 	Capped     bool    `json:"capped"`
 	AdmitCount int     `json:"admit_count"`
@@ -96,23 +117,32 @@ type liveGate struct {
 	NextInS    float64 `json:"next_in_s"`
 }
 
+// liveRates are token throughputs (tokens/s) over trailing windows.
+type liveRates struct {
+	In10  float64 `json:"in10"`
+	Out10 float64 `json:"out10"`
+	In60  float64 `json:"in60"`
+	Out60 float64 `json:"out60"`
+}
+
 // liveState counts the admitted session slots by what each is doing now.
 type liveState struct {
-	Slots    int       `json:"slots"`     // admitted session slots
-	Max      int       `json:"max"`       // admission ceiling (--max-series); 0 = none
-	InFlight int       `json:"in_flight"` // slots with a request outstanding at the engine
-	Waiting  int       `json:"waiting"`   // slots whose next turn is due but waits for a free concurrency slot
-	Think    int       `json:"think"`     // slots pausing until their next turn is due
-	Idle     int       `json:"idle"`      // slots with no turn pending (between sessions)
-	Requests int       `json:"requests"`  // outstanding HTTP requests (a fan-out slot can hold several)
-	Gate     *liveGate `json:"gate,omitempty"`
+	Slots    int        `json:"slots"`     // admitted session slots
+	Max      int        `json:"max"`       // admission ceiling (--max-series); 0 = none
+	InFlight int        `json:"in_flight"` // slots with a request outstanding at the engine
+	Waiting  int        `json:"waiting"`   // slots whose next turn is due but waits for a free concurrency slot
+	Think    int        `json:"think"`     // slots pausing until their next turn is due
+	Idle     int        `json:"idle"`      // slots with no turn pending (between sessions)
+	Requests int        `json:"requests"`  // outstanding HTTP requests (a fan-out slot can hold several)
+	Rates    *liveRates `json:"rates,omitempty"`
+	Gate     *liveGate  `json:"gate,omitempty"`
 }
 
 func newLiveArm(name string, max int) *liveArm {
 	if max <= 0 {
 		max = DefaultLiveMaxRequests
 	}
-	return &liveArm{name: name, t0: time.Now(), max: max, lanes: map[rowKey]int{}, lastSess: map[rowKey]int{}, thinking: map[rowKey]int{}, packers: map[rowKey]*subRowPacker{}, inflight: map[uint64]liveInflight{}}
+	return &liveArm{name: name, t0: time.Now(), max: max, lanes: map[rowKey]int{}, lastSess: map[rowKey]int{}, rates: newRateAccum(1000, liveRateBuckets), thinking: map[rowKey]int{}, packers: map[rowKey]*subRowPacker{}, inflight: map[uint64]liveInflight{}}
 }
 
 // lane returns the stable row group of a slot (or, without one, a series),
@@ -157,9 +187,10 @@ func (a *liveArm) begin(series, turn int, guid string, sl slotInfo, ready time.T
 	a.nextID++
 	k := rowKeyOf(sl.N, series)
 	sub := a.packer(k).place(float64(ready.Sub(a.t0).Milliseconds()), math.Inf(1))
+	prog := &liveProgress{}
 	a.inflight[a.nextID] = liveInflight{series: series, turn: turn, lane: a.lane(k), sub: sub, start: ready, guid: guid,
-		slot: sl, newSession: a.newSession(k, series)}
-	return liveToken{arm: a, id: a.nextID}
+		slot: sl, newSession: a.newSession(k, series), prog: prog}
+	return liveToken{arm: a, id: a.nextID, prog: prog}
 }
 
 // setSources wires the run's admission state into the live view.
@@ -227,6 +258,8 @@ func (a *liveArm) state() liveState {
 	}
 	seen := len(a.lanes)
 	slotsFn, gateFn := a.slotsFn, a.gateFn
+	nowMs := float64(time.Since(a.t0).Milliseconds())
+	st.Rates = a.windowRatesLocked(nowMs)
 	a.mu.Unlock()
 	st.Slots = seen
 	if slotsFn != nil {
@@ -237,8 +270,110 @@ func (a *liveArm) state() liveState {
 	}
 	if gateFn != nil {
 		st.Gate = gateFn()
+		a.recordTTFT(st.Gate, nowMs)
 	}
 	return st
+}
+
+// windowRatesLocked is the trailing 10s / 60s token rate: completed requests'
+// attributed tokens plus what requests still running have shown so far.
+func (a *liveArm) windowRatesLocked(nowMs float64) *liveRates {
+	r := &liveRates{}
+	for _, w := range [2]float64{10000, 60000} {
+		from := math.Max(0, nowMs-w)
+		in, out := a.rates.windowSum(from, nowMs)
+		for _, f := range a.inflight {
+			firstNs := f.prog.firstNs.Load()
+			if firstNs == 0 {
+				continue
+			}
+			first := float64(firstNs/1e6) - float64(a.t0.UnixMilli())
+			if first >= from {
+				in += float64(f.prog.promptEst.Load())
+			}
+			if dur := nowMs - first; dur > 0 {
+				overlap := nowMs - math.Max(from, first)
+				out += float64(f.prog.out.Load()) * overlap / dur
+			}
+		}
+		// Always divided by the full window: early in a run that under-reports
+		// rather than inflating a handful of tokens over a fraction of a second.
+		span := w / 1000
+		if w == 10000 {
+			r.In10, r.Out10 = in/span, out/span
+		} else {
+			r.In60, r.Out60 = in/span, out/span
+		}
+	}
+	return r
+}
+
+// recordTTFT keeps the governor's window statistics over time, one sample per
+// couple of seconds, for the TTFT strip.
+func (a *liveArm) recordTTFT(g *liveGate, nowMs float64) {
+	if g == nil || g.N == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if time.Since(a.lastSample) < 2*time.Second {
+		return
+	}
+	a.lastSample = time.Now()
+	a.ttftSamples = append(a.ttftSamples, ttftSample{nowMs, g.MeanMs, g.P50Ms, g.P95Ms, g.P99Ms})
+	if len(a.ttftSamples) > liveMaxTTFTSamples {
+		for i := 0; 2*i < len(a.ttftSamples); i++ {
+			a.ttftSamples[i] = a.ttftSamples[2*i]
+		}
+		a.ttftSamples = a.ttftSamples[:(len(a.ttftSamples)+1)/2]
+	}
+}
+
+// liveSeries is the /api/series response: token rates and TTFT over the run.
+type liveSeries struct {
+	Rates *rateSeries `json:"rates"`
+	TTFT  *ttftSeries `json:"ttft"`
+}
+
+// series returns the run-long rate and TTFT history reduced to about n points,
+// with in-flight requests' provisional tokens folded into the newest buckets.
+func (a *liveArm) series(n int) liveSeries {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	nowMs := float64(time.Since(a.t0).Milliseconds())
+	rs := a.rates.export(n)
+	// Fold in what running requests have shown, at the exported resolution.
+	prov := newRateAccum(rs.Bw, int(nowMs/rs.Bw)+2)
+	for _, f := range a.inflight {
+		firstNs := f.prog.firstNs.Load()
+		if firstNs == 0 {
+			continue
+		}
+		first := float64(firstNs/1e6) - float64(a.t0.UnixMilli())
+		prov.impulse(first, float64(f.prog.promptEst.Load()), 0, 0, 0)
+		prov.spread(first, nowMs, float64(f.prog.out.Load()))
+	}
+	for i := range prov.out {
+		for len(rs.In) <= i {
+			rs.In, rs.IC, rs.IE, rs.IG, rs.Out = append(rs.In, 0), append(rs.IC, 0), append(rs.IE, 0), append(rs.IG, 0), append(rs.Out, 0)
+		}
+		rs.In[i] += int(math.Round(prov.in[i]))
+		rs.Out[i] += int(math.Round(prov.out[i]))
+	}
+	ts := &ttftSeries{}
+	step := 1
+	if n > 0 && len(a.ttftSamples) > n {
+		step = (len(a.ttftSamples) + n - 1) / n
+	}
+	for i := 0; i < len(a.ttftSamples); i += step {
+		s := a.ttftSamples[i]
+		ts.T = append(ts.T, s.T)
+		ts.Mean = append(ts.Mean, s.Mean)
+		ts.P50 = append(ts.P50, s.P50)
+		ts.P95 = append(ts.P95, s.P95)
+		ts.P99 = append(ts.P99, s.P99)
+	}
+	return liveSeries{Rates: rs, TTFT: ts}
 }
 
 // sent marks that the request has been issued (the concurrency gate opened).
@@ -280,6 +415,7 @@ func (a *liveArm) complete(tok liveToken, rec requestDataRecord) {
 			req.Flags |= flagSession
 		}
 	}
+	a.rates.addRequest(&req)
 	a.seq++
 	a.done = append(a.done, liveDone{seq: a.seq, req: req})
 	if end := req.Start + req.E2E; end > a.span {
@@ -455,6 +591,22 @@ func (s *liveServer) handler() http.Handler {
 		st := s.arms[i].state()
 		d.State = &st
 		writeJSON(w, d)
+	})
+	mux.HandleFunc("/api/series", func(w http.ResponseWriter, r *http.Request) {
+		i := s.armIndex(r.URL.Query().Get("arm"))
+		if i < 0 {
+			http.Error(w, "unknown arm (use an index or an arm name from /api/arms)", http.StatusBadRequest)
+			return
+		}
+		n, _ := strconv.Atoi(r.URL.Query().Get("points"))
+		if n <= 0 || n > 4000 {
+			n = 1500
+		}
+		out := s.arms[i].series(n)
+		if g := s.arms[i].state().Gate; g != nil {
+			out.TTFT.LimitMs, out.TTFT.WindowS, out.TTFT.Stat = g.LimitMs, g.WindowS, g.Stat
+		}
+		writeJSON(w, out)
 	})
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		i := s.armIndex(r.URL.Query().Get("arm"))

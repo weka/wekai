@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -421,6 +423,10 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 // renderVisualization is generateVisualization with the optional Timeline
 // view: withTimeline embeds each arm's timeline model and the renderer.
 func renderVisualization(dir string, concurrency int, keepFileNames bool, maxElapsed time.Duration, baselineLabel string, overwrite bool, withTimeline bool) (string, error) {
+	// Building a report holds every row at once (decoded rows, the compact
+	// records, then the JSON). Collect more eagerly while it runs so the peak
+	// tracks the live data rather than twice it.
+	defer debug.SetGCPercent(debug.SetGCPercent(25))
 	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 	if err != nil {
 		return "", fmt.Errorf("glob jsonl files: %w", err)
@@ -460,7 +466,7 @@ func renderVisualization(dir string, concurrency int, keepFileNames bool, maxEla
 			}
 		}
 		guidTable, guidIdx := buildGuidTable(records)
-		var vr []vizRecord
+		vr := make([]vizRecord, 0, len(records))
 		for i, r := range records {
 			vr = append(vr, vizRecord{
 				T:                    float64(r.StartTime.UnixMilli()) - t0,
@@ -643,11 +649,24 @@ func readJSONLFileWithParams(path string) ([]requestDataRecord, []vllmMetricsSam
 		return nil, nil, nil, runParamsRecord{}, false, err
 	}
 	defer f.Close()
-	var records []requestDataRecord
+	// Sized from the line count so appending never doubles a 100MB+ slice (the
+	// copy is what dominates the peak when a report is built over 300k rows).
+	records := make([]requestDataRecord, 0, countLines(path))
 	var samples []vllmMetricsSample
 	var sglangSamples []sglangMetricsSample
 	var params runParamsRecord
 	var hasParams bool
+	// Every row repeats the (long) model spec and a session GUID that recurs
+	// across turns. Interning them keeps a 300k-row file from holding a private
+	// copy of each in memory while the report is built.
+	intern := map[string]string{}
+	canon := func(s string) string {
+		if c, ok := intern[s]; ok {
+			return c
+		}
+		intern[s] = s
+		return s
+	}
 	sc := bufio.NewScanner(f)
 	// 64 MiB cap: reqdata rows embed full prompts; 300k-token contexts exceed 1 MiB.
 	sc.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
@@ -664,6 +683,7 @@ func readJSONLFileWithParams(path string) ([]requestDataRecord, []vllmMetricsSam
 			if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
 				continue
 			}
+			r.Model, r.SeriesGUID = canon(r.Model), canon(r.SeriesGUID)
 			records = append(records, r)
 		case recordTypeVLLMMetricsSample:
 			var s vllmMetricsSample
@@ -686,6 +706,24 @@ func readJSONLFileWithParams(path string) ([]requestDataRecord, []vllmMetricsSam
 		}
 	}
 	return records, samples, sglangSamples, params, hasParams, sc.Err()
+}
+
+// countLines returns the number of newline-terminated lines in path, 0 on error.
+func countLines(path string) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	buf := make([]byte, 1<<20)
+	n := 0
+	for {
+		c, err := f.Read(buf)
+		n += bytes.Count(buf[:c], []byte{'\n'})
+		if err != nil {
+			return n
+		}
+	}
 }
 
 // reportHTMLPath returns the destination for the rendered HTML report.

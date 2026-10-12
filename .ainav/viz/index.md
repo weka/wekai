@@ -82,6 +82,15 @@ One renderer, three surfaces: `benchmark/timeline_assets/timeline.js` (+ `.css`,
   `/api/state`; offline reconstructs it at the view's right edge. Think pauses are
   `think_pause_ms` per request (`tp`), shaded just left of the bar. `lateTolerance`
   (50ms) keeps timer jitter out of the realtime late counts.
+- Throughput and TTFT strips: `rates.go` (`rateAccum`: prompt tokens at first-token time,
+  output spread first token -> end; bounded, coarsens past 20k buckets) and
+  `ttftOverTime` for offline pages; live keeps the governor's own ttftWindow samples and
+  serves both from `/api/series`. In-flight requests report the first token and stream
+  deltas through `liveProgress` (ctx value set at the router replay send site).
+- Memory (live): ~540 B per retained completed request, `--live-max-requests` cap
+  evicts oldest; rates / TTFT history are fixed-size and keep covering the whole run.
+- 429: `retries_429` / `retry_wait_ms` per request; the backoff is its own wait kind
+  (after client wait, before engine queue) and is excluded from "unattributed".
 - Perf: completed bars are painted into 512px tiles cached per view (scroll = blits),
   narrow bars collapse into runs, per-group requests are start-sorted for window
   search, wheel zoom previews the scaled old tiles and repaints after 150ms, hover is

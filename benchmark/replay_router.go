@@ -1063,6 +1063,7 @@ func runRouterReplayInstance(
 
 		sentAt := time.Now()
 		st.live.sent(liveTok, sentAt)
+		liveTok.prog.setPromptEst(req.InputTokens + req.CacheReadTokens + req.CacheCreationTokens)
 		sendAt := pacer.clk.Now()
 		if thinkPaced {
 			st.lag.observeThink(sendAt.Sub(due), sendAt.Sub(refEnd), time.Duration(*req.ThinkMs)*time.Millisecond)
@@ -1081,7 +1082,7 @@ func runRouterReplayInstance(
 			}
 		}
 
-		reqCtx, reqCancel := context.WithTimeout(ctx, reqTimeout)
+		reqCtx, reqCancel := context.WithTimeout(withProgress(ctx, liveTok.prog), reqTimeout)
 		var metrics RequestMetrics
 		// Per-request endpoint selection: prefer this series' home endpoint,
 		// fail over only if it is overloaded. The slot is held for exactly this

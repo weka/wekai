@@ -35,6 +35,7 @@ const (
 	segWaitClient     = 11 // client-side wait: due / eligible, but no free concurrency slot yet
 	segUnattributed   = 12 // sent, but not yet in the engine's clock: network / frontend
 	segWaited         = 13 // renderer only: all wait kinds merged
+	segRetry429       = 14 // client backoff after the fleet shed the request with a 429
 )
 
 // Per-request flag bits.
@@ -63,6 +64,7 @@ type timelineKind struct {
 // tier, warm amber for computed work.
 var timelineKinds = []timelineKind{
 	{segWaitClient, "wait_client", "client wait (no free slot)", "#b8c0c8"},
+	{segRetry429, "wait_429", "429 shed / backoff", "#d65db1"},
 	{segWaitOther, "wait_other", "engine queue: other limits", "#5b646d"},
 	{segWaitKV, "wait_kv", "engine queue: no free KV blocks", "#f08a3c"},
 	{segUnattributed, "wait_unattributed", "unattributed wait (network / frontend)", "#a08f7a"},
@@ -94,6 +96,8 @@ type timelineReq struct {
 	Cached int       `json:"c,omitempty"`
 	Out    int       `json:"o,omitempty"`
 	TP     float64   `json:"tp,omitempty"` // think pause (ms) immediately before the bar's start
+	RW     float64   `json:"rw,omitempty"` // 429 backoff (ms), part of E2E, drawn after the client wait
+	R4     int       `json:"r4,omitempty"` // number of 429 retries
 	CW     float64   `json:"cw,omitempty"` // client-side wait (ready -> sent) in ms; included in E2E
 	Flags  int       `json:"x,omitempty"`
 	Src    []int     `json:"src,omitempty"` // gpu, host, external, computed
@@ -129,6 +133,10 @@ type timelineArm struct {
 	// Guids interns the per-request session:instance ids (see timelineReq.GI).
 	Guids []string      `json:"guids,omitempty"`
 	Reqs  []timelineReq `json:"reqs"`
+	// Rates and TTFT are the run's token throughput and trailing-window TTFT
+	// over time (see rates.go), for the strips above the rows.
+	Rates *rateSeries `json:"rates,omitempty"`
+	TTFT  *ttftSeries `json:"ttft,omitempty"`
 }
 
 // timelinePayload is everything the renderer needs.
@@ -187,13 +195,33 @@ func splitPrefill(prefillMs, kvFetchMs float64, src *llm.TokenSources) []tlSeg {
 // Without engine timings the client's first-token time is the prefill span
 // (split by source when sources are known, e.g. SGLang) and the rest decode;
 // whatever wait preceded it cannot be separated from prefill.
-func timelineSegments(clientWaitMs, e2eMs, ttftMs float64, isErr bool, kv *llm.KVDetails) (segs []tlSeg, truncated bool) {
+func timelineSegments(clientWaitMs, retryMs, e2eMs, ttftMs float64, isErr bool, kv *llm.KVDetails) (segs []tlSeg, truncated bool) {
 	if e2eMs < 0 {
 		e2eMs = 0
 	}
-	if clientWaitMs > 0 {
+	// The 429 backoff is inside e2e and TTFT (the client waited it), but the
+	// engine only ever saw the attempt that was admitted: take it out first so
+	// it is not misread as unattributed time.
+	if retryMs > e2eMs {
+		retryMs = e2eMs
+	}
+	if retryMs < 0 {
+		retryMs = 0
+	}
+	e2eMs -= retryMs
+	if ttftMs > retryMs {
+		ttftMs -= retryMs
+	}
+	if clientWaitMs > 0 || retryMs > 0 {
 		defer func() {
-			segs = append([]tlSeg{{segWaitClient, clientWaitMs}}, segs...)
+			var lead []tlSeg
+			if clientWaitMs > 0 {
+				lead = append(lead, tlSeg{segWaitClient, clientWaitMs})
+			}
+			if retryMs > 0 {
+				lead = append(lead, tlSeg{segRetry429, retryMs})
+			}
+			segs = append(lead, segs...)
 		}()
 	}
 	if isErr {
@@ -255,13 +283,16 @@ func timelineFromRecord(r requestDataRecord, t0 int64) timelineReq {
 	}
 	cw := clientWaitMs(r)
 	tp := float64(r.ThinkPauseMs)
-	segs, trunc := timelineSegments(cw, e2e, r.TTFT, r.IsError, r.KV)
+	rw := float64(r.RetryWaitMs)
+	segs, trunc := timelineSegments(cw, rw, e2e, r.TTFT, r.IsError, r.KV)
 	tr := timelineReq{
 		Series: r.SeriesNum,
 		Turn:   r.Turn,
 		Start:  float64(r.StartTime.UnixMilli()-t0) - cw,
 		E2E:    e2e + cw,
 		CW:     cw,
+		RW:     rw,
+		R4:     r.Retries429,
 		TP:     tp,
 		TTFT:   r.TTFT,
 		In:     r.InputTokens,
@@ -398,6 +429,12 @@ func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
 		}
 	}
 	arm.Groups = len(groups)
+	acc := newRateAccum(1000, 4000)
+	for i := range arm.Reqs {
+		acc.addRequest(&arm.Reqs[i])
+	}
+	arm.Rates = acc.export(4000)
+	arm.TTFT = ttftOverTime(arm.Reqs, arm.Span, 30000, 1500)
 	return arm
 }
 

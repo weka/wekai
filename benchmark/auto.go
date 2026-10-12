@@ -331,6 +331,10 @@ type requestDataRecord struct {
 	// turn became eligible (real-time replay: previous turn's end to its due
 	// time). Idle by design, as opposed to idle for want of a session.
 	ThinkPauseMs int64 `json:"think_pause_ms,omitempty"`
+	// Retries429 / RetryWaitMs: 429 sheds this request backed off and retried,
+	// and the time slept doing so. Included in response_time_ms and ttft_ms.
+	Retries429  int   `json:"retries_429,omitempty"`
+	RetryWaitMs int64 `json:"retry_wait_ms,omitempty"`
 	// Turn is this request's 1-based position within its own instance, which
 	// RequestNum is not — that one counts the whole run. Carried because the
 	// summary locates a failure as series:turn:length, and without it that
@@ -2631,6 +2635,8 @@ func runSingleModelBenchmark(
 						RequestNum:           requestNum,
 						Slot:                 seriesNum,
 						SlotHot:              isHot,
+						Retries429:           metrics.Retries429,
+						RetryWaitMs:          metrics.RetryWait.Milliseconds(),
 						ReadyMs:              readyAt.UnixMilli(),
 						SentMs:               sentAt.UnixMilli(),
 						Turn:                 turnNum,

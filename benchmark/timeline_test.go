@@ -32,7 +32,7 @@ func goldenKV() *llm.KVDetails {
 // Golden numbers: prefill 2000ms splits 20/16/64 of 100 tokens; kv_fetch joins
 // the external share; the 500ms the engine did not see is unattributed wait.
 func TestTimelineSegmentsEngineTimings(t *testing.T) {
-	segs, trunc := timelineSegments(0, 8500, 3000, false, goldenKV())
+	segs, trunc := timelineSegments(0, 0, 8500, 3000, false, goldenKV())
 	if trunc {
 		t.Error("unexpected truncation")
 	}
@@ -76,7 +76,7 @@ func TestTimelineSegmentsEngineTimings(t *testing.T) {
 }
 
 func TestTimelineSegmentsScaleWhenEngineExceedsClient(t *testing.T) {
-	segs, trunc := timelineSegments(0, 4000, 1000, false, goldenKV()) // engine phases sum to 8000
+	segs, trunc := timelineSegments(0, 0, 4000, 1000, false, goldenKV()) // engine phases sum to 8000
 	if !trunc {
 		t.Error("expected the truncated flag")
 	}
@@ -97,7 +97,7 @@ func TestTimelineSegmentsExternalFromKVFetchWithoutTokens(t *testing.T) {
 		Sources: &llm.TokenSources{Computed: 100},
 		Timings: &llm.RequestTimings{KVFetch: 0.2, Prefill: 1, Decode: 1},
 	}
-	m := segMap(mustSegs(timelineSegments(0, 2200, 0, false, kv)))
+	m := segMap(mustSegs(timelineSegments(0, 0, 2200, 0, false, kv)))
 	if !near(m[segPrefillExt], 200) || !near(m[segPrefillCompute], 1000) {
 		t.Errorf("segments = %v", m)
 	}
@@ -109,7 +109,7 @@ func mustSegs(s []tlSeg, _ bool) []tlSeg { return s }
 // span, split by tokens.
 func TestTimelineSegmentsSourcesWithoutTimings(t *testing.T) {
 	kv := &llm.KVDetails{Sources: &llm.TokenSources{GPU: 600, Host: 300, External: 100, Computed: 200}}
-	m := segMap(mustSegs(timelineSegments(0, 5000, 1200, false, kv)))
+	m := segMap(mustSegs(timelineSegments(0, 0, 5000, 1200, false, kv)))
 	if !near(m[segPrefillGPU], 600) || !near(m[segPrefillHost], 300) || !near(m[segPrefillExt], 100) || !near(m[segPrefillCompute], 200) {
 		t.Errorf("prefill split = %v", m)
 	}
@@ -121,25 +121,25 @@ func TestTimelineSegmentsSourcesWithoutTimings(t *testing.T) {
 // No engine details at all: start, first token, end -> one unknown prefill
 // colour then decode.
 func TestTimelineSegmentsClientOnlyFallback(t *testing.T) {
-	segs, _ := timelineSegments(0, 5000, 1200, false, nil)
+	segs, _ := timelineSegments(0, 0, 5000, 1200, false, nil)
 	if len(segs) != 2 || segs[0] != (tlSeg{segPrefillUnknown, 1200}) || segs[1] != (tlSeg{segDecode, 3800}) {
 		t.Errorf("segs = %+v", segs)
 	}
 	// TTFT missing or beyond e2e: the whole bar is prefill.
 	for _, ttft := range []float64{0, 9000} {
-		segs, _ = timelineSegments(0, 5000, ttft, false, nil)
+		segs, _ = timelineSegments(0, 0, 5000, ttft, false, nil)
 		if len(segs) != 1 || segs[0] != (tlSeg{segPrefillUnknown, 5000}) {
 			t.Errorf("ttft=%v segs = %+v", ttft, segs)
 		}
 	}
-	if segs, _ = timelineSegments(0, 700, 100, true, goldenKV()); len(segs) != 1 || segs[0].kind != segError {
+	if segs, _ = timelineSegments(0, 0, 700, 100, true, goldenKV()); len(segs) != 1 || segs[0].kind != segError {
 		t.Errorf("error request segs = %+v", segs)
 	}
 }
 
 func TestTimelineSegmentsZeroSources(t *testing.T) {
 	kv := &llm.KVDetails{Sources: &llm.TokenSources{}, Timings: &llm.RequestTimings{Prefill: 1, KVFetch: 0.5, Decode: 1}}
-	m := segMap(mustSegs(timelineSegments(0, 2500, 0, false, kv)))
+	m := segMap(mustSegs(timelineSegments(0, 0, 2500, 0, false, kv)))
 	if !near(m[segPrefillUnknown], 1500) {
 		t.Errorf("segments = %v", m)
 	}
@@ -348,7 +348,7 @@ func TestRequestDataSlotRoundTrip(t *testing.T) {
 // Client wait (eligible but unsent) leads the bar and is not part of e2e; engine
 // queue waits and the unattributed gap follow, each in its own kind.
 func TestTimelineSegmentsWaitsSeparated(t *testing.T) {
-	segs, _ := timelineSegments(1200, 8500, 3000, false, goldenKV())
+	segs, _ := timelineSegments(1200, 0, 8500, 3000, false, goldenKV())
 	want := []int{segWaitClient, segWaitOther, segWaitKV, segUnattributed, segPrefillCompute, segPrefillExt, segPrefillGPU, segPreempted, segDecode}
 	if len(segs) != len(want) {
 		t.Fatalf("segs = %+v", segs)
@@ -369,16 +369,16 @@ func TestTimelineSegmentsWaitsSeparated(t *testing.T) {
 		t.Errorf("sum = %.1f, want 9700", total)
 	}
 	// No gate wait: no client segment at all.
-	if segs, _ = timelineSegments(0, 8500, 3000, false, goldenKV()); segs[0].kind == segWaitClient {
+	if segs, _ = timelineSegments(0, 0, 8500, 3000, false, goldenKV()); segs[0].kind == segWaitClient {
 		t.Error("client wait segment drawn for a request that did not wait")
 	}
 	// Without engine timings the client wait still leads, before the unknown prefill.
-	segs, _ = timelineSegments(300, 5000, 1200, false, nil)
+	segs, _ = timelineSegments(300, 0, 5000, 1200, false, nil)
 	if len(segs) != 3 || segs[0] != (tlSeg{segWaitClient, 300}) || segs[1].kind != segPrefillUnknown {
 		t.Errorf("client-only segs = %+v", segs)
 	}
 	// Engine phases exceeding the client e2e never make the unattributed gap negative.
-	for _, s := range mustSegs(timelineSegments(0, 4000, 1000, false, goldenKV())) {
+	for _, s := range mustSegs(timelineSegments(0, 0, 4000, 1000, false, goldenKV())) {
 		if s.ms < 0 {
 			t.Errorf("negative segment %+v", s)
 		}
@@ -436,7 +436,7 @@ func TestLiveInflightClientWait(t *testing.T) {
 // The renderer's merge toggle collapses exactly the wait kinds the model emits.
 func TestTimelineKindsMergeContract(t *testing.T) {
 	js := timelineJS
-	for _, want := range []string{"WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1 }", "WAITED = 13"} {
+	for _, want := range []string{"WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1, 14: 1 }", "WAITED = 13"} {
 		if !strings.Contains(js, want) {
 			t.Errorf("renderer lacks %q", want)
 		}
@@ -488,5 +488,45 @@ func TestTimelineCarriesThinkPause(t *testing.T) {
 	}
 	if q = timelineFromRecord(requestDataRecord{StartTime: base, ResponseMs: 500}, base.UnixMilli()); q.TP != 0 {
 		t.Errorf("tp = %v without a pause", q.TP)
+	}
+}
+
+// A 429 backoff leads the engine's own phases, after any client wait, and is
+// taken out of the unattributed gap rather than inflating it.
+func TestTimelineSegments429Backoff(t *testing.T) {
+	// e2e 9700 = 1200 backoff + 8500 engine-side; client waited 300 for a slot first.
+	segs, _ := timelineSegments(300, 1200, 9700, 4200, false, goldenKV())
+	if segs[0] != (tlSeg{segWaitClient, 300}) || segs[1] != (tlSeg{segRetry429, 1200}) || segs[2].kind != segWaitOther {
+		t.Fatalf("segs = %+v", segs)
+	}
+	m := segMap(segs)
+	if !near(m[segUnattributed], 500) { // 8500 - engine phases 8000
+		t.Errorf("unattributed = %.1f, want 500 (backoff must not count)", m[segUnattributed])
+	}
+	var total float64
+	for _, s := range segs {
+		total += s.ms
+	}
+	if !near(total, 10000) { // client wait + e2e
+		t.Errorf("sum = %.1f, want 10000", total)
+	}
+	// Without engine timings the backoff is carved out of the first-token span.
+	segs, _ = timelineSegments(0, 1000, 5000, 3000, false, nil)
+	if segs[0] != (tlSeg{segRetry429, 1000}) || segs[1] != (tlSeg{segPrefillUnknown, 2000}) {
+		t.Errorf("client-only segs = %+v", segs)
+	}
+	// Backoff larger than e2e is clamped, never negative time.
+	for _, s := range mustSegs(timelineSegments(0, 99999, 500, 100, false, nil)) {
+		if s.ms < 0 {
+			t.Errorf("negative segment %+v", s)
+		}
+	}
+}
+
+func TestTimelineCarries429Fields(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	q := timelineFromRecord(requestDataRecord{StartTime: base, ResponseMs: 3000, TTFT: 2500, SeriesNum: 1, Retries429: 3, RetryWaitMs: 1800}, base.UnixMilli())
+	if q.R4 != 3 || q.RW != 1800 || q.Segs[0] != segRetry429 || q.Segs[1] != 1800 {
+		t.Errorf("q = %+v", q)
 	}
 }

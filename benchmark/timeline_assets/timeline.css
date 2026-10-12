@@ -10,6 +10,10 @@
 .wtl-bar .wtl-hint { color: #8a9096; margin-left: auto; }
 .wtl-state { padding: 0 0 6px; color: #C9C9C9; line-height: 1.5; }
 .wtl-state b { color: #F2F2EB; font-weight: 500; }
+.wtl-gating { color: #6BE0A0 !important; }
+.wtl-warn { color: #FFB020 !important; }
+.wtl-bad { color: #ff5a5a !important; }
+.wtl-strip { display: block; margin: 0 0 2px 1px; background: #0D1013; border-radius: 3px; }
 .wtl-dim { color: #8a9096; }
 .wtl-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 0 0 6px; }
 .wtl-legend span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }

@@ -579,6 +579,8 @@ func recordReplayRequest(
 			RequestNum:           metrics.RequestNum,
 			Slot:                 metrics.Slot.N,
 			ThinkPauseMs:         metrics.ThinkPause.Milliseconds(),
+			Retries429:           metrics.Retries429,
+			RetryWaitMs:          metrics.RetryWait.Milliseconds(),
 			ReadyMs:              unixMilliOrZero(metrics.ReadyAt),
 			SentMs:               unixMilliOrZero(metrics.SentAt),
 			SlotHot:              metrics.Slot.Hot,

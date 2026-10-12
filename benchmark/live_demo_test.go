@@ -25,7 +25,8 @@ func TestLiveDemoServer(t *testing.T) {
 	defer s.Close()
 	a := s.arms[0]
 	a.setSources(func() (int, int) { return 24, 64 }, func() *liveGate {
-		return &liveGate{Enabled: true, Stat: "mean", ValueMs: 2350, LimitMs: 10000, WindowS: 30, N: 412, Open: true, AdmitCount: 16, EveryS: 60, NextInS: 23}
+		v := 2000 + 7500*float64(time.Now().UnixMilli()%60000)/60000 // sweeps through amber to near the limit
+		return &liveGate{Enabled: true, Stat: "mean", ValueMs: v, MeanMs: v, P50Ms: v * 0.8, P95Ms: v * 2.4, P99Ms: v * 3.5, LimitMs: 10000, WindowS: 30, N: 412, Open: v < 10000, AdmitCount: 16, EveryS: 60, NextInS: 23}
 	})
 	for slot := 1; slot <= 24; slot++ {
 		go func(slot int) {
@@ -46,12 +47,25 @@ func TestLiveDemoServer(t *testing.T) {
 				time.Sleep(time.Duration(rng.Intn(1500)) * time.Millisecond) // waits for a free slot
 				sent := time.Now()
 				a.sent(tok, sent)
+				var rw time.Duration
+				var retries int
+				if rng.Intn(5) == 0 {
+					retries, rw = 1+rng.Intn(3), time.Duration(300+rng.Intn(900))*time.Millisecond
+					time.Sleep(rw) // backing off after 429s
+				}
 				dur := time.Duration(300+rng.Intn(2500)) * time.Millisecond
-				time.Sleep(dur)
+				tok.progressTracker().setPromptEst(8000)
+				time.Sleep(dur / 3) // prefill
+				tok.progressTracker().markFirst()
+				for i := 0; i < 10; i++ {
+					time.Sleep(dur / 15)
+					tok.progressTracker().addOut(20)
+				}
 				now := time.Now()
+				dur += rw
 				ext := rng.Intn(20000)
-				rec := requestDataRecord{StartTime: now.Add(-dur), EndTime: now, ResponseMs: float64(dur.Milliseconds()), TTFT: float64(dur.Milliseconds()) / 3,
-					ThinkPauseMs: pause.Milliseconds(), ReadyMs: ready.UnixMilli(), SentMs: sent.UnixMilli(), SeriesNum: sess, Slot: slot, SlotHot: sl.Hot, Turn: turn, InputTokens: 3000, CachedTokens: ext + 5000, OutputTokens: 200}
+				rec := requestDataRecord{StartTime: sent, EndTime: now, ResponseMs: float64(dur.Milliseconds()), TTFT: float64(dur.Milliseconds()) / 3,
+					Retries429: retries, RetryWaitMs: rw.Milliseconds(), ThinkPauseMs: pause.Milliseconds(), ReadyMs: ready.UnixMilli(), SentMs: sent.UnixMilli(), SeriesNum: sess, Slot: slot, SlotHot: sl.Hot, Turn: turn, InputTokens: 3000, CachedTokens: ext + 5000, OutputTokens: 200}
 				if rng.Intn(3) > 0 {
 					d := dur.Seconds()
 					rec.KV = goldenKV()

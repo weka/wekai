@@ -25,3 +25,19 @@ func slotOf(ctx context.Context) slotInfo {
 	s, _ := ctx.Value(slotCtxKey{}).(slotInfo)
 	return s
 }
+
+type progressCtxKey struct{}
+
+// withProgress attaches a live request's progress tracker to ctx so the response
+// consumers can report the first token and streamed deltas as they arrive.
+func withProgress(ctx context.Context, p *liveProgress) context.Context {
+	if p == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, progressCtxKey{}, p)
+}
+
+func progressFrom(ctx context.Context) *liveProgress {
+	p, _ := ctx.Value(progressCtxKey{}).(*liveProgress)
+	return p
+}
