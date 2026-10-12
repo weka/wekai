@@ -183,10 +183,14 @@ from a directory that has grown.
 chart is published as a scratch image holding just `/replay.jsonl`, pulled
 anonymously with `curl` — no Docker engine, no registry client (~1.3 GB
 download, ~9 GB on disk). `Dockerfile`'s `REPLAY_IMAGE` ARG is the source
-of truth for the tag:
+of truth for the tag. The current capture is
+`replay-7-jul-2027-58d-weka-timings.jsonl` (replay-v4: the 2026-05-12 →
+2026-07-07 dataset — 5,441 sessions / 522,332 requests — with per-request
+`total_ms` and `think_ms`, so `--replay-realtime` keeps the original think
+time between turns; older v3 captures fall back to the absolute schedule):
 
 ```
-REPO=weka.io/wekai; TAG=replay-24e7f15ba0ea
+REPO=weka.io/wekai; TAG=replay-676947ddc2a9
 TOKEN=$(curl -s "https://quay.io/v2/auth?service=quay.io&scope=repository:$REPO:pull" | jq -r .token)
 LAYER=$(curl -s -H "Authorization: Bearer $TOKEN" \
   -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
