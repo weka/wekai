@@ -32,7 +32,13 @@
   if (!CFG.live) {
     var P = {{.Data}};
     var tl = WekaiTimeline.create(host, { kinds: P.kinds, handleEsc: true });
+    var t0 = performance.now();
     tl.setArms(P.arms);
+    var initialRender = +(performance.now() - t0).toFixed(1);
+    if (/[?&]perf=1/.test(location.search)) {
+      var res = tl.perf(); res.initialRender = initialRender;
+      var pre = document.createElement("pre"); pre.id = "wtl-perf"; pre.textContent = JSON.stringify(res); document.body.appendChild(pre);
+    }
     return;
   }
   // Live mode: poll the incremental endpoint for the selected arm.

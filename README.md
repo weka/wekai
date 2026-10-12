@@ -256,10 +256,15 @@ already ask for `stream_options.include_usage`, which is how vLLM delivers them.
   thin marker where a new session starts, and overlapping requests (sub-agent
   fan-out) are packed into sub-rows under it. Reqdata records `slot`/`slot_hot`
   per request; files without them group by `series_num` (the session) instead.
-  Rows are ordered by first request. Each request bar, left to right = queue wait (KV-blocked vs other),
+  Rows are ordered by first request. Each request bar, left to right = waits, separated by where they
+  happened: client wait (the turn was due but no concurrency slot was free;
+  `ready_ms` -> `sent_ms` in reqdata), engine queue (other limits, then no free
+  KV blocks), unattributed (network / frontend); then
   prefill split by token share into computed / external / host / GPU cache
   (kv_fetch counted in the external share), preempted, decode. Requests with no
   engine details use client timestamps with one "prefill (unknown source)" colour.
+  "Merge waits" collapses all wait kinds into one colour. Hovering anywhere on a
+  row outlines that whole slot row.
 - `wekai benchmark timeline <dir> -o timeline.html` renders just that view.
 - `wekai benchmark auto --live-port 8088` serves the same view live while the
   run executes: same per-series rows, in-flight requests growing, polled every 2s.

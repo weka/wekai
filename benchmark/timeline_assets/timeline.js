@@ -124,23 +124,42 @@ var WekaiTimeline = (function () {
 
     function addToGroup(a, q) {
       var g = a.groups[q.r];
-      if (!g) { for (var k = a.groups.length; k <= q.r; k++) a.groups[k] = { reqs: [], infl: [], subs: 1 }; g = a.groups[q.r]; }
+      if (!g) { for (var k = a.groups.length; k <= q.r; k++) a.groups[k] = newGroup(); g = a.groups[q.r]; }
+      var n = g.reqs.length;
+      if (n && q.t < g.reqs[n - 1].t) g.unsorted = true;
       g.reqs.push(q);
+      if (q.e > g.maxE) g.maxE = q.e;
+      if (q.x & FLAG_SESSION) { g.bounds.push(q.t); if (g.bounds.length > 1 && q.t < g.bounds[g.bounds.length - 2]) g.unsorted = true; }
       if ((q.u || 0) + 1 > g.subs) g.subs = (q.u || 0) + 1;
-      a.dirty = true;
+      a.dirty = true; a.ver = (a.ver || 0) + 1;
+    }
+    function newGroup() { return { reqs: [], infl: [], subs: 1, maxE: 0, bounds: [], unsorted: false }; }
+    // ensureSorted keeps a group's requests ordered by start so a time window can
+    // be found by binary search instead of scanning every request.
+    function ensureSorted(g) {
+      if (!g.unsorted) return;
+      g.reqs.sort(function (x, y) { return x.t - y.t; });
+      g.bounds.sort(function (x, y) { return x - y; });
+      g.unsorted = false;
+    }
+    // firstAtOrAfter: first index in g.reqs (sorted by start) with start >= t.
+    function firstAtOrAfter(list, t) {
+      var lo = 0, hi = list.length;
+      while (lo < hi) { var mid = (lo + hi) >> 1; if (list[mid].t < t) lo = mid + 1; else hi = mid; }
+      return lo;
     }
     function indexArm(a) {
       a.groups = [];
       a.reqs.forEach(function (q) { addToGroup(a, q); });
       a.inflight = a.inflight || [];
       indexInflight(a);
-      a.dirty = true;
+      a.dirty = true; a.ver = (a.ver || 0) + 1;
     }
     function indexInflight(a) {
       a.groups.forEach(function (g) { g.infl = []; });
       (a.inflight || []).forEach(function (q) {
         var g = a.groups[q.r];
-        if (!g) { for (var k = a.groups.length; k <= q.r; k++) a.groups[k] = { reqs: [], infl: [], subs: 1 }; g = a.groups[q.r]; }
+        if (!g) { for (var k = a.groups.length; k <= q.r; k++) a.groups[k] = newGroup(); g = a.groups[q.r]; }
         g.infl.push(q);
         if ((q.u || 0) + 1 > g.subs) g.subs = (q.u || 0) + 1;
       });
@@ -195,11 +214,31 @@ var WekaiTimeline = (function () {
       elReset.hidden = !isZoomed();
     }
 
+    // Redraws are coalesced to one per animation frame so scroll, wheel, zoom and
+    // resize storms cost one paint each frame.
+    var rafDraw = 0, rafOverlay = 0;
+    function scheduleDraw() {
+      if (rafDraw) return;
+      rafDraw = requestAnimationFrame(function () { rafDraw = 0; draw(); });
+    }
+    function scheduleOverlay() {
+      if (rafOverlay) return;
+      rafOverlay = requestAnimationFrame(function () { rafOverlay = 0; drawOverlay(); });
+    }
+    var sizeKey = "";
     function resize() {
       var a = arm();
       var w = elScroll.clientWidth, h = elScroll.clientHeight;
       if (w < 50 || h < 50) return;
       var dpr = window.devicePixelRatio || 1;
+      plotL = 44;
+      var key = w + "x" + h + "@" + dpr;
+      if (key === sizeKey) {   // same canvas: only the scroll extent may have changed
+        elContent.style.height = Math.max(h, contentHeight(a)) + "px";
+        draw();
+        return;
+      }
+      sizeKey = key;
       W = w; H = h;
       canvas.style.width = w + "px"; canvas.style.height = h + "px";
       canvas.style.marginBottom = (-h) + "px";
@@ -209,10 +248,56 @@ var WekaiTimeline = (function () {
       overlay.style.marginBottom = (-h) + "px";
       overlay.width = canvas.width; overlay.height = canvas.height;
       octx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      plotL = 44;
       plotW = Math.max(50, W - plotL - RIGHT);
       elContent.style.height = Math.max(h, contentHeight(a)) + "px";
       draw();
+    }
+
+    // ---- tile cache ----
+    var TILE_H = 512, MAX_TILES = 10;
+    var tiles = { key: "", map: {}, order: [], r: null };
+    var preview = false, settleTimer = 0;
+    function startPreview() {
+      preview = true;
+      clearTimeout(settleTimer);
+      settleTimer = setTimeout(function () { preview = false; draw(); }, 150);
+    }
+    var pc = ctx;   // the context drawReq / flushLod paint on (main canvas or a tile)
+    function getTile(a, r, ty, rh) {
+      var t = tiles.map[ty];
+      if (t) return t;
+      var dpr = window.devicePixelRatio || 1;
+      t = document.createElement("canvas");
+      t.width = Math.round(W * dpr); t.height = Math.round(TILE_H * dpr);
+      var c = t.getContext("2d");
+      c.setTransform(dpr, 0, 0, dpr, 0, 0);
+      paintRows(c, a, r, ty * TILE_H, ty * TILE_H + TILE_H, rh);
+      tiles.map[ty] = t; tiles.order.push(ty);
+      if (tiles.order.length > MAX_TILES) delete tiles.map[tiles.order.shift()];
+      return t;
+    }
+    // paintRows paints the completed requests of every row group intersecting
+    // [top, bottom) (px from the top of the rows area) on c, offset by top.
+    function paintRows(c, a, r, top, bottom, rh) {
+      pc = c;
+      var g0 = Math.max(0, groupAt(a, top));
+      for (var g = g0; g < a.groups.length; g++) {
+        var gy = groupTop(a, g) - top;
+        if (gy > bottom - top) break;
+        var grp = a.groups[g];
+        ensureSorted(grp);
+        if (g > 0 && rowH >= 6) { c.fillStyle = "#13181b"; c.fillRect(0, gy - 1, W, 1); }
+        // Session boundaries inside the window: the slot moved on to a new session.
+        c.fillStyle = "rgba(199,159,241,0.45)";
+        var gh = grp.subs * rowH;
+        for (var n = firstAtOrAfter(grp.bounds, r[0]); n < grp.bounds.length && grp.bounds[n] <= r[1]; n++) {
+          c.fillRect(Math.round(mapX(grp.bounds[n], r)) - 1, gy - 1, 1, gh + 1);
+        }
+        // Only requests that can intersect the window: starts in [r0 - longest, r1].
+        var i0 = firstAtOrAfter(grp.reqs, r[0] - grp.maxE);
+        for (var k = i0; k < grp.reqs.length && grp.reqs[k].t <= r[1]; k++) drawReq(grp.reqs[k], gy + (grp.reqs[k].u || 0) * rowH, rh, r, 0);
+        for (var u = 0; u < grp.subs; u++) flushLod(u, gy + u * rowH, rh);
+      }
     }
 
     function draw() {
@@ -240,24 +325,36 @@ var WekaiTimeline = (function () {
       layout(a);
       ctx.save();
       ctx.beginPath(); ctx.rect(0, AXIS_H, W, H - AXIS_H); ctx.clip();
+      // Completed requests come from cached tiles (a tile is a band of rows
+      // painted once per view, so scrolling is a few blits); anything that
+      // changes with the clock -- in-flight bars, labels -- is painted per frame.
+      var tilesKey = r[0] + "|" + r[1] + "|" + rowH + "|" + merge + "|" + W + "|" + a.ver + "|" + (window.devicePixelRatio || 1);
+      if (preview && tiles.r) {
+        // Mid wheel-zoom: show the tiles painted for the previous window, scaled
+        // to the new one, and repaint properly once the zoom settles.
+        var k = (tiles.r[1] - tiles.r[0]) / (r[1] - r[0]);
+        var ox = plotL + (tiles.r[0] - r[0]) / (r[1] - r[0]) * plotW - plotL * k;
+        ctx.save();
+        ctx.beginPath(); ctx.rect(plotL, AXIS_H, plotW, H - AXIS_H); ctx.clip();
+        for (var key in tiles.map) {
+          ctx.drawImage(tiles.map[key], ox, AXIS_H + (+key) * TILE_H - scrollTop, W * k, TILE_H);
+        }
+        ctx.restore();
+      } else {
+        if (tilesKey !== tiles.key) { tiles = { key: tilesKey, map: {}, order: [], r: r }; }
+        for (var ty = Math.floor(scrollTop / TILE_H); ty * TILE_H < scrollTop + H - AXIS_H; ty++) {
+          var tile = getTile(a, r, ty, rh);
+          ctx.drawImage(tile, 0, AXIS_H + ty * TILE_H - scrollTop, W, TILE_H);
+        }
+      }
       var g0 = Math.max(0, groupAt(a, scrollTop));
       for (var g = g0; g < a.groups.length; g++) {
         var gy = AXIS_H + groupTop(a, g) - scrollTop;
         if (gy > H) break;
         var grp = a.groups[g];
-        if (g > 0) { ctx.fillStyle = "#1c2226"; ctx.fillRect(0, gy - GAP, W, 1); }
-        // Session boundary: the slot moved on to a new session here.
-        ctx.fillStyle = "rgba(199,159,241,0.55)";
-        var gh = grp.subs * rowH;
-        for (var m = 0; m < 2; m++) {
-          var bl = m ? grp.infl : grp.reqs;
-          for (var n = 0; n < bl.length; n++) if (bl[n].x & FLAG_SESSION) {
-            var bx = mapX(bl[n].t, r);
-            if (bx >= plotL && bx <= plotL + plotW) ctx.fillRect(Math.round(bx) - 1, gy - 1, 1, gh + 1);
-          }
-        }
-        for (var k = 0; k < grp.reqs.length; k++) drawReq(grp.reqs[k], gy + (grp.reqs[k].u || 0) * rowH, rh, r, now);
-        for (k = 0; k < grp.infl.length; k++) drawReq(grp.infl[k], gy + (grp.infl[k].u || 0) * rowH, rh, r, now);
+        pc = ctx;
+        for (var k = 0; k < grp.infl.length; k++) drawReq(grp.infl[k], gy + (grp.infl[k].u || 0) * rowH, rh, r, now);
+        for (var u = 0; u < grp.subs; u++) flushLod(u, gy + u * rowH, rh);
         if (rowH >= 8) {
           var any = grp.reqs[0] || grp.infl[0];
           if (any) { ctx.fillStyle = "#6f767d"; ctx.textAlign = "right"; ctx.font = "10px monospace"; ctx.fillText(any.sl ? ((any.x & FLAG_HOT) ? "h" : "s") + any.sl : "s" + any.s, plotL - 5, gy + rh - 3); }
@@ -325,22 +422,41 @@ var WekaiTimeline = (function () {
       return out;
     }
 
+    var lodK = [], lodX0 = [], lodX1 = [];
+    function flushLod(u, y, rh) {
+      if (lodK[u] === undefined) return;
+      pc.fillStyle = colors[lodK[u]] || "#888";
+      pc.fillRect(lodX0[u], y, lodX1[u] - lodX0[u], rh);
+      lodK[u] = undefined;
+    }
     function drawReq(q, y, rh, r, now) {
-      var t = q.t;
       var infl = (q.x & FLAG_INFL) !== 0;
       var end = infl ? Math.max(0, now - q.t) : q.e;
-      if (mapX(q.t + end, r) < plotL || mapX(q.t, r) > plotL + plotW) return;
+      var xs = mapX(q.t, r), xe = mapX(q.t + end, r);
+      if (xe < plotL || xs > plotL + plotW) return;
       var segs = segsFor(q, now);
+      if (xe - xs < 6) {
+        // Too narrow to tell segments apart: one rect in the dominant kind.
+        var best = 0, bd = -1;
+        for (var j = 0; j < segs.length; j += 2) if (segs[j + 1] > bd) { bd = segs[j + 1]; best = segs[j]; }
+        var x0 = Math.max(xs, plotL), x1 = Math.max(Math.min(xe, plotL + plotW), x0 + 0.6), u = q.u || 0;
+        // Neighbouring narrow bars of the same kind in a sub-row paint as one run.
+        if (lodK[u] === best && x0 <= lodX1[u] + 0.75) { if (x1 > lodX1[u]) lodX1[u] = x1; return; }
+        flushLod(u, y, rh);
+        lodK[u] = best; lodX0[u] = x0; lodX1[u] = x1;
+        return;
+      }
+      var t = q.t;
       for (var i = 0; i < segs.length; i += 2) {
         var d = segs[i + 1];
-        var x0 = mapX(t, r), x1 = mapX(t + d, r);
+        var sx0 = mapX(t, r), sx1 = mapX(t + d, r);
         t += d;
-        if (x1 < plotL || x0 > plotL + plotW) continue;
-        if (x0 < plotL) x0 = plotL;
-        if (x1 > plotL + plotW) x1 = plotL + plotW;
-        var w = x1 - x0; if (w < 0.6) w = 0.6;
-        ctx.fillStyle = colors[segs[i]] || "#888";
-        ctx.fillRect(x0, y, w, rh);
+        if (sx1 < plotL || sx0 > plotL + plotW) continue;
+        if (sx0 < plotL) sx0 = plotL;
+        if (sx1 > plotL + plotW) sx1 = plotL + plotW;
+        var sw = sx1 - sx0; if (sw < 0.6) sw = 0.6;
+        pc.fillStyle = colors[segs[i]] || "#888";
+        pc.fillRect(sx0, y, sw, rh);
       }
     }
 
@@ -356,9 +472,11 @@ var WekaiTimeline = (function () {
       if (sub < 0 || sub >= grp.subs) return null;
       var r = range(), now = opts.live ? curNow() : 0, t = unmapX(p.x, r), tol = 3 * (r[1] - r[0]) / plotW;
       var best = null, bd = Infinity;
+      ensureSorted(grp);
       var lists = [grp.reqs, grp.infl];
-      for (var l = 0; l < 2; l++) for (var i = 0; i < lists[l].length; i++) {
+      for (var l = 0; l < 2; l++) for (var i = l ? 0 : firstAtOrAfter(grp.reqs, t - tol - grp.maxE); i < lists[l].length; i++) {
         var q = lists[l][i];
+        if (l === 0 && q.t > t + tol) break;
         if ((q.u || 0) !== sub) continue;
         var e = (q.x & FLAG_INFL) ? Math.max(0, now - q.t) : q.e;
         var d = t < q.t ? q.t - t : (t > q.t + e ? t - q.t - e : 0);
@@ -432,7 +550,7 @@ var WekaiTimeline = (function () {
       if (a === null || a === undefined) { vMin = vMax = null; }
       else { vMin = a; vMax = Math.max(b, a + 1); }
       elReset.hidden = !isZoomed();
-      draw();
+      scheduleDraw();
     }
     function userZoom(a, b) {
       setView(a, b);
@@ -445,10 +563,10 @@ var WekaiTimeline = (function () {
     });
     canvas.addEventListener("mousemove", function (e) {
       var p = pos(e);
-      if (drag) { drag.x1 = Math.max(plotL, Math.min(plotL + plotW, p.x)); drawOverlay(); return; }
+      if (drag) { drag.x1 = Math.max(plotL, Math.min(plotL + plotW, p.x)); scheduleOverlay(); return; }
       var h = pick(p);
       var g = rowAt(p);
-      if (g !== hoverGroup || (h ? h.q : null) !== (hover ? hover.q : null)) { hover = h; hoverGroup = g; drawOverlay(); }
+      if (g !== hoverGroup || (h ? h.q : null) !== (hover ? hover.q : null)) { hover = h; hoverGroup = g; scheduleOverlay(); }
       showTip(h, e);
     });
     function endDrag(e) {
@@ -469,6 +587,7 @@ var WekaiTimeline = (function () {
       if (!(e.ctrlKey || e.metaKey || e.shiftKey)) return;   // plain wheel scrolls rows
       e.preventDefault();
       var r = range(), p = pos(e), span = r[1] - r[0], f = fullRange();
+      startPreview();
       if (e.shiftKey && !e.ctrlKey && !e.metaKey) {
         var dt = (e.deltaY || e.deltaX) / plotW * span;
         var lo = Math.max(f[0], Math.min(f[1] - span, r[0] + dt));
@@ -480,7 +599,7 @@ var WekaiTimeline = (function () {
       lo2 = Math.max(f[0], Math.min(f[1] - nspan, lo2));
       if (nspan >= f[1] - f[0]) userZoom(null, null); else userZoom(lo2, lo2 + nspan);
     }, { passive: false });
-    elScroll.addEventListener("scroll", function () { hover = null; hoverGroup = -1; tip.style.display = "none"; draw(); });
+    elScroll.addEventListener("scroll", function () { hover = null; hoverGroup = -1; tip.style.display = "none"; scheduleDraw(); });
     elMerge.addEventListener("change", function () { merge = elMerge.checked; buildLegend(); draw(); });
     elRowH.addEventListener("change", function () { rowH = parseInt(elRowH.value, 10); userRowH = true; resize(); });
     elArm.addEventListener("change", function () { selectArm(parseInt(elArm.value, 10)); if (opts.onArm) opts.onArm(cur); });
@@ -508,6 +627,11 @@ var WekaiTimeline = (function () {
         // ?highlight_row=N / ?scroll_row=N pre-select a row (screenshots, bug reports).
         if (hs) { layout(arm()); elScroll.scrollTop = Math.max(0, groupTop(arm(), +hs[1])); }
         if (hm) { hoverGroup = +hm[1]; drawOverlay(); }
+        // ?mouse=X,Y dispatches a real mousemove at viewport (X,Y) once drawn.
+        var mm = /[?&]mouse=(\d+),(\d+)/.exec(location.search);
+        if (mm) setTimeout(function () {
+          canvas.dispatchEvent(new MouseEvent("mousemove", { clientX: +mm[1], clientY: +mm[2], bubbles: true }));
+        }, 50);
       },
       selectArm: selectArm,
       currentArm: function () { return cur; },
@@ -541,6 +665,28 @@ var WekaiTimeline = (function () {
         if (armIdx === cur) { if (!userRowH) { rowH = defaultRowH(a); elRowH.value = rowH; } updateInfo(); resize(); }
       },
       arms: function () { return arms; },
+      // perf runs a fixed interaction workload and returns per-operation timings
+      // in ms (used by ?perf=1 on the standalone page to track regressions).
+      perf: function () {
+        function time(n, fn) { var t = performance.now(); for (var i = 0; i < n; i++) fn(i); return +((performance.now() - t) / n).toFixed(3); }
+        var a = arm(), out = { requests: a.reqs.length, groups: a.groups.length, rowH: rowH };
+        out.drawFull = time(20, function () { draw(); });
+        var maxScroll = Math.max(0, elScroll.scrollHeight - elScroll.clientHeight);
+        out.scrollCold = time(100, function (i) { elScroll.scrollTop = maxScroll * i / 100; draw(); });
+        out.scrollWarm = time(100, function (i) { elScroll.scrollTop = maxScroll * (i % 3) / 100; draw(); });
+        elScroll.scrollTop = 0;
+        out.hover = time(200, function (i) {
+          var p = { x: plotL + (i * 37) % plotW, y: AXIS_H + (i * 11) % Math.max(1, H - AXIS_H) };
+          hover = pick(p); hoverGroup = rowAt(p); drawOverlay();
+        });
+        var f = fullRange(), span = f[1] - f[0];
+        out.zoomStep = time(60, function (i) { var w = span * (1 - i / 80); setView(f[0] + span * 0.3, f[0] + span * 0.3 + w); draw(); });
+        preview = true;
+        out.zoomPreview = time(60, function (i) { var w = span * (1 - i / 80); setView(f[0] + span * 0.3, f[0] + span * 0.3 + w); draw(); });
+        preview = false;
+        setView(null, null);
+        return out;
+      },
     };
     return api;
   }

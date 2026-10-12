@@ -64,7 +64,7 @@ type timelineKind struct {
 var timelineKinds = []timelineKind{
 	{segWaitClient, "wait_client", "client wait (no free slot)", "#b8c0c8"},
 	{segWaitOther, "wait_other", "engine queue: other limits", "#5b646d"},
-	{segWaitKV, "wait_kv", "engine queue: no free KV blocks", "#FF8569"},
+	{segWaitKV, "wait_kv", "engine queue: no free KV blocks", "#f08a3c"},
 	{segUnattributed, "wait_unattributed", "unattributed wait (network / frontend)", "#a08f7a"},
 	{segWaited, "waited", "waited (all kinds merged)", "#8a9096"},
 	{segPrefillCompute, "prefill_computed", "prefill: computed", "#d9b73a"},
@@ -74,7 +74,7 @@ var timelineKinds = []timelineKind{
 	{segPrefillUnknown, "prefill_unknown", "prefill (unknown source)", "#9aa5b1"},
 	{segPreempted, "preempted", "preempted", "#c2788a"},
 	{segDecode, "decode", "decode", "#5f987d"},
-	{segError, "error", "error", "#FF6B6B"},
+	{segError, "error", "error", "#ff3b3b"},
 	{segInflight, "inflight", "in flight", "#d0b3f5"},
 }
 

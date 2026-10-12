@@ -71,4 +71,14 @@ One renderer, three surfaces: `benchmark/timeline_assets/timeline.js` (+ `.css`,
   requests of a series packed greedily into sub-rows (`u`, `subRowPacker`; live
   assigns at begin and keeps the row on completion). Instance = series_guid
   (`session:instance`), shown in the tooltip. `/api/data?arm=` accepts index or name.
+- Waits: `ready_ms`/`sent_ms` (unix ms) are stamped per request (router replay: due time
+  or predecessor end -> gate opened, `eligibleAt`; synthetic/hermes: loop top -> gate
+  opened). Client wait leads the bar (`cw`, included in `e`), then engine queue other,
+  engine queue KV, unattributed (client e2e minus engine phases, never negative).
+  Live in-flight requests show client wait growing until `liveArm.sent`.
+- Perf: completed bars are painted into 512px tiles cached per view (scroll = blits),
+  narrow bars collapse into runs, per-group requests are start-sorted for window
+  search, wheel zoom previews the scaled old tiles and repaints after 150ms, hover is
+  an overlay canvas. `?perf=1` on a standalone page prints timings; `?highlight_row=N`,
+  `?scroll_row=N`, `?mouse=X,Y`, `?merge=1` pre-set state for headless screenshots.
 - Rendering is virtual-scrolled on one canvas, so ~70k requests cost one screenful.
