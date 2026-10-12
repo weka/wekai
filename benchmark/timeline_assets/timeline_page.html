@@ -42,7 +42,7 @@
   });
   var seqs = [], busy = false, failures = 0;
   function mkArms(list) {
-    return list.map(function (a) { return { name: a.name, t0: a.t0, span: 0, layout: "series", rows: 0, reqs: [], inflight: [] }; });
+    return list.map(function (a) { return { name: a.name, t0: a.t0, span: 0, reqs: [], inflight: [] }; });
   }
   function poll() {
     if (busy) return;

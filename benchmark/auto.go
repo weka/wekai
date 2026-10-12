@@ -2430,7 +2430,7 @@ func runSingleModelBenchmark(
 					prompt = buildSeriesPrompt(fullDocs, seriesGUID, groupGUID, stepCurrentTokens, useShared)
 				}
 				ratio := st.estimator.Observe(prompt + "\x00" + cfg.Question)
-				liveTok := st.live.begin(seriesNum, turnNum)
+				liveTok := st.live.begin(seriesNum, turnNum, seriesGUID)
 				metrics := runSingleRequest(reqCtx, cfg.Model, prompt, cfg.Question,
 					requestNum, seriesNum, 0, seriesGUID, endpointOverride, cfg.MaxOutputTokens)
 				reqCancel()

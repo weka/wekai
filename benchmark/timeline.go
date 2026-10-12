@@ -72,7 +72,8 @@ var timelineKinds = []timelineKind{
 // milliseconds; Start is relative to the arm's T0. Zero-valued optional
 // fields are omitted to keep a 70k-request payload small.
 type timelineReq struct {
-	Row    int       `json:"r"`
+	Row    int       `json:"r"`           // series group, in order of the series' first request
+	Sub    int       `json:"u,omitempty"` // sub-row within the group (overlapping requests of one series)
 	Series int       `json:"s"`
 	Turn   int       `json:"n"`
 	Start  float64   `json:"t"`
@@ -85,10 +86,13 @@ type timelineReq struct {
 	Src    []int     `json:"src,omitempty"` // gpu, host, external, computed
 	Rec    []int     `json:"rc,omitempty"`  // preemptions, discarded tokens, load failures, recompute tokens
 	Tm     []float64 `json:"tm,omitempty"`  // ms: queue_wait_kv, queue_wait_other, kv_fetch, prefill, decode, preempted; then preemption count
+	GI     int       `json:"gi,omitempty"`  // 1-based index into the arm's Guids (session:instance); static pages
+	GUID   string    `json:"gu,omitempty"`  // the same inline; live responses
 	Segs   []float64 `json:"g"`             // flattened (kind, durationMs) pairs, left to right
 }
 
-// timelineArm is one benchmark arm (one reqdata file / model).
+// timelineArm is one benchmark arm (one reqdata file / model). The layout is
+// one row group per series; Reqs[i].Row is the group, Reqs[i].Sub the sub-row.
 type timelineArm struct {
 	Name string `json:"name"`
 	// T0 is the epoch-ms of the earliest request start; every Start is
@@ -96,11 +100,11 @@ type timelineArm struct {
 	T0 int64 `json:"t0"`
 	// Span is the extent of the data in ms from T0.
 	Span float64 `json:"span"`
-	// Layout is "requests" (one row per request, sorted by start) or
-	// "series" (one row per series; requests of a series share its row).
-	Layout string        `json:"layout"`
-	Rows   int           `json:"rows"`
-	Reqs   []timelineReq `json:"reqs"`
+	// Groups is the number of series rows.
+	Groups int `json:"groups"`
+	// Guids interns the per-request session:instance ids (see timelineReq.GI).
+	Guids []string      `json:"guids,omitempty"`
+	Reqs  []timelineReq `json:"reqs"`
 }
 
 // timelinePayload is everything the renderer needs.
@@ -268,10 +272,38 @@ func flattenSegs(segs []tlSeg) []float64 {
 	return out
 }
 
-// buildTimelineArm builds an arm with one row per request, ordered by start
-// time. Time zero is the earliest start in recs.
+// subRowPacker assigns a series' requests to sub-rows greedily: a request
+// takes the first sub-row whose last request has ended by its start, else opens
+// a new one. Sequential turns therefore share sub-row 0; only overlapping
+// requests (fan-out to sub-agents) add sub-rows.
+type subRowPacker struct {
+	free []float64 // per sub-row: ms at which it is free (+Inf while a request is running)
+}
+
+// place returns the sub-row for a request starting at start; end is when it
+// frees the row (math.Inf(1) for a request still running).
+func (p *subRowPacker) place(start, end float64) int {
+	for i, f := range p.free {
+		if f <= start {
+			p.free[i] = end
+			return i
+		}
+	}
+	p.free = append(p.free, end)
+	return len(p.free) - 1
+}
+
+// release frees sub-row u at end.
+func (p *subRowPacker) release(u int, end float64) {
+	if u >= 0 && u < len(p.free) {
+		p.free[u] = end
+	}
+}
+
+// buildTimelineArm builds an arm with one row group per series, ordered by the
+// series' first request. Time zero is the earliest start in recs.
 func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
-	arm := timelineArm{Name: name, Layout: "requests", Reqs: make([]timelineReq, 0, len(recs))}
+	arm := timelineArm{Name: name, Reqs: make([]timelineReq, 0, len(recs))}
 	if len(recs) == 0 {
 		return arm
 	}
@@ -282,17 +314,38 @@ func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
 		}
 	}
 	arm.T0 = t0
+	guidIdx := map[string]int{}
 	for _, r := range recs {
-		arm.Reqs = append(arm.Reqs, timelineFromRecord(r, t0))
+		tr := timelineFromRecord(r, t0)
+		if r.SeriesGUID != "" {
+			i, ok := guidIdx[r.SeriesGUID]
+			if !ok {
+				arm.Guids = append(arm.Guids, r.SeriesGUID)
+				i = len(arm.Guids)
+				guidIdx[r.SeriesGUID] = i
+			}
+			tr.GI = i
+		}
+		arm.Reqs = append(arm.Reqs, tr)
 	}
 	sort.SliceStable(arm.Reqs, func(i, j int) bool { return arm.Reqs[i].Start < arm.Reqs[j].Start })
+	groups := map[int]int{}
+	packers := map[int]*subRowPacker{}
 	for i := range arm.Reqs {
-		arm.Reqs[i].Row = i
-		if end := arm.Reqs[i].Start + arm.Reqs[i].E2E; end > arm.Span {
+		q := &arm.Reqs[i]
+		g, ok := groups[q.Series]
+		if !ok {
+			g = len(groups)
+			groups[q.Series] = g
+			packers[q.Series] = &subRowPacker{}
+		}
+		q.Row = g
+		q.Sub = packers[q.Series].place(q.Start, q.Start+q.E2E)
+		if end := q.Start + q.E2E; end > arm.Span {
 			arm.Span = end
 		}
 	}
-	arm.Rows = len(arm.Reqs)
+	arm.Groups = len(groups)
 	return arm
 }
 

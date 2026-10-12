@@ -47,18 +47,17 @@ func TestLiveServerEndpoints(t *testing.T) {
 	var meta struct {
 		Kinds []timelineKind `json:"kinds"`
 		Arms  []struct {
-			Name   string `json:"name"`
-			Layout string `json:"layout"`
+			Name string `json:"name"`
 		} `json:"arms"`
 	}
 	getJSON(t, base+"/api/arms", &meta)
-	if len(meta.Arms) != 2 || meta.Arms[1].Name != "armB" || meta.Arms[0].Layout != "series" || len(meta.Kinds) != len(timelineKinds) {
+	if len(meta.Arms) != 2 || meta.Arms[1].Name != "armB" || len(meta.Kinds) != len(timelineKinds) {
 		t.Fatalf("meta = %+v", meta)
 	}
 
 	a := s.arms[0]
-	tok1 := a.begin(7, 1)
-	tok2 := a.begin(3, 4)
+	tok1 := a.begin(7, 1, "")
+	tok2 := a.begin(3, 4, "")
 	var d liveData
 	getJSON(t, base+"/api/data?arm=0&since=0", &d)
 	if len(d.Reqs) != 0 || len(d.Inflight) != 2 {
@@ -106,7 +105,7 @@ func TestLiveServerEndpoints(t *testing.T) {
 	}
 
 	for url, code := range map[string]int{
-		"/api/data?arm=5": 400, "/api/data?arm=x": 400, "/api/data?arm=0&since=zz": 400, "/nope": 404, "/healthz": 200,
+		"/api/data?arm=5": 400, "/api/data?arm=nope": 400, "/api/data?arm=x": 400, "/api/data?arm=0&since=zz": 400, "/nope": 404, "/healthz": 200,
 	} {
 		resp, err := http.Get(base + url)
 		if err != nil {
@@ -171,14 +170,14 @@ func TestLiveArmBoundedMemory(t *testing.T) {
 // Every hook is a no-op without a live view.
 func TestLiveArmNilSafe(t *testing.T) {
 	var a *liveArm
-	tok := a.begin(1, 1)
+	tok := a.begin(1, 1, "")
 	a.complete(tok, requestDataRecord{})
 	a.abandon(tok)
 }
 
 func TestLiveArmAbandon(t *testing.T) {
 	a := newLiveArm("a", 10)
-	tok := a.begin(1, 1)
+	tok := a.begin(1, 1, "")
 	a.abandon(tok)
 	if d := a.snapshot(0); len(d.Inflight) != 0 {
 		t.Errorf("inflight = %d after abandon", len(d.Inflight))
@@ -206,7 +205,7 @@ func TestLiveArmConcurrent(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < 300; i++ {
-				tok := a.begin(w+1, i)
+				tok := a.begin(w+1, i, "")
 				a.complete(tok, liveRec(a, w+1, i%2 == 0))
 			}
 		}(w)
@@ -226,5 +225,73 @@ func TestLiveArmConcurrent(t *testing.T) {
 	wg.Wait()
 	if d := a.snapshot(0); d.Seq != 2400 || len(d.Inflight) != 0 {
 		t.Errorf("seq=%d inflight=%d", d.Seq, len(d.Inflight))
+	}
+}
+
+// /api/data accepts the arm's name as well as its index.
+func TestLiveServerArmByName(t *testing.T) {
+	s, err := startLiveServer("127.0.0.1", 0, []string{"hbm", "weka"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.arms[1].complete(liveToken{}, liveRec(s.arms[1], 1, false))
+	var d liveData
+	getJSON(t, "http://"+s.Addr()+"/api/data?arm=weka&since=0", &d)
+	if len(d.Reqs) != 1 {
+		t.Errorf("by name: %d reqs", len(d.Reqs))
+	}
+	getJSON(t, "http://"+s.Addr()+"/api/data?arm=1&since=0", &d)
+	if len(d.Reqs) != 1 {
+		t.Errorf("by index: %d reqs", len(d.Reqs))
+	}
+}
+
+// Sequential turns of a series stay on one sub-row of one group; a request that
+// overlaps a running one opens a second sub-row; later requests reuse freed
+// rows; a new series opens a new group, in order of first sight.
+func TestLiveArmSeriesRowsAndSubRows(t *testing.T) {
+	a := newLiveArm("a", 100)
+	t1 := a.begin(5, 1, "sess:main")
+	t2 := a.begin(5, 2, "sess:child") // overlaps t1: fan-out
+	t3 := a.begin(9, 1, "other:main")
+	d := a.snapshot(0)
+	type key struct{ s, sub int }
+	got := map[key]int{}
+	for _, f := range d.Inflight {
+		got[key{f.Series, f.Sub}] = f.Row
+		if f.GUID == "" {
+			t.Errorf("in-flight request lost its instance id: %+v", f)
+		}
+	}
+	if got[key{5, 0}] != 0 || got[key{5, 1}] != 0 || got[key{9, 0}] != 1 || len(got) != 3 {
+		t.Fatalf("rows = %v", got)
+	}
+	a.complete(t1, liveRec(a, 5, false))
+	a.complete(t2, liveRec(a, 5, false))
+	a.complete(t3, liveRec(a, 9, false))
+	cursor := a.snapshot(0).Seq
+	// Next turn of series 5 begins after both finished: back on sub-row 0, same group.
+	t4 := a.begin(5, 3, "sess:main")
+	a.complete(t4, liveRec(a, 5, false))
+	inc := a.snapshot(cursor)
+	if len(inc.Reqs) != 1 || inc.Reqs[0].Row != 0 || inc.Reqs[0].Sub != 0 || len(inc.Inflight) != 0 {
+		t.Fatalf("incremental append = %+v", inc.Reqs)
+	}
+	// A completed request keeps the sub-row it grew in.
+	full := a.snapshot(0)
+	subs := map[int]bool{}
+	for _, r := range full.Reqs {
+		if r.Series == 5 {
+			subs[r.Sub] = true
+		}
+	}
+	if !subs[0] || !subs[1] {
+		t.Errorf("series 5 sub-rows = %v, want 0 and 1", subs)
+	}
+	if t5 := a.begin(77, 1, ""); a.snapshot(0).Inflight[0].Row != 2 {
+		t.Error("a new series must open a new group at the bottom")
+	} else {
+		a.abandon(t5)
 	}
 }

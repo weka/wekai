@@ -1013,7 +1013,7 @@ func runRouterReplayInstance(
 		// global/read-only (set identically on construction — see auto.go
 		// and above), and do()/dryDo() derive this call's sessionIdx from
 		// seriesNum directly, so a shared poster safely serves any session.
-		liveTok := st.live.begin(seriesNum, ti+1)
+		liveTok := st.live.begin(seriesNum, ti+1, sessionID+":"+inst.InstanceID)
 		st.skipClk.AddInflight(1)
 		if reqPoster.dryRun {
 			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, su)

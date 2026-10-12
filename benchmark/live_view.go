@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"sort"
@@ -49,8 +50,9 @@ type liveDone struct {
 }
 
 type liveInflight struct {
-	series, turn, lane int
-	start              time.Time
+	series, turn, lane, sub int
+	start                   time.Time
+	guid                    string
 }
 
 // liveArm is the live state of one model/arm. All methods are safe on a nil
@@ -65,6 +67,7 @@ type liveArm struct {
 	done     []liveDone
 	dropped  int
 	lanes    map[int]int
+	packers  map[int]*subRowPacker // per series, indexed by lane key (series number)
 	inflight map[uint64]liveInflight
 	nextID   uint64
 	span     float64
@@ -74,7 +77,7 @@ func newLiveArm(name string, max int) *liveArm {
 	if max <= 0 {
 		max = DefaultLiveMaxRequests
 	}
-	return &liveArm{name: name, t0: time.Now(), max: max, lanes: map[int]int{}, inflight: map[uint64]liveInflight{}}
+	return &liveArm{name: name, t0: time.Now(), max: max, lanes: map[int]int{}, packers: map[int]*subRowPacker{}, inflight: map[uint64]liveInflight{}}
 }
 
 // lane returns the series' stable row, assigned in order of first sight.
@@ -88,15 +91,27 @@ func (a *liveArm) lane(series int) int {
 	return l
 }
 
+// packer returns the series' sub-row packer. Callers hold a.mu.
+func (a *liveArm) packer(series int) *subRowPacker {
+	p := a.packers[series]
+	if p == nil {
+		p = &subRowPacker{}
+		a.packers[series] = p
+	}
+	return p
+}
+
 // begin registers a request that is about to be sent.
-func (a *liveArm) begin(series, turn int) liveToken {
+func (a *liveArm) begin(series, turn int, guid string) liveToken {
 	if a == nil {
 		return liveToken{}
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.nextID++
-	a.inflight[a.nextID] = liveInflight{series: series, turn: turn, lane: a.lane(series), start: time.Now()}
+	now := time.Now()
+	sub := a.packer(series).place(float64(now.Sub(a.t0).Milliseconds()), math.Inf(1))
+	a.inflight[a.nextID] = liveInflight{series: series, turn: turn, lane: a.lane(series), sub: sub, start: now, guid: guid}
 	return liveToken{arm: a, id: a.nextID}
 }
 
@@ -107,11 +122,18 @@ func (a *liveArm) complete(tok liveToken, rec requestDataRecord) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if tok.arm == a {
-		delete(a.inflight, tok.id)
-	}
 	req := timelineFromRecord(rec, a.t0.UnixMilli())
+	req.GUID = rec.SeriesGUID
 	req.Row = a.lane(rec.SeriesNum)
+	end := req.Start + req.E2E
+	if f, ok := a.inflight[tok.id]; ok && tok.arm == a {
+		// Keep the sub-row the request grew in while running.
+		req.Sub = f.sub
+		a.packer(rec.SeriesNum).release(f.sub, float64(time.Since(a.t0).Milliseconds()))
+		delete(a.inflight, tok.id)
+	} else {
+		req.Sub = a.packer(rec.SeriesNum).place(req.Start, end)
+	}
 	a.seq++
 	a.done = append(a.done, liveDone{seq: a.seq, req: req})
 	if end := req.Start + req.E2E; end > a.span {
@@ -133,7 +155,10 @@ func (a *liveArm) abandon(tok liveToken) {
 		return
 	}
 	a.mu.Lock()
-	delete(a.inflight, tok.id)
+	if f, ok := a.inflight[tok.id]; ok {
+		a.packer(f.series).release(f.sub, float64(time.Since(a.t0).Milliseconds()))
+		delete(a.inflight, tok.id)
+	}
 	a.mu.Unlock()
 }
 
@@ -175,7 +200,7 @@ func (a *liveArm) snapshot(since uint64) liveData {
 			break
 		}
 		d.Inflight = append(d.Inflight, timelineReq{
-			Row: f.lane, Series: f.series, Turn: f.turn,
+			Row: f.lane, Sub: f.sub, Series: f.series, Turn: f.turn, GUID: f.guid,
 			Start: float64(f.start.Sub(a.t0).Milliseconds()), Flags: flagInflight,
 		})
 	}
@@ -246,27 +271,27 @@ func (s *liveServer) handler() http.Handler {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	mux.HandleFunc("/api/arms", func(w http.ResponseWriter, r *http.Request) {
 		type armInfo struct {
-			Name   string `json:"name"`
-			T0     int64  `json:"t0"`
-			Layout string `json:"layout"`
+			Name string `json:"name"`
+			T0   int64  `json:"t0"`
 		}
 		out := struct {
 			Kinds []timelineKind `json:"kinds"`
 			Arms  []armInfo      `json:"arms"`
 		}{Kinds: timelineKinds}
 		for _, a := range s.arms {
-			out.Arms = append(out.Arms, armInfo{Name: a.name, T0: a.t0.UnixMilli(), Layout: "series"})
+			out.Arms = append(out.Arms, armInfo{Name: a.name, T0: a.t0.UnixMilli()})
 		}
 		writeJSON(w, out)
 	})
 	mux.HandleFunc("/api/data", func(w http.ResponseWriter, r *http.Request) {
-		i, err := strconv.Atoi(r.URL.Query().Get("arm"))
-		if err != nil || i < 0 || i >= len(s.arms) {
-			http.Error(w, "unknown arm", http.StatusBadRequest)
+		i := s.armIndex(r.URL.Query().Get("arm"))
+		if i < 0 {
+			http.Error(w, "unknown arm (use an index or an arm name from /api/arms)", http.StatusBadRequest)
 			return
 		}
 		var since uint64
 		if v := r.URL.Query().Get("since"); v != "" {
+			var err error
 			since, err = strconv.ParseUint(v, 10, 64)
 			if err != nil {
 				http.Error(w, "bad since", http.StatusBadRequest)
@@ -276,6 +301,19 @@ func (s *liveServer) handler() http.Handler {
 		writeJSON(w, s.arms[i].snapshot(since))
 	})
 	return mux
+}
+
+// armIndex resolves an arm given as an index or a name; -1 if unknown.
+func (s *liveServer) armIndex(v string) int {
+	for i, a := range s.arms {
+		if a.name == v {
+			return i
+		}
+	}
+	if i, err := strconv.Atoi(v); err == nil && i >= 0 && i < len(s.arms) {
+		return i
+	}
+	return -1
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

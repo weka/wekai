@@ -145,22 +145,28 @@ func TestTimelineSegmentsZeroSources(t *testing.T) {
 
 func TestBuildTimelineArm(t *testing.T) {
 	base := time.Unix(1_800_000_000, 0)
-	mk := func(off time.Duration, series int, kv *llm.KVDetails) requestDataRecord {
+	mk := func(off time.Duration, series int, guid string, kv *llm.KVDetails) requestDataRecord {
 		return requestDataRecord{StartTime: base.Add(off), EndTime: base.Add(off + 2*time.Second), ResponseMs: 2000, TTFT: 500,
-			SeriesNum: series, Turn: 1, InputTokens: 10, CachedTokens: 90, OutputTokens: 5, KV: kv}
+			SeriesNum: series, SeriesGUID: guid, Turn: 1, InputTokens: 10, CachedTokens: 90, OutputTokens: 5, KV: kv}
 	}
-	arm := buildTimelineArm("a", []requestDataRecord{mk(10*time.Second, 2, nil), mk(0, 1, goldenKV()), mk(5*time.Second, 3, nil)})
+	arm := buildTimelineArm("a", []requestDataRecord{
+		mk(10*time.Second, 2, "s2:main", nil), mk(0, 1, "s1:main", goldenKV()), mk(5*time.Second, 3, "s3:main", nil),
+	})
 	if arm.T0 != base.UnixMilli() {
 		t.Errorf("t0 = %d", arm.T0)
 	}
-	if len(arm.Reqs) != 3 || arm.Rows != 3 || arm.Layout != "requests" {
+	// One group per series, ordered by first request: series 1, 3, 2.
+	if len(arm.Reqs) != 3 || arm.Groups != 3 {
 		t.Fatalf("arm = %+v", arm)
 	}
-	for i, wantSeries := range []int{1, 3, 2} {
+	for i, want := range []struct{ series, row int }{{1, 0}, {3, 1}, {2, 2}} {
 		r := arm.Reqs[i]
-		if r.Series != wantSeries || r.Row != i {
-			t.Errorf("row %d = series %d row %d, want series %d", i, r.Series, r.Row, wantSeries)
+		if r.Series != want.series || r.Row != want.row || r.Sub != 0 {
+			t.Errorf("req %d = series %d row %d sub %d, want series %d row %d", i, r.Series, r.Row, r.Sub, want.series, want.row)
 		}
+	}
+	if len(arm.Guids) != 3 || arm.Guids[arm.Reqs[0].GI-1] != "s1:main" {
+		t.Errorf("guid table = %v", arm.Guids)
 	}
 	if arm.Reqs[0].Flags&flagTimings == 0 || arm.Reqs[0].Flags&flagSources == 0 || len(arm.Reqs[0].Tm) != 7 || len(arm.Reqs[0].Src) != 4 {
 		t.Errorf("engine details not carried: %+v", arm.Reqs[0])
@@ -173,6 +179,39 @@ func TestBuildTimelineArm(t *testing.T) {
 	}
 	if got := buildTimelineArm("empty", nil); len(got.Reqs) != 0 {
 		t.Errorf("empty arm = %+v", got)
+	}
+}
+
+// Sequential turns of one series tile a single sub-row; overlapping fan-out
+// requests take as many sub-rows as are concurrently running, reusing freed ones.
+func TestBuildTimelineArmSubRowPacking(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	mk := func(startSec, durSec float64, series int) requestDataRecord {
+		return requestDataRecord{StartTime: base.Add(time.Duration(startSec * float64(time.Second))), ResponseMs: durSec * 1000, TTFT: 100, SeriesNum: series}
+	}
+	seq := buildTimelineArm("seq", []requestDataRecord{mk(0, 2, 1), mk(2, 2, 1), mk(10, 1, 1), mk(20, 1, 1)})
+	for _, r := range seq.Reqs {
+		if r.Row != 0 || r.Sub != 0 {
+			t.Errorf("sequential turn at %.0f on row %d sub %d, want 0/0", r.Start, r.Row, r.Sub)
+		}
+	}
+	// Turn at t=0 (10s) fans out to children at 1s (2s) and 2s (5s); the one at 4s fits
+	// the row freed at 3s; the one at 20s is back on row 0.
+	fan := buildTimelineArm("fan", []requestDataRecord{mk(0, 10, 1), mk(1, 2, 1), mk(2, 5, 1), mk(4, 1, 1), mk(20, 1, 1), mk(0, 1, 2)})
+	got := map[float64]int{}
+	for _, r := range fan.Reqs {
+		if r.Series == 1 {
+			got[r.Start/1000] = r.Sub
+		}
+		if r.Series == 2 && (r.Row != 1 || r.Sub != 0) {
+			t.Errorf("second series = row %d sub %d", r.Row, r.Sub)
+		}
+	}
+	want := map[float64]int{0: 0, 1: 1, 2: 2, 4: 1, 20: 0}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("request at %.0fs on sub-row %d, want %d (all: %v)", k, got[k], v, got)
+		}
 	}
 }
 

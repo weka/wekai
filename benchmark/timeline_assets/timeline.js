@@ -6,8 +6,12 @@
 // canvas), so tens of thousands of requests cost the same as a screenful.
 //
 // Data (produced by benchmark/timeline.go):
-//   arm  = { name, t0 (epoch ms), span (ms), layout: "requests"|"series", rows, reqs: [req] }
-//   req  = { r row, s series, n turn, t start ms, e end-to-end ms, f ttft ms, i/c/o tokens,
+//   arm  = { name, t0 (epoch ms), span (ms), reqs: [req], guids?: [instance ids] }
+//   Layout: one row GROUP per series (req.r = the series' group index, in order of
+//   first request); requests of a series that overlap in time (sub-agent fan-out)
+//   are packed into sub-rows (req.u) inside the group. Groups are separated by a
+//   thin gap.
+//   req  = { r group, u sub-row, s series, n turn, gi/gu instance, t start ms, e end-to-end ms, f ttft ms, i/c/o tokens,
 //            x flag bits, src [gpu,host,ext,computed], rc [recompute], tm [timings ms],
 //            g [kind, ms, kind, ms ...] }
 //   kind = { id, key, label, color }
@@ -16,7 +20,7 @@ var WekaiTimeline = (function () {
 
   var FLAG_ERR = 1, FLAG_COLD = 2, FLAG_EMPTY = 4, FLAG_TIMINGS = 8, FLAG_SRC = 16, FLAG_INFL = 32, FLAG_TRUNC = 64;
   var INFLIGHT_KIND = 10;
-  var AXIS_H = 34, RIGHT = 14;
+  var AXIS_H = 34, RIGHT = 14, GAP = 2;
   var ROW_HEIGHTS = [1, 2, 3, 4, 6, 10, 14, 20];
 
   function fmtDur(ms) {
@@ -105,37 +109,63 @@ var WekaiTimeline = (function () {
     function mapX(t, r) { return plotL + (t - r[0]) / (r[1] - r[0]) * plotW; }
     function unmapX(px, r) { return r[0] + (px - plotL) / plotW * (r[1] - r[0]); }
 
-    function indexArm(a) {
-      a.byRow = null;
-      if (a.layout === "series") {
-        a.byRow = [];
-        a.reqs.forEach(function (q) { (a.byRow[q.r] = a.byRow[q.r] || []).push(q); });
-        a.rows = Math.max(a.rows || 0, a.byRow.length);
-      } else {
-        a.rows = a.reqs.length;
-      }
-      a.inflight = a.inflight || [];
+    function addToGroup(a, q) {
+      var g = a.groups[q.r];
+      if (!g) { for (var k = a.groups.length; k <= q.r; k++) a.groups[k] = { reqs: [], infl: [], subs: 1 }; g = a.groups[q.r]; }
+      g.reqs.push(q);
+      if ((q.u || 0) + 1 > g.subs) g.subs = (q.u || 0) + 1;
+      a.dirty = true;
     }
-    function rowReqs(a, r) {
-      if (a.layout !== "series") { var q = a.reqs[r]; return q ? [q] : []; }
-      var base = a.byRow[r] || [];
-      if (!a.inflight.length) return base;
-      var extra = a.inflightByRow && a.inflightByRow[r];
-      return extra ? base.concat(extra) : base;
+    function indexArm(a) {
+      a.groups = [];
+      a.reqs.forEach(function (q) { addToGroup(a, q); });
+      a.inflight = a.inflight || [];
+      indexInflight(a);
+      a.dirty = true;
     }
     function indexInflight(a) {
-      a.inflightByRow = null;
-      if (a.layout === "series" && a.inflight.length) {
-        a.inflightByRow = {};
-        a.inflight.forEach(function (q) { (a.inflightByRow[q.r] = a.inflightByRow[q.r] || []).push(q); });
-        a.rows = Math.max(a.rows || 0, (a.inflight.reduce(function (m, q) { return Math.max(m, q.r + 1); }, 0)));
+      a.groups.forEach(function (g) { g.infl = []; });
+      (a.inflight || []).forEach(function (q) {
+        var g = a.groups[q.r];
+        if (!g) { for (var k = a.groups.length; k <= q.r; k++) a.groups[k] = { reqs: [], infl: [], subs: 1 }; g = a.groups[q.r]; }
+        g.infl.push(q);
+        if ((q.u || 0) + 1 > g.subs) g.subs = (q.u || 0) + 1;
+      });
+      a.dirty = true;
+    }
+    // layout computes each group's first sub-row (offRows) and the total row count.
+    function layout(a) {
+      if (!a || !a.dirty) return;
+      var off = 0;
+      a.offRows = new Array(a.groups.length);
+      for (var g = 0; g < a.groups.length; g++) { a.offRows[g] = off; off += a.groups[g].subs; }
+      a.totalRows = off;
+      a.dirty = false;
+    }
+    function groupTop(a, g) { return g * GAP + a.offRows[g] * rowH; }  // px from the top of the rows area
+    function defaultRowH(a) {
+      var n = a.groups.length;
+      return n <= 60 ? 14 : n <= 300 ? 6 : n <= 1000 ? 4 : 3;
+    }
+    function contentHeight(a) {
+      layout(a);
+      return AXIS_H + (a ? a.groups.length * GAP + (a.totalRows || 0) * rowH : 0) + 8;
+    }
+    // groupAt finds the group whose rows contain content-area y (px from rows top).
+    function groupAt(a, c) {
+      layout(a);
+      var lo = 0, hi = a.groups.length - 1, ans = -1;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (groupTop(a, mid) <= c) { ans = mid; lo = mid + 1; } else hi = mid - 1;
       }
+      return ans;
     }
 
     function applyArm() {
       var a = arm();
       if (!a) return;
-      if (!userRowH) rowH = a.layout === "series" ? 14 : 3;
+      if (!userRowH) rowH = defaultRowH(a);
       elRowH.value = rowH;
       resize();
       updateInfo();
@@ -162,10 +192,9 @@ var WekaiTimeline = (function () {
       canvas.style.marginBottom = (-h) + "px";
       canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      plotL = a && a.layout === "series" ? 44 : 8;
+      plotL = 44;
       plotW = Math.max(50, W - plotL - RIGHT);
-      var rows = a ? (a.rows || 0) : 0;
-      elContent.style.height = Math.max(h, AXIS_H + rows * rowH + 8) + "px";
+      elContent.style.height = Math.max(h, contentHeight(a)) + "px";
       draw();
     }
 
@@ -191,21 +220,24 @@ var WekaiTimeline = (function () {
       if (!a) return;
       var rh = rowH >= 3 ? rowH - 1 : rowH;
       var scrollTop = elScroll.scrollTop;
-      var r0 = Math.max(0, Math.floor(scrollTop / rowH));
-      var r1 = Math.min((a.rows || 0) - 1, Math.ceil((scrollTop + H - AXIS_H) / rowH));
+      layout(a);
       ctx.save();
       ctx.beginPath(); ctx.rect(0, AXIS_H, W, H - AXIS_H); ctx.clip();
-      for (var row = r0; row <= r1; row++) {
-        var y = AXIS_H + row * rowH - scrollTop;
-        var list = rowReqs(a, row);
-        if (a.layout === "series" && rowH >= 8) {
-          ctx.fillStyle = "#6f767d"; ctx.textAlign = "right"; ctx.font = "10px monospace";
-          ctx.fillText(list.length ? "s" + list[0].s : "", plotL - 5, y + rh - 3);
+      var g0 = Math.max(0, groupAt(a, scrollTop));
+      for (var g = g0; g < a.groups.length; g++) {
+        var gy = AXIS_H + groupTop(a, g) - scrollTop;
+        if (gy > H) break;
+        var grp = a.groups[g];
+        if (g > 0) { ctx.fillStyle = "#1c2226"; ctx.fillRect(0, gy - GAP, W, 1); }
+        for (var k = 0; k < grp.reqs.length; k++) drawReq(grp.reqs[k], gy + (grp.reqs[k].u || 0) * rowH, rh, r, now);
+        for (k = 0; k < grp.infl.length; k++) drawReq(grp.infl[k], gy + (grp.infl[k].u || 0) * rowH, rh, r, now);
+        if (rowH >= 8) {
+          var any = grp.reqs[0] || grp.infl[0];
+          if (any) { ctx.fillStyle = "#6f767d"; ctx.textAlign = "right"; ctx.font = "10px monospace"; ctx.fillText("s" + any.s, plotL - 5, gy + rh - 3); }
         }
-        for (var k = 0; k < list.length; k++) drawReq(list[k], y, rh, r, now);
       }
       if (hover) {
-        var hy = AXIS_H + hover.row * rowH - scrollTop;
+        var hy = AXIS_H + groupTop(a, hover.q.r) + (hover.q.u || 0) * rowH - scrollTop;
         var q = hover.q, he = (q.x & FLAG_INFL) ? Math.max(0, now - q.t) : q.e;
         var hx0 = mapX(q.t, r), hx1 = mapX(q.t + he, r);
         ctx.strokeStyle = "#F2F2EB"; ctx.lineWidth = 1;
@@ -246,22 +278,31 @@ var WekaiTimeline = (function () {
     function pos(e) { var b = canvas.getBoundingClientRect(); return { x: e.clientX - b.left, y: e.clientY - b.top }; }
     function pick(p) {
       var a = arm(); if (!a || p.y < AXIS_H || p.x < plotL) return null;
-      var row = Math.floor((p.y - AXIS_H + elScroll.scrollTop) / rowH);
-      if (row < 0 || row >= (a.rows || 0)) return null;
+      var c = p.y - AXIS_H + elScroll.scrollTop;
+      var g = groupAt(a, c);
+      if (g < 0) return null;
+      var sub = Math.floor((c - groupTop(a, g)) / rowH);
+      var grp = a.groups[g];
+      if (sub < 0 || sub >= grp.subs) return null;
       var r = range(), now = opts.live ? curNow() : 0, t = unmapX(p.x, r), tol = 3 * (r[1] - r[0]) / plotW;
-      var list = rowReqs(a, row), best = null, bd = Infinity;
-      for (var i = 0; i < list.length; i++) {
-        var q = list[i], e = (q.x & FLAG_INFL) ? Math.max(0, now - q.t) : q.e;
+      var best = null, bd = Infinity;
+      var lists = [grp.reqs, grp.infl];
+      for (var l = 0; l < 2; l++) for (var i = 0; i < lists[l].length; i++) {
+        var q = lists[l][i];
+        if ((q.u || 0) !== sub) continue;
+        var e = (q.x & FLAG_INFL) ? Math.max(0, now - q.t) : q.e;
         var d = t < q.t ? q.t - t : (t > q.t + e ? t - q.t - e : 0);
         if (d <= tol && d < bd) { bd = d; best = q; }
       }
-      return best ? { q: best, row: row } : null;
+      return best ? { q: best } : null;
     }
     function showTip(h, e) {
       if (!h) { tip.style.display = "none"; return; }
       var q = h.q, a = arm(), now = opts.live ? curNow() : 0;
       var infl = (q.x & FLAG_INFL) !== 0, e2e = infl ? Math.max(0, now - q.t) : q.e;
-      var html = "<b>series " + q.s + "</b> turn " + q.n + (infl ? " <b>(in flight)</b>" : "") +
+      var inst = q.gu || (a.guids && q.gi ? a.guids[q.gi - 1] : "");
+      var ic = inst.indexOf(":"); if (ic >= 0) inst = inst.slice(ic + 1);
+      var html = "<b>series " + q.s + "</b> turn " + q.n + (inst ? " &middot; instance " + esc(inst.length > 24 ? inst.slice(0, 24) + "\u2026" : inst) : "") + (infl ? " <b>(in flight)</b>" : "") +
         ((q.x & FLAG_ERR) ? " <b style='color:#FF6B6B'>error</b>" : "") + ((q.x & FLAG_COLD) ? " cold start" : "") + ((q.x & FLAG_EMPTY) ? " empty" : "") + "<br>" +
         "start " + fmtClock(a.t0 + q.t, true) + " (+" + fmtDur(q.t) + ")<br>";
       html += "e2e <b>" + fmtDur(e2e) + "</b>" + (q.f ? " &middot; ttft <b>" + fmtDur(q.f) + "</b>" : "") + "<br>";
@@ -392,18 +433,14 @@ var WekaiTimeline = (function () {
           var drop = Math.floor(maxReqs / 10);
           a.reqs.splice(0, drop); a.dropped = (a.dropped || 0) + drop;
           indexArm(a);
-        } else if (a.layout === "series") {
-          a.byRow = a.byRow || [];
-          for (var j = 0; j < reqs.length; j++) { var q = reqs[j]; (a.byRow[q.r] = a.byRow[q.r] || []).push(q); }
-          a.rows = Math.max(a.rows || 0, a.byRow.length);
         } else {
-          a.rows = a.reqs.length;
+          for (var j = 0; j < reqs.length; j++) addToGroup(a, reqs[j]);
         }
         a.inflight = inflight || [];
         indexInflight(a);
         if (meta.t0 !== undefined) a.t0 = meta.t0;
         if (meta.span !== undefined) a.span = meta.span;
-        if (armIdx === cur) { updateInfo(); resize(); }
+        if (armIdx === cur) { if (!userRowH) { rowH = defaultRowH(a); elRowH.value = rowH; } updateInfo(); resize(); }
       },
       arms: function () { return arms; },
     };

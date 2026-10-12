@@ -234,17 +234,20 @@ already ask for `stream_options.include_usage`, which is how vLLM delivers them.
 
 - `wekai benchmark visualize <dir> --timeline` (also `visualize-merge`, and
   `benchmark auto --timeline` for the end-of-run report) adds a Metrics/Timeline
-  switch to the report. Timeline: one thin bar per request, x = time (zoom shared
-  with the report), bars left to right = queue wait (KV-blocked vs other),
+  switch to the report. Timeline: one row per series (session), x = time (zoom
+  shared with the report); a series' turns tile left to right along its row, and
+  overlapping requests (sub-agent fan-out) are packed into sub-rows under it.
+  Rows are ordered by the series' first request. Each request bar, left to right = queue wait (KV-blocked vs other),
   prefill split by token share into computed / external / host / GPU cache
   (kv_fetch counted in the external share), preempted, decode. Requests with no
   engine details use client timestamps with one "prefill (unknown source)" colour.
 - `wekai benchmark timeline <dir> -o timeline.html` renders just that view.
 - `wekai benchmark auto --live-port 8088` serves the same view live while the
-  run executes: one row per series, in-flight requests growing, polled every 2s.
+  run executes: same per-series rows, in-flight requests growing, polled every 2s.
   It binds `127.0.0.1` by default (reachable with `kubectl port-forward pod/<pod>
   8088:8088`); `--live-bind 0.0.0.0` exposes request metadata to the network.
   `--live-max-requests` (default 100000) bounds memory per arm.
+  `/api/data?arm=` takes the arm's index or name.
 
 **Server-side cache-source sampling.** When `--save-request-data` is on and
 the model spec points at an OpenAI-compatible (chat/completions) endpoint,

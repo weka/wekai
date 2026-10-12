@@ -244,7 +244,7 @@ func runReplayConversation(
 		history.WriteString(userContent)
 		ratio := st.estimator.Observe(history.String())
 
-		liveTok := st.live.begin(seriesNum, turnNum)
+		liveTok := st.live.begin(seriesNum, turnNum, seriesGUID)
 		reqCtx, reqCancel := context.WithTimeout(benchCtx, reqTimeout)
 		resetTTFT(time.Now())
 		response, err := chat.Request(reqCtx, llm.TextParts(userContent), nil)
