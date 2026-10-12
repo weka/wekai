@@ -925,6 +925,7 @@ func runRouterReplayInstance(
 			recordReplayRequest(cfg, st, rdw, RequestMetrics{
 				RequestNum: int(st.totalCompleted.Load()) + 1,
 				SeriesNum:  seriesNum,
+				Slot:       slotOf(ctx),
 				CycleNum:   ti + 1,
 				SeriesGUID: sessionID + ":" + inst.InstanceID,
 				Error:      err,
@@ -1013,7 +1014,8 @@ func runRouterReplayInstance(
 		// global/read-only (set identically on construction — see auto.go
 		// and above), and do()/dryDo() derive this call's sessionIdx from
 		// seriesNum directly, so a shared poster safely serves any session.
-		liveTok := st.live.begin(seriesNum, ti+1, sessionID+":"+inst.InstanceID)
+		slot := slotOf(ctx)
+		liveTok := st.live.begin(seriesNum, ti+1, sessionID+":"+inst.InstanceID, slot)
 		st.skipClk.AddInflight(1)
 		if reqPoster.dryRun {
 			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, su)
@@ -1025,6 +1027,7 @@ func runRouterReplayInstance(
 		reqCancel()
 		gate.Release()
 		metrics.live = liveTok
+		metrics.Slot = slot
 
 		if metrics.Error != nil && ctx.Err() != nil {
 			// Run shutdown aborted this in-flight request (timeout or

@@ -18,7 +18,7 @@
 var WekaiTimeline = (function () {
   "use strict";
 
-  var FLAG_ERR = 1, FLAG_COLD = 2, FLAG_EMPTY = 4, FLAG_TIMINGS = 8, FLAG_SRC = 16, FLAG_INFL = 32, FLAG_TRUNC = 64;
+  var FLAG_ERR = 1, FLAG_COLD = 2, FLAG_EMPTY = 4, FLAG_TIMINGS = 8, FLAG_SRC = 16, FLAG_INFL = 32, FLAG_TRUNC = 64, FLAG_SESSION = 128, FLAG_HOT = 256;
   var INFLIGHT_KIND = 10;
   var AXIS_H = 34, RIGHT = 14, GAP = 2;
   var ROW_HEIGHTS = [1, 2, 3, 4, 6, 10, 14, 20];
@@ -229,11 +229,21 @@ var WekaiTimeline = (function () {
         if (gy > H) break;
         var grp = a.groups[g];
         if (g > 0) { ctx.fillStyle = "#1c2226"; ctx.fillRect(0, gy - GAP, W, 1); }
+        // Session boundary: the slot moved on to a new session here.
+        ctx.fillStyle = "rgba(199,159,241,0.55)";
+        var gh = grp.subs * rowH;
+        for (var m = 0; m < 2; m++) {
+          var bl = m ? grp.infl : grp.reqs;
+          for (var n = 0; n < bl.length; n++) if (bl[n].x & FLAG_SESSION) {
+            var bx = mapX(bl[n].t, r);
+            if (bx >= plotL && bx <= plotL + plotW) ctx.fillRect(Math.round(bx) - 1, gy - 1, 1, gh + 1);
+          }
+        }
         for (var k = 0; k < grp.reqs.length; k++) drawReq(grp.reqs[k], gy + (grp.reqs[k].u || 0) * rowH, rh, r, now);
         for (k = 0; k < grp.infl.length; k++) drawReq(grp.infl[k], gy + (grp.infl[k].u || 0) * rowH, rh, r, now);
         if (rowH >= 8) {
           var any = grp.reqs[0] || grp.infl[0];
-          if (any) { ctx.fillStyle = "#6f767d"; ctx.textAlign = "right"; ctx.font = "10px monospace"; ctx.fillText("s" + any.s, plotL - 5, gy + rh - 3); }
+          if (any) { ctx.fillStyle = "#6f767d"; ctx.textAlign = "right"; ctx.font = "10px monospace"; ctx.fillText(any.sl ? ((any.x & FLAG_HOT) ? "h" : "s") + any.sl : "s" + any.s, plotL - 5, gy + rh - 3); }
         }
       }
       if (hover) {
@@ -302,7 +312,8 @@ var WekaiTimeline = (function () {
       var infl = (q.x & FLAG_INFL) !== 0, e2e = infl ? Math.max(0, now - q.t) : q.e;
       var inst = q.gu || (a.guids && q.gi ? a.guids[q.gi - 1] : "");
       var ic = inst.indexOf(":"); if (ic >= 0) inst = inst.slice(ic + 1);
-      var html = "<b>series " + q.s + "</b> turn " + q.n + (inst ? " &middot; instance " + esc(inst.length > 24 ? inst.slice(0, 24) + "\u2026" : inst) : "") + (infl ? " <b>(in flight)</b>" : "") +
+      var head = q.sl ? "<b>" + ((q.x & FLAG_HOT) ? "hot slot " : "slot ") + q.sl + "</b> &middot; session " + q.s : "<b>series " + q.s + "</b>";
+      var html = head + " turn " + q.n + ((q.x & FLAG_SESSION) ? " (first of session)" : "") + (inst ? " &middot; instance " + esc(inst.length > 24 ? inst.slice(0, 24) + "\u2026" : inst) : "") + (infl ? " <b>(in flight)</b>" : "") +
         ((q.x & FLAG_ERR) ? " <b style='color:#FF6B6B'>error</b>" : "") + ((q.x & FLAG_COLD) ? " cold start" : "") + ((q.x & FLAG_EMPTY) ? " empty" : "") + "<br>" +
         "start " + fmtClock(a.t0 + q.t, true) + " (+" + fmtDur(q.t) + ")<br>";
       html += "e2e <b>" + fmtDur(e2e) + "</b>" + (q.f ? " &middot; ttft <b>" + fmtDur(q.f) + "</b>" : "") + "<br>";

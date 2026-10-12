@@ -64,7 +64,10 @@ One renderer, three surfaces: `benchmark/timeline_assets/timeline.js` (+ `.css`,
   bounded buffer), `/healthz`. Hooks (`liveArm.begin/complete/abandon`) are
   nil-safe, called where `requestDataRecord`s are written (auto.go, replay.go,
   replay_router.go). Default bind is loopback; kubectl port-forward reaches it.
-- Layout: one row group per series_num (`r`, ordered by first request), overlapping
+- Layout: one row group per concurrency SLOT (`r`, ordered by first request; the worker
+  lane from `withSlot` in slot.go, recorded as `slot`/`slot_hot`; `series_num` is the
+  SESSION the slot runs and only groups rows for old data without `slot`). A flag bit
+  marks the first request of each session on a slot (boundary line), overlapping
   requests of a series packed greedily into sub-rows (`u`, `subRowPacker`; live
   assigns at begin and keeps the row on completion). Instance = series_guid
   (`session:instance`), shown in the tooltip. `/api/data?arm=` accepts index or name.

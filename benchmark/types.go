@@ -48,7 +48,9 @@ type RequestMetrics struct {
 	KV *llm.KVDetails
 	// live identifies this request in the live view's in-flight table; the
 	// zero value means no live view is attached.
-	live     liveToken
+	live liveToken
+	// Slot is the concurrency slot that issued the request (see slotInfo).
+	Slot     slotInfo
 	Error    error
 	Response string // The actual response content
 	// ContentOnly is the assistant's content stream WITHOUT the reasoning

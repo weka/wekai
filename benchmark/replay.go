@@ -244,7 +244,8 @@ func runReplayConversation(
 		history.WriteString(userContent)
 		ratio := st.estimator.Observe(history.String())
 
-		liveTok := st.live.begin(seriesNum, turnNum, seriesGUID)
+		slot := slotOf(benchCtx)
+		liveTok := st.live.begin(seriesNum, turnNum, seriesGUID, slot)
 		reqCtx, reqCancel := context.WithTimeout(benchCtx, reqTimeout)
 		resetTTFT(time.Now())
 		response, err := chat.Request(reqCtx, llm.TextParts(userContent), nil)
@@ -262,6 +263,7 @@ func runReplayConversation(
 			TotalResponseTime: totalTime,
 			Error:             err,
 			live:              liveTok,
+			Slot:              slot,
 		}
 		if response != nil {
 			metrics.Response = response.Content
@@ -570,6 +572,8 @@ func recordReplayRequest(
 			SeriesGUID:           metrics.SeriesGUID,
 			SeriesNum:            metrics.SeriesNum,
 			RequestNum:           metrics.RequestNum,
+			Slot:                 metrics.Slot.N,
+			SlotHot:              metrics.Slot.Hot,
 			Turn:                 metrics.CycleNum,
 			CacheHit:             cacheHit,
 			CacheHitRatio:        cacheHitRatio,

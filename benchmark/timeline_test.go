@@ -1,6 +1,7 @@
 package benchmark
 
 import (
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
@@ -271,5 +272,74 @@ func TestReportTimelineOptIn(t *testing.T) {
 	b, _ = os.ReadFile(p)
 	if strings.Contains(string(b), `"timeline":{`) {
 		t.Error("default report must not embed timeline data")
+	}
+}
+
+// Slots are the row groups; the sessions a slot replays follow one another along
+// its row, each new session flagged. Data recorded without slots falls back to
+// grouping by series_num.
+func TestBuildTimelineArmSlotGrouping(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	mk := func(startSec float64, slot, series int, hot bool) requestDataRecord {
+		return requestDataRecord{StartTime: base.Add(time.Duration(startSec * float64(time.Second))), ResponseMs: 1000, TTFT: 100,
+			Slot: slot, SlotHot: hot, SeriesNum: series, Turn: 1}
+	}
+	arm := buildTimelineArm("slots", []requestDataRecord{
+		mk(0, 1, 100, true), mk(1, 1, 100, true), mk(5, 1, 101, true), // slot 1: session 100 then 101
+		mk(0, 2, 200, false), mk(7, 2, 205, false), // slot 2: session 200 then 205
+	})
+	if arm.Groups != 2 {
+		t.Fatalf("groups = %d, want 2 slots (not 4 sessions)", arm.Groups)
+	}
+	type k struct {
+		slot   int
+		series int
+	}
+	flagged := map[k]bool{}
+	for _, r := range arm.Reqs {
+		if r.Row != r.Slot-1 || r.Sub != 0 {
+			t.Errorf("request %+v not on its slot row", r)
+		}
+		if r.Flags&flagSession != 0 {
+			flagged[k{r.Slot, r.Series}] = true
+		}
+		if (r.Slot == 1) != (r.Flags&flagHot != 0) {
+			t.Errorf("hot flag wrong on %+v", r)
+		}
+	}
+	want := map[k]bool{{1, 100}: true, {1, 101}: true, {2, 200}: true, {2, 205}: true}
+	if len(flagged) != len(want) {
+		t.Errorf("session boundaries = %v, want %v", flagged, want)
+	}
+	// The second turn of session 100 is not a boundary.
+	for _, r := range arm.Reqs {
+		if r.Slot == 1 && r.Series == 100 && r.Start == 1000 && r.Flags&flagSession != 0 {
+			t.Error("a continuing session was flagged as a boundary")
+		}
+	}
+
+	// Old files: no slot recorded -> one group per series_num, as before.
+	old := buildTimelineArm("old", []requestDataRecord{mk(0, 0, 7, false), mk(1, 0, 8, false), mk(2, 0, 7, false)})
+	if old.Groups != 2 {
+		t.Errorf("fallback groups = %d, want 2 series", old.Groups)
+	}
+}
+
+func TestRequestDataSlotRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := newRequestDataWriter(dir, "m", time.Now())
+	w.write(requestDataRecord{StartTime: time.Now(), Slot: 12, SlotHot: true, SeriesNum: 302})
+	w.close()
+	files, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	recs, _, err := readJSONLFile(files[0])
+	if err != nil || len(recs) != 1 || recs[0].Slot != 12 || !recs[0].SlotHot || recs[0].SeriesNum != 302 {
+		t.Fatalf("recs=%+v err=%v", recs, err)
+	}
+	// Rows written without a slot do not carry the keys at all.
+	w2, _ := newRequestDataWriter(t.TempDir(), "m", time.Now())
+	_ = w2
+	b, _ := json.Marshal(requestDataRecord{})
+	if strings.Contains(string(b), `"slot"`) || strings.Contains(string(b), `"slot_hot"`) {
+		t.Errorf("zero slot serialized: %s", b)
 	}
 }

@@ -53,6 +53,8 @@ type liveInflight struct {
 	series, turn, lane, sub int
 	start                   time.Time
 	guid                    string
+	slot                    slotInfo
+	newSession              bool
 }
 
 // liveArm is the live state of one model/arm. All methods are safe on a nil
@@ -66,8 +68,9 @@ type liveArm struct {
 	seq      uint64
 	done     []liveDone
 	dropped  int
-	lanes    map[int]int
-	packers  map[int]*subRowPacker // per series, indexed by lane key (series number)
+	lanes    map[rowKey]int
+	lastSess map[rowKey]int // series_num last seen on each row, to flag session boundaries
+	packers  map[rowKey]*subRowPacker
 	inflight map[uint64]liveInflight
 	nextID   uint64
 	span     float64
@@ -77,32 +80,40 @@ func newLiveArm(name string, max int) *liveArm {
 	if max <= 0 {
 		max = DefaultLiveMaxRequests
 	}
-	return &liveArm{name: name, t0: time.Now(), max: max, lanes: map[int]int{}, packers: map[int]*subRowPacker{}, inflight: map[uint64]liveInflight{}}
+	return &liveArm{name: name, t0: time.Now(), max: max, lanes: map[rowKey]int{}, lastSess: map[rowKey]int{}, packers: map[rowKey]*subRowPacker{}, inflight: map[uint64]liveInflight{}}
 }
 
-// lane returns the series' stable row, assigned in order of first sight.
-// Callers hold a.mu.
-func (a *liveArm) lane(series int) int {
-	l, ok := a.lanes[series]
+// lane returns the stable row group of a slot (or, without one, a series),
+// assigned in order of first sight. Callers hold a.mu.
+func (a *liveArm) lane(k rowKey) int {
+	l, ok := a.lanes[k]
 	if !ok {
 		l = len(a.lanes)
-		a.lanes[series] = l
+		a.lanes[k] = l
 	}
 	return l
 }
 
+// newSession reports whether series is a different session from the one the
+// row last ran, and records it. Callers hold a.mu.
+func (a *liveArm) newSession(k rowKey, series int) bool {
+	prev, seen := a.lastSess[k]
+	a.lastSess[k] = series
+	return !seen || prev != series
+}
+
 // packer returns the series' sub-row packer. Callers hold a.mu.
-func (a *liveArm) packer(series int) *subRowPacker {
-	p := a.packers[series]
+func (a *liveArm) packer(k rowKey) *subRowPacker {
+	p := a.packers[k]
 	if p == nil {
 		p = &subRowPacker{}
-		a.packers[series] = p
+		a.packers[k] = p
 	}
 	return p
 }
 
 // begin registers a request that is about to be sent.
-func (a *liveArm) begin(series, turn int, guid string) liveToken {
+func (a *liveArm) begin(series, turn int, guid string, sl slotInfo) liveToken {
 	if a == nil {
 		return liveToken{}
 	}
@@ -110,8 +121,10 @@ func (a *liveArm) begin(series, turn int, guid string) liveToken {
 	defer a.mu.Unlock()
 	a.nextID++
 	now := time.Now()
-	sub := a.packer(series).place(float64(now.Sub(a.t0).Milliseconds()), math.Inf(1))
-	a.inflight[a.nextID] = liveInflight{series: series, turn: turn, lane: a.lane(series), sub: sub, start: now, guid: guid}
+	k := rowKeyOf(sl.N, series)
+	sub := a.packer(k).place(float64(now.Sub(a.t0).Milliseconds()), math.Inf(1))
+	a.inflight[a.nextID] = liveInflight{series: series, turn: turn, lane: a.lane(k), sub: sub, start: now, guid: guid,
+		slot: sl, newSession: a.newSession(k, series)}
 	return liveToken{arm: a, id: a.nextID}
 }
 
@@ -124,15 +137,22 @@ func (a *liveArm) complete(tok liveToken, rec requestDataRecord) {
 	defer a.mu.Unlock()
 	req := timelineFromRecord(rec, a.t0.UnixMilli())
 	req.GUID = rec.SeriesGUID
-	req.Row = a.lane(rec.SeriesNum)
+	k := rowKeyOf(rec.Slot, rec.SeriesNum)
+	req.Row = a.lane(k)
 	end := req.Start + req.E2E
 	if f, ok := a.inflight[tok.id]; ok && tok.arm == a {
-		// Keep the sub-row the request grew in while running.
+		// Keep the sub-row (and boundary flag) the request had while running.
 		req.Sub = f.sub
-		a.packer(rec.SeriesNum).release(f.sub, float64(time.Since(a.t0).Milliseconds()))
+		if f.newSession {
+			req.Flags |= flagSession
+		}
+		a.packer(k).release(f.sub, float64(time.Since(a.t0).Milliseconds()))
 		delete(a.inflight, tok.id)
 	} else {
-		req.Sub = a.packer(rec.SeriesNum).place(req.Start, end)
+		req.Sub = a.packer(k).place(req.Start, end)
+		if a.newSession(k, rec.SeriesNum) {
+			req.Flags |= flagSession
+		}
 	}
 	a.seq++
 	a.done = append(a.done, liveDone{seq: a.seq, req: req})
@@ -156,7 +176,7 @@ func (a *liveArm) abandon(tok liveToken) {
 	}
 	a.mu.Lock()
 	if f, ok := a.inflight[tok.id]; ok {
-		a.packer(f.series).release(f.sub, float64(time.Since(a.t0).Milliseconds()))
+		a.packer(rowKeyOf(f.slot.N, f.series)).release(f.sub, float64(time.Since(a.t0).Milliseconds()))
 		delete(a.inflight, tok.id)
 	}
 	a.mu.Unlock()
@@ -200,8 +220,8 @@ func (a *liveArm) snapshot(since uint64) liveData {
 			break
 		}
 		d.Inflight = append(d.Inflight, timelineReq{
-			Row: f.lane, Sub: f.sub, Series: f.series, Turn: f.turn, GUID: f.guid,
-			Start: float64(f.start.Sub(a.t0).Milliseconds()), Flags: flagInflight,
+			Row: f.lane, Sub: f.sub, Series: f.series, Slot: f.slot.N, Turn: f.turn, GUID: f.guid,
+			Start: float64(f.start.Sub(a.t0).Milliseconds()), Flags: flagInflight | f.flags(),
 		})
 	}
 	return d
@@ -320,4 +340,16 @@ func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// flags returns the per-request flag bits an in-flight request carries.
+func (f liveInflight) flags() int {
+	x := 0
+	if f.newSession {
+		x |= flagSession
+	}
+	if f.slot.Hot {
+		x |= flagHot
+	}
+	return x
 }

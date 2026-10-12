@@ -56,8 +56,8 @@ func TestLiveServerEndpoints(t *testing.T) {
 	}
 
 	a := s.arms[0]
-	tok1 := a.begin(7, 1, "")
-	tok2 := a.begin(3, 4, "")
+	tok1 := a.begin(7, 1, "", slotInfo{})
+	tok2 := a.begin(3, 4, "", slotInfo{})
 	var d liveData
 	getJSON(t, base+"/api/data?arm=0&since=0", &d)
 	if len(d.Reqs) != 0 || len(d.Inflight) != 2 {
@@ -170,14 +170,14 @@ func TestLiveArmBoundedMemory(t *testing.T) {
 // Every hook is a no-op without a live view.
 func TestLiveArmNilSafe(t *testing.T) {
 	var a *liveArm
-	tok := a.begin(1, 1, "")
+	tok := a.begin(1, 1, "", slotInfo{})
 	a.complete(tok, requestDataRecord{})
 	a.abandon(tok)
 }
 
 func TestLiveArmAbandon(t *testing.T) {
 	a := newLiveArm("a", 10)
-	tok := a.begin(1, 1, "")
+	tok := a.begin(1, 1, "", slotInfo{})
 	a.abandon(tok)
 	if d := a.snapshot(0); len(d.Inflight) != 0 {
 		t.Errorf("inflight = %d after abandon", len(d.Inflight))
@@ -205,7 +205,7 @@ func TestLiveArmConcurrent(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < 300; i++ {
-				tok := a.begin(w+1, i, "")
+				tok := a.begin(w+1, i, "", slotInfo{})
 				a.complete(tok, liveRec(a, w+1, i%2 == 0))
 			}
 		}(w)
@@ -252,9 +252,9 @@ func TestLiveServerArmByName(t *testing.T) {
 // rows; a new series opens a new group, in order of first sight.
 func TestLiveArmSeriesRowsAndSubRows(t *testing.T) {
 	a := newLiveArm("a", 100)
-	t1 := a.begin(5, 1, "sess:main")
-	t2 := a.begin(5, 2, "sess:child") // overlaps t1: fan-out
-	t3 := a.begin(9, 1, "other:main")
+	t1 := a.begin(5, 1, "sess:main", slotInfo{})
+	t2 := a.begin(5, 2, "sess:child", slotInfo{}) // overlaps t1: fan-out
+	t3 := a.begin(9, 1, "other:main", slotInfo{})
 	d := a.snapshot(0)
 	type key struct{ s, sub int }
 	got := map[key]int{}
@@ -272,7 +272,7 @@ func TestLiveArmSeriesRowsAndSubRows(t *testing.T) {
 	a.complete(t3, liveRec(a, 9, false))
 	cursor := a.snapshot(0).Seq
 	// Next turn of series 5 begins after both finished: back on sub-row 0, same group.
-	t4 := a.begin(5, 3, "sess:main")
+	t4 := a.begin(5, 3, "sess:main", slotInfo{})
 	a.complete(t4, liveRec(a, 5, false))
 	inc := a.snapshot(cursor)
 	if len(inc.Reqs) != 1 || inc.Reqs[0].Row != 0 || inc.Reqs[0].Sub != 0 || len(inc.Inflight) != 0 {
@@ -289,9 +289,53 @@ func TestLiveArmSeriesRowsAndSubRows(t *testing.T) {
 	if !subs[0] || !subs[1] {
 		t.Errorf("series 5 sub-rows = %v, want 0 and 1", subs)
 	}
-	if t5 := a.begin(77, 1, ""); a.snapshot(0).Inflight[0].Row != 2 {
+	if t5 := a.begin(77, 1, "", slotInfo{}); a.snapshot(0).Inflight[0].Row != 2 {
 		t.Error("a new series must open a new group at the bottom")
 	} else {
 		a.abandon(t5)
+	}
+}
+
+// Rows are concurrency SLOTS: a slot that moves on to the next session stays on
+// its row, the new session's first request carries a boundary flag, and the
+// session numbers (series_num) never open rows of their own.
+func TestLiveArmSlotRows(t *testing.T) {
+	a := newLiveArm("a", 100)
+	rec := func(slot, series int, hot bool) requestDataRecord {
+		r := liveRec(a, series, false)
+		r.Slot, r.SlotHot = slot, hot
+		return r
+	}
+	// Slot 1 (hot) runs sessions 10 then 11; slot 2 runs session 12.
+	t1 := a.begin(10, 1, "s10:main", slotInfo{N: 1, Hot: true})
+	t2 := a.begin(12, 1, "s12:main", slotInfo{N: 2})
+	a.complete(t1, rec(1, 10, true))
+	a.complete(t2, rec(2, 12, false))
+	t3 := a.begin(10, 2, "s10:main", slotInfo{N: 1, Hot: true})
+	a.complete(t3, rec(1, 10, true))
+	t4 := a.begin(11, 1, "s11:main", slotInfo{N: 1, Hot: true})
+	in := a.snapshot(0).Inflight
+	if len(in) != 1 || in[0].Row != 0 || in[0].Slot != 1 || in[0].Flags&flagSession == 0 || in[0].Flags&flagHot == 0 {
+		t.Fatalf("new session on slot 1 = %+v", in)
+	}
+	a.complete(t4, rec(1, 11, true))
+	d := a.snapshot(0)
+	if len(d.Reqs) != 4 {
+		t.Fatalf("reqs = %d", len(d.Reqs))
+	}
+	rows := map[int]bool{}
+	var boundaries int
+	for _, r := range d.Reqs {
+		rows[r.Row] = true
+		if r.Flags&flagSession != 0 {
+			boundaries++
+		}
+		if r.Row != r.Slot-1 || r.Sub != 0 {
+			t.Errorf("request = %+v, want row slot-1 on sub-row 0", r)
+		}
+	}
+	// Boundaries: first of slot 1 (s10), first of slot 2 (s12), first of s11.
+	if len(rows) != 2 || boundaries != 3 {
+		t.Errorf("rows=%v boundaries=%d", rows, boundaries)
 	}
 }

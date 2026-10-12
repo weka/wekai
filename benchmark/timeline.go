@@ -38,10 +38,12 @@ const (
 	flagError     = 1
 	flagCold      = 2
 	flagEmpty     = 4
-	flagTimings   = 8  // engine timings were reported
-	flagSources   = 16 // per-source token counts were reported
-	flagInflight  = 32 // live view: not finished yet
-	flagTruncated = 64 // segments were scaled down to fit the client-observed duration
+	flagTimings   = 8   // engine timings were reported
+	flagSources   = 16  // per-source token counts were reported
+	flagInflight  = 32  // live view: not finished yet
+	flagTruncated = 64  // segments were scaled down to fit the client-observed duration
+	flagSession   = 128 // first request of a new session on its slot: draw a boundary
+	flagHot       = 256 // issued by a hot-pool slot
 )
 
 type timelineKind struct {
@@ -72,9 +74,10 @@ var timelineKinds = []timelineKind{
 // milliseconds; Start is relative to the arm's T0. Zero-valued optional
 // fields are omitted to keep a 70k-request payload small.
 type timelineReq struct {
-	Row    int       `json:"r"`           // series group, in order of the series' first request
-	Sub    int       `json:"u,omitempty"` // sub-row within the group (overlapping requests of one series)
-	Series int       `json:"s"`
+	Row    int       `json:"r"`            // series group, in order of the series' first request
+	Sub    int       `json:"u,omitempty"`  // sub-row within the group (overlapping requests of one series)
+	Series int       `json:"s"`            // series_num: the replay session this request belongs to
+	Slot   int       `json:"sl,omitempty"` // concurrency slot (worker lane); the row group when present
 	Turn   int       `json:"n"`
 	Start  float64   `json:"t"`
 	E2E    float64   `json:"e"`
@@ -91,6 +94,17 @@ type timelineReq struct {
 	Segs   []float64 `json:"g"`             // flattened (kind, durationMs) pairs, left to right
 }
 
+// rowKey identifies a row group: the concurrency slot when the request carries
+// one, else (files written before slots were recorded) its series_num.
+type rowKey struct{ slot, series int }
+
+func rowKeyOf(slot, series int) rowKey {
+	if slot > 0 {
+		return rowKey{slot: slot}
+	}
+	return rowKey{series: series}
+}
+
 // timelineArm is one benchmark arm (one reqdata file / model). The layout is
 // one row group per series; Reqs[i].Row is the group, Reqs[i].Sub the sub-row.
 type timelineArm struct {
@@ -100,7 +114,7 @@ type timelineArm struct {
 	T0 int64 `json:"t0"`
 	// Span is the extent of the data in ms from T0.
 	Span float64 `json:"span"`
-	// Groups is the number of series rows.
+	// Groups is the number of slot (or series) rows.
 	Groups int `json:"groups"`
 	// Guids interns the per-request session:instance ids (see timelineReq.GI).
 	Guids []string      `json:"guids,omitempty"`
@@ -257,6 +271,10 @@ func timelineFromRecord(r requestDataRecord, t0 int64) timelineReq {
 			}
 		}
 	}
+	tr.Slot = r.Slot
+	if r.SlotHot {
+		tr.Flags |= flagHot
+	}
 	tr.Segs = flattenSegs(segs)
 	return tr
 }
@@ -300,8 +318,10 @@ func (p *subRowPacker) release(u int, end float64) {
 	}
 }
 
-// buildTimelineArm builds an arm with one row group per series, ordered by the
-// series' first request. Time zero is the earliest start in recs.
+// buildTimelineArm builds an arm with one row group per concurrency slot (per
+// series_num for data recorded without slots), ordered by the group's first
+// request. A slot replays sessions one after another, so the first request of
+// each new session is flagged for a boundary marker. Time zero is the earliest start in recs.
 func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
 	arm := timelineArm{Name: name, Reqs: make([]timelineReq, 0, len(recs))}
 	if len(recs) == 0 {
@@ -329,18 +349,24 @@ func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
 		arm.Reqs = append(arm.Reqs, tr)
 	}
 	sort.SliceStable(arm.Reqs, func(i, j int) bool { return arm.Reqs[i].Start < arm.Reqs[j].Start })
-	groups := map[int]int{}
-	packers := map[int]*subRowPacker{}
+	groups := map[rowKey]int{}
+	packers := map[rowKey]*subRowPacker{}
+	lastSeries := map[rowKey]int{}
 	for i := range arm.Reqs {
 		q := &arm.Reqs[i]
-		g, ok := groups[q.Series]
+		k := rowKeyOf(q.Slot, q.Series)
+		g, ok := groups[k]
 		if !ok {
 			g = len(groups)
-			groups[q.Series] = g
-			packers[q.Series] = &subRowPacker{}
+			groups[k] = g
+			packers[k] = &subRowPacker{}
+		}
+		if prev, seen := lastSeries[k]; !seen || prev != q.Series {
+			q.Flags |= flagSession
+			lastSeries[k] = q.Series
 		}
 		q.Row = g
-		q.Sub = packers[q.Series].place(q.Start, q.Start+q.E2E)
+		q.Sub = packers[k].place(q.Start, q.Start+q.E2E)
 		if end := q.Start + q.E2E; end > arm.Span {
 			arm.Span = end
 		}

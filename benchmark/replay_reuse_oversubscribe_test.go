@@ -383,3 +383,52 @@ func TestReuseOnAnEmptyCorpusStops(t *testing.T) {
 		t.Error("an empty corpus handed out a session")
 	}
 }
+
+// The live view's rows are the slots, not the sessions: with more slots than
+// sessions (the corpus cycling), each slot that holds a request shows up as its
+// own row, tagged with its slot number.
+func TestReplayRequestsCarryTheirSlot(t *testing.T) {
+	const sessions, slots = 3, 5
+	path := oversubscribeCorpus(t, sessions)
+	bf := newBlockingFleet()
+	defer bf.close()
+	stream, err := openRouterReplayStream(path, routerReplayStreamOpts{ChanCap: 8, Reuse: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	cfg := AutoBenchmarkConfig{
+		Model:          fmt.Sprintf("dynamic/%s,type=openai,model=test-model", bf.srv.URL),
+		RunID:          oversubscribeRunID,
+		RequestTimeout: 30 * time.Second,
+	}
+	st := newTestAutoState(256)
+	st.live = newLiveArm("a", 100)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	for slot := 1; slot <= slots; slot++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runRouterReplaySeriesLoop(withSlot(ctx, slot, slot == 1), cfg, st, nil, stream, endpointPicker{},
+				strings.Repeat("reuse-docs ", 100), func(*autoState) {}, st.gate)
+		}()
+	}
+	bf.settle(slots, 15*time.Second)
+	in := st.live.snapshot(0).Inflight
+	cancel()
+	bf.close()
+	wg.Wait()
+
+	rows := map[int]int{}
+	for _, f := range in {
+		rows[f.Row] = f.Slot
+		if (f.Slot == 1) != (f.Flags&flagHot != 0) {
+			t.Errorf("hot flag wrong on %+v", f)
+		}
+	}
+	if len(in) != slots || len(rows) != slots {
+		t.Fatalf("%d in-flight requests on %d rows, want %d slots each on its own row", len(in), len(rows), slots)
+	}
+}

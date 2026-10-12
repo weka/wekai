@@ -309,6 +309,11 @@ type requestDataRecord struct {
 	SeriesGUID string `json:"series_guid"`
 	SeriesNum  int    `json:"series_num"`
 	RequestNum int    `json:"request_num"`
+	// Slot is the concurrency slot (worker lane) that issued the request; for
+	// replay, series_num is the SESSION the slot was running. 0 / absent in
+	// files written before slots were recorded. SlotHot marks hot-pool slots.
+	Slot    int  `json:"slot,omitempty"`
+	SlotHot bool `json:"slot_hot,omitempty"`
 	// Turn is this request's 1-based position within its own instance, which
 	// RequestNum is not — that one counts the whole run. Carried because the
 	// summary locates a failure as series:turn:length, and without it that
@@ -2334,7 +2339,7 @@ func runSingleModelBenchmark(
 				if endpointRouter != nil {
 					endpointOverride = endpointRouter.EndpointForSeries(seriesNum)
 				}
-				runReplaySeriesLoop(benchCtx, cfg, st, rdw, st.replay, endpointOverride, updateSnap, workerGate)
+				runReplaySeriesLoop(withSlot(benchCtx, seriesNum, isHot), cfg, st, rdw, st.replay, endpointOverride, updateSnap, workerGate)
 			}()
 			return
 		}
@@ -2344,7 +2349,7 @@ func runSingleModelBenchmark(
 			go func() {
 				defer seriesWg.Done()
 				defer st.activeReplayWorkers.Add(-1)
-				runRouterReplaySeriesLoop(benchCtx, cfg, st, rdw, st.routerReplay, replayPicker, fullDocs, updateSnap, workerGate)
+				runRouterReplaySeriesLoop(withSlot(benchCtx, seriesNum, isHot), cfg, st, rdw, st.routerReplay, replayPicker, fullDocs, updateSnap, workerGate)
 			}()
 			return
 		}
@@ -2430,7 +2435,7 @@ func runSingleModelBenchmark(
 					prompt = buildSeriesPrompt(fullDocs, seriesGUID, groupGUID, stepCurrentTokens, useShared)
 				}
 				ratio := st.estimator.Observe(prompt + "\x00" + cfg.Question)
-				liveTok := st.live.begin(seriesNum, turnNum, seriesGUID)
+				liveTok := st.live.begin(seriesNum, turnNum, seriesGUID, slotInfo{N: seriesNum, Hot: isHot})
 				metrics := runSingleRequest(reqCtx, cfg.Model, prompt, cfg.Question,
 					requestNum, seriesNum, 0, seriesGUID, endpointOverride, cfg.MaxOutputTokens)
 				reqCancel()
@@ -2604,6 +2609,8 @@ func runSingleModelBenchmark(
 						SeriesGUID:           seriesGUID,
 						SeriesNum:            seriesNum,
 						RequestNum:           requestNum,
+						Slot:                 seriesNum,
+						SlotHot:              isHot,
 						Turn:                 turnNum,
 						CacheHit:             cacheHit,
 						CacheHitRatio:        cacheHitRatio,

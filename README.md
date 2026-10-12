@@ -234,10 +234,13 @@ already ask for `stream_options.include_usage`, which is how vLLM delivers them.
 
 - `wekai benchmark visualize <dir> --timeline` (also `visualize-merge`, and
   `benchmark auto --timeline` for the end-of-run report) adds a Metrics/Timeline
-  switch to the report. Timeline: one row per series (session), x = time (zoom
-  shared with the report); a series' turns tile left to right along its row, and
-  overlapping requests (sub-agent fan-out) are packed into sub-rows under it.
-  Rows are ordered by the series' first request. Each request bar, left to right = queue wait (KV-blocked vs other),
+  switch to the report. Timeline: one row per concurrency SLOT (`--series N` gives N
+  rows; hot-pool slots are labelled `h<N>`), x = time (zoom shared with the
+  report). The sessions a slot replays follow one another along its row with a
+  thin marker where a new session starts, and overlapping requests (sub-agent
+  fan-out) are packed into sub-rows under it. Reqdata records `slot`/`slot_hot`
+  per request; files without them group by `series_num` (the session) instead.
+  Rows are ordered by first request. Each request bar, left to right = queue wait (KV-blocked vs other),
   prefill split by token share into computed / external / host / GPU cache
   (kv_fetch counted in the external share), preempted, decode. Requests with no
   engine details use client timestamps with one "prefill (unknown source)" colour.
