@@ -91,6 +91,12 @@ func GenerateVisualizationMerged(dirs []string, labels []string, outputDir strin
 // few minutes) that would otherwise accumulate one report_vN.html copy per
 // render.
 func GenerateVisualizationMergedWithOverwrite(dirs []string, labels []string, outputDir string, concurrency int, maxElapsed time.Duration, baselineLabel string, overwrite bool) (string, error) {
+	return GenerateVisualizationMergedTimeline(dirs, labels, outputDir, concurrency, maxElapsed, baselineLabel, overwrite, false)
+}
+
+// GenerateVisualizationMergedTimeline is GenerateVisualizationMergedWithOverwrite
+// with the optional Timeline view embedded for every arm.
+func GenerateVisualizationMergedTimeline(dirs []string, labels []string, outputDir string, concurrency int, maxElapsed time.Duration, baselineLabel string, overwrite bool, withTimeline bool) (string, error) {
 	outDir, err := prepareMergedSources(dirs, labels, outputDir, maxElapsed)
 	if err != nil {
 		return "", err
@@ -99,7 +105,7 @@ func GenerateVisualizationMergedWithOverwrite(dirs []string, labels []string, ou
 	// the merged filenames: pin display names to the label-derived basenames
 	// so a record alias shared by both arms can't collapse them into one name.
 	// maxElapsed 0: the sources were already truncated per-arm above.
-	return generateVisualization(outDir, concurrency, len(labels) > 0, 0, baselineLabel, overwrite)
+	return renderVisualization(outDir, concurrency, len(labels) > 0, 0, baselineLabel, overwrite, withTimeline)
 }
 
 // prepareMergedSources is the file-merging half of GenerateVisualizationMerged:

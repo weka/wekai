@@ -222,6 +222,30 @@ uses the elapsed duration. Each arm uses its recorded concurrency, falling
 back to the visualization's `--concurrency`; unknown concurrency produces no
 line. The rate has its own scale, independent of latency.
 
+**Per-request KV details and the request timeline.** Each reqdata row records,
+when the engine reports them, the prompt's token sources (`kv.sources`: gpu,
+host, external, computed), recompute counters, and engine-side timings in
+seconds (`kv.timings`: queue_wait_kv, queue_wait_other, kv_fetch, prefill,
+decode, preempted_time). vLLM supplies them with `--enable-request-kv-details`
+(`usage.prompt_tokens_details.kv_sources`, `usage.vllm_request_timings`); SGLang's
+tier split is mapped onto the same sources. Nothing is recorded for engines
+that report neither, and older reqdata files load unchanged. Streaming requests
+already ask for `stream_options.include_usage`, which is how vLLM delivers them.
+
+- `wekai benchmark visualize <dir> --timeline` (also `visualize-merge`, and
+  `benchmark auto --timeline` for the end-of-run report) adds a Metrics/Timeline
+  switch to the report. Timeline: one thin bar per request, x = time (zoom shared
+  with the report), bars left to right = queue wait (KV-blocked vs other),
+  prefill split by token share into computed / external / host / GPU cache
+  (kv_fetch counted in the external share), preempted, decode. Requests with no
+  engine details use client timestamps with one "prefill (unknown source)" colour.
+- `wekai benchmark timeline <dir> -o timeline.html` renders just that view.
+- `wekai benchmark auto --live-port 8088` serves the same view live while the
+  run executes: one row per series, in-flight requests growing, polled every 2s.
+  It binds `127.0.0.1` by default (reachable with `kubectl port-forward pod/<pod>
+  8088:8088`); `--live-bind 0.0.0.0` exposes request metadata to the network.
+  `--live-max-requests` (default 100000) bounds memory per arm.
+
 **Server-side cache-source sampling.** When `--save-request-data` is on and
 the model spec points at an OpenAI-compatible (chat/completions) endpoint,
 a sampler polls the server's Prometheus endpoint — `<base>/metrics`, with

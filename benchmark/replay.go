@@ -244,6 +244,7 @@ func runReplayConversation(
 		history.WriteString(userContent)
 		ratio := st.estimator.Observe(history.String())
 
+		liveTok := st.live.begin(seriesNum, turnNum)
 		reqCtx, reqCancel := context.WithTimeout(benchCtx, reqTimeout)
 		resetTTFT(time.Now())
 		response, err := chat.Request(reqCtx, llm.TextParts(userContent), nil)
@@ -260,6 +261,7 @@ func runReplayConversation(
 			TimeToFirstToken:  ttft,
 			TotalResponseTime: totalTime,
 			Error:             err,
+			live:              liveTok,
 		}
 		if response != nil {
 			metrics.Response = response.Content
@@ -273,6 +275,8 @@ func runReplayConversation(
 				ReasoningTokens: tools.TokenUsage{Count: response.Usage.ReasoningTokens},
 				RequestCount:    1,
 			}
+			metrics.CachedDetails = response.Usage.CachedDetails
+			metrics.KV = response.Usage.KV
 		}
 		if err == nil && strings.TrimSpace(metrics.Response) == "" {
 			metrics.IsEmpty = true
@@ -550,7 +554,7 @@ func recordReplayRequest(
 		st.sglangTiers.add(metrics.CachedDetails, metrics.UsageData.InputTokens.Count)
 	}
 
-	if rdw != nil {
+	if rdw != nil || st.live != nil {
 		reqEnd := time.Now()
 		reqStart := reqEnd.Add(-metrics.TotalResponseTime)
 		errMsg := ""
@@ -583,7 +587,7 @@ func recordReplayRequest(
 			UUIDLeaked:           uuidLeakedCount,
 			UUIDExactMatch:       metrics.ExactMatch,
 		}
-		rec.applyCachedDetails(metrics.CachedDetails)
+		rec.applyKV(&metrics)
 		// Raw detail lists only on a miss or a leak — mirrors the
 		// failed-request-only policy on PromptText/ResponseText/RawResponseTail
 		// above (avoid bloating every row with data that matters only when
@@ -593,9 +597,12 @@ func recordReplayRequest(
 			rec.FoundMask = metrics.UUIDFound
 			rec.LeakedUUIDsRaw = metrics.LeakedUUIDs
 		}
-		if writeErr := rdw.write(rec); writeErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to write request data: %v\n", writeErr)
+		if rdw != nil {
+			if writeErr := rdw.write(rec); writeErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to write request data: %v\n", writeErr)
+			}
 		}
+		st.live.complete(metrics.live, rec)
 	}
 
 	st.stream.Add(completionRecord{

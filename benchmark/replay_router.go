@@ -1013,6 +1013,7 @@ func runRouterReplayInstance(
 		// global/read-only (set identically on construction — see auto.go
 		// and above), and do()/dryDo() derive this call's sessionIdx from
 		// seriesNum directly, so a shared poster safely serves any session.
+		liveTok := st.live.begin(seriesNum, ti+1)
 		st.skipClk.AddInflight(1)
 		if reqPoster.dryRun {
 			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, su)
@@ -1023,11 +1024,13 @@ func runRouterReplayInstance(
 		picker.release(epIdx)
 		reqCancel()
 		gate.Release()
+		metrics.live = liveTok
 
 		if metrics.Error != nil && ctx.Err() != nil {
 			// Run shutdown aborted this in-flight request (timeout or
 			// --total cancellation) — a termination artifact, not a
 			// serving failure. Don't record it as an error.
+			st.live.abandon(liveTok)
 			return
 		}
 
@@ -1045,6 +1048,7 @@ func runRouterReplayInstance(
 			// --total emitted while completions can never reach it, and the
 			// run hangs drained forever.
 			st.totalEmitted.Add(-1)
+			st.live.abandon(liveTok)
 			return
 		}
 

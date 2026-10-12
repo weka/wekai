@@ -294,6 +294,7 @@ func runSingleRequest(ctx context.Context, model, cachedPrompt, question string,
 	} else {
 		// Copy usage data from response
 		metrics.CachedDetails = response.Usage.CachedDetails
+		metrics.KV = response.Usage.KV
 		metrics.UsageData = tools.ExecutionUsageData{
 			InputTokens: tools.TokenUsage{
 				Count: response.Usage.PromptTokens,

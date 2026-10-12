@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500&display=swap">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { font-family: "Onest", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0D1013; color: #C9C9C9; padding: 0 16px 12px; display: flex; flex-direction: column; }
+  .brandbar { height: 3px; margin: 0 -16px 10px; background: linear-gradient(90deg, #7C03EC, #C91FF8, #FF3FD5); flex: none; }
+  h1 { font-size: 15px; font-weight: 500; color: #F2F2EB; margin-bottom: 2px; }
+  .sub { font-size: 12px; color: #8a9096; margin-bottom: 6px; }
+  #tl { flex: 1 1 auto; min-height: 0; }
+{{.CSS}}
+</style>
+</head>
+<body>
+<div class="brandbar"></div>
+<h1>{{.Title}}</h1>
+<div class="sub" id="sub">{{.Subtitle}}</div>
+<div id="tl"></div>
+<script>
+{{.JS}}
+</script>
+<script>
+(function () {
+  var CFG = {{.Config}};
+  var host = document.getElementById("tl");
+  var sub = document.getElementById("sub");
+  if (!CFG.live) {
+    var P = {{.Data}};
+    var tl = WekaiTimeline.create(host, { kinds: P.kinds, handleEsc: true });
+    tl.setArms(P.arms);
+    return;
+  }
+  // Live mode: poll the incremental endpoint for the selected arm.
+  var tl = WekaiTimeline.create(host, {
+    kinds: CFG.kinds, live: true, handleEsc: true, maxRequests: CFG.maxRequests,
+    onArm: function (i) { seqs[i] = seqs[i] || 0; poll(); },
+  });
+  var seqs = [], busy = false, failures = 0;
+  function mkArms(list) {
+    return list.map(function (a) { return { name: a.name, t0: a.t0, span: 0, layout: "series", rows: 0, reqs: [], inflight: [] }; });
+  }
+  function poll() {
+    if (busy) return;
+    busy = true;
+    var i = tl.currentArm();
+    fetch(CFG.base + "api/data?arm=" + i + "&since=" + (seqs[i] || 0), { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (d) {
+        failures = 0;
+        seqs[i] = d.seq;
+        tl.setClock(d.now);
+        tl.append(i, d.reqs || [], d.inflight || [], { reset: d.reset, t0: d.t0, span: d.span });
+        sub.textContent = "live · updated " + new Date().toLocaleTimeString() + " · polling every " + (CFG.pollMs / 1000) + "s";
+      })
+      .catch(function (e) { failures++; sub.textContent = "connection lost (" + e.message + ") — retrying"; })
+      .then(function () { busy = false; });
+  }
+  fetch(CFG.base + "api/arms", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (m) {
+    tl.setArms(mkArms(m.arms));
+    poll();
+    setInterval(poll, CFG.pollMs);
+    // In-flight bars grow between polls: repaint on a light timer.
+    setInterval(function () { tl.redraw(); }, 500);
+  });
+})();
+</script>
+</body>
+</html>

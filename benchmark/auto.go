@@ -58,6 +58,10 @@ type AutoBenchmarkConfig struct {
 	PrintResponses            bool          // print each request/response to stdout; forces non-TTY display mode
 	PrintErrorsThreshold      time.Duration // if >0, print at most one error to stderr per this interval (rate-limited)
 	SaveRequestDataDir        string        // if non-empty, write per-request JSONL to this dir
+	Timeline                  bool          // embed the request-timeline view in the end-of-run report
+	LivePort                  int           // >0: serve the live request timeline on this port during the run
+	LiveBind                  string        // address the live view binds (default 127.0.0.1)
+	LiveMaxRequests           int           // completed requests the live view keeps per arm (default DefaultLiveMaxRequests)
 	Total                     int           // stop after N total completed requests (0 = unlimited)
 	HotSeriesConcurrency      int           // H of the --series workers run as a 'hot' pool with a dedicated gate; 0 = no hot pool.
 	EndpointOverloadThreshold float64       // Multi-endpoint only: fail over off an endpoint once its in-flight exceeds this multiple of its fair share. 0 = default (1.5).
@@ -225,6 +229,10 @@ type AutoBenchmarkConfig struct {
 	// startup progress).
 	replayConversations []Conversation
 
+	// liveArm is this model's slice of the live timeline server; nil when
+	// --live-port is off. Every live hook is nil-safe.
+	liveArm *liveArm
+
 	// Tree-aware router replay. When set, instead of synthetic prompts
 	// or hermes-style flat conversations, the benchmark replays a tree of
 	// CLI sessions captured by the router (see `wekai router
@@ -328,6 +336,11 @@ type requestDataRecord struct {
 	CachedHost           *int   `json:"cached_host,omitempty"`
 	CachedStorage        *int   `json:"cached_storage,omitempty"`
 	CachedStorageBackend string `json:"cached_storage_backend,omitempty"`
+	// KV is the engine-reported provenance of this request's prompt tokens
+	// (engine-neutral sources: vLLM --enable-request-kv-details or SGLang
+	// tiers), recompute counters, and engine-side timings in seconds. Absent
+	// when the engine reported none; files written before it existed lack it.
+	KV *llm.KVDetails `json:"kv,omitempty"`
 
 	// Status
 	IsError      bool   `json:"is_error"`
@@ -1139,6 +1152,9 @@ type autoState struct {
 	// SGLang per-tier cached-token totals over every request that reported a
 	// breakdown, and the uncached remainder (computed) of those same requests.
 	sglangTiers sglangTierTotals
+
+	// live feeds the live timeline view (--live-port); nil when off.
+	live *liveArm
 
 	// Real-time replay governor. ttft is what the admission gate reads; skipClk
 	// is the shared clock the pacers wait against; lag records how far behind
@@ -2169,6 +2185,7 @@ func runSingleModelBenchmark(
 		ttft:              newTTFTWindow(cfg.TTFTWindow),
 		skipClk:           newSkipClock(cfg.ReplayRealtime && cfg.ReplaySkipIdle),
 		lag:               &pacingLag{},
+		live:              cfg.liveArm,
 	}
 	if sampler := startVLLMMetricsSampler(benchCtx, cfg.Model, cfg.VLLMMetricsURLs, st.datasetTracker, rdw); sampler != nil {
 		// stop() is deferred after rdw's close, so it runs first (LIFO) and
@@ -2413,6 +2430,7 @@ func runSingleModelBenchmark(
 					prompt = buildSeriesPrompt(fullDocs, seriesGUID, groupGUID, stepCurrentTokens, useShared)
 				}
 				ratio := st.estimator.Observe(prompt + "\x00" + cfg.Question)
+				liveTok := st.live.begin(seriesNum, turnNum)
 				metrics := runSingleRequest(reqCtx, cfg.Model, prompt, cfg.Question,
 					requestNum, seriesNum, 0, seriesGUID, endpointOverride, cfg.MaxOutputTokens)
 				reqCancel()
@@ -2569,8 +2587,8 @@ func runSingleModelBenchmark(
 					st.sglangTiers.add(metrics.CachedDetails, metrics.UsageData.InputTokens.Count)
 				}
 
-				// Write per-request data if configured.
-				if rdw != nil {
+				// Write per-request data if configured, and feed the live view.
+				if rdw != nil || st.live != nil {
 					reqEnd := time.Now()
 					reqStart := reqEnd.Add(-metrics.TotalResponseTime)
 					errMsg := ""
@@ -2599,16 +2617,19 @@ func runSingleModelBenchmark(
 						IsEmpty:              metrics.IsEmpty,
 						LocalCacheRatio:      ratio,
 					}
-					rec.applyCachedDetails(metrics.CachedDetails)
+					rec.applyKV(&metrics)
 					if rec.IsError || rec.IsEmpty {
 						rec.PromptText = metrics.CachedPrompt
 						rec.Question = metrics.Question
 						rec.ResponseText = metrics.Response
 						rec.RawResponseTail = metrics.RawResponseTail
 					}
-					if writeErr := rdw.write(rec); writeErr != nil {
-						fmt.Fprintf(os.Stderr, "warning: failed to write request data: %v\n", writeErr)
+					if rdw != nil {
+						if writeErr := rdw.write(rec); writeErr != nil {
+							fmt.Fprintf(os.Stderr, "warning: failed to write request data: %v\n", writeErr)
+						}
 					}
+					st.live.complete(liveTok, rec)
 				}
 
 				st.stream.Add(completionRecord{
@@ -3557,12 +3578,33 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 	// Shared display state.
 	display := newDisplayState()
 
+	// Live timeline view (opt-in). Started before any model so the first
+	// request is already visible; stopped when the run returns.
+	var liveSrv *liveServer
+	if cfg.LivePort > 0 {
+		names := make([]string, len(models))
+		for i, m := range models {
+			names[i] = shortModelName(m)
+		}
+		var err error
+		liveSrv, err = startLiveServer(cfg.LiveBind, cfg.LivePort, names, cfg.LiveMaxRequests)
+		if err != nil {
+			return err
+		}
+		defer liveSrv.Close()
+		fmt.Printf("Live timeline: http://%s/ (keeps up to %d completed requests per arm)\n",
+			liveSrv.Addr(), liveSrv.max)
+	}
+
 	// Launch one goroutine per model.
 	results := make([]modelBenchmarkResult, len(models))
 	var wg sync.WaitGroup
 	for i, model := range models {
 		modelCfg := cfg
 		modelCfg.Model = model
+		if liveSrv != nil {
+			modelCfg.liveArm = liveSrv.arms[i]
+		}
 		wg.Add(1)
 		go func(idx int, mcfg AutoBenchmarkConfig) {
 			defer wg.Done()
@@ -3596,7 +3638,13 @@ func RunAutoBenchmark(ctx context.Context, cfg AutoBenchmarkConfig) error {
 
 	// Auto-generate HTML visualization if request data was saved.
 	if cfg.SaveRequestDataDir != "" {
-		htmlPath, err := GenerateVisualization(cfg.SaveRequestDataDir, cfg.Concurrency)
+		var htmlPath string
+		var err error
+		if cfg.Timeline {
+			htmlPath, err = GenerateVisualizationTimeline(cfg.SaveRequestDataDir, cfg.Concurrency, 0, false)
+		} else {
+			htmlPath, err = GenerateVisualization(cfg.SaveRequestDataDir, cfg.Concurrency)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to generate HTML visualization: %v\n", err)
 		} else {

@@ -363,11 +363,30 @@ type OpenAIUsage struct {
 	TotalTokens       int                           `json:"total_tokens"`
 	PromptDetails     *OpenAIPromptTokenDetails     `json:"prompt_tokens_details,omitempty"`
 	CompletionDetails *OpenAICompletionTokenDetails `json:"completion_tokens_details,omitempty"`
+	// Timings is vLLM's vllm_request_timings (--enable-request-kv-details).
+	Timings *RequestTimings `json:"vllm_request_timings,omitempty"`
+}
+
+// KV returns the per-request KV details vLLM attached to this usage, or nil.
+func (u *OpenAIUsage) KV() *KVDetails {
+	if u == nil {
+		return nil
+	}
+	var src *KVSources
+	var rc *KVRecompute
+	if u.PromptDetails != nil {
+		src, rc = u.PromptDetails.KVSources, u.PromptDetails.KVRecompute
+	}
+	return NewKVDetails(src, rc, u.Timings)
 }
 
 type OpenAIPromptTokenDetails struct {
 	CachedTokens int `json:"cached_tokens"`
 	AudioTokens  int `json:"audio_tokens"`
+	// KVSources and KVRecompute are vLLM's --enable-request-kv-details
+	// extension; nil from every other server.
+	KVSources   *KVSources   `json:"kv_sources,omitempty"`
+	KVRecompute *KVRecompute `json:"kv_recompute,omitempty"`
 }
 
 type OpenAICompletionTokenDetails struct {
@@ -431,6 +450,9 @@ func (l *OpenAiChat) processStreamingResponse(ctx context.Context, resp *http.Re
 
 			if streamResp.Usage.CompletionDetails != nil {
 				usageData.ReasoningTokens = streamResp.Usage.CompletionDetails.ReasoningTokens
+			}
+			if kv := streamResp.Usage.KV(); kv != nil {
+				usageData.KV = kv
 			}
 		}
 

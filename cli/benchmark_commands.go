@@ -255,6 +255,10 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		VerboseCache:                  c.VerboseCache,
 		PrintResponses:                c.PrintResponses,
 		SaveRequestDataDir:            c.SaveRequestData,
+		Timeline:                      c.Timeline,
+		LivePort:                      c.LivePort,
+		LiveBind:                      c.LiveBind,
+		LiveMaxRequests:               c.LiveMaxRequests,
 		ErrorRateLimit:                c.ErrorRateLimit,
 		MaxConsecutiveFailures:        c.MaxConsecutiveFailures,
 		MaxTotalErrors:                c.MaxTotalErrors,
@@ -416,11 +420,37 @@ func (c *BenchmarkVisualizeCommand) Execute(args []string) error {
 	if err != nil {
 		return err
 	}
-	htmlPath, err := benchmark.GenerateVisualizationWithOverwrite(dir, c.Concurrency, maxElapsed, c.Overwrite)
+	generate := benchmark.GenerateVisualizationWithOverwrite
+	if c.Timeline {
+		generate = benchmark.GenerateVisualizationTimeline
+	}
+	htmlPath, err := generate(dir, c.Concurrency, maxElapsed, c.Overwrite)
 	if err != nil {
 		return fmt.Errorf("generate visualization: %w", err)
 	}
 	fmt.Printf("Visualization saved to: %s\n", htmlPath)
+	return nil
+}
+
+// BenchmarkTimelineCommand implements the benchmark timeline subcommand: the
+// request-timeline view on its own, as a standalone page.
+type BenchmarkTimelineCommand struct {
+	*BenchmarkTimelineOptions
+}
+
+func (c *BenchmarkTimelineCommand) Execute(args []string) error {
+	if err := runPreExecute(context.Background()); err != nil {
+		return err
+	}
+	maxElapsed, err := parseMaxElapsed(c.MaxElapsed)
+	if err != nil {
+		return err
+	}
+	out, err := benchmark.GenerateTimeline(c.Args.Dir, c.Output, maxElapsed)
+	if err != nil {
+		return fmt.Errorf("generate timeline: %w", err)
+	}
+	fmt.Printf("Timeline saved to: %s\n", out)
 	return nil
 }
 
@@ -473,7 +503,7 @@ func (c *BenchmarkVisualizeMergeCommand) Execute(args []string) error {
 	if err != nil {
 		return err
 	}
-	htmlPath, err := benchmark.GenerateVisualizationMergedWithOverwrite(dirs, labels, c.Output, c.Concurrency, maxElapsed, c.Baseline, c.Overwrite)
+	htmlPath, err := benchmark.GenerateVisualizationMergedTimeline(dirs, labels, c.Output, c.Concurrency, maxElapsed, c.Baseline, c.Overwrite, c.Timeline)
 	if err != nil {
 		return fmt.Errorf("generate merged visualization: %w", err)
 	}

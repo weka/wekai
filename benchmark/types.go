@@ -43,8 +43,14 @@ type RequestMetrics struct {
 	// CachedDetails is SGLang's per-tier cached-token split for this request
 	// (sglext.cached_tokens_details); nil when the server reported none.
 	CachedDetails *llm.CachedTokensDetails
-	Error         error
-	Response      string // The actual response content
+	// KV is vLLM's per-request token sources, recompute counters and engine
+	// timings (--enable-request-kv-details); nil when the server reported none.
+	KV *llm.KVDetails
+	// live identifies this request in the live view's in-flight table; the
+	// zero value means no live view is attached.
+	live     liveToken
+	Error    error
+	Response string // The actual response content
 	// ContentOnly is the assistant's content stream WITHOUT the reasoning
 	// trace. Response merges reasoning in, so a UUID recalled inside a
 	// reasoning trace still counts as PRESENT; that merge is wrong for any

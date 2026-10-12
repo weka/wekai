@@ -66,6 +66,14 @@ func GenerateVisualizationWithOverwrite(dir string, concurrency int, maxElapsed 
 	return generateVisualization(dir, concurrency, false, maxElapsed, "", overwrite)
 }
 
+// GenerateVisualizationTimeline is GenerateVisualizationWithOverwrite with the
+// report's Timeline view embedded (one bar per request on a wall-clock axis;
+// see timeline.go). The view adds roughly 100 bytes per request to the page,
+// which is why it is opt-in.
+func GenerateVisualizationTimeline(dir string, concurrency int, maxElapsed time.Duration, overwrite bool) (string, error) {
+	return renderVisualization(dir, concurrency, false, maxElapsed, "", overwrite, true)
+}
+
 // truncateToElapsed drops request records and metrics samples whose elapsed
 // time from the run's own start exceeds maxElapsed, so a crashed run's
 // terminal error-storm can be excluded from a report. t0 is the earliest
@@ -312,6 +320,9 @@ type seriesData struct {
 	// not by request count. Omitted entirely when no record carried a GUID
 	// (legacy data).
 	GuidTable []string `json:"guidTable,omitempty"`
+	// Timeline is this arm's request timeline (see timeline.go), present only
+	// when the report was generated with the timeline view enabled.
+	Timeline *timelineArm `json:"timeline,omitempty"`
 }
 
 // buildGuidTable interns each record's series_guid into a de-duplicated,
@@ -404,6 +415,12 @@ func buildVizRunParams(p runParamsRecord) *vizRunParams {
 // back to the default slowest-arm baseline at render time.
 // overwrite selects the HTML report's destination path — see reportHTMLPath.
 func generateVisualization(dir string, concurrency int, keepFileNames bool, maxElapsed time.Duration, baselineLabel string, overwrite bool) (string, error) {
+	return renderVisualization(dir, concurrency, keepFileNames, maxElapsed, baselineLabel, overwrite, false)
+}
+
+// renderVisualization is generateVisualization with the optional Timeline
+// view: withTimeline embeds each arm's timeline model and the renderer.
+func renderVisualization(dir string, concurrency int, keepFileNames bool, maxElapsed time.Duration, baselineLabel string, overwrite bool, withTimeline bool) (string, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 	if err != nil {
 		return "", fmt.Errorf("glob jsonl files: %w", err)
@@ -491,6 +508,10 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 			sd.Conc = params.effectiveConcurrency()
 			sd.Params = buildVizRunParams(params)
 		}
+		if withTimeline && len(records) > 0 {
+			tla := buildTimelineArm(name, records)
+			sd.Timeline = &tla
+		}
 		allSeries = append(allSeries, sd)
 	}
 
@@ -548,11 +569,23 @@ func generateVisualization(dir string, concurrency int, keepFileNames bool, maxE
 	}
 	defer out.Close()
 
-	if err := vizTemplate.Execute(out, map[string]template.JS{
+	tlJS, tlCSS, tlKinds := template.JS("null"), template.CSS(""), template.JS("[]")
+	if withTimeline {
+		kb, err := json.Marshal(timelineKinds)
+		if err != nil {
+			return "", fmt.Errorf("marshal timeline kinds: %w", err)
+		}
+		tlJS, tlCSS, tlKinds = template.JS(timelineJS), template.CSS(timelineCSS), template.JS(kb)
+	}
+
+	if err := vizTemplate.Execute(out, map[string]any{
 		"Data":           template.JS(seriesJSON),
 		"Concurrency":    template.JS(concStr),
 		"PublicTemplate": template.JS(pubTplJSON),
 		"BaselineLabel":  template.JS(baselineLabelJSON),
+		"TimelineJS":     tlJS,
+		"TimelineCSS":    tlCSS,
+		"TimelineKinds":  tlKinds,
 	}); err != nil {
 		return "", fmt.Errorf("execute template: %w", err)
 	}
@@ -841,6 +874,11 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   .modal-actions button { font-size: 0.8em; padding: 4px 12px; background: #171C20; color: #F2F2EB; border: 1px solid #42464A; border-radius: 4px; cursor: pointer; }
   .modal-actions button:hover { background: #2A3038; }
   #ctxApply { border-color: #7C03EC; }
+  .view-switch { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; font-size: 0.8em; color: #8a9096; }
+  .view-switch button { font: inherit; padding: 3px 12px; background: #171C20; color: #C9C9C9; border: 1px solid #42464A; border-radius: 4px; cursor: pointer; }
+  .view-switch button.on { background: #2A3038; color: #F2F2EB; border-color: #7C03EC; }
+  #tlHost { display: none; }
+{{.TimelineCSS}}
 </style>
 </head>
 <body>
@@ -882,7 +920,12 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 </div>
 <div id="legend"></div>
 </div>
+<div class="view-switch" id="viewSwitch" hidden>View:
+  <button id="viewMetrics" class="on">Metrics</button>
+  <button id="viewTimeline">Timeline</button>
+</div>
 <canvas id="chart"></canvas>
+<div id="tlHost"></div>
 <div id="tooltip"></div>
 <div id="helpTip" class="help-tip" role="tooltip"></div>
 <div id="ctxModal" class="modal-backdrop">
@@ -949,6 +992,8 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 </div>
 
 <script>
+{{.TimelineJS}}
+;
 const RAW_DATA = {{.Data}};
 // BASELINE_LABEL is the --baseline flag's value (visualize-merge only), or
 // "" when absent -- see findBaselineIndex() below RAW_DATA's normalization
@@ -2916,6 +2961,7 @@ function drawOutputWorker() {
 }
 
 function draw() {
+  tlSyncFromReport();
   // Recalc the right margin: whether the Totals layer's ingest-token axis is
   // currently contributing pixels (see calcRightMargin) can change between
   // frames from a checkbox toggle or a series being hidden/shown. The bottom
@@ -4475,6 +4521,60 @@ document.getElementById("downloadPublicBtn").addEventListener("click", downloadP
   const btn = document.getElementById(id);
   if (btn) btn.addEventListener("click", downloadSummaryCsv);
 });
+
+// --- Timeline view (opt-in: generated with --timeline) ---
+// The renderer (WekaiTimeline) is the same module the standalone and live
+// pages use. It shares THIS page's zoom window: viewTMin/viewTMax are elapsed
+// ms from each arm's own start, which is exactly the timeline's time basis, so
+// zooming in either view is reflected in the other and in the Summary panel.
+const TIMELINE_KINDS = {{.TimelineKinds}};
+var tlView = null;
+var timelineMode = false;
+function tlSyncFromReport() {
+  if (!timelineMode || !tlView) return;
+  if (isZoomed()) tlView.setView(viewTMin, viewTMax); else tlView.setView(null, null);
+}
+{
+  const withTl = DATA.filter(s => s.timeline);
+  if (withTl.length && typeof WekaiTimeline !== "undefined") {
+    const sw = document.getElementById("viewSwitch");
+    const host = document.getElementById("tlHost");
+    const btnM = document.getElementById("viewMetrics");
+    const btnT = document.getElementById("viewTimeline");
+    sw.hidden = false;
+    const sizeHost = () => {
+      host.style.width = W + "px";
+      host.style.height = Math.max(H, 480) + "px";
+    };
+    const setMode = on => {
+      timelineMode = on;
+      btnM.classList.toggle("on", !on);
+      btnT.classList.toggle("on", on);
+      canvas.style.display = on ? "none" : "";
+      host.style.display = on ? "flex" : "none";
+      if (on) {
+        if (!tlView) {
+          tlView = WekaiTimeline.create(host, {
+            kinds: TIMELINE_KINDS,
+            onZoom: (a, b) => {
+              if (a === null) { resetZoomView(); return; }
+              viewTMin = a; viewTMax = b;
+              recalcYMax();
+              draw();
+            },
+          });
+          tlView.setArms(withTl.map(s => s.timeline));
+        }
+        sizeHost();
+        tlView.resize();
+        tlSyncFromReport();
+      }
+    };
+    btnM.addEventListener("click", () => setMode(false));
+    btnT.addEventListener("click", () => setMode(true));
+    window.addEventListener("resize", () => { if (timelineMode) { sizeHost(); tlView.resize(); } });
+  }
+}
 
 window.addEventListener("resize", () => { resize(); draw(); });
 resize();

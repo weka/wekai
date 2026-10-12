@@ -1,0 +1,39 @@
+{
+  "details": {
+    "num_prompt_tokens": 100,
+    "num_gpu_cached_tokens": 64,
+    "num_external_tokens": 16,
+    "num_computed_tokens": 20,
+    "num_preemptions": 1,
+    "preempt_discarded_tokens": 40,
+    "num_external_load_failures": 2,
+    "external_load_recompute_tokens": 32,
+    "queue_wait_kv": 0.5,
+    "queue_wait_other": 0.25,
+    "kv_fetch": 1.5,
+    "prefill": 2.0,
+    "decode": 3.0,
+    "preempted_time": 0.75
+  },
+  "usage_extension": {
+    "prompt_tokens_details": {
+      "cached_tokens": 80,
+      "kv_sources": {"gpu_cache": 64, "external": 16, "computed": 20},
+      "kv_recompute": {
+        "num_preemptions": 1,
+        "preempt_discarded_tokens": 40,
+        "num_external_load_failures": 2,
+        "external_load_recompute_tokens": 32
+      }
+    },
+    "vllm_request_timings": {
+      "queue_wait_kv": 0.5,
+      "queue_wait_other": 0.25,
+      "kv_fetch": 1.5,
+      "prefill": 2.0,
+      "decode": 3.0,
+      "preempted_time": 0.75,
+      "num_preemptions": 1
+    }
+  }
+}

@@ -1,0 +1,23 @@
+/* Timeline renderer styles. Scoped under .wtl so the component can sit inside
+   the benchmark report, the standalone page and the live page unchanged.
+   Palette follows the report (WEKA brand surfaces, restrained tints). */
+.wtl { display: flex; flex-direction: column; min-height: 0; min-width: 0; color: #C9C9C9; font-family: "Onest", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; }
+.wtl-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 4px 0 6px; }
+.wtl-bar label { display: inline-flex; align-items: center; gap: 4px; color: #8a9096; }
+.wtl-bar select, .wtl-bar button { font: inherit; padding: 2px 8px; background: #171C20; color: #F2F2EB; border: 1px solid #42464A; border-radius: 4px; cursor: pointer; }
+.wtl-bar button:hover { background: #2A3038; }
+.wtl-bar .wtl-info { color: #C79FF1; }
+.wtl-bar .wtl-hint { color: #8a9096; margin-left: auto; }
+.wtl-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 0 0 6px; }
+.wtl-legend span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.wtl-legend i { display: inline-block; width: 14px; height: 8px; border-radius: 1px; }
+.wtl-scroll { position: relative; flex: 1 1 auto; min-height: 120px; overflow-y: auto; overflow-x: hidden; background: #0D1013; border: 1px solid #42464A; border-radius: 6px; }
+.wtl-content { position: relative; width: 100%; }
+.wtl-canvas { position: sticky; top: 0; left: 0; display: block; cursor: crosshair; }
+.wtl-tip { position: fixed; z-index: 50; display: none; max-width: 420px; padding: 8px 10px; background: #1E2429; color: #F2F2EB; border: 1px solid #42464A; border-radius: 6px; font-size: 12px; line-height: 1.45; pointer-events: none; box-shadow: 0 4px 16px rgba(0,0,0,.45); }
+.wtl-tip b { color: #C79FF1; font-weight: 500; }
+.wtl-tip table { border-collapse: collapse; margin-top: 4px; }
+.wtl-tip td { padding: 0 8px 0 0; vertical-align: baseline; }
+.wtl-tip td:last-child { text-align: right; padding-right: 0; font-variant-numeric: tabular-nums; }
+.wtl-tip i { display: inline-block; width: 9px; height: 9px; border-radius: 1px; margin-right: 5px; }
+.wtl-empty { position: absolute; inset: 40px 0 0 0; text-align: center; color: #8a9096; pointer-events: none; }

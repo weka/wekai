@@ -69,6 +69,9 @@ type UsageData struct {
 	// CachedDetails is SGLang's per-tier cached-token breakdown
 	// (sglext.cached_tokens_details); nil when the server did not report one.
 	CachedDetails *CachedTokensDetails `json:"cached_tokens_details,omitempty"`
+	// KV is vLLM's per-request KV provenance and engine timings
+	// (--enable-request-kv-details); nil when the server reported none.
+	KV *KVDetails `json:"kv,omitempty"`
 }
 
 // CachedTokensDetails is SGLang's per-tier split of a request's cached prompt

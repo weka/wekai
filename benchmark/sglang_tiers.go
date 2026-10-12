@@ -60,3 +60,15 @@ func (s sglangTierSnapshot) summaryLine() string {
 	return fmt.Sprintf("sglang cache tiers: device=%s host=%s storage=%s computed=%s (%d reqs)",
 		formatKiloInt(s.device), formatKiloInt(s.host), formatKiloInt(s.storage), formatKiloInt(s.computed), s.reqs)
 }
+
+// applyKV records the engine's per-request KV provenance on rec: vLLM's
+// token sources, recompute counters and timings when the server reported
+// them, and SGLang's tier split mapped onto the same token-sources shape.
+// Absent from rec entirely when the engine reported neither. InputTokens must
+// already be set (SGLang's computed share is the prompt remainder).
+func (rec *requestDataRecord) applyKV(m *RequestMetrics) {
+	rec.applyCachedDetails(m.CachedDetails)
+	if kv := m.KV.WithSGLang(m.CachedDetails, rec.InputTokens+rec.CachedTokens); kv != nil {
+		rec.KV = kv
+	}
+}

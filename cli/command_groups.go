@@ -8,6 +8,7 @@ type BenchmarkCommands struct {
 	Throughput     BenchmarkThroughputCommand     `command:"throughput" description:"Three-phase throughput benchmark (cold prefill, warm prefill, decode)"`
 	Visualize      BenchmarkVisualizeCommand      `command:"visualize" description:"Generate HTML visualization from request data directory"`
 	VisualizeMerge BenchmarkVisualizeMergeCommand `command:"visualize-merge" description:"Merge multiple result directories into a single visualization"`
+	Timeline       BenchmarkTimelineCommand       `command:"timeline" description:"Generate just the request-timeline view (one bar per request) from a request data directory"`
 }
 
 func (b *BenchmarkCommands) Init() {
@@ -15,6 +16,7 @@ func (b *BenchmarkCommands) Init() {
 	b.Throughput.BenchmarkThroughputOptions = &BenchmarkThroughputOptions{}
 	b.Visualize.BenchmarkVisualizeOptions = &BenchmarkVisualizeOptions{}
 	b.VisualizeMerge.BenchmarkVisualizeMergeOptions = &BenchmarkVisualizeMergeOptions{}
+	b.Timeline.BenchmarkTimelineOptions = &BenchmarkTimelineOptions{}
 }
 
 // RouterCommands groups the `router` subcommand tree.

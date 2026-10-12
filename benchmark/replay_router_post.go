@@ -1111,8 +1111,11 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 				CompletionTokens    int `json:"completion_tokens"`
 				TotalTokens         int `json:"total_tokens"`
 				PromptTokensDetails *struct {
-					CachedTokens int `json:"cached_tokens"`
+					CachedTokens int              `json:"cached_tokens"`
+					KVSources    *llm.KVSources   `json:"kv_sources,omitempty"`
+					KVRecompute  *llm.KVRecompute `json:"kv_recompute,omitempty"`
 				} `json:"prompt_tokens_details,omitempty"`
+				Timings *llm.RequestTimings `json:"vllm_request_timings,omitempty"`
 			} `json:"usage,omitempty"`
 			SGLExt *llm.SGLExt `json:"sglext,omitempty"`
 		}
@@ -1130,10 +1133,13 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 		if chunk.Usage != nil {
 			m.UsageObserved = true
 			cached := 0
-			if chunk.Usage.PromptTokensDetails != nil {
-				cached = chunk.Usage.PromptTokensDetails.CachedTokens
+			var kvSrc *llm.KVSources
+			var kvRc *llm.KVRecompute
+			if d := chunk.Usage.PromptTokensDetails; d != nil {
+				cached, kvSrc, kvRc = d.CachedTokens, d.KVSources, d.KVRecompute
 			}
 			m.UsageData = buildReplayUsage(chunk.Usage.PromptTokens, cached, chunk.Usage.CompletionTokens)
+			m.KV = llm.NewKVDetails(kvSrc, kvRc, chunk.Usage.Timings)
 		}
 
 		// Capture content delta & TTFT.
@@ -1200,8 +1206,11 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 			CompletionTokens    int `json:"completion_tokens"`
 			TotalTokens         int `json:"total_tokens"`
 			PromptTokensDetails *struct {
-				CachedTokens int `json:"cached_tokens"`
+				CachedTokens int              `json:"cached_tokens"`
+				KVSources    *llm.KVSources   `json:"kv_sources,omitempty"`
+				KVRecompute  *llm.KVRecompute `json:"kv_recompute,omitempty"`
 			} `json:"prompt_tokens_details,omitempty"`
+			Timings *llm.RequestTimings `json:"vllm_request_timings,omitempty"`
 		} `json:"usage,omitempty"`
 		SGLExt *llm.SGLExt `json:"sglext,omitempty"`
 	}
@@ -1225,10 +1234,13 @@ func consumeOpenAIPlain(body io.Reader, startTime time.Time, m *RequestMetrics) 
 	if resp.Usage != nil {
 		m.UsageObserved = true
 		cached := 0
-		if resp.Usage.PromptTokensDetails != nil {
-			cached = resp.Usage.PromptTokensDetails.CachedTokens
+		var kvSrc *llm.KVSources
+		var kvRc *llm.KVRecompute
+		if d := resp.Usage.PromptTokensDetails; d != nil {
+			cached, kvSrc, kvRc = d.CachedTokens, d.KVSources, d.KVRecompute
 		}
 		m.UsageData = buildReplayUsage(resp.Usage.PromptTokens, cached, resp.Usage.CompletionTokens)
+		m.KV = llm.NewKVDetails(kvSrc, kvRc, resp.Usage.Timings)
 	} else {
 		// Unchanged prior behavior: absent usage renders as all-zero, not an
 		// error — only UsageObserved distinguishes this from a genuinely

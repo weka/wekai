@@ -43,3 +43,25 @@ tree.
 `router/internal/viz/` (types, handlers, embedded page) and
 `router/internal/policy/affinity/snapshot.go` (the `viz.DataSource`). The shared tree
 is natively the shape the page wants, so there is no per-poll merge step.
+
+# Request timeline (benchmark report, standalone, live)
+
+One renderer, three surfaces: `benchmark/timeline_assets/timeline.js` (+ `.css`,
+`timeline_page.html`), embedded via `go:embed` in `benchmark/timeline_page.go`.
+
+- Model (`benchmark/timeline.go`): `timelineSegments` turns a reqdata row into
+  coloured segments in Go (wait -> prefill split by token source -> preempted ->
+  decode; client-timestamp fallback). The JS only draws. `timelineKinds` is the
+  legend/colour contract shipped to the page.
+- Report: `visualize --timeline` / `visualize-merge --timeline` / `auto --timeline`
+  embed each arm's `timeline` plus the renderer and a Metrics/Timeline switch;
+  the view shares the report's `viewTMin/viewTMax` (draw() calls
+  `tlSyncFromReport`). Time basis is ms since the arm's first request.
+- Standalone: `wekai benchmark timeline <reqdata dir> -o file.html`.
+- Live: `benchmark/live_view.go`, `benchmark auto --live-port N [--live-bind A]
+  [--live-max-requests N]`. Endpoints: `/` page, `/api/arms`,
+  `/api/data?arm=i&since=seq` (incremental; `reset` when the cursor fell off the
+  bounded buffer), `/healthz`. Hooks (`liveArm.begin/complete/abandon`) are
+  nil-safe, called where `requestDataRecord`s are written (auto.go, replay.go,
+  replay_router.go). Default bind is loopback; kubectl port-forward reaches it.
+- Rendering is virtual-scrolled on one canvas, so ~70k requests cost one screenful.

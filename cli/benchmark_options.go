@@ -47,6 +47,10 @@ type BenchmarkAutoOptions struct {
 	PrintResponses                bool          `long:"print-responses" description:"Print each request and LLM response to stdout for sanity-checking; forces non-TTY display mode"`
 	PrintErrorsThreshold          string        `long:"print-errors-threshold" description:"Print errors to stderr as they occur, rate-limited to at most one per this interval (e.g. 1s, 500ms). Empty/0 = disabled." env:"BENCHMARK_PRINT_ERRORS_THRESHOLD"`
 	SaveRequestData               string        `long:"save-request-data" description:"Directory to save per-request JSONL data files (one file per model)" env:"BENCHMARK_SAVE_REQUEST_DATA"`
+	Timeline                      bool          `long:"timeline" description:"Embed the request-timeline view (one bar per request: wait, prefill split by token source, decode) in the end-of-run report. Needs --save-request-data. Adds ~100 bytes per request to the HTML." env:"BENCHMARK_TIMELINE"`
+	LivePort                      int           `long:"live-port" description:"Serve a live request timeline on this port while the benchmark runs (0 = off). Updates in place as requests complete; in-flight requests grow. Open it through kubectl port-forward when running in a pod." default:"0" env:"BENCHMARK_LIVE_PORT"`
+	LiveBind                      string        `long:"live-bind" description:"Address the --live-port server binds. Loopback by default (reachable via kubectl port-forward, nothing else); pass 0.0.0.0 only on a trusted network -- the page exposes request metadata." default:"127.0.0.1" env:"BENCHMARK_LIVE_BIND"`
+	LiveMaxRequests               int           `long:"live-max-requests" description:"Completed requests the live view keeps per arm in memory; older ones are dropped (0 = 100000)." default:"0" env:"BENCHMARK_LIVE_MAX_REQUESTS"`
 	Total                         int           `long:"total" description:"Stop after emitting this many total requests (0 = unlimited). Useful for fixed-count time measurements." env:"BENCHMARK_TOTAL"`
 	ErrorRateLimit                float64       `long:"error-rate-limit" description:"DEPRECATED: no-op. Retained for backwards compatibility. See --max-consecutive-failures." default:"0.10" env:"BENCHMARK_ERROR_RATE_LIMIT"`
 	MaxConsecutiveFailures        int           `long:"max-consecutive-failures" description:"Abort the benchmark after this many request failures in a row (any successful request resets the counter). Default 512 — high enough that brief server overload recovers before triggering." default:"512" env:"BENCHMARK_MAX_CONSECUTIVE_FAILURES"`
@@ -129,7 +133,17 @@ type BenchmarkVisualizeOptions struct {
 	Concurrency int    `long:"concurrency" description:"Override the concurrency used for the moving-average window (window = concurrency*3). Normally unnecessary: runs record their own concurrency in the reqdata JSONL and each arm is sized from its own. Use only for data recorded before run params were saved, or to force a different smoothing window." default:"0"`
 	MaxElapsed  string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
 	Overwrite   bool   `long:"overwrite" description:"Write report.html in place (overwriting an existing one) instead of creating a new report_vN.html; use for live-refreshed reports so versions do not accumulate"`
+	Timeline    bool   `long:"timeline" description:"Embed the Timeline view: one bar per request on a wall-clock axis (wait, prefill split by token source, decode), switchable from the report header. Adds ~100 bytes per request to the HTML."`
 	Args        struct {
+		Dir string `positional-arg-name:"directory" description:"Directory containing .jsonl request data files" required:"yes"`
+	} `positional-args:"yes"`
+}
+
+// BenchmarkTimelineOptions contains options for the benchmark timeline subcommand
+type BenchmarkTimelineOptions struct {
+	Output     string `long:"output" short:"o" description:"Output HTML file (default: a new timeline.html / timeline_vN.html inside the directory)"`
+	MaxElapsed string `long:"max-elapsed" description:"Drop records past this elapsed time from each file's own run start -- e.g. 7h45m, 465m, 27900s."`
+	Args       struct {
 		Dir string `positional-arg-name:"directory" description:"Directory containing .jsonl request data files" required:"yes"`
 	} `positional-args:"yes"`
 }
@@ -141,6 +155,7 @@ type BenchmarkVisualizeMergeOptions struct {
 	Concurrency int    `long:"concurrency" description:"Override the concurrency used for the moving-average window (window = concurrency*3). Normally unnecessary: runs record their own concurrency in the reqdata JSONL and each arm is sized from its own. Use only for data recorded before run params were saved, or to force a different smoothing window." default:"0"`
 	Labels      string `long:"labels" description:"Comma-separated labels for each input directory, in positional order (overrides auto-detected model aliases / directory names). Count must exactly match the number of directories (post --all expansion)."`
 	MaxElapsed  string `long:"max-elapsed" description:"Drop records past this elapsed time from each run's own start (per input directory/arm, not global wall-clock) -- e.g. 7h45m, 465m, 27900s. Also truncates vllm_metrics_sample rows so the cache-mix overlay, ingest volume, and dataset rows stop at the cutoff. Use to strip a crashed run's terminal error-storm from the report."`
+	Timeline    bool   `long:"timeline" description:"Embed the Timeline view (one bar per request, per arm) in the merged report. Adds ~100 bytes per request to the HTML."`
 	Baseline    string `long:"baseline" description:"Displayed name of the arm the summary's % comparison should be relative to (exact match; a --labels value when given). Overrides the default, which is the slowest arm by completed requests. Errors if no arm matches."`
 	Overwrite   bool   `long:"overwrite" description:"Write report.html in place (overwriting an existing one) instead of creating a new report_vN.html; use for live-refreshed reports so versions do not accumulate"`
 	Args        struct {
