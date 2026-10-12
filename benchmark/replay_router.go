@@ -984,6 +984,7 @@ func runRouterReplayInstance(
 			return
 		}
 		req.passStamp = passStamp
+		loopTop := time.Now() // the previous turn is done: the earliest this one can be eligible
 		// Hold until this turn is due. Already-late turns return at once, which
 		// is the normal case on a fleet slower than the capture: the session
 		// falls behind rather than firing a backlog.
@@ -992,6 +993,7 @@ func runRouterReplayInstance(
 		// captured think time; the lateness is taken after the concurrency gate
 		// below so that a capped run counts the time spent queued for a slot.
 		var due, refEnd time.Time
+		var pacerLate time.Duration
 		thinkPaced := false
 		if pacer.think {
 			switch req.ThinkRef {
@@ -1006,12 +1008,17 @@ func runRouterReplayInstance(
 			}
 			due, thinkPaced = pacer.thinkDue(req, refEnd)
 			if thinkPaced {
-				pacer.waitUntil(ctx, due)
+				pacerLate = pacer.waitUntil(ctx, due)
 			}
 		}
 		if !thinkPaced {
-			st.lag.observe(pacer.Wait(ctx, req.Ts))
+			pacerLate = pacer.Wait(ctx, req.Ts)
+			st.lag.observe(pacerLate)
 		}
+		// The turn became eligible at its due time (or, for a turn that is late
+		// or unpaced, when its predecessor finished). Everything from here to
+		// the concurrency gate opening is client-side wait.
+		readyAt := eligibleAt(loopTop, time.Now(), pacerLate)
 		// How far into its captured conversation this session has reached. The
 		// furthest offset any of its instances dispatched is the session's own
 		// progress through the capture, and summed across sessions it is what
@@ -1029,16 +1036,22 @@ func runRouterReplayInstance(
 		}
 		st.totalEmitted.Add(1)
 
+		slot := slotOf(ctx)
+		liveTok := st.live.begin(seriesNum, ti+1, sessionID+":"+inst.InstanceID, slot, readyAt)
 		if isFirstRequest {
 			if gerr := gate.AcquireCold(ctx); gerr != nil {
+				st.live.abandon(liveTok)
 				return
 			}
 		} else {
 			if gerr := gate.Acquire(ctx); gerr != nil {
+				st.live.abandon(liveTok)
 				return
 			}
 		}
 
+		sentAt := time.Now()
+		st.live.sent(liveTok, sentAt)
 		sendAt := pacer.clk.Now()
 		if thinkPaced {
 			st.lag.observeThink(sendAt.Sub(due), sendAt.Sub(refEnd), time.Duration(*req.ThinkMs)*time.Millisecond)
@@ -1074,8 +1087,6 @@ func runRouterReplayInstance(
 		// global/read-only (set identically on construction — see auto.go
 		// and above), and do()/dryDo() derive this call's sessionIdx from
 		// seriesNum directly, so a shared poster safely serves any session.
-		slot := slotOf(ctx)
-		liveTok := st.live.begin(seriesNum, ti+1, sessionID+":"+inst.InstanceID, slot)
 		st.skipClk.AddInflight(1)
 		if reqPoster.dryRun {
 			metrics = reqPoster.dryDo(reqCtx, req, docs, ti+1, sessionID, inst.InstanceID, seriesNum, st, su)
@@ -1089,6 +1100,7 @@ func runRouterReplayInstance(
 		gate.Release()
 		metrics.live = liveTok
 		metrics.Slot = slot
+		metrics.ReadyAt, metrics.SentAt = readyAt, sentAt
 
 		if metrics.Error != nil && ctx.Err() != nil {
 			// Run shutdown aborted this in-flight request (timeout or

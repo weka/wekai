@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/weka/wekai/llm"
 )
@@ -20,8 +21,8 @@ import (
 // timelineKinds below carries the matching legend entries, so the renderer
 // never hard-codes a kind.
 const (
-	segWaitOther      = 0 // queue wait that is not KV-blocked; also client-side wait when the engine reported none
-	segWaitKV         = 1 // waiting because KV blocks could not be allocated
+	segWaitOther      = 0 // engine queue wait that is not KV-blocked (admission limits)
+	segWaitKV         = 1 // engine queue wait because KV blocks could not be allocated
 	segPrefillCompute = 2 // prefill share for tokens the engine computed
 	segPrefillExt     = 3 // prefill share for externally loaded tokens (weka/offload), plus kv_fetch
 	segPrefillHost    = 4 // prefill share for host-DRAM tokens (SGLang HiCache L2)
@@ -31,6 +32,9 @@ const (
 	segDecode         = 8
 	segError          = 9
 	segInflight       = 10 // live view: request still running
+	segWaitClient     = 11 // client-side wait: due / eligible, but no free concurrency slot yet
+	segUnattributed   = 12 // sent, but not yet in the engine's clock: network / frontend
+	segWaited         = 13 // renderer only: all wait kinds merged
 )
 
 // Per-request flag bits.
@@ -44,6 +48,7 @@ const (
 	flagTruncated = 64  // segments were scaled down to fit the client-observed duration
 	flagSession   = 128 // first request of a new session on its slot: draw a boundary
 	flagHot       = 256 // issued by a hot-pool slot
+	flagWaiting   = 512 // live view: still waiting for a concurrency slot
 )
 
 type timelineKind struct {
@@ -57,8 +62,11 @@ type timelineKind struct {
 // report palette: cool slate for waiting, the weka purple for the external
 // tier, warm amber for computed work.
 var timelineKinds = []timelineKind{
-	{segWaitOther, "wait_other", "queue wait (other / client)", "#5b646d"},
-	{segWaitKV, "wait_kv", "queue wait (no free KV blocks)", "#FF8569"},
+	{segWaitClient, "wait_client", "client wait (no free slot)", "#b8c0c8"},
+	{segWaitOther, "wait_other", "engine queue: other limits", "#5b646d"},
+	{segWaitKV, "wait_kv", "engine queue: no free KV blocks", "#FF8569"},
+	{segUnattributed, "wait_unattributed", "unattributed wait (network / frontend)", "#a08f7a"},
+	{segWaited, "waited", "waited (all kinds merged)", "#8a9096"},
 	{segPrefillCompute, "prefill_computed", "prefill: computed", "#d9b73a"},
 	{segPrefillExt, "prefill_external", "prefill: external (weka / offload)", "#a678e8"},
 	{segPrefillHost, "prefill_host", "prefill: host DRAM", "#3fa7b5"},
@@ -85,6 +93,7 @@ type timelineReq struct {
 	In     int       `json:"i,omitempty"` // net-of-cache input tokens
 	Cached int       `json:"c,omitempty"`
 	Out    int       `json:"o,omitempty"`
+	CW     float64   `json:"cw,omitempty"` // client-side wait (ready -> sent) in ms; included in E2E
 	Flags  int       `json:"x,omitempty"`
 	Src    []int     `json:"src,omitempty"` // gpu, host, external, computed
 	Rec    []int     `json:"rc,omitempty"`  // preemptions, discarded tokens, load failures, recompute tokens
@@ -164,18 +173,27 @@ func splitPrefill(prefillMs, kvFetchMs float64, src *llm.TokenSources) []tlSeg {
 // timelineSegments computes a request's bar. e2eMs and ttftMs are the
 // client-observed durations.
 //
-// With engine timings the bar is: wait (any client-side time the engine did
-// not see, then queue_wait_other), queue_wait_kv, prefill (split by token
-// source, kv_fetch folded into the external share), preempted, decode. If the
+// clientWaitMs is time the request spent eligible but not yet sent (no free
+// concurrency slot); it leads the bar and is NOT part of e2eMs.
+//
+// With engine timings the bar is: client wait, engine queue_wait_other,
+// queue_wait_kv, unattributed (client time the engine did not see: network,
+// frontend), prefill (split by token source, kv_fetch folded into the external
+// share), preempted, decode. If the
 // engine's phases add up to more than the client saw (clock skew, rounding)
 // they are scaled down to fit and the truncated flag is returned.
 //
 // Without engine timings the client's first-token time is the prefill span
 // (split by source when sources are known, e.g. SGLang) and the rest decode;
 // whatever wait preceded it cannot be separated from prefill.
-func timelineSegments(e2eMs, ttftMs float64, isErr bool, kv *llm.KVDetails) (segs []tlSeg, truncated bool) {
+func timelineSegments(clientWaitMs, e2eMs, ttftMs float64, isErr bool, kv *llm.KVDetails) (segs []tlSeg, truncated bool) {
 	if e2eMs < 0 {
 		e2eMs = 0
+	}
+	if clientWaitMs > 0 {
+		defer func() {
+			segs = append([]tlSeg{{segWaitClient, clientWaitMs}}, segs...)
+		}()
 	}
 	if isErr {
 		return []tlSeg{{segError, e2eMs}}, false
@@ -199,11 +217,14 @@ func timelineSegments(e2eMs, ttftMs float64, isErr bool, kv *llm.KVDetails) (seg
 			}
 			lead = 0
 		}
-		if w := lead + qo; w > 0 {
-			segs = append(segs, tlSeg{segWaitOther, w})
+		if qo > 0 {
+			segs = append(segs, tlSeg{segWaitOther, qo})
 		}
 		if qkv > 0 {
 			segs = append(segs, tlSeg{segWaitKV, qkv})
+		}
+		if lead > 0 {
+			segs = append(segs, tlSeg{segUnattributed, lead})
 		}
 		segs = append(segs, splitPrefill(pre, kvf, src)...)
 		if prm > 0 {
@@ -231,12 +252,14 @@ func timelineFromRecord(r requestDataRecord, t0 int64) timelineReq {
 	if e2e <= 0 && !r.EndTime.IsZero() {
 		e2e = float64(r.EndTime.Sub(r.StartTime).Milliseconds())
 	}
-	segs, trunc := timelineSegments(e2e, r.TTFT, r.IsError, r.KV)
+	cw := clientWaitMs(r)
+	segs, trunc := timelineSegments(cw, e2e, r.TTFT, r.IsError, r.KV)
 	tr := timelineReq{
 		Series: r.SeriesNum,
 		Turn:   r.Turn,
-		Start:  float64(r.StartTime.UnixMilli() - t0),
-		E2E:    e2e,
+		Start:  float64(r.StartTime.UnixMilli()-t0) - cw,
+		E2E:    e2e + cw,
+		CW:     cw,
 		TTFT:   r.TTFT,
 		In:     r.InputTokens,
 		Cached: r.CachedTokens,
@@ -382,4 +405,24 @@ func newTimelinePayload(arms ...timelineArm) timelinePayload {
 // timelineSummary is a one-line description for CLI output.
 func (a timelineArm) summary() string {
 	return fmt.Sprintf("%s: %d requests over %.0fs", a.Name, len(a.Reqs), a.Span/1000)
+}
+
+// clientWaitMs is how long the request sat eligible but unsent (ready -> sent),
+// or 0 when either stamp is absent (older data) or they are inconsistent.
+func clientWaitMs(r requestDataRecord) float64 {
+	if r.ReadyMs <= 0 || r.SentMs < r.ReadyMs {
+		return 0
+	}
+	return float64(r.SentMs - r.ReadyMs)
+}
+
+// eligibleAt is when a paced request became eligible to send. The pacer waited
+// until the request was due (late == 0, so it is eligible now) or found it
+// already late by `late` (it was due that long ago). It cannot have been
+// eligible before its predecessor finished (loopTop).
+func eligibleAt(loopTop, now time.Time, late time.Duration) time.Time {
+	if r := now.Add(-late); r.After(loopTop) {
+		return r
+	}
+	return loopTop
 }

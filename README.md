@@ -159,13 +159,25 @@ Helm equivalents: `replay.realtime=true`, `replay.admitCount=32`, and
 
 **Where the replay file comes from.** `wekai router serve` proxies live
 LLM traffic and captures it (redacted); `wekai router replay-prepare`
-compiles those captures into a single replay-v3 JSONL file — one header
+compiles those captures into a single replay-v4 JSONL file (replay-v3 still loads) — one header
 line plus one session per line, so the replayer streams it with a bounded
 queue regardless of file size. Each request embeds the original structured
 spec (system blocks, tools, messages) with content regenerated
 deterministically from each block's hash: same hash → same bytes → the
 server's prefix cache hits exactly the way the original traffic did,
 without shipping any real captured text.
+
+**Think time (replay-v4).** Each request carries `total_ms` and `think_ms`:
+the gap between the END of its reference (`think_ref`: `prev` = the same
+agent's previous request, `spawn` = the parent request that spawned a
+sub-agent, `session_start`) and its own start, clamped at 0. With
+`--replay-realtime`, `--replay-timing=think` (the default when the file
+has `think_ms`) schedules each turn at the end of its reference on THIS
+run's clock plus the captured think time, so a fleet that answers faster or
+slower than the capture keeps the user's pauses; `--replay-timing=absolute`
+keeps the captured-offset schedule. `replay-prepare --since/--until/
+--complete-by` bound the capture by request time when a corpus is rebuilt
+from a directory that has grown.
 
 **Downloading it.** The capture embedded in the image and run by the Helm
 chart is published as a scratch image holding just `/replay.jsonl`, pulled

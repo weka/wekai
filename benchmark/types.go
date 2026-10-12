@@ -50,9 +50,13 @@ type RequestMetrics struct {
 	// zero value means no live view is attached.
 	live liveToken
 	// Slot is the concurrency slot that issued the request (see slotInfo).
-	Slot     slotInfo
-	Error    error
-	Response string // The actual response content
+	Slot slotInfo
+	// ReadyAt is when the request became eligible to send (its turn was due /
+	// its predecessor had finished); SentAt is when it was actually issued after
+	// the concurrency gate opened. Their difference is client-side wait.
+	ReadyAt, SentAt time.Time
+	Error           error
+	Response        string // The actual response content
 	// ContentOnly is the assistant's content stream WITHOUT the reasoning
 	// trace. Response merges reasoning in, so a UUID recalled inside a
 	// reasoning trace still counts as PRESENT; that merge is wrong for any

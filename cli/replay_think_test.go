@@ -147,12 +147,19 @@ func TestReplayRequestOmitsAbsentThink(t *testing.T) {
 
 func TestFilterRecordsByTime(t *testing.T) {
 	mk := func(s string) treeRecord { ts, _ := time.Parse(time.RFC3339Nano, s); return treeRecord{Ts: ts} }
+	slow := mk("2026-07-07T08:17:13Z")
+	slow.TotalMs = 21_000
 	recs := []treeRecord{mk("2026-05-11T00:00:00Z"), mk("2026-05-12T00:00:00Z"), mk("2026-07-07T08:17:18.5Z"), mk("2026-07-08T00:00:00Z")}
-	out, err := filterRecordsByTime(append([]treeRecord(nil), recs...), "2026-05-12T00:00:00Z", "2026-07-07T08:17:18.999999999Z")
+	out, err := filterRecordsByTime(append([]treeRecord(nil), recs...), "2026-05-12T00:00:00Z", "2026-07-07T08:17:18.999999999Z", "")
 	if err != nil || len(out) != 2 {
 		t.Fatalf("got %d records (err %v), want 2", len(out), err)
 	}
-	if _, err := filterRecordsByTime(recs, "garbage", ""); err == nil {
+	// A request still in flight at the cut is dropped; one that finished stays.
+	out, err = filterRecordsByTime([]treeRecord{mk("2026-07-07T08:17:00Z"), slow}, "", "", "2026-07-07T08:17:24Z")
+	if err != nil || len(out) != 1 {
+		t.Errorf("complete-by kept %d records (err %v), want 1", len(out), err)
+	}
+	if _, err := filterRecordsByTime(recs, "garbage", "", ""); err == nil {
 		t.Error("bad --since accepted")
 	}
 }

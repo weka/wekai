@@ -48,7 +48,7 @@
     if (busy) return;
     busy = true;
     var i = tl.currentArm();
-    fetch(CFG.base + "api/data?arm=" + i + "&since=" + (seqs[i] || 0), { cache: "no-store" })
+    fetch((CFG.base || "") + "api/data?arm=" + i + "&since=" + (seqs[i] || 0), { cache: "no-store" })
       .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
       .then(function (d) {
         failures = 0;
@@ -60,7 +60,7 @@
       .catch(function (e) { failures++; sub.textContent = "connection lost (" + e.message + ") — retrying"; })
       .then(function () { busy = false; });
   }
-  fetch(CFG.base + "api/arms", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (m) {
+  fetch((CFG.base || "") + "api/arms", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (m) {
     tl.setArms(mkArms(m.arms));
     poll();
     setInterval(poll, CFG.pollMs);

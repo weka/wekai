@@ -30,16 +30,17 @@ func goldenKV() *llm.KVDetails {
 }
 
 // Golden numbers: prefill 2000ms splits 20/16/64 of 100 tokens; kv_fetch joins
-// the external share; the 500ms the engine did not see leads as wait.
+// the external share; the 500ms the engine did not see is unattributed wait.
 func TestTimelineSegmentsEngineTimings(t *testing.T) {
-	segs, trunc := timelineSegments(8500, 3000, false, goldenKV())
+	segs, trunc := timelineSegments(0, 8500, 3000, false, goldenKV())
 	if trunc {
 		t.Error("unexpected truncation")
 	}
 	m := segMap(segs)
 	want := map[int]float64{
-		segWaitOther:      750,  // 500 client-side lead + 250 queue_wait_other
-		segWaitKV:         500,  //
+		segWaitOther:      250, // queue_wait_other
+		segWaitKV:         500,
+		segUnattributed:   500,  // e2e minus everything the engine accounted for
 		segPrefillCompute: 400,  // 2000 * 20/100
 		segPrefillExt:     1820, // 2000 * 16/100 + 1500 kv_fetch
 		segPrefillGPU:     1280, // 2000 * 64/100
@@ -58,12 +59,12 @@ func TestTimelineSegmentsEngineTimings(t *testing.T) {
 	if !near(total, 8500) {
 		t.Errorf("segments sum to %.2f, want the 8500ms e2e", total)
 	}
-	// Left to right: wait, kv wait, computed, external, gpu, preempted, decode.
+	// Left to right: engine queue, kv queue, unattributed, computed, external, gpu, preempted, decode.
 	order := []int{}
 	for _, s := range segs {
 		order = append(order, s.kind)
 	}
-	wantOrder := []int{segWaitOther, segWaitKV, segPrefillCompute, segPrefillExt, segPrefillGPU, segPreempted, segDecode}
+	wantOrder := []int{segWaitOther, segWaitKV, segUnattributed, segPrefillCompute, segPrefillExt, segPrefillGPU, segPreempted, segDecode}
 	if len(order) != len(wantOrder) {
 		t.Fatalf("order = %v", order)
 	}
@@ -75,7 +76,7 @@ func TestTimelineSegmentsEngineTimings(t *testing.T) {
 }
 
 func TestTimelineSegmentsScaleWhenEngineExceedsClient(t *testing.T) {
-	segs, trunc := timelineSegments(4000, 1000, false, goldenKV()) // engine phases sum to 8000
+	segs, trunc := timelineSegments(0, 4000, 1000, false, goldenKV()) // engine phases sum to 8000
 	if !trunc {
 		t.Error("expected the truncated flag")
 	}
@@ -96,7 +97,7 @@ func TestTimelineSegmentsExternalFromKVFetchWithoutTokens(t *testing.T) {
 		Sources: &llm.TokenSources{Computed: 100},
 		Timings: &llm.RequestTimings{KVFetch: 0.2, Prefill: 1, Decode: 1},
 	}
-	m := segMap(mustSegs(timelineSegments(2200, 0, false, kv)))
+	m := segMap(mustSegs(timelineSegments(0, 2200, 0, false, kv)))
 	if !near(m[segPrefillExt], 200) || !near(m[segPrefillCompute], 1000) {
 		t.Errorf("segments = %v", m)
 	}
@@ -108,7 +109,7 @@ func mustSegs(s []tlSeg, _ bool) []tlSeg { return s }
 // span, split by tokens.
 func TestTimelineSegmentsSourcesWithoutTimings(t *testing.T) {
 	kv := &llm.KVDetails{Sources: &llm.TokenSources{GPU: 600, Host: 300, External: 100, Computed: 200}}
-	m := segMap(mustSegs(timelineSegments(5000, 1200, false, kv)))
+	m := segMap(mustSegs(timelineSegments(0, 5000, 1200, false, kv)))
 	if !near(m[segPrefillGPU], 600) || !near(m[segPrefillHost], 300) || !near(m[segPrefillExt], 100) || !near(m[segPrefillCompute], 200) {
 		t.Errorf("prefill split = %v", m)
 	}
@@ -120,25 +121,25 @@ func TestTimelineSegmentsSourcesWithoutTimings(t *testing.T) {
 // No engine details at all: start, first token, end -> one unknown prefill
 // colour then decode.
 func TestTimelineSegmentsClientOnlyFallback(t *testing.T) {
-	segs, _ := timelineSegments(5000, 1200, false, nil)
+	segs, _ := timelineSegments(0, 5000, 1200, false, nil)
 	if len(segs) != 2 || segs[0] != (tlSeg{segPrefillUnknown, 1200}) || segs[1] != (tlSeg{segDecode, 3800}) {
 		t.Errorf("segs = %+v", segs)
 	}
 	// TTFT missing or beyond e2e: the whole bar is prefill.
 	for _, ttft := range []float64{0, 9000} {
-		segs, _ = timelineSegments(5000, ttft, false, nil)
+		segs, _ = timelineSegments(0, 5000, ttft, false, nil)
 		if len(segs) != 1 || segs[0] != (tlSeg{segPrefillUnknown, 5000}) {
 			t.Errorf("ttft=%v segs = %+v", ttft, segs)
 		}
 	}
-	if segs, _ = timelineSegments(700, 100, true, goldenKV()); len(segs) != 1 || segs[0].kind != segError {
+	if segs, _ = timelineSegments(0, 700, 100, true, goldenKV()); len(segs) != 1 || segs[0].kind != segError {
 		t.Errorf("error request segs = %+v", segs)
 	}
 }
 
 func TestTimelineSegmentsZeroSources(t *testing.T) {
 	kv := &llm.KVDetails{Sources: &llm.TokenSources{}, Timings: &llm.RequestTimings{Prefill: 1, KVFetch: 0.5, Decode: 1}}
-	m := segMap(mustSegs(timelineSegments(2500, 0, false, kv)))
+	m := segMap(mustSegs(timelineSegments(0, 2500, 0, false, kv)))
 	if !near(m[segPrefillUnknown], 1500) {
 		t.Errorf("segments = %v", m)
 	}
@@ -341,5 +342,140 @@ func TestRequestDataSlotRoundTrip(t *testing.T) {
 	b, _ := json.Marshal(requestDataRecord{})
 	if strings.Contains(string(b), `"slot"`) || strings.Contains(string(b), `"slot_hot"`) {
 		t.Errorf("zero slot serialized: %s", b)
+	}
+}
+
+// Client wait (eligible but unsent) leads the bar and is not part of e2e; engine
+// queue waits and the unattributed gap follow, each in its own kind.
+func TestTimelineSegmentsWaitsSeparated(t *testing.T) {
+	segs, _ := timelineSegments(1200, 8500, 3000, false, goldenKV())
+	want := []int{segWaitClient, segWaitOther, segWaitKV, segUnattributed, segPrefillCompute, segPrefillExt, segPrefillGPU, segPreempted, segDecode}
+	if len(segs) != len(want) {
+		t.Fatalf("segs = %+v", segs)
+	}
+	for i, k := range want {
+		if segs[i].kind != k {
+			t.Fatalf("segment %d kind = %d, want %d (%+v)", i, segs[i].kind, k, segs)
+		}
+	}
+	if !near(segs[0].ms, 1200) {
+		t.Errorf("client wait = %.1f, want 1200", segs[0].ms)
+	}
+	var total float64
+	for _, s := range segs {
+		total += s.ms
+	}
+	if !near(total, 9700) { // client wait + e2e
+		t.Errorf("sum = %.1f, want 9700", total)
+	}
+	// No gate wait: no client segment at all.
+	if segs, _ = timelineSegments(0, 8500, 3000, false, goldenKV()); segs[0].kind == segWaitClient {
+		t.Error("client wait segment drawn for a request that did not wait")
+	}
+	// Without engine timings the client wait still leads, before the unknown prefill.
+	segs, _ = timelineSegments(300, 5000, 1200, false, nil)
+	if len(segs) != 3 || segs[0] != (tlSeg{segWaitClient, 300}) || segs[1].kind != segPrefillUnknown {
+		t.Errorf("client-only segs = %+v", segs)
+	}
+	// Engine phases exceeding the client e2e never make the unattributed gap negative.
+	for _, s := range mustSegs(timelineSegments(0, 4000, 1000, false, goldenKV())) {
+		if s.ms < 0 {
+			t.Errorf("negative segment %+v", s)
+		}
+	}
+}
+
+// ready/sent stamps become the client wait and shift the bar's start left; old
+// rows (no stamps) are unchanged.
+func TestTimelineClientWaitFromStamps(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	rec := requestDataRecord{StartTime: base.Add(2 * time.Second), ResponseMs: 1000, TTFT: 200, SeriesNum: 1,
+		ReadyMs: base.UnixMilli(), SentMs: base.Add(1500 * time.Millisecond).UnixMilli()}
+	q := timelineFromRecord(rec, base.UnixMilli())
+	if q.CW != 1500 || q.Start != 500 || q.E2E != 2500 {
+		t.Errorf("cw=%v start=%v e2e=%v, want 1500 / 500 / 2500", q.CW, q.Start, q.E2E)
+	}
+	if q.Segs[0] != segWaitClient || q.Segs[1] != 1500 {
+		t.Errorf("segs = %v", q.Segs)
+	}
+	rec.ReadyMs, rec.SentMs = 0, 0
+	if q = timelineFromRecord(rec, base.UnixMilli()); q.CW != 0 || q.Start != 2000 || q.E2E != 1000 {
+		t.Errorf("old row: %+v", q)
+	}
+	// Inconsistent stamps (sent before ready) are ignored rather than trusted.
+	rec.ReadyMs, rec.SentMs = base.UnixMilli()+5000, base.UnixMilli()
+	if q = timelineFromRecord(rec, base.UnixMilli()); q.CW != 0 {
+		t.Errorf("inconsistent stamps gave cw=%v", q.CW)
+	}
+}
+
+// Gate wait present vs absent in the live in-flight view: a request that has not
+// been sent yet is flagged waiting; once sent, its wait is fixed.
+func TestLiveInflightClientWait(t *testing.T) {
+	a := newLiveArm("a", 10)
+	ready := time.Now().Add(-2 * time.Second)
+	tok := a.begin(1, 1, "", slotInfo{N: 1}, ready)
+	d := a.snapshot(0)
+	if d.Inflight[0].Flags&flagWaiting == 0 {
+		t.Error("unsent request must be flagged waiting")
+	}
+	a.sent(tok, ready.Add(1500*time.Millisecond))
+	q := a.snapshot(0).Inflight[0]
+	if q.Flags&flagWaiting != 0 || q.CW != 1500 {
+		t.Errorf("after sent: flags=%d cw=%v", q.Flags, q.CW)
+	}
+	rec := requestDataRecord{StartTime: ready.Add(1500 * time.Millisecond), ResponseMs: 400, SeriesNum: 1, Slot: 1,
+		ReadyMs: ready.UnixMilli(), SentMs: ready.Add(1500 * time.Millisecond).UnixMilli()}
+	a.complete(tok, rec)
+	done := a.snapshot(0).Reqs[0]
+	if done.CW != 1500 || done.E2E != 1900 {
+		t.Errorf("completed: cw=%v e=%v", done.CW, done.E2E)
+	}
+}
+
+// The renderer's merge toggle collapses exactly the wait kinds the model emits.
+func TestTimelineKindsMergeContract(t *testing.T) {
+	js := timelineJS
+	for _, want := range []string{"WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1 }", "WAITED = 13"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("renderer lacks %q", want)
+		}
+	}
+	ids := map[int]string{}
+	for _, k := range timelineKinds {
+		ids[k.ID] = k.Key
+	}
+	if ids[segWaitClient] != "wait_client" || ids[segWaitOther] != "wait_other" || ids[segWaitKV] != "wait_kv" ||
+		ids[segUnattributed] != "wait_unattributed" || ids[segWaited] != "waited" {
+		t.Errorf("kinds = %v", ids)
+	}
+}
+
+// The live page's fetch URLs are built from a base that is absent from the config
+// when empty; concatenating it unguarded requested "undefinedapi/arms".
+func TestLivePageFetchBaseGuarded(t *testing.T) {
+	if strings.Contains(timelinePageHTML, "CFG.base +") {
+		t.Error("page concatenates CFG.base without a default")
+	}
+}
+
+// Realtime replay: a turn the pacer waited for became eligible at its due time
+// (now); one it found late was eligible `late` ago, but never before its
+// predecessor finished.
+func TestEligibleAtDueVersusSent(t *testing.T) {
+	top := time.Unix(1000, 0)
+	now := top.Add(10 * time.Second)
+	if got := eligibleAt(top, now, 0); !got.Equal(now) {
+		t.Errorf("waited-for turn: ready = %v, want now", got)
+	}
+	if got := eligibleAt(top, now, 4*time.Second); !got.Equal(top.Add(6 * time.Second)) {
+		t.Errorf("4s-late turn: ready = %v, want due time", got)
+	}
+	if got := eligibleAt(top, now, time.Hour); !got.Equal(top) {
+		t.Errorf("turn due before its predecessor ended: ready = %v, want loop top", got)
+	}
+	// Closed loop (no pacing): ready is the loop top only when nothing delays it.
+	if got := eligibleAt(top, top, 0); !got.Equal(top) {
+		t.Errorf("unpaced: ready = %v", got)
 	}
 }

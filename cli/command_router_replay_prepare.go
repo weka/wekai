@@ -23,7 +23,11 @@ type RouterReplayPrepareCommand struct {
 	// so a corpus can be rebuilt from a directory that has grown since.
 	Since string `long:"since" description:"Only records with ts >= this RFC3339 instant"`
 	Until string `long:"until" description:"Only records with ts <= this RFC3339 instant"`
-	Args  struct {
+	// CompleteBy drops records still in flight at an instant: a capture synced
+	// while requests were running holds only those already finished, so
+	// rebuilding the same corpus from the finished file needs the same cut.
+	CompleteBy string `long:"complete-by" description:"Only records whose response had finished (ts + total_ms) by this RFC3339 instant"`
+	Args       struct {
 		Src string `positional-arg-name:"src" description:"Directory of redacted *.jsonl files (or one .jsonl). Default: ~/.wekai/router/capture/redacted/"`
 	} `positional-args:"yes"`
 }
@@ -184,7 +188,7 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 		if err != nil {
 			return fmt.Errorf("parse %s: %w", f, err)
 		}
-		recs, err = filterRecordsByTime(recs, c.Since, c.Until)
+		recs, err = filterRecordsByTime(recs, c.Since, c.Until, c.CompleteBy)
 		if err != nil {
 			return err
 		}
@@ -463,13 +467,13 @@ func parseTreeFile(path string) ([]treeRecord, error) {
 	return recs, err
 }
 
-// filterRecordsByTime keeps records with since <= ts <= until; an empty bound
-// is open.
-func filterRecordsByTime(recs []treeRecord, since, until string) ([]treeRecord, error) {
-	if since == "" && until == "" {
+// filterRecordsByTime keeps records with since <= ts <= until whose response
+// finished (ts + total_ms) by completeBy; an empty bound is open.
+func filterRecordsByTime(recs []treeRecord, since, until, completeBy string) ([]treeRecord, error) {
+	if since == "" && until == "" && completeBy == "" {
 		return recs, nil
 	}
-	var lo, hi time.Time
+	var lo, hi, done time.Time
 	var err error
 	if since != "" {
 		if lo, err = time.Parse(time.RFC3339Nano, since); err != nil {
@@ -481,8 +485,16 @@ func filterRecordsByTime(recs []treeRecord, since, until string) ([]treeRecord, 
 			return nil, fmt.Errorf("--until: %w", err)
 		}
 	}
+	if completeBy != "" {
+		if done, err = time.Parse(time.RFC3339Nano, completeBy); err != nil {
+			return nil, fmt.Errorf("--complete-by: %w", err)
+		}
+	}
 	out := recs[:0]
 	for _, r := range recs {
+		if completeBy != "" && r.Ts.Add(time.Duration(r.TotalMs)*time.Millisecond).After(done) {
+			continue
+		}
 		if since != "" && r.Ts.Before(lo) {
 			continue
 		}

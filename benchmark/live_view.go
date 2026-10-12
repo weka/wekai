@@ -51,7 +51,8 @@ type liveDone struct {
 
 type liveInflight struct {
 	series, turn, lane, sub int
-	start                   time.Time
+	start                   time.Time // when the request became eligible (ready)
+	sentAt                  time.Time // zero while it still waits for a concurrency slot
 	guid                    string
 	slot                    slotInfo
 	newSession              bool
@@ -113,19 +114,34 @@ func (a *liveArm) packer(k rowKey) *subRowPacker {
 }
 
 // begin registers a request that is about to be sent.
-func (a *liveArm) begin(series, turn int, guid string, sl slotInfo) liveToken {
+//
+// ready is when the request became eligible to send; until sent is called it
+// shows as client wait (no free concurrency slot).
+func (a *liveArm) begin(series, turn int, guid string, sl slotInfo, ready time.Time) liveToken {
 	if a == nil {
 		return liveToken{}
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.nextID++
-	now := time.Now()
 	k := rowKeyOf(sl.N, series)
-	sub := a.packer(k).place(float64(now.Sub(a.t0).Milliseconds()), math.Inf(1))
-	a.inflight[a.nextID] = liveInflight{series: series, turn: turn, lane: a.lane(k), sub: sub, start: now, guid: guid,
+	sub := a.packer(k).place(float64(ready.Sub(a.t0).Milliseconds()), math.Inf(1))
+	a.inflight[a.nextID] = liveInflight{series: series, turn: turn, lane: a.lane(k), sub: sub, start: ready, guid: guid,
 		slot: sl, newSession: a.newSession(k, series)}
 	return liveToken{arm: a, id: a.nextID}
+}
+
+// sent marks that the request has been issued (the concurrency gate opened).
+func (a *liveArm) sent(tok liveToken, at time.Time) {
+	if a == nil || tok.arm != a {
+		return
+	}
+	a.mu.Lock()
+	if f, ok := a.inflight[tok.id]; ok {
+		f.sentAt = at
+		a.inflight[tok.id] = f
+	}
+	a.mu.Unlock()
 }
 
 // complete retires the request tok began (if any) and records its result.
@@ -219,10 +235,16 @@ func (a *liveArm) snapshot(since uint64) liveData {
 		if len(d.Inflight) >= liveMaxInflight {
 			break
 		}
-		d.Inflight = append(d.Inflight, timelineReq{
+		q := timelineReq{
 			Row: f.lane, Sub: f.sub, Series: f.series, Slot: f.slot.N, Turn: f.turn, GUID: f.guid,
 			Start: float64(f.start.Sub(a.t0).Milliseconds()), Flags: flagInflight | f.flags(),
-		})
+		}
+		if f.sentAt.IsZero() {
+			q.Flags |= flagWaiting
+		} else {
+			q.CW = float64(f.sentAt.Sub(f.start).Milliseconds())
+		}
+		d.Inflight = append(d.Inflight, q)
 	}
 	return d
 }

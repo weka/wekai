@@ -14,6 +14,7 @@
 .wtl-scroll { position: relative; flex: 1 1 auto; min-height: 120px; overflow-y: auto; overflow-x: hidden; background: #0D1013; border: 1px solid #42464A; border-radius: 6px; }
 .wtl-content { position: relative; width: 100%; }
 .wtl-canvas { position: sticky; top: 0; left: 0; display: block; cursor: crosshair; }
+.wtl-overlay { position: sticky; top: 0; left: 0; display: block; pointer-events: none; }
 .wtl-tip { position: fixed; z-index: 50; display: none; max-width: 420px; padding: 8px 10px; background: #1E2429; color: #F2F2EB; border: 1px solid #42464A; border-radius: 6px; font-size: 12px; line-height: 1.45; pointer-events: none; box-shadow: 0 4px 16px rgba(0,0,0,.45); }
 .wtl-tip b { color: #C79FF1; font-weight: 500; }
 .wtl-tip table { border-collapse: collapse; margin-top: 4px; }

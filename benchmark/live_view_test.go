@@ -56,8 +56,8 @@ func TestLiveServerEndpoints(t *testing.T) {
 	}
 
 	a := s.arms[0]
-	tok1 := a.begin(7, 1, "", slotInfo{})
-	tok2 := a.begin(3, 4, "", slotInfo{})
+	tok1 := a.begin(7, 1, "", slotInfo{}, time.Now())
+	tok2 := a.begin(3, 4, "", slotInfo{}, time.Now())
 	var d liveData
 	getJSON(t, base+"/api/data?arm=0&since=0", &d)
 	if len(d.Reqs) != 0 || len(d.Inflight) != 2 {
@@ -170,14 +170,14 @@ func TestLiveArmBoundedMemory(t *testing.T) {
 // Every hook is a no-op without a live view.
 func TestLiveArmNilSafe(t *testing.T) {
 	var a *liveArm
-	tok := a.begin(1, 1, "", slotInfo{})
+	tok := a.begin(1, 1, "", slotInfo{}, time.Now())
 	a.complete(tok, requestDataRecord{})
 	a.abandon(tok)
 }
 
 func TestLiveArmAbandon(t *testing.T) {
 	a := newLiveArm("a", 10)
-	tok := a.begin(1, 1, "", slotInfo{})
+	tok := a.begin(1, 1, "", slotInfo{}, time.Now())
 	a.abandon(tok)
 	if d := a.snapshot(0); len(d.Inflight) != 0 {
 		t.Errorf("inflight = %d after abandon", len(d.Inflight))
@@ -205,7 +205,7 @@ func TestLiveArmConcurrent(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < 300; i++ {
-				tok := a.begin(w+1, i, "", slotInfo{})
+				tok := a.begin(w+1, i, "", slotInfo{}, time.Now())
 				a.complete(tok, liveRec(a, w+1, i%2 == 0))
 			}
 		}(w)
@@ -252,9 +252,9 @@ func TestLiveServerArmByName(t *testing.T) {
 // rows; a new series opens a new group, in order of first sight.
 func TestLiveArmSeriesRowsAndSubRows(t *testing.T) {
 	a := newLiveArm("a", 100)
-	t1 := a.begin(5, 1, "sess:main", slotInfo{})
-	t2 := a.begin(5, 2, "sess:child", slotInfo{}) // overlaps t1: fan-out
-	t3 := a.begin(9, 1, "other:main", slotInfo{})
+	t1 := a.begin(5, 1, "sess:main", slotInfo{}, time.Now())
+	t2 := a.begin(5, 2, "sess:child", slotInfo{}, time.Now()) // overlaps t1: fan-out
+	t3 := a.begin(9, 1, "other:main", slotInfo{}, time.Now())
 	d := a.snapshot(0)
 	type key struct{ s, sub int }
 	got := map[key]int{}
@@ -272,7 +272,7 @@ func TestLiveArmSeriesRowsAndSubRows(t *testing.T) {
 	a.complete(t3, liveRec(a, 9, false))
 	cursor := a.snapshot(0).Seq
 	// Next turn of series 5 begins after both finished: back on sub-row 0, same group.
-	t4 := a.begin(5, 3, "sess:main", slotInfo{})
+	t4 := a.begin(5, 3, "sess:main", slotInfo{}, time.Now())
 	a.complete(t4, liveRec(a, 5, false))
 	inc := a.snapshot(cursor)
 	if len(inc.Reqs) != 1 || inc.Reqs[0].Row != 0 || inc.Reqs[0].Sub != 0 || len(inc.Inflight) != 0 {
@@ -289,7 +289,7 @@ func TestLiveArmSeriesRowsAndSubRows(t *testing.T) {
 	if !subs[0] || !subs[1] {
 		t.Errorf("series 5 sub-rows = %v, want 0 and 1", subs)
 	}
-	if t5 := a.begin(77, 1, "", slotInfo{}); a.snapshot(0).Inflight[0].Row != 2 {
+	if t5 := a.begin(77, 1, "", slotInfo{}, time.Now()); a.snapshot(0).Inflight[0].Row != 2 {
 		t.Error("a new series must open a new group at the bottom")
 	} else {
 		a.abandon(t5)
@@ -307,13 +307,13 @@ func TestLiveArmSlotRows(t *testing.T) {
 		return r
 	}
 	// Slot 1 (hot) runs sessions 10 then 11; slot 2 runs session 12.
-	t1 := a.begin(10, 1, "s10:main", slotInfo{N: 1, Hot: true})
-	t2 := a.begin(12, 1, "s12:main", slotInfo{N: 2})
+	t1 := a.begin(10, 1, "s10:main", slotInfo{N: 1, Hot: true}, time.Now())
+	t2 := a.begin(12, 1, "s12:main", slotInfo{N: 2}, time.Now())
 	a.complete(t1, rec(1, 10, true))
 	a.complete(t2, rec(2, 12, false))
-	t3 := a.begin(10, 2, "s10:main", slotInfo{N: 1, Hot: true})
+	t3 := a.begin(10, 2, "s10:main", slotInfo{N: 1, Hot: true}, time.Now())
 	a.complete(t3, rec(1, 10, true))
-	t4 := a.begin(11, 1, "s11:main", slotInfo{N: 1, Hot: true})
+	t4 := a.begin(11, 1, "s11:main", slotInfo{N: 1, Hot: true}, time.Now())
 	in := a.snapshot(0).Inflight
 	if len(in) != 1 || in[0].Row != 0 || in[0].Slot != 1 || in[0].Flags&flagSession == 0 || in[0].Flags&flagHot == 0 {
 		t.Fatalf("new session on slot 1 = %+v", in)

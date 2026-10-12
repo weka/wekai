@@ -321,6 +321,12 @@ type requestDataRecord struct {
 	// files written before slots were recorded. SlotHot marks hot-pool slots.
 	Slot    int  `json:"slot,omitempty"`
 	SlotHot bool `json:"slot_hot,omitempty"`
+	// ReadyMs / SentMs are unix-ms: when the request became eligible to send
+	// and when it was issued after the concurrency gate opened. Their
+	// difference is client-side wait (no free worker); both absent in files
+	// written before they were recorded.
+	ReadyMs int64 `json:"ready_ms,omitempty"`
+	SentMs  int64 `json:"sent_ms,omitempty"`
 	// Turn is this request's 1-based position within its own instance, which
 	// RequestNum is not — that one counts the whole run. Carried because the
 	// summary locates a failure as series:turn:length, and without it that
@@ -2418,6 +2424,7 @@ func runSingleModelBenchmark(
 				}
 				st.totalEmitted.Add(1)
 
+				readyAt := time.Now()
 				if isFirstRequest {
 					if err := workerGate.AcquireCold(benchCtx); err != nil {
 						return
@@ -2427,6 +2434,7 @@ func runSingleModelBenchmark(
 						return
 					}
 				}
+				sentAt := time.Now()
 
 				requestNum := int(st.totalCompleted.Load()) + 1
 				turnNum++
@@ -2442,7 +2450,8 @@ func runSingleModelBenchmark(
 					prompt = buildSeriesPrompt(fullDocs, seriesGUID, groupGUID, stepCurrentTokens, useShared)
 				}
 				ratio := st.estimator.Observe(prompt + "\x00" + cfg.Question)
-				liveTok := st.live.begin(seriesNum, turnNum, seriesGUID, slotInfo{N: seriesNum, Hot: isHot})
+				liveTok := st.live.begin(seriesNum, turnNum, seriesGUID, slotInfo{N: seriesNum, Hot: isHot}, readyAt)
+				st.live.sent(liveTok, sentAt)
 				metrics := runSingleRequest(reqCtx, cfg.Model, prompt, cfg.Question,
 					requestNum, seriesNum, 0, seriesGUID, endpointOverride, cfg.MaxOutputTokens)
 				reqCancel()
@@ -2618,6 +2627,8 @@ func runSingleModelBenchmark(
 						RequestNum:           requestNum,
 						Slot:                 seriesNum,
 						SlotHot:              isHot,
+						ReadyMs:              readyAt.UnixMilli(),
+						SentMs:               sentAt.UnixMilli(),
 						Turn:                 turnNum,
 						CacheHit:             cacheHit,
 						CacheHitRatio:        cacheHitRatio,

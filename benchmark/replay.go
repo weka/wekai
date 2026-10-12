@@ -222,6 +222,7 @@ func runReplayConversation(
 		st.totalEmitted.Add(1)
 
 		// Gate acquisition — cold for the first request of each conversation.
+		readyAt := time.Now()
 		if isFirstRequest {
 			if err := gate.AcquireCold(benchCtx); err != nil {
 				return false
@@ -232,6 +233,7 @@ func runReplayConversation(
 			}
 		}
 
+		sentAt := time.Now()
 		turnNum++
 		requestNum := int(st.totalCompleted.Load()) + 1
 
@@ -245,7 +247,8 @@ func runReplayConversation(
 		ratio := st.estimator.Observe(history.String())
 
 		slot := slotOf(benchCtx)
-		liveTok := st.live.begin(seriesNum, turnNum, seriesGUID, slot)
+		liveTok := st.live.begin(seriesNum, turnNum, seriesGUID, slot, readyAt)
+		st.live.sent(liveTok, sentAt)
 		reqCtx, reqCancel := context.WithTimeout(benchCtx, reqTimeout)
 		resetTTFT(time.Now())
 		response, err := chat.Request(reqCtx, llm.TextParts(userContent), nil)
@@ -264,6 +267,8 @@ func runReplayConversation(
 			Error:             err,
 			live:              liveTok,
 			Slot:              slot,
+			ReadyAt:           readyAt,
+			SentAt:            sentAt,
 		}
 		if response != nil {
 			metrics.Response = response.Content
@@ -573,6 +578,8 @@ func recordReplayRequest(
 			SeriesNum:            metrics.SeriesNum,
 			RequestNum:           metrics.RequestNum,
 			Slot:                 metrics.Slot.N,
+			ReadyMs:              unixMilliOrZero(metrics.ReadyAt),
+			SentMs:               unixMilliOrZero(metrics.SentAt),
 			SlotHot:              metrics.Slot.Hot,
 			Turn:                 metrics.CycleNum,
 			CacheHit:             cacheHit,
@@ -643,4 +650,12 @@ func recordReplayRequest(
 	} else {
 		st.consecutiveFailures.Store(0)
 	}
+}
+
+// unixMilliOrZero is t in unix milliseconds, or 0 for the zero time.
+func unixMilliOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
 }

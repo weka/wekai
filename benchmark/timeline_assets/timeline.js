@@ -18,8 +18,9 @@
 var WekaiTimeline = (function () {
   "use strict";
 
-  var FLAG_ERR = 1, FLAG_COLD = 2, FLAG_EMPTY = 4, FLAG_TIMINGS = 8, FLAG_SRC = 16, FLAG_INFL = 32, FLAG_TRUNC = 64, FLAG_SESSION = 128, FLAG_HOT = 256;
-  var INFLIGHT_KIND = 10;
+  var FLAG_ERR = 1, FLAG_COLD = 2, FLAG_EMPTY = 4, FLAG_TIMINGS = 8, FLAG_SRC = 16, FLAG_INFL = 32, FLAG_TRUNC = 64, FLAG_SESSION = 128, FLAG_HOT = 256, FLAG_WAITING = 512;
+  var INFLIGHT_KIND = 10, WAIT_CLIENT = 11, WAITED = 13;
+  var WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1 };   // kinds the "merge waits" toggle collapses into WAITED
   var AXIS_H = 34, RIGHT = 14, GAP = 2;
   var ROW_HEIGHTS = [1, 2, 3, 4, 6, 10, 14, 20];
 
@@ -67,22 +68,34 @@ var WekaiTimeline = (function () {
       '<div class="wtl-bar">' +
       '<label class="wtl-armwrap" hidden>Arm <select class="wtl-arm"></select></label>' +
       '<label>Row height <select class="wtl-rowh"></select></label>' +
+      '<label title="Collapse client wait, engine queue and unattributed wait into one colour"><input type="checkbox" class="wtl-merge"> Merge waits</label>' +
       '<button class="wtl-reset" hidden>Reset zoom</button>' +
       '<label class="wtl-followwrap" hidden><input type="checkbox" class="wtl-follow"> Follow latest</label>' +
       '<span class="wtl-info"></span>' +
       '<span class="wtl-hint">Drag to zoom &middot; double-click or Esc to reset &middot; Ctrl+wheel zooms, Shift+wheel pans</span>' +
       '</div><div class="wtl-legend"></div>' +
-      '<div class="wtl-scroll"><div class="wtl-content"><canvas class="wtl-canvas"></canvas></div><div class="wtl-empty" hidden>No requests yet</div></div>' +
+      '<div class="wtl-scroll"><div class="wtl-content"><canvas class="wtl-canvas"></canvas><canvas class="wtl-overlay"></canvas></div><div class="wtl-empty" hidden>No requests yet</div></div>' +
       '<div class="wtl-tip"></div>';
     var $ = function (c) { return host.querySelector(c); };
     var elArm = $(".wtl-arm"), elRowH = $(".wtl-rowh"), elReset = $(".wtl-reset"), elFollow = $(".wtl-follow");
     var elInfo = $(".wtl-info"), elLegend = $(".wtl-legend"), elScroll = $(".wtl-scroll");
     var elContent = $(".wtl-content"), canvas = $(".wtl-canvas"), tip = $(".wtl-tip"), elEmpty = $(".wtl-empty");
     var ctx = canvas.getContext("2d");
+    var elMerge = $(".wtl-merge"), overlay = $(".wtl-overlay"), octx = overlay.getContext("2d");
+    var merge = /[?&]merge=1/.test(location.search);
+    elMerge.checked = merge;
 
-    elLegend.innerHTML = kinds.filter(function (k) { return k.id !== INFLIGHT_KIND || opts.live; }).map(function (k) {
-      return '<span><i style="background:' + k.color + '"></i>' + esc(k.label) + "</span>";
-    }).join("");
+    function buildLegend() {
+      elLegend.innerHTML = kinds.filter(function (k) {
+        if (k.id === INFLIGHT_KIND) return !!opts.live;
+        if (k.id === WAITED) return merge;
+        if (WAIT_KINDS[k.id]) return !merge;
+        return true;
+      }).map(function (k) {
+        return '<span><i style="background:' + k.color + '"></i>' + esc(k.label) + "</span>";
+      }).join("");
+    }
+    buildLegend();
     ROW_HEIGHTS.forEach(function (h) { var o = document.createElement("option"); o.value = h; o.textContent = h + "px"; elRowH.appendChild(o); });
 
     var arms = [], cur = 0;
@@ -90,7 +103,7 @@ var WekaiTimeline = (function () {
     var vMin = null, vMax = null;           // null = full range
     var nowMs = 0, nowAt = 0;               // live clock: arm-time at wall-clock nowAt
     var W = 0, H = 0, plotL = 8, plotW = 100;
-    var hover = null, drag = null;
+    var hover = null, drag = null, hoverGroup = -1;
 
     function arm() { return arms[cur]; }
     function curNow() { return nowMs + (performance.now() - nowAt); }
@@ -192,6 +205,10 @@ var WekaiTimeline = (function () {
       canvas.style.marginBottom = (-h) + "px";
       canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      overlay.style.width = w + "px"; overlay.style.height = h + "px";
+      overlay.style.marginBottom = (-h) + "px";
+      overlay.width = canvas.width; overlay.height = canvas.height;
+      octx.setTransform(dpr, 0, 0, dpr, 0, 0);
       plotL = 44;
       plotW = Math.max(50, W - plotL - RIGHT);
       elContent.style.height = Math.max(h, contentHeight(a)) + "px";
@@ -246,31 +263,74 @@ var WekaiTimeline = (function () {
           if (any) { ctx.fillStyle = "#6f767d"; ctx.textAlign = "right"; ctx.font = "10px monospace"; ctx.fillText(any.sl ? ((any.x & FLAG_HOT) ? "h" : "s") + any.sl : "s" + any.s, plotL - 5, gy + rh - 3); }
         }
       }
-      if (hover) {
-        var hy = AXIS_H + groupTop(a, hover.q.r) + (hover.q.u || 0) * rowH - scrollTop;
-        var q = hover.q, he = (q.x & FLAG_INFL) ? Math.max(0, now - q.t) : q.e;
-        var hx0 = mapX(q.t, r), hx1 = mapX(q.t + he, r);
-        ctx.strokeStyle = "#F2F2EB"; ctx.lineWidth = 1;
-        ctx.strokeRect(Math.round(hx0) - 0.5, hy - 0.5, Math.max(2, hx1 - hx0) + 1, rh + 1);
-      }
       ctx.restore();
       if (opts.live) {
         var nx = mapX(now, r);
         if (nx >= plotL && nx <= plotL + plotW) { ctx.strokeStyle = "#7C03EC"; ctx.beginPath(); ctx.moveTo(nx + 0.5, AXIS_H); ctx.lineTo(nx + 0.5, H); ctx.stroke(); }
       }
+      drawOverlay();
+    }
+
+    // The overlay is a second canvas holding what changes on every mouse move
+    // (hovered row band, hovered bar, zoom drag), so hovering never repaints the
+    // data canvas.
+    function drawOverlay() {
+      if (!W) return;
+      octx.clearRect(0, 0, W, H);
+      var a = arm(); if (!a) return;
+      var scrollTop = elScroll.scrollTop, rh = rowH >= 3 ? rowH - 1 : rowH;
+      octx.save();
+      octx.beginPath(); octx.rect(0, AXIS_H, W, H - AXIS_H); octx.clip();
+      if (hoverGroup >= 0 && hoverGroup < a.groups.length) {
+        layout(a);
+        var gy = AXIS_H + groupTop(a, hoverGroup) - scrollTop, gh = a.groups[hoverGroup].subs * rowH;
+        octx.fillStyle = "rgba(199,159,241,0.10)"; octx.fillRect(0, gy, W, gh);
+        octx.strokeStyle = "#C79FF1"; octx.lineWidth = 1;
+        octx.strokeRect(0.5, gy - 0.5, W - 1, gh + 1);
+      }
+      if (hover) {
+        var r = range(), now = opts.live ? curNow() : 0, q = hover.q;
+        var hy = AXIS_H + groupTop(a, q.r) + (q.u || 0) * rowH - scrollTop;
+        var he = (q.x & FLAG_INFL) ? Math.max(0, now - q.t) : q.e;
+        var hx0 = mapX(q.t, r), hx1 = mapX(q.t + he, r);
+        octx.strokeStyle = "#F2F2EB"; octx.lineWidth = 1;
+        octx.strokeRect(Math.round(hx0) - 0.5, hy - 0.5, Math.max(2, hx1 - hx0) + 1, rh + 1);
+      }
+      octx.restore();
       if (drag) {
         var dx0 = Math.min(drag.x0, drag.x1), dx1 = Math.max(drag.x0, drag.x1);
-        ctx.fillStyle = "rgba(124,3,236,0.18)"; ctx.fillRect(dx0, AXIS_H, dx1 - dx0, H - AXIS_H);
-        ctx.strokeStyle = "#7C03EC"; ctx.strokeRect(dx0 + 0.5, AXIS_H + 0.5, dx1 - dx0, H - AXIS_H - 1);
+        octx.fillStyle = "rgba(124,3,236,0.18)"; octx.fillRect(dx0, AXIS_H, dx1 - dx0, H - AXIS_H);
+        octx.strokeStyle = "#7C03EC"; octx.strokeRect(dx0 + 0.5, AXIS_H + 0.5, dx1 - dx0, H - AXIS_H - 1);
       }
     }
 
+    // segsFor returns a request's flattened (kind, ms) segments: the stored ones,
+    // or for a live request the client wait so far / since it was sent followed by
+    // the still-running part. With merge on, consecutive wait kinds become one.
+    function segsFor(q, now) {
+      var segs = q.g;
+      if (q.x & FLAG_INFL) {
+        var el = Math.max(0, now - q.t);
+        if (q.x & FLAG_WAITING) segs = [WAIT_CLIENT, el];
+        else { var cw = Math.min(q.cw || 0, el); segs = cw > 0 ? [WAIT_CLIENT, cw, INFLIGHT_KIND, el - cw] : [INFLIGHT_KIND, el]; }
+      }
+      if (!merge) return segs;
+      var out = [], accum = 0;
+      for (var i = 0; i < segs.length; i += 2) {
+        if (WAIT_KINDS[segs[i]]) { accum += segs[i + 1]; continue; }
+        if (accum) { out.push(WAITED, accum); accum = 0; }
+        out.push(segs[i], segs[i + 1]);
+      }
+      if (accum) out.push(WAITED, accum);
+      return out;
+    }
+
     function drawReq(q, y, rh, r, now) {
-      var segs = q.g, t = q.t;
+      var t = q.t;
       var infl = (q.x & FLAG_INFL) !== 0;
       var end = infl ? Math.max(0, now - q.t) : q.e;
       if (mapX(q.t + end, r) < plotL || mapX(q.t, r) > plotL + plotW) return;
-      if (infl) segs = [INFLIGHT_KIND, end];
+      var segs = segsFor(q, now);
       for (var i = 0; i < segs.length; i += 2) {
         var d = segs[i + 1];
         var x0 = mapX(t, r), x1 = mapX(t + d, r);
@@ -306,6 +366,14 @@ var WekaiTimeline = (function () {
       }
       return best ? { q: best } : null;
     }
+    // rowAt is the row group under the pointer, counting the gaps between a row's
+    // requests and the label gutter; -1 over the axis, the separators or below the data.
+    function rowAt(p) {
+      var a = arm(); if (!a || p.y < AXIS_H) return -1;
+      var c = p.y - AXIS_H + elScroll.scrollTop, g = groupAt(a, c);
+      if (g < 0 || c >= groupTop(a, g) + a.groups[g].subs * rowH) return -1;
+      return g;
+    }
     function showTip(h, e) {
       if (!h) { tip.style.display = "none"; return; }
       var q = h.q, a = arm(), now = opts.live ? curNow() : 0;
@@ -316,6 +384,8 @@ var WekaiTimeline = (function () {
       var html = head + " turn " + q.n + ((q.x & FLAG_SESSION) ? " (first of session)" : "") + (inst ? " &middot; instance " + esc(inst.length > 24 ? inst.slice(0, 24) + "\u2026" : inst) : "") + (infl ? " <b>(in flight)</b>" : "") +
         ((q.x & FLAG_ERR) ? " <b style='color:#FF6B6B'>error</b>" : "") + ((q.x & FLAG_COLD) ? " cold start" : "") + ((q.x & FLAG_EMPTY) ? " empty" : "") + "<br>" +
         "start " + fmtClock(a.t0 + q.t, true) + " (+" + fmtDur(q.t) + ")<br>";
+      var cw = q.cw || 0;
+      if (!infl) e2e -= cw;   // e includes the client wait; e2e below is sent -> done
       html += "e2e <b>" + fmtDur(e2e) + "</b>" + (q.f ? " &middot; ttft <b>" + fmtDur(q.f) + "</b>" : "") + "<br>";
       var total = (q.i || 0) + (q.c || 0);
       html += "tokens: " + fmtTok(total) + " prompt (" + fmtTok(q.c || 0) + " cached) &rarr; " + fmtTok(q.o || 0) + " out<br>";
@@ -326,10 +396,22 @@ var WekaiTimeline = (function () {
         for (var i = 0; i < 4; i++) if (s[i] > 0) html += "<tr><td><i style='background:" + colors[ids[i]] + "'></i>" + names[i] + "</td><td>" + fmtTok(s[i]) + " tok (" + Math.round(100 * s[i] / tot) + "%)</td></tr>";
         html += "</table>";
       }
+      // Every wait, by where it happened.
+      var unattr = 0;
+      if (q.tm && !(q.x & FLAG_TRUNC)) unattr = Math.max(0, e2e - (q.tm[0] + q.tm[1] + q.tm[2] + q.tm[3] + q.tm[4] + q.tm[5]));
+      if (cw > 0 || (q.x & FLAG_WAITING) || (q.tm && (q.tm[0] > 0 || q.tm[1] > 0 || unattr > 1))) {
+        html += "<table>";
+        if ((q.x & FLAG_WAITING)) html += "<tr><td><i style='background:" + colors[WAIT_CLIENT] + "'></i>client wait (still waiting)</td><td>" + fmtDur(Math.max(0, now - q.t)) + "</td></tr>";
+        else if (cw > 0) html += "<tr><td><i style='background:" + colors[WAIT_CLIENT] + "'></i>client wait (no free slot)</td><td>" + fmtDur(cw) + "</td></tr>";
+        if (q.tm && q.tm[1] > 0) html += "<tr><td><i style='background:" + colors[0] + "'></i>engine queue: other</td><td>" + fmtDur(q.tm[1]) + "</td></tr>";
+        if (q.tm && q.tm[0] > 0) html += "<tr><td><i style='background:" + colors[1] + "'></i>engine queue: no KV blocks</td><td>" + fmtDur(q.tm[0]) + "</td></tr>";
+        if (unattr > 1) html += "<tr><td><i style='background:" + colors[12] + "'></i>unattributed (network / frontend)</td><td>" + fmtDur(unattr) + "</td></tr>";
+        html += "</table>";
+      }
       if (q.tm) {
         var tn = ["queue wait (KV)", "queue wait (other)", "kv fetch", "prefill", "decode", "preempted"], tid = [1, 0, 3, 6, 8, 7];
         html += "<table>";
-        for (var j = 0; j < 6; j++) if (q.tm[j] > 0) html += "<tr><td><i style='background:" + colors[tid[j]] + "'></i>" + tn[j] + "</td><td>" + fmtDur(q.tm[j]) + "</td></tr>";
+        for (var j = 2; j < 6; j++) if (q.tm[j] > 0) html += "<tr><td><i style='background:" + colors[tid[j]] + "'></i>" + tn[j] + "</td><td>" + fmtDur(q.tm[j]) + "</td></tr>";
         if (q.tm[6] > 0) html += "<tr><td>preemptions</td><td>" + q.tm[6] + "</td></tr>";
         html += "</table>";
       } else if (!infl) {
@@ -363,24 +445,23 @@ var WekaiTimeline = (function () {
     });
     canvas.addEventListener("mousemove", function (e) {
       var p = pos(e);
-      if (drag) { drag.x1 = Math.max(plotL, Math.min(plotL + plotW, p.x)); draw(); return; }
+      if (drag) { drag.x1 = Math.max(plotL, Math.min(plotL + plotW, p.x)); drawOverlay(); return; }
       var h = pick(p);
-      var changed = (h && hover && h.q === hover.q) ? false : (h || hover) ? true : false;
-      hover = h;
-      if (changed) draw();
+      var g = rowAt(p);
+      if (g !== hoverGroup || (h ? h.q : null) !== (hover ? hover.q : null)) { hover = h; hoverGroup = g; drawOverlay(); }
       showTip(h, e);
     });
     function endDrag(e) {
       if (!drag) return;
       var d = drag; drag = null;
       var lo = Math.min(d.x0, d.x1), hi = Math.max(d.x0, d.x1);
-      if (hi - lo < 5) { draw(); return; }
+      if (hi - lo < 5) { drawOverlay(); return; }
       var r = range();
       userZoom(unmapX(lo, r), unmapX(hi, r));
     }
     canvas.addEventListener("mouseup", endDrag);
     window.addEventListener("mouseup", endDrag);
-    canvas.addEventListener("mouseleave", function () { hover = null; tip.style.display = "none"; if (!drag) draw(); });
+    canvas.addEventListener("mouseleave", function () { hover = null; hoverGroup = -1; tip.style.display = "none"; if (!drag) drawOverlay(); });
     canvas.addEventListener("dblclick", function () { userZoom(null, null); });
     elReset.addEventListener("click", function () { userZoom(null, null); });
     if (opts.handleEsc) window.addEventListener("keydown", function (e) { if (e.key === "Escape" && isZoomed()) userZoom(null, null); });
@@ -399,7 +480,8 @@ var WekaiTimeline = (function () {
       lo2 = Math.max(f[0], Math.min(f[1] - nspan, lo2));
       if (nspan >= f[1] - f[0]) userZoom(null, null); else userZoom(lo2, lo2 + nspan);
     }, { passive: false });
-    elScroll.addEventListener("scroll", function () { hover = null; tip.style.display = "none"; draw(); });
+    elScroll.addEventListener("scroll", function () { hover = null; hoverGroup = -1; tip.style.display = "none"; draw(); });
+    elMerge.addEventListener("change", function () { merge = elMerge.checked; buildLegend(); draw(); });
     elRowH.addEventListener("change", function () { rowH = parseInt(elRowH.value, 10); userRowH = true; resize(); });
     elArm.addEventListener("change", function () { selectArm(parseInt(elArm.value, 10)); if (opts.onArm) opts.onArm(cur); });
     elFollow.addEventListener("change", function () { draw(); });
@@ -409,7 +491,7 @@ var WekaiTimeline = (function () {
     function selectArm(i) {
       cur = Math.max(0, Math.min(arms.length - 1, i));
       elArm.value = cur;
-      hover = null; elScroll.scrollTop = 0;
+      hover = null; hoverGroup = -1; elScroll.scrollTop = 0;
       applyArm();
     }
 
@@ -418,9 +500,14 @@ var WekaiTimeline = (function () {
       setArms: function (list, select) {
         arms = list;
         arms.forEach(indexArm);
+        var hm = /[?&]highlight_row=(\d+)/.exec(location.search);
+        var hs = /[?&]scroll_row=(\d+)/.exec(location.search);
         elArm.innerHTML = arms.map(function (a, i) { return '<option value="' + i + '">' + esc(a.name) + "</option>"; }).join("");
         host.querySelector(".wtl-armwrap").hidden = arms.length < 2;
         selectArm(select || 0);
+        // ?highlight_row=N / ?scroll_row=N pre-select a row (screenshots, bug reports).
+        if (hs) { layout(arm()); elScroll.scrollTop = Math.max(0, groupTop(arm(), +hs[1])); }
+        if (hm) { hoverGroup = +hm[1]; drawOverlay(); }
       },
       selectArm: selectArm,
       currentArm: function () { return cur; },
