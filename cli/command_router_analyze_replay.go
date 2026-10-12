@@ -145,7 +145,7 @@ func (c *RouterAnalyzeReplayCommand) isReplayV3(path string) (bool, error) {
 
 	// Try replay-v3 header first.
 	var hdr benchmark.RouterReplayHeader
-	if json.Unmarshal(line, &hdr) == nil && hdr.Schema == "replay-v3" {
+	if json.Unmarshal(line, &hdr) == nil && benchmark.SupportedReplaySchema(hdr.Schema) {
 		return true, nil
 	}
 	return false, nil
@@ -173,8 +173,8 @@ func (c *RouterAnalyzeReplayCommand) collectReplayV3(path string) ([]replayReque
 	if err := json.Unmarshal(line, &hdr); err != nil {
 		return nil, fmt.Errorf("parse header: %w", err)
 	}
-	if hdr.Schema != "replay-v3" {
-		return nil, fmt.Errorf("expected replay-v3, got %q", hdr.Schema)
+	if !benchmark.SupportedReplaySchema(hdr.Schema) {
+		return nil, fmt.Errorf("expected replay-v3 or replay-v4, got %q", hdr.Schema)
 	}
 
 	var out []replayRequestWithModel

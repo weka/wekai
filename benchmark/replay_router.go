@@ -57,6 +57,10 @@ const (
 	ThinkRefSessionStart = "session_start"
 )
 
+// SupportedReplaySchema reports whether the replayer can read a file with this
+// header schema. v4 only adds fields to v3.
+func SupportedReplaySchema(s string) bool { return s == "replay-v3" || s == "replay-v4" }
+
 // RouterReplayHeader is the first-line metadata of a replay-v3 file.
 type RouterReplayHeader struct {
 	Schema      string              `json:"_schema"` // "replay-v3"
@@ -242,7 +246,7 @@ func readRouterReplayHeader(path string) (RouterReplayHeader, error) {
 	if err := json.Unmarshal(line, &hdr); err != nil {
 		return RouterReplayHeader{}, fmt.Errorf("parse header: %w", err)
 	}
-	if hdr.Schema != "replay-v3" && hdr.Schema != "replay-v4" {
+	if !SupportedReplaySchema(hdr.Schema) {
 		return RouterReplayHeader{}, fmt.Errorf("unsupported replay schema %q (expected replay-v3 or replay-v4)", hdr.Schema)
 	}
 	return hdr, nil
@@ -315,9 +319,9 @@ func openRouterReplayStream(path string, opts routerReplayStreamOpts) (*routerRe
 		f.Close()
 		return nil, fmt.Errorf("parse header: %w", err)
 	}
-	if hdr.Schema != "replay-v3" {
+	if !SupportedReplaySchema(hdr.Schema) {
 		f.Close()
-		return nil, fmt.Errorf("unsupported replay schema %q (expected replay-v3)", hdr.Schema)
+		return nil, fmt.Errorf("unsupported replay schema %q (expected replay-v3 or replay-v4)", hdr.Schema)
 	}
 	if chanCap < 1 {
 		chanCap = 4

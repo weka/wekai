@@ -939,3 +939,33 @@ func TestV3RequestLoadsWithoutThink(t *testing.T) {
 		t.Errorf("a v3 request loaded with think %v/%q", r.ThinkMs, r.ThinkRef)
 	}
 }
+
+// TestOpenRouterReplayStreamAcceptsV4 opens a v4 file through the stream opener
+// that `benchmark auto` uses and reads a session carrying think_ms back out.
+func TestOpenRouterReplayStreamAcceptsV4(t *testing.T) {
+	think := int64(1234)
+	path := filepath.Join(t.TempDir(), "v4.jsonl")
+	hdr := RouterReplayHeader{Schema: "replay-v4", Summary: RouterReplaySummary{Sessions: 1,
+		Timing: &RouterReplayTiming{RequestsWithThink: 1}}}
+	sess := RouterReplaySession{SessionID: "s", StartTs: "2026-05-12T08:50:06Z",
+		Instances: []RouterReplayInstance{{InstanceID: "i", Role: "main", Requests: []RouterReplayRequest{
+			{RequestID: 1, Ts: "2026-05-12T08:50:06Z", ThinkMs: &think, ThinkRef: ThinkRefSessionStart}}}}}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+	_ = enc.Encode(hdr)
+	_ = enc.Encode(sess)
+	f.Close()
+
+	st, err := openRouterReplayStream(path, routerReplayStreamOpts{})
+	if err != nil {
+		t.Fatalf("v4 file rejected by the stream opener: %v", err)
+	}
+	defer st.Close()
+	got, _, ok := st.Pull(context.Background())
+	if !ok || got.Instances[0].Requests[0].ThinkMs == nil || *got.Instances[0].Requests[0].ThinkMs != 1234 {
+		t.Fatalf("session did not round-trip think_ms: %+v ok=%v", got, ok)
+	}
+}
