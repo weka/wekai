@@ -229,6 +229,57 @@ func TestStartSGLangMetricsSamplerLifecycle(t *testing.T) {
 	}
 }
 
+// TestStartSGLangMetricsSamplerUsesOverride confirms the override replaces
+// the derived-from-model-URL endpoint once the spec has already qualified as
+// type=openai_sglang -- the shape this cluster's router-fronted topology
+// needs, since the router refuses to serve real backend counters on its own
+// serving port. The spec's own URL deliberately points nowhere reachable, so
+// the sampler can only ever land a sample via the override.
+func TestStartSGLangMetricsSamplerUsesOverride(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(sglangPromFixture))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	rdw, err := newRequestDataWriter(dir, "sglang_override_model", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tracker := newActiveDatasetTracker()
+	model := "dynamic/http://127.0.0.1:1,type=openai_sglang"
+	s := startSGLangMetricsSampler(context.Background(), model, []string{srv.URL}, tracker, rdw)
+	if s == nil {
+		t.Fatal("sampler did not start for an openai_sglang spec with an override")
+	}
+	path := filepath.Join(dir, "sglang_override_model.jsonl")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), recordTypeSGLangMetricsSample) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.stop()
+	if err := rdw.close(); err != nil {
+		t.Fatal(err)
+	}
+
+	samples := readSGLangSamplesFromFile(t, path)
+	if len(samples) != 1 {
+		t.Fatalf("got %d sglang samples, want 1 -- the override endpoint must have been scraped instead "+
+			"of the unreachable derived one", len(samples))
+	}
+	if samples[0].EndpointsOK != 1 || samples[0].EndpointsTotal != 1 {
+		t.Errorf("coverage = %d/%d, want 1/1", samples[0].EndpointsOK, samples[0].EndpointsTotal)
+	}
+}
+
 // readSGLangSamplesFromFile reads only the sglang_metrics_sample rows from a
 // request-data JSONL file via the shared reader.
 func readSGLangSamplesFromFile(t *testing.T, path string) []sglangMetricsSample {
@@ -418,6 +469,71 @@ func TestSGLangComputeDerivedFromPromptMinusCachedTotal(t *testing.T) {
 	}
 	if got.Device != 70 || got.Host != 20 || got.Storage != 10 {
 		t.Errorf("sources = %+v, want device=70 host=20 storage=10", got)
+	}
+}
+
+// fakeSGLangNoTotal serves cached_tokens_total/prompt_tokens_total WITHOUT
+// ever emitting a cache_source="total" series -- matching a real sglang
+// deployment that reports the per-tier breakdown (cached_tokens_details is
+// populated), where "total" is structurally absent rather than just zero.
+type fakeSGLangNoTotal struct {
+	device, host, storage, prompt atomic.Int64
+	srv                           *httptest.Server
+}
+
+func newFakeSGLangNoTotal(t *testing.T) *fakeSGLangNoTotal {
+	t.Helper()
+	f := &fakeSGLangNoTotal{}
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `# TYPE sglang:cached_tokens_total counter
+sglang:cached_tokens_total{cache_source="device",model_name="m"} %d
+sglang:cached_tokens_total{cache_source="host",model_name="m"} %d
+sglang:cached_tokens_total{cache_source="storage",model_name="m"} %d
+# TYPE sglang:prompt_tokens_total counter
+sglang:prompt_tokens_total{model_name="m"} %d
+`, f.device.Load(), f.host.Load(), f.storage.Load(), f.prompt.Load())
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *fakeSGLangNoTotal) url() string { return f.srv.URL + "/metrics" }
+
+// TestSGLangComputeWithoutTotalLabel is the regression case for the bug: a
+// real sglang deployment reporting the per-tier breakdown (device/host/storage)
+// NEVER emits cache_source="total" at all -- it's an either/or backward-compat
+// fallback, not a sibling aggregate (see metrics_collector.py's
+// report_cache_source). A fixture that omits the "total" series entirely must
+// still produce a correct, nonzero-subtracted compute -- not the unsubtracted
+// full prompt_tokens_total delta the old `s.totals["total"]` (always 0 here,
+// since it's never scraped) formula would have silently produced.
+func TestSGLangComputeWithoutTotalLabel(t *testing.T) {
+	a := newFakeSGLangNoTotal(t)
+	var cap sglangCapture
+	s := newTestSGLangSampler(t, []string{a.url()}, &cap)
+	ctx := context.Background()
+
+	a.device.Store(129447424)
+	a.host.Store(149774592)
+	a.storage.Store(231680)
+	a.prompt.Store(328000000)
+	s.sampleOnce(ctx) // baseline
+
+	a.device.Add(100)
+	a.host.Add(200)
+	a.storage.Add(50)
+	a.prompt.Add(1000)
+	s.sampleOnce(ctx)
+
+	got := cap.all()[1].Sources
+	wantCompute := int64(1000 - (100 + 200 + 50)) // 650
+	if got.Compute != wantCompute {
+		t.Errorf("compute = %d, want %d: with no \"total\" label ever present, the old "+
+			"s.totals[\"total\"] formula would have stayed 0 and produced compute=1000 "+
+			"(the full prompt_tokens_total delta, silently wrong)", got.Compute, wantCompute)
+	}
+	if got.Device != 100 || got.Host != 200 || got.Storage != 50 {
+		t.Errorf("sources = %+v, want device=100 host=200 storage=50", got)
 	}
 }
 
