@@ -67,20 +67,53 @@ func (cfg *AutoBenchmarkConfig) setSeriesDefaults() {
 	}
 }
 
-func admitSeries(ctx context.Context, cfg AutoBenchmarkConfig, window *ttftWindow, spawn func(int), capped func()) {
+// retireThreshold is the gate statistic above which --ttft-retire retires a
+// finished session's slot: --ttft-limit raised by --ttft-retire-margin.
+func retireThreshold(cfg AutoBenchmarkConfig) time.Duration {
+	return time.Duration(float64(cfg.TTFTLimit) * (1 + cfg.TTFTRetireMargin))
+}
+
+// shouldRetireSlot reports whether a slot whose session just ended should stop
+// instead of pulling the next one. Only with --ttft-retire on a realtime run,
+// and only while the windowed statistic is above the retire threshold; between
+// the limit and the threshold sessions are still replaced (the gate merely
+// stops adding), and an empty window never retires.
+func shouldRetireSlot(cfg AutoBenchmarkConfig, window *ttftWindow, now time.Time) bool {
+	if !cfg.TTFTRetire || !cfg.ReplayRealtime || window == nil {
+		return false
+	}
+	s := window.Stats(now)
+	return s.N > 0 && s.pick(cfg.TTFTLimitStat) > retireThreshold(cfg)
+}
+
+// admitSeries adds --admit-count slots every --admit-every while the TTFT gate
+// is open. spawn gets the new slot's 1-based number. Without --ttft-retire
+// slots only ever grow, so --max-series caps the number spawned and admission
+// ends there (capped). With it, retired slots free room: active(), the slots
+// still running, is what --max-series caps, and admission keeps ticking so the
+// run can regrow after TTFT recovers.
+func admitSeries(ctx context.Context, cfg AutoBenchmarkConfig, window *ttftWindow, spawn func(int), capped func(), active func() int) {
 	if cfg.AdmitEvery <= 0 {
 		return
 	}
 	ticker := time.NewTicker(cfg.AdmitEvery)
 	defer ticker.Stop()
 	next := cfg.StartSeries
+	retire := cfg.TTFTRetire && active != nil
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
-		if cfg.MaxSeries > 0 && next >= cfg.MaxSeries {
+		running := next
+		if retire {
+			running = active()
+		}
+		if cfg.MaxSeries > 0 && running >= cfg.MaxSeries {
+			if retire {
+				continue
+			}
 			capped()
 			return
 		}
@@ -89,7 +122,7 @@ func admitSeries(ctx context.Context, cfg AutoBenchmarkConfig, window *ttftWindo
 		}
 		count := max(1, cfg.AdmitCount)
 		if cfg.MaxSeries > 0 {
-			count = min(count, cfg.MaxSeries-next)
+			count = min(count, cfg.MaxSeries-running)
 		}
 		for range count {
 			if ctx.Err() != nil {
@@ -743,6 +776,11 @@ func admissionGate(cfg AutoBenchmarkConfig, st *autoState, admitStart time.Time)
 	st.mu.Lock()
 	g.Capped = cfg.MaxSeries > 0 && st.series >= cfg.MaxSeries
 	st.mu.Unlock()
+	if cfg.TTFTRetire {
+		g.RetireMs = float64(retireThreshold(cfg).Milliseconds())
+		g.Retired = st.seriesRetired.Load()
+		g.Capped = cfg.MaxSeries > 0 && int(st.activeReplayWorkers.Load()) >= cfg.MaxSeries
+	}
 	if cfg.AdmitEvery > 0 {
 		ticks := now.Sub(admitStart) / cfg.AdmitEvery
 		g.NextInS = (admitStart.Add((ticks + 1) * cfg.AdmitEvery)).Sub(now).Seconds()

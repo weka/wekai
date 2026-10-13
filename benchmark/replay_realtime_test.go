@@ -28,7 +28,7 @@ func TestAdmissionAddsBatchesOnlyAtTicksAndClampsToCap(t *testing.T) {
 			if want := int(admitted.Add(1)) + 1; n != want {
 				t.Errorf("series index = %d, want %d", n, want)
 			}
-		}, func() { capped.Store(true) })
+		}, func() { capped.Store(true) }, nil)
 		synctest.Wait()
 		time.Sleep(2*time.Minute - time.Nanosecond)
 		synctest.Wait()
@@ -60,7 +60,7 @@ func TestAdmissionDefaultAddsOnePerTick(t *testing.T) {
 		defer cancel()
 		cfg := AutoBenchmarkConfig{StartSeries: 1, AdmitEvery: time.Second}
 		var count atomic.Int64
-		go admitSeries(ctx, cfg, newTTFTWindow(0), func(int) { count.Add(1) }, func() {})
+		go admitSeries(ctx, cfg, newTTFTWindow(0), func(int) { count.Add(1) }, func() {}, nil)
 		synctest.Wait()
 		time.Sleep(3 * time.Second)
 		synctest.Wait()
@@ -79,7 +79,7 @@ func TestAdmissionWithoutRealtimeIgnoresTTFTAndHasNoDefaultCap(t *testing.T) {
 		window := newTTFTWindow(time.Hour)
 		window.Observe(time.Now(), time.Minute)
 		var last atomic.Int64
-		go admitSeries(ctx, cfg, window, func(n int) { last.Store(int64(n)) }, func() { t.Error("unexpected series cap") })
+		go admitSeries(ctx, cfg, window, func(n int) { last.Store(int64(n)) }, func() { t.Error("unexpected series cap") }, nil)
 		synctest.Wait()
 		time.Sleep(6 * time.Minute)
 		synctest.Wait()
@@ -110,7 +110,7 @@ func TestAdmissionPausesWithoutAccumulatingMissedBatches(t *testing.T) {
 		window := newTTFTWindow(1500 * time.Millisecond)
 		window.Observe(time.Now(), 2*time.Second)
 		var count atomic.Int64
-		go admitSeries(ctx, cfg, window, func(int) { count.Add(1) }, func() {})
+		go admitSeries(ctx, cfg, window, func(int) { count.Add(1) }, func() {}, nil)
 		synctest.Wait()
 		time.Sleep(time.Second)
 		synctest.Wait()
@@ -1016,4 +1016,63 @@ func TestAdmissionGateState(t *testing.T) {
 	if admissionGate(cfg, st, start) != nil {
 		t.Error("neither realtime nor a governor: no gate state")
 	}
+}
+
+func TestShouldRetireSlotOnlyAboveLimitPlusMargin(t *testing.T) {
+	now := time.Now()
+	cfg := AutoBenchmarkConfig{ReplayRealtime: true, TTFTRetire: true, TTFTRetireMargin: 0.15, TTFTLimit: 10 * time.Second}
+	at := func(d time.Duration) *ttftWindow {
+		w := newTTFTWindow(time.Minute)
+		w.Observe(now, d)
+		return w
+	}
+	for _, c := range []struct {
+		name   string
+		cfg    AutoBenchmarkConfig
+		window *ttftWindow
+		want   bool
+	}{
+		{"below limit: replace", cfg, at(9 * time.Second), false},
+		{"inside margin band: replace", cfg, at(11 * time.Second), false},
+		{"at threshold: replace", cfg, at(11500 * time.Millisecond), false},
+		{"above limit+15%: retire", cfg, at(12 * time.Second), true},
+		{"empty window: replace", cfg, newTTFTWindow(time.Minute), false},
+		{"opt-in off: replace", AutoBenchmarkConfig{ReplayRealtime: true, TTFTLimit: 10 * time.Second}, at(time.Minute), false},
+		{"not realtime: replace", AutoBenchmarkConfig{TTFTRetire: true, TTFTRetireMargin: 0.15, TTFTLimit: 10 * time.Second}, at(time.Minute), false},
+	} {
+		if got := shouldRetireSlot(c.cfg, c.window, now); got != c.want {
+			t.Errorf("%s: shouldRetireSlot = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestAdmissionWithRetireCapsActiveSlotsAndRegrows(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := AutoBenchmarkConfig{StartSeries: 4, MaxSeries: 4, AdmitCount: 2, AdmitEvery: time.Minute,
+			TTFTLimit: time.Second, ReplayRealtime: true, TTFTRetire: true, TTFTRetireMargin: 0.15}
+		var active, last atomic.Int64
+		active.Store(4)
+		go admitSeries(ctx, cfg, newTTFTWindow(0), func(n int) { active.Add(1); last.Store(int64(n)) },
+			func() { t.Error("--ttft-retire must not end admission at the cap") }, func() int { return int(active.Load()) })
+		synctest.Wait()
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if last.Load() != 0 {
+			t.Fatalf("admitted slot %d while 4/4 slots were active", last.Load())
+		}
+		active.Store(1) // three slots retired
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if active.Load() != 3 || last.Load() != 6 {
+			t.Fatalf("after retirement: active=%d last=%d, want one batch of 2 (active 3, slots 5..6)", active.Load(), last.Load())
+		}
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if active.Load() != 4 || last.Load() != 7 {
+			t.Fatalf("regrow: active=%d last=%d, want clamped to the cap (active 4, slot 7)", active.Load(), last.Load())
+		}
+		cancel()
+	})
 }

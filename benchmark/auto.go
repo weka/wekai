@@ -133,6 +133,12 @@ type AutoBenchmarkConfig struct {
 	AdmitCount  int           // sessions per admission tick; 0 = 1
 	TTFTLimit   time.Duration // gate closes at or above this windowed mean
 	TTFTWindow  time.Duration // how far back the gate looks; default 30s
+	// TTFTRetire (opt-in) lets the realtime session count shrink: a slot whose
+	// session ends while the gate statistic is above TTFTLimit*(1+TTFTRetireMargin)
+	// retires instead of pulling the next session. Admission then caps ACTIVE
+	// slots at MaxSeries and keeps ticking, so a recovered fleet regrows.
+	TTFTRetire       bool
+	TTFTRetireMargin float64
 	// TTFTLimitStat is which statistic over that window the gate compares
 	// against TTFTLimit: mean (default), p50, p95 or p99.
 	//
@@ -1245,6 +1251,10 @@ type autoState struct {
 	// running out of conversations to pull.
 	activeReplayWorkers atomic.Int64
 
+	// Slots retired by --ttft-retire (a session ended while TTFT was above the
+	// retire threshold, so the slot did not take another session).
+	seriesRetired atomic.Int64
+
 	// Content-level cache estimator (*cacheEstimator) that estimates repeated
 	// (warm) prompt tokens client-side across all modes (synthetic/step/replay).
 	// Its Ratio() drives the cold/warm split and gcache display, replacing the
@@ -1495,6 +1505,7 @@ type displaySnapshot struct {
 	replayCompleted int64 // conversations fully walked
 	replayRemaining int   // still-queued conversations
 	replayActive    int64 // worker goroutines still alive (effective concurrency cap)
+	seriesRetired   int64 // slots retired by --ttft-retire
 }
 
 // displayState manages the display snapshot.
@@ -1805,6 +1816,10 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 	if snap.replayTotal > 0 {
 		replayPrefix = fmt.Sprintf("replay=%d/%d(queue=%d,active=%d) ",
 			snap.replayCompleted, snap.replayTotal, snap.replayRemaining, snap.replayActive)
+		if snap.seriesRetired > 0 {
+			replayPrefix = fmt.Sprintf("replay=%d/%d(queue=%d,active=%d,retired=%d) ",
+				snap.replayCompleted, snap.replayTotal, snap.replayRemaining, snap.replayActive, snap.seriesRetired)
+		}
 	}
 	// Two counts, because they answer different questions and were being read
 	// as one. in_flight is requests whose HTTP exchange is open — the
@@ -2138,12 +2153,14 @@ func runSingleModelBenchmark(
 			snap.replayCompleted = st.seriesReplayCompleted.Load()
 			snap.replayRemaining = st.replay.Remaining()
 			snap.replayActive = st.activeReplayWorkers.Load()
+			snap.seriesRetired = st.seriesRetired.Load()
 		}
 		if st.routerReplay != nil {
 			snap.replayTotal = st.routerReplay.Total()
 			snap.replayCompleted = st.seriesReplayCompleted.Load()
 			snap.replayRemaining = st.routerReplay.Remaining()
 			snap.replayActive = st.activeReplayWorkers.Load()
+			snap.seriesRetired = st.seriesRetired.Load()
 		}
 		snap.globalLocalCacheRate = st.stream.GlobalLocalCacheRate()
 		if cfg.Verify {
@@ -2783,7 +2800,7 @@ func runSingleModelBenchmark(
 				fmt.Fprintf(os.Stderr, "[admit] stopped at --max-series=%d; this is the cap, "+
 					"not the fleet's ceiling — raise it or the result is the cap's\n", cfg.MaxSeries)
 			}
-		})
+		}, func() int { return int(st.activeReplayWorkers.Load()) })
 	}
 
 	// Replay-mode drain watcher: when every worker has exited (queue drained
@@ -3332,12 +3349,14 @@ func runSingleModelBenchmark(
 			finalSnap.replayCompleted = st.seriesReplayCompleted.Load()
 			finalSnap.replayRemaining = st.replay.Remaining()
 			finalSnap.replayActive = st.activeReplayWorkers.Load()
+			finalSnap.seriesRetired = st.seriesRetired.Load()
 		}
 		if st.routerReplay != nil {
 			finalSnap.replayTotal = st.routerReplay.Total()
 			finalSnap.replayCompleted = st.seriesReplayCompleted.Load()
 			finalSnap.replayRemaining = st.routerReplay.Remaining()
 			finalSnap.replayActive = st.activeReplayWorkers.Load()
+			finalSnap.seriesRetired = st.seriesRetired.Load()
 		}
 		if cfg.Verify {
 			finalSnap.verifyOn = true

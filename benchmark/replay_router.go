@@ -708,6 +708,14 @@ func runRouterReplaySeriesLoop(
 		// Session slot retired — drop its active-dataset snapshot.
 		st.datasetTracker.Reset(seriesNum)
 		st.seriesReplayCompleted.Add(1)
+		if shouldRetireSlot(cfg, st.ttft, time.Now()) {
+			// --ttft-retire: the fleet is over the limit by more than the
+			// margin, so this slot stops here instead of adding the next
+			// session's load; admission re-adds slots once TTFT recovers.
+			st.seriesRetired.Add(1)
+			updateSnap(st)
+			return
+		}
 		updateSnap(st)
 	}
 }

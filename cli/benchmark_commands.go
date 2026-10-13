@@ -285,6 +285,8 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		AdmitEvery:                    c.AdmitEvery,
 		AdmitCount:                    c.AdmitCount,
 		TTFTLimit:                     c.TTFTLimit,
+		TTFTRetire:                    c.TTFTRetire,
+		TTFTRetireMargin:              c.TTFTRetireMargin,
 		TTFTWindow:                    c.TTFTWindowDur,
 		ReplaySkipIdle:                c.ReplaySkipIdle,
 		ReplayNoStamp:                 c.ReplayNoStamp,
@@ -748,6 +750,13 @@ func (c *BenchmarkAutoCommand) validateRealtime(w io.Writer) error {
 	}
 	if c.AdmitCount > 0 && c.AdmitEvery == 0 {
 		return fmt.Errorf("--admit-count requires a positive --admit-every")
+	}
+	if c.TTFTRetire && (!c.ReplayRealtime || c.AdmitEvery <= 0) {
+		return fmt.Errorf("--ttft-retire needs --replay-realtime and a positive --admit-every: retiring slots " +
+			"with nothing to re-add them would only ever shrink the run")
+	}
+	if c.TTFTRetireMargin < 0 {
+		return fmt.Errorf("--ttft-retire-margin must be non-negative (0.15 = retire at 15%% above --ttft-limit)")
 	}
 	if c.ReplayRealtime && c.Series > 0 {
 		return fmt.Errorf("--series pins the session count, which --replay-realtime grows on its own; "+

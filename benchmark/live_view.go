@@ -115,6 +115,10 @@ type liveGate struct {
 	AdmitCount int     `json:"admit_count"`
 	EveryS     float64 `json:"every_s"`
 	NextInS    float64 `json:"next_in_s"`
+	// --ttft-retire: the threshold above which finished sessions' slots retire
+	// (0 = off) and how many have.
+	RetireMs float64 `json:"retire_ms,omitempty"`
+	Retired  int64   `json:"retired,omitempty"`
 }
 
 // liveRates are token throughputs (tokens/s) over trailing windows.

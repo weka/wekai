@@ -364,6 +364,10 @@ var WekaiTimeline = (function () {
         else {
           h += " &mdash; gate: " + g.stat + " &lt; " + fmtSec(g.limit_ms / 1000) + " &rarr; <b class='" + (g.open ? "wtl-gating" : "wtl-bad") + "'>" + (g.open ? "OPEN" : "CLOSED") + "</b>";
           h += g.capped ? " (at the series cap, no more admissions)" : g.every_s ? (g.open ? " (next +" + g.admit_count + " in " + fmtSec(g.next_in_s) + ")" : " (admissions held; next check in " + fmtSec(g.next_in_s) + ")") : "";
+          if (g.retire_ms) {
+            var shedding = g.value_ms > g.retire_ms;
+            h += " &middot; <span title='--ttft-retire: a slot whose session ends while the gate statistic is above this does not take another session'>retire above " + fmtSec(g.retire_ms / 1000) + " &rarr; <b class='" + (shedding ? "wtl-bad" : "wtl-gating") + "'>" + (shedding ? "SHRINKING" : "holding") + "</b>, retired <b>" + (g.retired || 0) + "</b></span>";
+          }
         }
       }
       setStateText(h);

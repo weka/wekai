@@ -151,6 +151,12 @@ To start with 32 series and add 32 more every two minutes, replace
 is capped only when `--max-series` is set. Omit it for an unlimited ramp.
 With `--replay-realtime`, admission pauses while the TTFT gate is closed
 and resumes with one batch per tick, without catching up on skipped ticks.
+Add `--ttft-retire` (opt-in) to let the session count shrink as well: when a
+session ends while the gate statistic is more than `--ttft-retire-margin`
+(default 0.15, i.e. 15%) above `--ttft-limit`, its slot retires instead of
+starting the next session. Between the limit and that threshold sessions are
+still replaced but none are added; below the limit admission adds batches as
+usual, with `--max-series` capping active slots rather than slots ever added.
 Without real-time replay, admission depends only on the interval.
 Omitting `--admit-count` preserves one series per tick. Add `--replay-realtime`
 to preserve captured think times; without it, sessions run back-to-back.

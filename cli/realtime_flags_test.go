@@ -109,3 +109,37 @@ func TestDefaultsAreSilent(t *testing.T) {
 		t.Errorf("a plain fixed-pool run warned: %q", w.String())
 	}
 }
+
+// TestTTFTRetireFlags: --ttft-retire is opt-in, defaults its margin to 15%, and
+// is refused where nothing could re-add the slots it retires.
+func TestTTFTRetireFlags(t *testing.T) {
+	t.Setenv("BENCHMARK_ADMIT_COUNT", "0")
+	t.Setenv("BENCHMARK_ADMIT_EVERY", "0s")
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		margin  float64
+		wantErr bool
+	}{
+		{"off by default", []string{"--replay-realtime", "--admit-every=1m"}, 0.15, false},
+		{"on with default margin", []string{"--replay-realtime", "--admit-every=1m", "--ttft-retire"}, 0.15, false},
+		{"explicit margin", []string{"--replay-realtime", "--admit-every=1m", "--ttft-retire", "--ttft-retire-margin=0.3"}, 0.3, false},
+		{"needs realtime", []string{"--admit-every=1m", "--ttft-retire"}, 0.15, true},
+		{"needs admission", []string{"--replay-realtime", "--ttft-retire"}, 0.15, true},
+		{"negative margin", []string{"--replay-realtime", "--admit-every=1m", "--ttft-retire", "--ttft-retire-margin=-0.1"}, -0.1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var opts BenchmarkAutoOptions
+			if _, err := flags.ParseArgs(&opts, tc.args); err != nil {
+				t.Fatal(err)
+			}
+			c := BenchmarkAutoCommand{BenchmarkAutoOptions: &opts}
+			if err := c.validateRealtime(&bytes.Buffer{}); (err != nil) != tc.wantErr {
+				t.Fatalf("validation error = %v, want error %v", err, tc.wantErr)
+			}
+			if opts.TTFTRetireMargin != tc.margin {
+				t.Fatalf("margin = %v, want %v", opts.TTFTRetireMargin, tc.margin)
+			}
+		})
+	}
+}
