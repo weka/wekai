@@ -208,6 +208,21 @@ func GetChatGetter(model string, params *ChatParams) *ChatGetter {
 	}
 }
 
+// IsOpenAIChatWire reports whether dynType names one of the three dynamic
+// model types that speak the OpenAI /v1/chat/completions wire format:
+// "openai", "openai_vllm", and "openai_sglang". It does NOT include
+// "openai_responses" (a different wire format) — callers that also need to
+// admit that type, or that branch differently among these three (distinct
+// URL path, auth header, or exact-type behavior like UseCompatMaxTokens or
+// the SGLang cached-tokens request flag), must not use this helper.
+//
+// Exported (rather than the lowercase isOpenAIChatWire one might expect from
+// its name) because benchmark/replay_router_post.go, a separate package,
+// needs the same family test and benchmark already imports llm.
+func IsOpenAIChatWire(dynType string) bool {
+	return dynType == "openai" || dynType == "openai_vllm" || dynType == "openai_sglang"
+}
+
 // getDynamicChatGetter creates a ChatGetter for a dynamic model specification
 func getDynamicChatGetter(model string, params *ChatParams) *ChatGetter {
 	// Parse dynamic model config
