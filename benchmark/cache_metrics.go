@@ -169,15 +169,22 @@ func engineEndpoints(engine cacheEngine, model string) metricsEligibility {
 	return out
 }
 
-// normalizeMetricsURLs accepts either a bare endpoint or a full /metrics URL,
-// because both are natural to type and guessing wrong costs a whole run's
-// cache-source breakdown.
+// normalizeMetricsURLs accepts a bare host:port, a bare host:port/v1, or a
+// full /metrics URL, with or without a scheme — all are natural to type and
+// guessing wrong costs a whole run's cache-source breakdown. A bare
+// "host:port" with no "://" is assumed http://, matching the CLI help text's
+// claim that a bare host:port is accepted (previously this silently produced
+// a schemeless URL that failed at request time with "unsupported protocol
+// scheme").
 func normalizeMetricsURLs(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, u := range in {
 		u = strings.TrimSpace(u)
 		if u == "" {
 			continue
+		}
+		if !strings.Contains(u, "://") {
+			u = "http://" + u
 		}
 		u = strings.TrimRight(u, "/")
 		if !strings.HasSuffix(u, "/metrics") {

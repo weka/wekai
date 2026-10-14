@@ -476,6 +476,8 @@ func TestADTWiringReachesSamples(t *testing.T) {
 	}
 }
 
+// ── B7: normalizeMetricsURLs accepts a bare host:port without a scheme ─────
+
 func TestNormalizeMetricsURLs(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"http://h:29000", "http://h:29000/metrics"},
@@ -483,6 +485,15 @@ func TestNormalizeMetricsURLs(t *testing.T) {
 		{"http://h:29000/metrics", "http://h:29000/metrics"},
 		{"http://h:8000/v1", "http://h:8000/metrics"},
 		{"http://h:8000/v1/", "http://h:8000/metrics"},
+		// B7: a bare host:port (no scheme) must resolve to http://, not fail
+		// at request time with "unsupported protocol scheme" — the CLI help
+		// text has always claimed this shape is accepted.
+		{"h:29000", "http://h:29000/metrics"},
+		{"h:29000/metrics", "http://h:29000/metrics"},
+		{"h:8000/v1", "http://h:8000/metrics"},
+		// A scheme that isn't http is left alone (only the "no scheme at
+		// all" case is assumed http).
+		{"https://h:29000", "https://h:29000/metrics"},
 	} {
 		got := normalizeMetricsURLs([]string{tc.in})
 		if len(got) != 1 || got[0] != tc.want {
