@@ -339,24 +339,7 @@ function cumAt(cum, t) {
 // generator that built this file (see visualize.go's export builder), so
 // there is no further client-side reduction -- what is plotted is exactly
 // what was emitted.
-const MIX_COMPUTE_COLOR = "#a86853";
-const MIX_LOCAL_COLOR = "#756a99";
-const MIX_EXTERNAL_COLOR = "#7C03EC";
-// See visualize.go's MIX_HOST_COLOR doc -- kept in lockstep.
-const MIX_HOST_COLOR = "#4a9d8f";
-const ADT_LINE_COLOR = "#F2F2EB";
-const MIX_BAND_H = 64;
-const MIX_FILL_ALPHA = 0.78;
-// MIX_BAND_STYLE: see visualize.go's version -- kept in lockstep.
-const MIX_BAND_STYLE = {
-  local_compute:        { color: MIX_COMPUTE_COLOR,  label: "compute",     alpha: MIX_FILL_ALPHA },
-  compute:              { color: MIX_COMPUTE_COLOR,  label: "compute",     alpha: MIX_FILL_ALPHA },
-  local_cache_hit:      { color: MIX_LOCAL_COLOR,    label: "local cache", alpha: MIX_FILL_ALPHA },
-  device:               { color: MIX_LOCAL_COLOR,    label: "device",      alpha: MIX_FILL_ALPHA },
-  host:                 { color: MIX_HOST_COLOR,     label: "host",        alpha: MIX_FILL_ALPHA },
-  external_kv_transfer: { color: MIX_EXTERNAL_COLOR, label: "external KV", alpha: 0.95 },
-  storage:              { color: MIX_EXTERNAL_COLOR, label: "storage",     alpha: 0.95 },
-};
+` + mixBandStyleJS + `
 // mixSegTotal: see visualize.go's version -- kept in lockstep.
 function mixSegTotal(seg) {
   let sum = 0;

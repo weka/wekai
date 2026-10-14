@@ -494,7 +494,7 @@ func (w *requestDataWriter) write(rec requestDataRecord) error {
 	return w.enc.Encode(rec)
 }
 
-// writeAny encodes a non-request record (e.g. vllmMetricsSample) into the
+// writeAny encodes a non-request record (e.g. cacheMetricsSample) into the
 // same JSONL stream. Safe for concurrent use with write(); same silent
 // no-op after close.
 func (w *requestDataWriter) writeAny(v any) error {
