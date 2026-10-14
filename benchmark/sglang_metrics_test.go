@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -101,6 +102,117 @@ func TestParseSGLangCountersGarbage(t *testing.T) {
 	}
 	if len(vals) != 0 {
 		t.Fatalf("expected no keys from garbage, got %v", vals)
+	}
+}
+
+// ── B1: storage_* prefix fold ───────────────────────────────────────────────
+
+// TestParseSGLangCountersStorageUnderscorePrefixFoldsToStorage: sglang
+// versions before upstream PR #37503 emit cache_source=f"storage_{backend}"
+// (e.g. "storage_HiCacheFile") instead of plain "storage". Both must fold
+// into the one "storage" key.
+func TestParseSGLangCountersStorageUnderscorePrefixFoldsToStorage(t *testing.T) {
+	for _, label := range []string{"storage_HiCacheFile", "storage_WekaFS", "storage"} {
+		in := fmt.Sprintf(`sglang:cached_tokens_total{cache_source=%q,model_name="m"} 777`, label) + "\n"
+		vals, err := parseSGLangCounters(strings.NewReader(in))
+		if err != nil {
+			t.Fatalf("%s: parse: %v", label, err)
+		}
+		if vals["storage"] != 777 {
+			t.Errorf("%s: storage = %v, want 777 (folded regardless of the exact suffix)", label, vals["storage"])
+		}
+		if _, ok := vals[label]; ok && label != "storage" {
+			t.Errorf("%s: must not ALSO appear under its own raw label — got %v", label, vals)
+		}
+	}
+}
+
+// TestParseSGLangCountersStorageContinuityAcrossLabelSpellingChange: a
+// cluster upgrade can change the label spelling mid-fleet (one pod reporting
+// "storage_HiCacheFile", another already upgraded to "storage"). Because
+// parseSGLangCounters folds both into the same "storage" key BEFORE fold()
+// ever sees them, the delta-accumulator's per-key continuity is unaffected by
+// which spelling a given scrape happened to use.
+func TestParseSGLangCountersStorageContinuityAcrossLabelSpellingChange(t *testing.T) {
+	s := &metricsSampler{prev: map[string]map[string]float64{}, totals: map[string]float64{}}
+
+	v1, err := parseSGLangCounters(strings.NewReader(`sglang:cached_tokens_total{cache_source="storage_HiCacheFile"} 100` + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.fold("u1", v1) // baseline
+
+	v2, err := parseSGLangCounters(strings.NewReader(`sglang:cached_tokens_total{cache_source="storage_HiCacheFile"} 150` + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.fold("u1", v2)
+	if s.totals["storage"] != 50 {
+		t.Fatalf("storage total = %v, want 50", s.totals["storage"])
+	}
+
+	// The exposition text now spells the label differently -- continuity must
+	// not break just because of that.
+	v3, err := parseSGLangCounters(strings.NewReader(`sglang:cached_tokens_total{cache_source="storage"} 200` + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.fold("u1", v3)
+	if s.totals["storage"] != 100 {
+		t.Errorf("storage total after the label spelling changed = %v, want 100 (50 + another 50) — "+
+			"a label-spelling change must not look like a brand new series", s.totals["storage"])
+	}
+}
+
+// TestSGLangUnknownCacheSourceWarnsOnce: a cache_source value outside
+// {device, host, storage*, total} must trigger exactly one warning across
+// repeated occurrences (dedup is for the process lifetime — this is a
+// one-shot CLI, not a long-lived server) — so a FUTURE unrecognized label
+// doesn't silently vanish the way storage_HiCacheFile did before B1.
+func TestSGLangUnknownCacheSourceWarnsOnce(t *testing.T) {
+	var warnings []string
+	orig := sglangUnknownCacheSourceWarn
+	sglangUnknownCacheSourceWarn = func(label string) { warnings = append(warnings, label) }
+	defer func() { sglangUnknownCacheSourceWarn = orig }()
+
+	// A label unique to this test run, so process-lifetime dedup state from
+	// other tests can't mask a regression here.
+	label := "mystery_tier_for_TestSGLangUnknownCacheSourceWarnsOnce"
+	in := fmt.Sprintf(`sglang:cached_tokens_total{cache_source=%q,model_name="m"} 5`, label) + "\n"
+	for i := 0; i < 3; i++ {
+		if _, err := parseSGLangCounters(strings.NewReader(in)); err != nil {
+			t.Fatalf("attempt %d: parse: %v", i, err)
+		}
+	}
+	if len(warnings) != 1 || warnings[0] != label {
+		t.Fatalf("warnings = %v, want exactly one firing for %q across 3 occurrences", warnings, label)
+	}
+
+	// Its tokens are still parsed and accumulated (just not under a known
+	// band) — an unrecognized label must not be silently dropped either.
+	vals, err := parseSGLangCounters(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vals[label] != 5 {
+		t.Errorf("unrecognized label's tokens = %v, want still-parsed 5 under %q", vals[label], label)
+	}
+}
+
+// TestKnownCacheSourceLabelsNeverWarn confirms the known vocabulary (device,
+// host, any storage* spelling, and the backward-compat "total") never
+// triggers the unknown-label warning.
+func TestKnownCacheSourceLabelsNeverWarn(t *testing.T) {
+	var warnings []string
+	orig := sglangUnknownCacheSourceWarn
+	sglangUnknownCacheSourceWarn = func(label string) { warnings = append(warnings, label) }
+	defer func() { sglangUnknownCacheSourceWarn = orig }()
+
+	if _, err := parseSGLangCounters(strings.NewReader(sglangPromFixture)); err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("known labels triggered warnings: %v", warnings)
 	}
 }
 

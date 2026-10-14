@@ -35,13 +35,23 @@ package benchmark
 // An explicit --sglang-metrics-url override is operator intent too, and
 // bypasses this gate the same way vLLM's (speculative) override does — see
 // startMetricsSampler in cache_metrics.go.
+//
+// Pre-upstream-PR#37503 sglang versions emit cache_source=f"storage_{backend}"
+// (e.g. "storage_HiCacheFile") instead of plain "storage". parseSGLangCounters
+// folds ANY "storage"-prefixed label value into the single key "storage" (see
+// below) so this sampler's delta-fold sees one continuous series across a
+// label-spelling change, instead of the pre-storage-rename tokens silently
+// vanishing into an unrecognized key that never surfaces in any report band.
 
 import (
 	"bufio"
+	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -57,6 +67,38 @@ const (
 
 var sglangCacheSourceLabelRe = regexp.MustCompile(`\bcache_source="([^"]*)"`)
 
+// sglangUnknownCacheSourceSeen dedups the one-time unrecognized-cache_source
+// warning for the lifetime of the process — this is a one-shot CLI, not a
+// long-lived server, so a simple in-memory set is sufficient and avoids a
+// per-scrape log storm for a label this code doesn't yet know about.
+var (
+	sglangUnknownCacheSourceMu   sync.Mutex
+	sglangUnknownCacheSourceSeen = map[string]bool{}
+
+	// sglangUnknownCacheSourceWarn is the warning sink. A package-level var
+	// (rather than a hardcoded fmt.Fprintf call) so a test can override it to
+	// observe that it fires exactly once across repeated occurrences of the
+	// same unrecognized label.
+	sglangUnknownCacheSourceWarn = func(label string) {
+		fmt.Fprintf(os.Stderr, "[sglang-metrics] unrecognized cache_source=%q — its tokens are "+
+			"parsed but will not appear in any report band until parseSGLangCounters is taught "+
+			"about it\n", label)
+	}
+)
+
+// warnUnknownCacheSourceOnce logs via sglangUnknownCacheSourceWarn the first
+// time a given label is seen, and is a silent no-op on every later call with
+// the same label.
+func warnUnknownCacheSourceOnce(label string) {
+	sglangUnknownCacheSourceMu.Lock()
+	defer sglangUnknownCacheSourceMu.Unlock()
+	if sglangUnknownCacheSourceSeen[label] {
+		return
+	}
+	sglangUnknownCacheSourceSeen[label] = true
+	sglangUnknownCacheSourceWarn(label)
+}
+
 // parseSGLangCounters scans Prometheus text exposition for the
 // sglang:cached_tokens_total family (labeled by cache_source, summed across
 // all other label combinations — model_name, engine/rank) and the
@@ -64,6 +106,16 @@ var sglangCacheSourceLabelRe = regexp.MustCompile(`\bcache_source="([^"]*)"`)
 // value), returning cumulative values keyed by "device", "host", "storage",
 // "total", and sglangPromptTokensKey. Missing families simply produce no
 // entries for their keys; malformed lines are skipped.
+//
+// Any cache_source value with a "storage" prefix (e.g. "storage_HiCacheFile",
+// emitted by sglang versions before upstream PR #37503) folds into the single
+// "storage" key, so a cluster upgrade that changes the label spelling mid-fleet
+// doesn't break the delta-fold's per-key continuity. Any OTHER cache_source
+// value outside {device, host, storage*, total} triggers a one-time (not
+// per-scrape) warning — see warnUnknownCacheSourceOnce — so a future
+// unrecognized label doesn't silently vanish the way storage_HiCacheFile did;
+// its tokens are still parsed and accumulated under their own raw key, just
+// not surfaced in any report band.
 func parseSGLangCounters(r io.Reader) (map[string]float64, error) {
 	out := map[string]float64{}
 	sc := bufio.NewScanner(r)
@@ -96,7 +148,17 @@ func parseSGLangCounters(r io.Reader) (map[string]float64, error) {
 			if m == nil {
 				continue
 			}
-			out[m[1]] += v
+			label := m[1]
+			key := label
+			switch {
+			case label == "device", label == "host", label == "total":
+				// Known, as-is.
+			case strings.HasPrefix(label, "storage"):
+				key = "storage"
+			default:
+				warnUnknownCacheSourceOnce(label)
+			}
+			out[key] += v
 			continue
 		}
 		if rest, ok := strings.CutPrefix(line, sglangPromptTokensTotalFamily); ok {
