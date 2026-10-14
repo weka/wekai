@@ -2,15 +2,11 @@ package benchmark
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -108,41 +104,106 @@ func TestParseSGLangCountersGarbage(t *testing.T) {
 	}
 }
 
-func TestSGLangMetricsEndpoints(t *testing.T) {
+// ── sglangEngine.Derive ──────────────────────────────────────────────────────
+
+// TestSGLangEngineDeriveSubtractsCachedSum verifies the one non-direct band:
+// compute = prompt_tokens_total − (device + host + storage + total). sglang
+// emits cache_source="total" only as a backward-compat fallback when the
+// per-tier breakdown is unavailable — mutually exclusive with device/host/
+// storage, never a sibling (see the package comment) — so summing it in
+// alongside the tiers handles both deployment shapes without double
+// counting: whichever shape is active, the other side of the sum is 0.
+func TestSGLangEngineDeriveSubtractsCachedSum(t *testing.T) {
+	got := sglangEngine.Derive(map[string]float64{
+		sglangPromptTokensKey: 1000,
+		"device":              150,
+		"host":                40,
+		"storage":             10,
+		"total":               100,
+	})
+	want := map[string]float64{"compute": 700, "gpu": 150, "host": 40, "storage": 10}
+	for k, w := range want {
+		if got[k] != w {
+			t.Errorf("band %q = %v, want %v: %+v", k, got[k], w, got)
+		}
+	}
+}
+
+// TestSGLangEngineDeriveWithoutTotalLabel is the regression case for the bug:
+// a real sglang deployment reporting the per-tier breakdown (device/host/
+// storage) NEVER emits cache_source="total" at all -- it's an either/or
+// backward-compat fallback, not a sibling aggregate. compute must still come
+// out correctly when "total" is simply absent from the totals map (Go's
+// zero-value default), not just when it's present-but-zero.
+func TestSGLangEngineDeriveWithoutTotalLabel(t *testing.T) {
+	got := sglangEngine.Derive(map[string]float64{
+		sglangPromptTokensKey: 328001000,
+		"device":              100,
+		"host":                200,
+		"storage":             50,
+		// "total" intentionally absent.
+	})
+	wantCompute := 328001000.0 - (100 + 200 + 50)
+	if got["compute"] != wantCompute {
+		t.Errorf("compute = %v, want %v", got["compute"], wantCompute)
+	}
+}
+
+// TestSGLangEngineDeriveClampsNegativeComputeToZero guards against transient
+// scrape skew between the independently-updated prompt/cached counters
+// producing a negative compute value.
+func TestSGLangEngineDeriveClampsNegativeComputeToZero(t *testing.T) {
+	got := sglangEngine.Derive(map[string]float64{
+		sglangPromptTokensKey: 100,
+		"device":              200, // more cached than total prompt tokens this interval
+	})
+	if got["compute"] != 0 {
+		t.Errorf("compute = %v, want 0 (clamped)", got["compute"])
+	}
+}
+
+// ── Eligibility ──────────────────────────────────────────────────────────────
+
+func TestSGLangEngineEndpoints(t *testing.T) {
 	cases := []struct {
 		spec string
 		want []string
 	}{
 		{"dynamic/http://localhost:8000/v1,type=openai_sglang,alias=x", []string{"http://localhost:8000/metrics"}},
 		{"dynamic/http://a:8000/v1|http://b:8001/v1,type=openai_sglang", []string{"http://a:8000/metrics", "http://b:8001/metrics"}},
-		// Unlike vLLM, SGLang sampling is never speculative: plain "openai" or
-		// the default type must NOT start a sampler.
+		// Unlike vLLM, sglang sampling is never speculative: plain "openai" or
+		// the default type must NOT be eligible.
 		{"dynamic/http://localhost:8000/v1,type=openai", nil},
 		{"dynamic/http://localhost:8000/v1", nil},
 		{"dynamic/http://localhost:8000/v1,type=openai_vllm", nil},
-		// Not a dynamic model at all.
 		{"gpt-4", nil},
 	}
 	for _, c := range cases {
-		got := sglangMetricsEndpoints(c.spec)
-		if len(got) != len(c.want) {
-			t.Errorf("spec %q: got %v, want %v", c.spec, got, c.want)
+		got := engineEndpoints(sglangEngine, c.spec)
+		if len(got.urls) != len(c.want) {
+			t.Errorf("spec %q: got %v, want %v", c.spec, got.urls, c.want)
 			continue
 		}
-		for i := range got {
-			if got[i] != c.want[i] {
-				t.Errorf("spec %q: got %v, want %v", c.spec, got, c.want)
+		for i := range got.urls {
+			if got.urls[i] != c.want[i] {
+				t.Errorf("spec %q: got %v, want %v", c.spec, got.urls, c.want)
 				break
 			}
+		}
+		if len(c.want) > 0 && !got.explicit {
+			t.Errorf("spec %q: want explicit=true (sglang only ever starts on an exact type match)", c.spec)
 		}
 	}
 }
 
 // TestSGLangMetricsSamplerDoesNotStartForNonSGLang confirms
 // startSGLangMetricsSampler stays inert for the vLLM/default eligibility
-// shapes — SGLang sampling is additive, never a second guess at the same
-// endpoint — and for a nil tracker, mirroring startVLLMMetricsSampler's
-// nil-dependency guard.
+// shapes without an override, and for a nil tracker. An override is covered
+// separately by TestSGLangMetricsURLOverride — it DOES bypass the
+// explicit-type gate (see startMetricsSampler's doc in cache_metrics.go): the
+// gate exists to stop a speculative guess from costing failed-probe traffic,
+// and an explicit override is the operator naming exactly where to scrape,
+// leaving no guess to protect against.
 func TestSGLangMetricsSamplerDoesNotStartForNonSGLang(t *testing.T) {
 	dir := t.TempDir()
 	rdw, err := newRequestDataWriter(dir, "no_sglang_model", time.Now())
@@ -168,9 +229,8 @@ func TestSGLangMetricsSamplerDoesNotStartForNonSGLang(t *testing.T) {
 }
 
 // TestStartSGLangMetricsSamplerLifecycle drives a real sampler (via the
-// background goroutine, not sampleOnce directly) against a fake SGLang
-// /metrics endpoint and confirms it lands one sample record — mirroring
-// TestStartVLLMMetricsSamplerLifecycle.
+// background goroutine, not sampleOnce directly) against a fake sglang
+// /metrics endpoint and confirms it lands one sample record.
 func TestStartSGLangMetricsSamplerLifecycle(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/metrics" {
@@ -199,7 +259,7 @@ func TestStartSGLangMetricsSamplerLifecycle(t *testing.T) {
 	path := filepath.Join(dir, "sglang_lifecycle_model.jsonl")
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), recordTypeSGLangMetricsSample) {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), recordTypeCacheMetricsSample) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -209,17 +269,25 @@ func TestStartSGLangMetricsSamplerLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	samples := readSGLangSamplesFromFile(t, path)
+	_, samples, err := readJSONLFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(samples) != 1 {
 		t.Fatalf("got %d sglang samples, want 1: %v", len(samples), samples)
 	}
 	got := samples[0]
-	if got.RecordType != recordTypeSGLangMetricsSample {
+	if got.RecordType != recordTypeCacheMetricsSample {
 		t.Errorf("record_type = %q", got.RecordType)
 	}
+	if got.Engine != "sglang" {
+		t.Errorf("engine = %q, want sglang", got.Engine)
+	}
 	// First sighting is the baseline and contributes nothing — see fold's doc.
-	if got.Sources != (sglangSourceCounters{}) {
-		t.Errorf("first sample = %+v, want all zero: it is the baseline, not a measurement", got.Sources)
+	for band, v := range got.Bands {
+		if v != 0 {
+			t.Errorf("first sample band %q = %d, want 0: it is the baseline, not a measurement", band, v)
+		}
 	}
 	if got.EndpointsOK != 1 || got.EndpointsTotal != 1 {
 		t.Errorf("coverage = %d/%d, want 1/1", got.EndpointsOK, got.EndpointsTotal)
@@ -260,7 +328,7 @@ func TestStartSGLangMetricsSamplerUsesOverride(t *testing.T) {
 	path := filepath.Join(dir, "sglang_override_model.jsonl")
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), recordTypeSGLangMetricsSample) {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), recordTypeCacheMetricsSample) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -270,7 +338,10 @@ func TestStartSGLangMetricsSamplerUsesOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	samples := readSGLangSamplesFromFile(t, path)
+	_, samples, err := readJSONLFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(samples) != 1 {
 		t.Fatalf("got %d sglang samples, want 1 -- the override endpoint must have been scraped instead "+
 			"of the unreachable derived one", len(samples))
@@ -280,371 +351,31 @@ func TestStartSGLangMetricsSamplerUsesOverride(t *testing.T) {
 	}
 }
 
-// readSGLangSamplesFromFile reads only the sglang_metrics_sample rows from a
-// request-data JSONL file via the shared reader.
-func readSGLangSamplesFromFile(t *testing.T, path string) []sglangMetricsSample {
-	t.Helper()
-	_, _, sglangSamples, _, _, err := readJSONLFileWithParams(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	return sglangSamples
-}
-
-// ── Delta accumulation (mirrors vllm_metrics_delta_test.go) ────────────────
-
-// fakeSGLang serves the cached_tokens_total/prompt_tokens_total families with
-// settable values, or fails.
-type fakeSGLang struct {
-	device, host, storage, total, prompt atomic.Int64
-	fail                                 atomic.Bool
-	srv                                  *httptest.Server
-}
-
-func newFakeSGLang(t *testing.T) *fakeSGLang {
-	t.Helper()
-	f := &fakeSGLang{}
-	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if f.fail.Load() {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintf(w, `# TYPE sglang:cached_tokens_total counter
-sglang:cached_tokens_total{cache_source="device",model_name="m"} %d
-sglang:cached_tokens_total{cache_source="host",model_name="m"} %d
-sglang:cached_tokens_total{cache_source="storage",model_name="m"} %d
-sglang:cached_tokens_total{cache_source="total",model_name="m"} %d
-# TYPE sglang:prompt_tokens_total counter
-sglang:prompt_tokens_total{model_name="m"} %d
-`, f.device.Load(), f.host.Load(), f.storage.Load(), f.total.Load(), f.prompt.Load())
+// TestSGLangSamplerNeverGivesUpRegardlessOfFailureCount: sglang sampling is
+// never speculative (sglangEngine.Speculative = false), so unlike vLLM it
+// must keep polling forever even past what would be vLLM's speculative
+// budget — the operator asserted type=openai_sglang outright.
+func TestSGLangSamplerNeverGivesUpRegardlessOfFailureCount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
 	}))
-	t.Cleanup(f.srv.Close)
-	return f
-}
+	defer srv.Close()
 
-func (f *fakeSGLang) url() string { return f.srv.URL + "/metrics" }
-
-// sglangCapture reads back what the sampler actually persisted, through the
-// real writer and the real JSONL encoding.
-type sglangCapture struct {
-	t    *testing.T
-	path string
-}
-
-func (c *sglangCapture) all() []sglangMetricsSample {
-	c.t.Helper()
-	f, err := os.Open(c.path)
-	if err != nil {
-		c.t.Fatalf("open jsonl: %v", err)
-	}
-	defer f.Close()
-	var out []sglangMetricsSample
-	dec := json.NewDecoder(f)
-	for {
-		var s sglangMetricsSample
-		if err := dec.Decode(&s); err == io.EOF {
-			break
-		} else if err != nil {
-			c.t.Fatalf("decode jsonl: %v", err)
-		}
-		if s.RecordType == recordTypeSGLangMetricsSample {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-func newTestSGLangSampler(t *testing.T, urls []string, cap *sglangCapture) *sglangMetricsSampler {
-	t.Helper()
-	cap.t = t
-	cap.path = filepath.Join(t.TempDir(), "sglang_samples.jsonl")
-	f, err := os.Create(cap.path)
-	if err != nil {
-		t.Fatalf("create jsonl: %v", err)
-	}
-	t.Cleanup(func() { f.Close() })
-	rdw := &requestDataWriter{f: f, enc: json.NewEncoder(f)}
-	return &sglangMetricsSampler{
+	s := &metricsSampler{
+		engine:   sglangEngine,
 		model:    "m",
-		urls:     urls,
+		urls:     []string{srv.URL + "/metrics"},
+		explicit: true, // sglang is always explicit -- see engineEndpoints
 		tracker:  newActiveDatasetTracker(),
-		rdw:      rdw,
 		interval: time.Minute,
 		client:   &http.Client{},
 		now:      time.Now,
-		prev:     map[string]map[string]float64{},
-		totals:   map[string]float64{},
 		logf:     func(string, ...any) {},
 	}
-}
-
-func TestSGLangTotalsAreDeltasNotRawSums(t *testing.T) {
-	a, b := newFakeSGLang(t), newFakeSGLang(t)
-	var cap sglangCapture
-	s := newTestSGLangSampler(t, []string{a.url(), b.url()}, &cap)
-	ctx := context.Background()
-
-	// Baseline: both pods already carry history from whatever ran before —
-	// the first sighting must count as zero.
-	a.device.Store(1_000_000)
-	b.device.Store(2_000_000)
-	s.sampleOnce(ctx)
-	if got := cap.all()[0].Sources.Device; got != 0 {
-		t.Errorf("first sample = %d, want 0: the baseline must not import counters accumulated "+
-			"before the run started", got)
-	}
-
-	a.device.Add(100)
-	b.device.Add(200)
-	s.sampleOnce(ctx)
-	if got := cap.all()[1].Sources.Device; got != 300 {
-		t.Errorf("after +100/+200 the total is %d, want 300", got)
-	}
-}
-
-// TestSGLangRestartCountsFromZeroInsteadOfGoingBackwards mirrors vLLM's
-// equivalent: a pod restarts, its counter resets, and a sum of raw counters
-// would DROP — which downstream reads as a counter reset and discards.
-func TestSGLangRestartCountsFromZeroInsteadOfGoingBackwards(t *testing.T) {
-	a, b := newFakeSGLang(t), newFakeSGLang(t)
-	var cap sglangCapture
-	s := newTestSGLangSampler(t, []string{a.url(), b.url()}, &cap)
-	ctx := context.Background()
-
-	a.device.Store(500)
-	b.device.Store(500)
-	s.sampleOnce(ctx) // baseline
-	a.device.Store(900)
-	b.device.Store(700)
-	s.sampleOnce(ctx) // +400 +200 = 600
-	if got := cap.all()[1].Sources.Device; got != 600 {
-		t.Fatalf("device total = %d, want 600", got)
-	}
-
-	// a restarts: its device counter resets to 0 and climbs to 50.
-	a.device.Store(50)
-	b.device.Store(750)
-	s.sampleOnce(ctx)
-
-	got := cap.all()[2].Sources.Device
-	if got < cap.all()[1].Sources.Device {
-		t.Errorf("device total went backwards %d -> %d across a restart; that is the failure the "+
-			"delta scheme exists to prevent", cap.all()[1].Sources.Device, got)
-	}
-	// 600 + a's post-restart 50 + b's +50.
-	if got != 700 {
-		t.Errorf("device total = %d, want 700 (600 + 50 from the restarted pod counted from zero + 50)", got)
-	}
-	if cap.all()[2].Resets != 1 {
-		t.Errorf("Resets = %d, want 1", cap.all()[2].Resets)
-	}
-}
-
-// TestSGLangComputeDerivedFromPromptMinusCachedTotal verifies the one
-// non-direct band: compute = Δprompt − Δ(device+host+storage+total), where
-// "total" is the untiered fallback series.
-func TestSGLangComputeDerivedFromPromptMinusCachedTotal(t *testing.T) {
-	a := newFakeSGLang(t)
-	var cap sglangCapture
-	s := newTestSGLangSampler(t, []string{a.url()}, &cap)
-	ctx := context.Background()
-
-	a.prompt.Store(1000)
-	a.total.Store(200)
-	a.device.Store(150)
-	a.host.Store(40)
-	a.storage.Store(10)
-	s.sampleOnce(ctx) // baseline
-
-	a.prompt.Add(500)
-	a.total.Add(100)
-	a.device.Add(70)
-	a.host.Add(20)
-	a.storage.Add(10)
-	s.sampleOnce(ctx)
-
-	got := cap.all()[1].Sources
-	if got.Compute != 300 { // Δprompt(500) - (70+20+10 tiered + 100 untiered)
-		t.Errorf("compute = %d, want 300", got.Compute)
-	}
-	if got.Device != 70 || got.Host != 20 || got.Storage != 10 {
-		t.Errorf("sources = %+v, want device=70 host=20 storage=10", got)
-	}
-}
-
-// fakeSGLangNoTotal serves cached_tokens_total/prompt_tokens_total WITHOUT
-// ever emitting a cache_source="total" series -- matching a real sglang
-// deployment that reports the per-tier breakdown (cached_tokens_details is
-// populated), where "total" is structurally absent rather than just zero.
-type fakeSGLangNoTotal struct {
-	device, host, storage, prompt atomic.Int64
-	srv                           *httptest.Server
-}
-
-func newFakeSGLangNoTotal(t *testing.T) *fakeSGLangNoTotal {
-	t.Helper()
-	f := &fakeSGLangNoTotal{}
-	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `# TYPE sglang:cached_tokens_total counter
-sglang:cached_tokens_total{cache_source="device",model_name="m"} %d
-sglang:cached_tokens_total{cache_source="host",model_name="m"} %d
-sglang:cached_tokens_total{cache_source="storage",model_name="m"} %d
-# TYPE sglang:prompt_tokens_total counter
-sglang:prompt_tokens_total{model_name="m"} %d
-`, f.device.Load(), f.host.Load(), f.storage.Load(), f.prompt.Load())
-	}))
-	t.Cleanup(f.srv.Close)
-	return f
-}
-
-func (f *fakeSGLangNoTotal) url() string { return f.srv.URL + "/metrics" }
-
-// TestSGLangComputeWithoutTotalLabel is the regression case for the bug: a
-// real sglang deployment reporting the per-tier breakdown (device/host/storage)
-// NEVER emits cache_source="total" at all -- it's an either/or backward-compat
-// fallback, not a sibling aggregate (see metrics_collector.py's
-// report_cache_source). A fixture that omits the "total" series entirely must
-// still produce a correct, nonzero-subtracted compute -- not the unsubtracted
-// full prompt_tokens_total delta the old `s.totals["total"]` (always 0 here,
-// since it's never scraped) formula would have silently produced.
-func TestSGLangComputeWithoutTotalLabel(t *testing.T) {
-	a := newFakeSGLangNoTotal(t)
-	var cap sglangCapture
-	s := newTestSGLangSampler(t, []string{a.url()}, &cap)
-	ctx := context.Background()
-
-	a.device.Store(129447424)
-	a.host.Store(149774592)
-	a.storage.Store(231680)
-	a.prompt.Store(328000000)
-	s.sampleOnce(ctx) // baseline
-
-	a.device.Add(100)
-	a.host.Add(200)
-	a.storage.Add(50)
-	a.prompt.Add(1000)
-	s.sampleOnce(ctx)
-
-	got := cap.all()[1].Sources
-	wantCompute := int64(1000 - (100 + 200 + 50)) // 650
-	if got.Compute != wantCompute {
-		t.Errorf("compute = %d, want %d: with no \"total\" label ever present, the old "+
-			"s.totals[\"total\"] formula would have stayed 0 and produced compute=1000 "+
-			"(the full prompt_tokens_total delta, silently wrong)", got.Compute, wantCompute)
-	}
-	if got.Device != 100 || got.Host != 200 || got.Storage != 50 {
-		t.Errorf("sources = %+v, want device=100 host=200 storage=50", got)
-	}
-}
-
-// TestSGLangOneEndpointFailingCostsOnlyItsOwnDelta mirrors vLLM's equivalent:
-// one endpoint failing must not zero the whole interval.
-func TestSGLangOneEndpointFailingCostsOnlyItsOwnDelta(t *testing.T) {
-	a, b := newFakeSGLang(t), newFakeSGLang(t)
-	var cap sglangCapture
-	s := newTestSGLangSampler(t, []string{a.url(), b.url()}, &cap)
-	ctx := context.Background()
-
-	s.sampleOnce(ctx) // baseline at 0/0
-
-	a.device.Add(100)
-	b.device.Add(999)
-	b.fail.Store(true)
-	s.sampleOnce(ctx)
-
-	smp := cap.all()[1]
-	if smp.Sources.Device != 100 {
-		t.Errorf("device total = %d, want 100: the healthy endpoint's delta must land even though "+
-			"its peer failed", smp.Sources.Device)
-	}
-	if smp.EndpointsOK != 1 || smp.EndpointsTotal != 2 {
-		t.Errorf("coverage %d/%d, want 1/2", smp.EndpointsOK, smp.EndpointsTotal)
-	}
-}
-
-// TestSGLangNoEndpointsAnsweringIsRecordedAsUnobserved: a flat interval and
-// an unobserved one are different claims.
-func TestSGLangNoEndpointsAnsweringIsRecordedAsUnobserved(t *testing.T) {
-	a := newFakeSGLang(t)
-	var cap sglangCapture
-	s := newTestSGLangSampler(t, []string{a.url()}, &cap)
-	ctx := context.Background()
-
-	s.sampleOnce(ctx)
-	a.fail.Store(true)
-	s.sampleOnce(ctx)
-
-	if len(cap.all()) != 2 {
-		t.Fatalf("%d samples written, want 2", len(cap.all()))
-	}
-	if got := cap.all()[1].EndpointsOK; got != 0 {
-		t.Errorf("EndpointsOK = %d, want 0", got)
-	}
-	if cap.all()[1].EndpointsTotal != 1 {
-		t.Errorf("EndpointsTotal = %d, want 1", cap.all()[1].EndpointsTotal)
-	}
-	// Unlike vLLM's speculative sampler, sglang sampling never gives up —
-	// the operator asserted type=openai_sglang.
-	if !s.sampleOnce(ctx) {
-		t.Error("sglang sampler must keep polling after failures; it is never speculative")
-	}
-}
-
-// ── buildSampleVizSGLang ─────────────────────────────────────────────────
-
-func TestBuildSampleVizSGLangDeltasAndClamp(t *testing.T) {
-	t0 := time.Unix(1000, 0)
-	mk := func(offsetSec int, compute, device, host, storage, adt int64, as int) sglangMetricsSample {
-		return sglangMetricsSample{
-			RecordType:          recordTypeSGLangMetricsSample,
-			TS:                  t0.Add(time.Duration(offsetSec) * time.Second),
-			Sources:             sglangSourceCounters{Compute: compute, Device: device, Host: host, Storage: storage},
-			ActiveDatasetTokens: adt,
-			ActiveSeries:        as,
+	for i := 0; i < metricsSpeculativeBudget+5; i++ {
+		if !s.sampleOnce(context.Background()) {
+			t.Fatalf("sglang sampler gave up on attempt %d; it must never give up", i+1)
 		}
-	}
-	// Out of order on purpose; sample 3 has a counter reset (values drop).
-	samples := []sglangMetricsSample{
-		mk(60, 1500, 300, 100, 42, 2000, 2),
-		mk(0, 1000, 200, 50, 40, 1000, 1),
-		mk(120, 100, 50, 10, 5, 3000, 3), // reset: deltas must clamp to 0
-		mk(180, 200, 80, 20, 6, 2500, 2),
-	}
-	mix, adt := buildSampleVizSGLang(samples)
-	if len(mix) != 3 {
-		t.Fatalf("got %d segments, want 3", len(mix))
-	}
-	if len(mix[0].Bands) != 4 {
-		t.Fatalf("seg0 has %d bands, want 4 (compute/device/host/storage)", len(mix[0].Bands))
-	}
-	// Segment 1: 0s -> 60s.
-	if bandTokens(t, mix[0], "compute") != 500 || bandTokens(t, mix[0], "device") != 100 ||
-		bandTokens(t, mix[0], "host") != 50 || bandTokens(t, mix[0], "storage") != 2 {
-		t.Errorf("seg0 deltas = %+v, want compute=500 device=100 host=50 storage=2", mix[0])
-	}
-	// Segment 2 spans the counter reset: all deltas clamp at 0.
-	for _, name := range sglangBandOrder {
-		if bandTokens(t, mix[1], name) != 0 {
-			t.Errorf("seg1 (reset) band %q = %v, want 0", name, bandTokens(t, mix[1], name))
-		}
-	}
-	// Segment 3 resumes from the post-reset baseline.
-	if bandTokens(t, mix[2], "compute") != 100 || bandTokens(t, mix[2], "device") != 30 ||
-		bandTokens(t, mix[2], "host") != 10 || bandTokens(t, mix[2], "storage") != 1 {
-		t.Errorf("seg2 deltas = %+v, want compute=100 device=30 host=10 storage=1", mix[2])
-	}
-	if mix[0].T0 != float64(t0.UnixMilli()) || mix[0].T1 != float64(t0.Add(60*time.Second).UnixMilli()) {
-		t.Errorf("seg0 span = %v..%v", mix[0].T0, mix[0].T1)
-	}
-	if len(adt) != 4 || adt[0].Tokens != 1000 || adt[3].Tokens != 2500 || adt[3].Series != 2 {
-		t.Errorf("adt points wrong: %+v", adt)
-	}
-}
-
-func TestBuildSampleVizSGLangEmpty(t *testing.T) {
-	mix, adt := buildSampleVizSGLang(nil)
-	if mix != nil || adt != nil {
-		t.Fatalf("expected nil/nil, got %v %v", mix, adt)
 	}
 }
 
@@ -709,15 +440,12 @@ func TestSGLangComputeClampsAtZero(t *testing.T) {
 }
 
 func TestSGLangMetricsURLOverride(t *testing.T) {
-	var cap sglangCapture
-	_ = cap
 	tracker := newActiveDatasetTracker()
-	f, err := os.Create(filepath.Join(t.TempDir(), "o.jsonl"))
+	rdw, err := newRequestDataWriter(t.TempDir(), "override_model", time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	rdw := &requestDataWriter{f: f, enc: json.NewEncoder(f)}
+	defer func() { _ = rdw.close() }()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// A non-sglang spec samples nothing without an override...

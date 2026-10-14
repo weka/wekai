@@ -384,7 +384,7 @@ the model spec points at an OpenAI-compatible (chat/completions) endpoint,
 a sampler polls the server's Prometheus endpoint — `<base>/metrics`, with
 the `/v1` API suffix stripped — once a minute and appends the result to the
 same JSONL. This is what splits the report's prompt tokens into compute vs
-local cache vs external cache.
+cached, by cache tier (device / host / storage or external connector).
 
 Exactly one series is read — `vllm:prompt_tokens_by_source_total` — keeping
 the three `source` label values `local_compute`, `local_cache_hit`, and
@@ -392,16 +392,22 @@ the three `source` label values `local_compute`, `local_cache_hit`, and
 (`model_name`, engine index); nothing else from `/metrics` is retained. The
 `_total` is `prometheus_client` appending the counter suffix to the family
 declared as `vllm:prompt_tokens_by_source`, which is why the bare name still
-appears on the `# HELP`/`# TYPE` lines. Each sample is one JSONL row with
-`record_type: "vllm_metrics_sample"` and fields `ts`, `model`,
-`sources.compute` / `sources.local_cache` / `sources.external_cache`, plus
-the locally-computed `active_dataset_tokens` and `active_series`.
+appears on the `# HELP`/`# TYPE` lines. Both engines write the same JSONL
+row, `record_type: "cache_metrics_sample"`, with fields `ts`, `model`,
+`engine` (`vllm` / `sglang`), `bands` (cumulative tokens per band, below),
+`resets`, `endpoints_ok` / `endpoints_total`, plus the locally-computed
+`active_dataset_tokens` and `active_series`. vLLM's bands are
+`compute` (`local_compute`), `host` (`local_cache_hit`; vLLM does not split
+GPU- from CPU-resident local cache) and `external` (`external_kv_transfer`,
+shown as "external connector"). Legacy `vllm_metrics_sample` /
+`sglang_metrics_sample` rows from older runs are translated on read, so old
+trace directories still render.
 
 **SGLang.** For `type=openai_sglang` the sampler reads
 `sglang:cached_tokens_total` (`cache_source` = `device` / `host` / `storage`,
 plus SGLang's untiered `total` fallback) and `sglang:prompt_tokens_total`, and
-writes `record_type: "sglang_metrics_sample"` rows with
-`sources.{device,host,storage,compute}`, where
+writes the same `cache_metrics_sample` rows with bands
+`{compute,gpu,host,storage}` (`gpu` is the `device` label), where
 `compute = max(0, prompt - (device + host + storage + total))`. Point it
 elsewhere with `--sglang-metrics-url` (repeatable; e.g. the router's
 aggregate metrics listener), the SGLang counterpart of `--vllm-metrics-url`.
