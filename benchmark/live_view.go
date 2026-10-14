@@ -119,6 +119,11 @@ type liveGate struct {
 	// (0 = off) and how many have.
 	RetireMs float64 `json:"retire_ms,omitempty"`
 	Retired  int64   `json:"retired,omitempty"`
+	// --decode-rate-min: the per-request decode rate now, the minimum, and
+	// how many due requests are currently held back.
+	DecodeRate    float64 `json:"decode_rate,omitempty"`
+	DecodeMin     float64 `json:"decode_min,omitempty"`
+	DecodeHolding int64   `json:"decode_holding,omitempty"`
 }
 
 // liveRates are token throughputs (tokens/s) over trailing windows.

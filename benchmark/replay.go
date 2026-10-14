@@ -354,12 +354,18 @@ func recordReplayRequest(
 	// Observing zero would be the opposite error, dragging the mean down. What
 	// the caller actually experienced is the elapsed time, so that is what goes
 	// in.
+	//
+	// A --decode-rate-min hold is the same kind of caller-visible wait: the
+	// request was due and was not sent. It is reported apart from TTFT
+	// (decode_hold_ms) but the gate -- and so admission and --ttft-retire --
+	// sees it added, so a fleet that is only "fast" because requests are being
+	// held does not keep admitting sessions.
 	if st.ttft != nil {
 		switch {
 		case metrics.TimeToFirstToken > 0:
-			st.ttft.Observe(time.Now(), metrics.TimeToFirstToken)
+			st.ttft.Observe(time.Now(), metrics.TimeToFirstToken+metrics.DecodeHold)
 		case metrics.Error != nil && metrics.TotalResponseTime > 0:
-			st.ttft.Observe(time.Now(), metrics.TotalResponseTime)
+			st.ttft.Observe(time.Now(), metrics.TotalResponseTime+metrics.DecodeHold)
 		}
 	}
 
@@ -579,6 +585,7 @@ func recordReplayRequest(
 			RequestNum:           metrics.RequestNum,
 			Slot:                 metrics.Slot.N,
 			ThinkPauseMs:         metrics.ThinkPause.Milliseconds(),
+			DecodeHoldMs:         metrics.DecodeHold.Milliseconds(),
 			Retries429:           metrics.Retries429,
 			RetryWaitMs:          metrics.RetryWait.Milliseconds(),
 			ReadyMs:              unixMilliOrZero(metrics.ReadyAt),

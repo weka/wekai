@@ -20,7 +20,7 @@ var WekaiTimeline = (function () {
 
   var FLAG_ERR = 1, FLAG_COLD = 2, FLAG_EMPTY = 4, FLAG_TIMINGS = 8, FLAG_SRC = 16, FLAG_INFL = 32, FLAG_TRUNC = 64, FLAG_SESSION = 128, FLAG_HOT = 256, FLAG_WAITING = 512;
   var INFLIGHT_KIND = 10, WAIT_CLIENT = 11, WAITED = 13;
-  var WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1, 14: 1 };   // kinds the "merge waits" toggle collapses into WAITED
+  var WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1, 14: 1, 15: 1 };   // kinds the "merge waits" toggle collapses into WAITED
   var AXIS_H = 34, RIGHT = 14, GAP = 2;
   var ROW_HEIGHTS = [1, 2, 3, 4, 6, 10, 14, 20];
 
@@ -364,6 +364,10 @@ var WekaiTimeline = (function () {
         else {
           h += " &mdash; gate: " + g.stat + " &lt; " + fmtSec(g.limit_ms / 1000) + " &rarr; <b class='" + (g.open ? "wtl-gating" : "wtl-bad") + "'>" + (g.open ? "OPEN" : "CLOSED") + "</b>";
           h += g.capped ? " (at the series cap, no more admissions)" : g.every_s ? (g.open ? " (next +" + g.admit_count + " in " + fmtSec(g.next_in_s) + ")" : " (admissions held; next check in " + fmtSec(g.next_in_s) + ")") : "";
+          if (g.decode_min) {
+            var slow = (g.decode_rate || 0) < g.decode_min;
+            h += " &middot; <span title='--decode-rate-min: due requests are held while the per-request decode rate over the window is below the minimum'>decode <b class='" + (slow ? "wtl-bad" : "wtl-gating") + "'>" + (g.decode_rate || 0).toFixed(1) + "</b> / " + g.decode_min + " tok/s per request, held <b>" + (g.decode_holding || 0) + "</b></span>";
+          }
           if (g.retire_ms) {
             var shedding = g.value_ms > g.retire_ms;
             h += " &middot; <span title='--ttft-retire: a slot whose session ends while the gate statistic is above this does not take another session'>retire above " + fmtSec(g.retire_ms / 1000) + " &rarr; <b class='" + (shedding ? "wtl-bad" : "wtl-gating") + "'>" + (shedding ? "SHRINKING" : "holding") + "</b>, retired <b>" + (g.retired || 0) + "</b></span>";

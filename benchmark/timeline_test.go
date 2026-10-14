@@ -436,7 +436,7 @@ func TestLiveInflightClientWait(t *testing.T) {
 // The renderer's merge toggle collapses exactly the wait kinds the model emits.
 func TestTimelineKindsMergeContract(t *testing.T) {
 	js := timelineJS
-	for _, want := range []string{"WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1, 14: 1 }", "WAITED = 13"} {
+	for _, want := range []string{"WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1, 14: 1, 15: 1 }", "WAITED = 13"} {
 		if !strings.Contains(js, want) {
 			t.Errorf("renderer lacks %q", want)
 		}

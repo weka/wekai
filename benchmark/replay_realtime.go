@@ -776,6 +776,11 @@ func admissionGate(cfg AutoBenchmarkConfig, st *autoState, admitStart time.Time)
 	st.mu.Lock()
 	g.Capped = cfg.MaxSeries > 0 && st.series >= cfg.MaxSeries
 	st.mu.Unlock()
+	if st.decode != nil {
+		g.DecodeRate, _ = st.decode.rate(now)
+		g.DecodeMin = cfg.DecodeRateMin
+		g.DecodeHolding = st.decodeHolding.Load()
+	}
 	if cfg.TTFTRetire {
 		g.RetireMs = float64(retireThreshold(cfg).Milliseconds())
 		g.Retired = st.seriesRetired.Load()

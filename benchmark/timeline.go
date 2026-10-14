@@ -36,6 +36,7 @@ const (
 	segUnattributed   = 12 // sent, but not yet in the engine's clock: network / frontend
 	segWaited         = 13 // renderer only: all wait kinds merged
 	segRetry429       = 14 // client backoff after the fleet shed the request with a 429
+	segDecodeHold     = 15 // client held the due request back: --decode-rate-min not met
 )
 
 // Per-request flag bits.
@@ -65,6 +66,7 @@ type timelineKind struct {
 var timelineKinds = []timelineKind{
 	{segWaitClient, "wait_client", "client wait (no free slot)", "#b8c0c8"},
 	{segRetry429, "wait_429", "429 shed / backoff", "#d65db1"},
+	{segDecodeHold, "wait_decode_hold", "held: decode rate below minimum", "#c9a227"},
 	{segWaitOther, "wait_other", "engine queue: other limits", "#5b646d"},
 	{segWaitKV, "wait_kv", "engine queue: no free KV blocks", "#f08a3c"},
 	{segUnattributed, "wait_unattributed", "unattributed wait (network / frontend)", "#a08f7a"},
@@ -285,6 +287,7 @@ func timelineFromRecord(r requestDataRecord, t0 int64) timelineReq {
 	tp := float64(r.ThinkPauseMs)
 	rw := float64(r.RetryWaitMs)
 	segs, trunc := timelineSegments(cw, rw, e2e, r.TTFT, r.IsError, r.KV)
+	segs = splitDecodeHold(segs, float64(r.DecodeHoldMs))
 	tr := timelineReq{
 		Series: r.SeriesNum,
 		Turn:   r.Turn,
@@ -465,4 +468,22 @@ func eligibleAt(loopTop, now time.Time, late time.Duration) time.Time {
 		return r
 	}
 	return loopTop
+}
+
+// splitDecodeHold carves the --decode-rate-min hold out of the leading client
+// wait: the hold comes first (the request was due and deliberately not sent),
+// then whatever slot wait followed it.
+func splitDecodeHold(segs []tlSeg, holdMs float64) []tlSeg {
+	if holdMs <= 0 || len(segs) == 0 || segs[0].kind != segWaitClient {
+		return segs
+	}
+	cw := segs[0].ms
+	if holdMs > cw {
+		holdMs = cw
+	}
+	out := []tlSeg{{segDecodeHold, holdMs}}
+	if rest := cw - holdMs; rest > 0 {
+		out = append(out, tlSeg{segWaitClient, rest})
+	}
+	return append(out, segs[1:]...)
 }

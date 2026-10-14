@@ -132,6 +132,8 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		return fmt.Errorf("--global-model-override cannot be used with benchmark auto; specify model via --model or --models flag")
 	}
 
+	c.applyRealtimeDefaults()
+
 	// --series is a shortcut for --start-series=N --max-series=N; enforce mutual exclusivity
 	startSeries := c.StartSeries
 	maxSeries := c.MaxSeries
@@ -285,7 +287,9 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		AdmitEvery:                    c.AdmitEvery,
 		AdmitCount:                    c.AdmitCount,
 		TTFTLimit:                     c.TTFTLimit,
-		TTFTRetire:                    c.TTFTRetire,
+		TTFTRetire:                    c.ReplayRealtime && c.Retire(),
+		DecodeRateMin:                 c.DecodeRateMin,
+		DecodeRateWindow:              c.DecodeRateWindow,
 		TTFTRetireMargin:              c.TTFTRetireMargin,
 		TTFTWindow:                    c.TTFTWindowDur,
 		ReplaySkipIdle:                c.ReplaySkipIdle,
@@ -741,7 +745,30 @@ func (c *BenchmarkThroughputCommand) Execute(args []string) error {
 //
 // The other two are warnings: they describe a run that does less than the
 // operator asked for, not one that reports something false.
+// applyRealtimeDefaults makes --replay-realtime a complete recipe on its own:
+// the TTFT-gated ramp (start 32, +16 every minute, uncapped), session reuse
+// (the run keeps going until --timeout instead of running out of corpus),
+// --ttft-retire with its 15% margin, and the request timeline in the report.
+// Every one of them stays overridable by passing the flag explicitly;
+// --replay-timing already resolves to think when the file carries think_ms.
+func (c *BenchmarkAutoCommand) applyRealtimeDefaults() {
+	if !c.ReplayRealtime {
+		return
+	}
+	if c.AdmitEvery == 0 {
+		c.AdmitEvery = time.Minute
+	}
+	if c.AdmitCount == 0 {
+		c.AdmitCount = 16
+	}
+	if c.StartSeries == 0 && c.Series == 0 {
+		c.StartSeries = 32
+	}
+	c.Timeline = true
+}
+
 func (c *BenchmarkAutoCommand) validateRealtime(w io.Writer) error {
+	c.applyRealtimeDefaults() // idempotent; Execute applies it first, tests may not
 	if c.AdmitCount < 0 {
 		return fmt.Errorf("--admit-count must be non-negative (0 means one session)")
 	}
@@ -751,9 +778,18 @@ func (c *BenchmarkAutoCommand) validateRealtime(w io.Writer) error {
 	if c.AdmitCount > 0 && c.AdmitEvery == 0 {
 		return fmt.Errorf("--admit-count requires a positive --admit-every")
 	}
-	if c.TTFTRetire && (!c.ReplayRealtime || c.AdmitEvery <= 0) {
-		return fmt.Errorf("--ttft-retire needs --replay-realtime and a positive --admit-every: retiring slots " +
-			"with nothing to re-add them would only ever shrink the run")
+	if c.ReplayRealtime && c.Retire() && c.AdmitEvery <= 0 {
+		return fmt.Errorf("--ttft-retire needs a positive --admit-every: retiring slots " +
+			"with nothing to re-add them would only ever shrink the run (or pass --ttft-retire=false)")
+	}
+	if c.DecodeRateMin < 0 {
+		return fmt.Errorf("--decode-rate-min must be non-negative (0 = off)")
+	}
+	if c.DecodeRateMin > 0 && !c.ReplayRealtime {
+		return fmt.Errorf("--decode-rate-min needs --replay-realtime")
+	}
+	if c.DecodeRateMin > 0 && c.DecodeRateWindow <= 0 {
+		return fmt.Errorf("--decode-rate-window must be positive")
 	}
 	if c.TTFTRetireMargin < 0 {
 		return fmt.Errorf("--ttft-retire-margin must be non-negative (0.15 = retire at 15%% above --ttft-limit)")

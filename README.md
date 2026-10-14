@@ -151,12 +151,22 @@ To start with 32 series and add 32 more every two minutes, replace
 is capped only when `--max-series` is set. Omit it for an unlimited ramp.
 With `--replay-realtime`, admission pauses while the TTFT gate is closed
 and resumes with one batch per tick, without catching up on skipped ticks.
-Add `--ttft-retire` (opt-in) to let the session count shrink as well: when a
-session ends while the gate statistic is more than `--ttft-retire-margin`
-(default 0.15, i.e. 15%) above `--ttft-limit`, its slot retires instead of
-starting the next session. Between the limit and that threshold sessions are
-still replaced but none are added; below the limit admission adds batches as
-usual, with `--max-series` capping active slots rather than slots ever added.
+`--replay-realtime` on its own is the full recipe: think-time pacing, start
+32 sessions and add 16 every minute while the windowed mean TTFT is under
+`--ttft-limit` (10s), no session cap, sessions reused from the top of the file
+(so the run lasts until `--timeout`), and the request timeline in the report.
+`--ttft-retire` is on by default: when a session ends while TTFT is more than
+`--ttft-retire-margin` (0.15) above the limit, its slot retires instead of
+starting the next session (between the limit and that threshold sessions are
+replaced but none added; below it admission adds batches). Every default can be
+overridden with the explicit flag (`--ttft-retire=false`, `--max-series=N`, ...).
+
+`--decode-rate-min=N` (opt-in) also holds back due requests while the average
+per-request decode rate (output tokens/s of streaming requests over
+`--decode-rate-window`, default 30s; exact per-chunk counts via vLLM's
+`continuous_usage_stats`) is below N, and sends them when it recovers. The hold
+is reported as `decode_hold_ms` and its own timeline segment, outside `ttft_ms`,
+but it is added to the TTFT the admission gate and `--ttft-retire` see.
 Without real-time replay, admission depends only on the interval.
 Omitting `--admit-count` preserves one series per tick. Add `--replay-realtime`
 to preserve captured think times; without it, sessions run back-to-back.

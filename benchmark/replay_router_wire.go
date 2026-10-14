@@ -717,9 +717,13 @@ func buildOpenAIChatCompletionsBody(req RouterReplayRequest, docs string, modelN
 		body["top_p"] = *req.TopP
 	}
 	if req.Stream {
-		body["stream_options"] = map[string]interface{}{
-			"include_usage": true,
+		so := map[string]interface{}{"include_usage": true}
+		if !sglang && openAIContinuousUsage.Load() {
+			// Per-chunk usage gives the decode-rate gate exact streamed token
+			// counts (a delta can carry several tokens under spec decode).
+			so["continuous_usage_stats"] = true
 		}
+		body["stream_options"] = so
 	}
 	if value, ok := llm.ResolveReasoningEffort(llm.ReasoningEffort(reasoningEffort)); ok {
 		body["reasoning_effort"] = value

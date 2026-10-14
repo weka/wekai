@@ -1088,6 +1088,7 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 	var resp strings.Builder
 	var contentOnly strings.Builder
 	var reasoningOnly strings.Builder
+	exactOut := false // per-chunk usage seen: streamed token count is exact
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -1141,6 +1142,10 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 			}
 			m.UsageData = buildReplayUsage(chunk.Usage.PromptTokens, cached, chunk.Usage.CompletionTokens)
 			m.KV = llm.NewKVDetails(kvSrc, kvRc, chunk.Usage.Timings)
+			if len(chunk.Choices) > 0 { // continuous_usage_stats: usage rides each content chunk
+				m.progress.setOut(int64(chunk.Usage.CompletionTokens))
+				exactOut = true
+			}
 		}
 
 		// Capture content delta & TTFT.
@@ -1156,7 +1161,9 @@ func consumeOpenAISSE(body io.Reader, startTime time.Time, m *RequestMetrics) {
 					m.TimeToFirstToken = time.Since(startTime)
 					m.progress.markFirst()
 				})
-				m.progress.addOut(1)
+				if !exactOut {
+					m.progress.addOut(1)
+				}
 			}
 			resp.WriteString(content)
 			resp.WriteString(reasoning)

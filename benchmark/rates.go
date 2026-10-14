@@ -282,6 +282,20 @@ func (p *liveProgress) addOut(n int64) {
 	}
 }
 
+// setOut replaces the streamed-token estimate with an exact count (per-chunk
+// usage from the server); it never moves the count backwards.
+func (p *liveProgress) setOut(n int64) {
+	if p == nil {
+		return
+	}
+	for {
+		cur := p.out.Load()
+		if n <= cur || p.out.CompareAndSwap(cur, n) {
+			return
+		}
+	}
+}
+
 func (p *liveProgress) setPromptEst(n int) {
 	if p != nil {
 		p.promptEst.Store(int64(n))

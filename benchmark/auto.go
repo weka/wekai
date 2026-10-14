@@ -139,6 +139,12 @@ type AutoBenchmarkConfig struct {
 	// slots at MaxSeries and keeps ticking, so a recovered fleet regrows.
 	TTFTRetire       bool
 	TTFTRetireMargin float64
+	// DecodeRateMin (opt-in, tokens/s per streaming request) holds new requests
+	// while the fleet's per-request decode rate over DecodeRateWindow is below
+	// it; see decodeRate. The hold is reported apart from TTFT but is added to
+	// the TTFT the admission gate and retire decisions see.
+	DecodeRateMin    float64
+	DecodeRateWindow time.Duration
 	// TTFTLimitStat is which statistic over that window the gate compares
 	// against TTFTLimit: mean (default), p50, p95 or p99.
 	//
@@ -337,6 +343,9 @@ type requestDataRecord struct {
 	// turn became eligible (real-time replay: previous turn's end to its due
 	// time). Idle by design, as opposed to idle for want of a session.
 	ThinkPauseMs int64 `json:"think_pause_ms,omitempty"`
+	// DecodeHoldMs is the part of the ready -> sent wait spent held back by
+	// --decode-rate-min (not part of ttft_ms; the admission gate adds it).
+	DecodeHoldMs int64 `json:"decode_hold_ms,omitempty"`
 	// Retries429 / RetryWaitMs: 429 sheds this request backed off and retried,
 	// and the time slept doing so. Included in response_time_ms and ttft_ms.
 	Retries429  int   `json:"retries_429,omitempty"`
@@ -1255,6 +1264,11 @@ type autoState struct {
 	// retire threshold, so the slot did not take another session).
 	seriesRetired atomic.Int64
 
+	// decode is the --decode-rate-min tracker (nil when the gate is off);
+	// decodeHolding counts requests currently held back by it.
+	decode        *decodeRate
+	decodeHolding atomic.Int64
+
 	// Content-level cache estimator (*cacheEstimator) that estimates repeated
 	// (warm) prompt tokens client-side across all modes (synthetic/step/replay).
 	// Its Ratio() drives the cold/warm split and gcache display, replacing the
@@ -1501,11 +1515,14 @@ type displaySnapshot struct {
 	totalOutput    int64 // total output tokens
 
 	// Replay-mode progress (replayTotal > 0 enables the replay panel in render)
-	replayTotal     int   // total conversations queued (fixed at start)
-	replayCompleted int64 // conversations fully walked
-	replayRemaining int   // still-queued conversations
-	replayActive    int64 // worker goroutines still alive (effective concurrency cap)
-	seriesRetired   int64 // slots retired by --ttft-retire
+	replayTotal     int     // total conversations queued (fixed at start)
+	replayCompleted int64   // conversations fully walked
+	replayRemaining int     // still-queued conversations
+	replayActive    int64   // worker goroutines still alive (effective concurrency cap)
+	seriesRetired   int64   // slots retired by --ttft-retire
+	decodeRate      float64 // --decode-rate-min: per-request decode tok/s now (0 = gate off / no data)
+	decodeHolding   int64   // --decode-rate-min: requests held right now
+	decodeOn        bool
 }
 
 // displayState manages the display snapshot.
@@ -1819,6 +1836,9 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 		if snap.seriesRetired > 0 {
 			replayPrefix = fmt.Sprintf("replay=%d/%d(queue=%d,active=%d,retired=%d) ",
 				snap.replayCompleted, snap.replayTotal, snap.replayRemaining, snap.replayActive, snap.seriesRetired)
+		}
+		if snap.decodeOn {
+			replayPrefix += fmt.Sprintf("dec=%.1ft/s held=%d ", snap.decodeRate, snap.decodeHolding)
 		}
 	}
 	// Two counts, because they answer different questions and were being read
@@ -2154,6 +2174,11 @@ func runSingleModelBenchmark(
 			snap.replayRemaining = st.replay.Remaining()
 			snap.replayActive = st.activeReplayWorkers.Load()
 			snap.seriesRetired = st.seriesRetired.Load()
+			if st.decode != nil {
+				snap.decodeOn = true
+				snap.decodeRate, _ = st.decode.rate(time.Now())
+				snap.decodeHolding = st.decodeHolding.Load()
+			}
 		}
 		if st.routerReplay != nil {
 			snap.replayTotal = st.routerReplay.Total()
@@ -2161,6 +2186,11 @@ func runSingleModelBenchmark(
 			snap.replayRemaining = st.routerReplay.Remaining()
 			snap.replayActive = st.activeReplayWorkers.Load()
 			snap.seriesRetired = st.seriesRetired.Load()
+			if st.decode != nil {
+				snap.decodeOn = true
+				snap.decodeRate, _ = st.decode.rate(time.Now())
+				snap.decodeHolding = st.decodeHolding.Load()
+			}
 		}
 		snap.globalLocalCacheRate = st.stream.GlobalLocalCacheRate()
 		if cfg.Verify {
@@ -2226,6 +2256,7 @@ func runSingleModelBenchmark(
 		gate:              newConcurrencyGate(initConc, !cfg.FIFOGateOrder),
 		datasetTracker:    newActiveDatasetTracker(),
 		ttft:              newTTFTWindow(cfg.TTFTWindow),
+		decode:            newDecodeRateFor(cfg),
 		skipClk:           newSkipClock(cfg.ReplayRealtime && cfg.ReplaySkipIdle),
 		lag:               &pacingLag{},
 		live:              cfg.liveArm,

@@ -1057,6 +1057,18 @@ func runRouterReplayInstance(
 
 		slot := slotOf(ctx)
 		liveTok := st.live.begin(seriesNum, ti+1, sessionID+":"+inst.InstanceID, slot, readyAt)
+		// --decode-rate-min: hold the request while streaming requests decode
+		// too slowly. Client-side time like the slot wait, recorded on its own.
+		var decodeHold time.Duration
+		if st.decode != nil {
+			st.decodeHolding.Add(1)
+			decodeHold = st.decode.hold(ctx, cfg.DecodeRateMin)
+			st.decodeHolding.Add(-1)
+			if ctx.Err() != nil {
+				st.live.abandon(liveTok)
+				return
+			}
+		}
 		if isFirstRequest {
 			if gerr := gate.AcquireCold(ctx); gerr != nil {
 				st.live.abandon(liveTok)
@@ -1090,7 +1102,12 @@ func runRouterReplayInstance(
 			}
 		}
 
-		reqCtx, reqCancel := context.WithTimeout(withProgress(ctx, liveTok.prog), reqTimeout)
+		prog := liveTok.prog
+		if prog == nil && st.decode != nil {
+			prog = &liveProgress{} // the decode tracker needs one even without the live view
+		}
+		st.decode.begin(prog)
+		reqCtx, reqCancel := context.WithTimeout(withProgress(ctx, prog), reqTimeout)
 		var metrics RequestMetrics
 		// Per-request endpoint selection: prefer this series' home endpoint,
 		// fail over only if it is overloaded. The slot is held for exactly this
@@ -1115,12 +1132,14 @@ func runRouterReplayInstance(
 		}
 		st.skipClk.AddInflight(-1)
 		endAt := pacer.clk.Now()
+		st.decode.end(prog, time.Now(), int64(metrics.UsageData.OutputTokens.Count))
 		picker.release(epIdx)
 		reqCancel()
 		gate.Release()
 		metrics.live = liveTok
 		metrics.Slot = slot
 		metrics.ReadyAt, metrics.SentAt = readyAt, sentAt
+		metrics.DecodeHold = decodeHold
 		if cfg.ReplayRealtime {
 			metrics.ThinkPause = thinkPause
 		}
