@@ -20,7 +20,10 @@ var WekaiTimeline = (function () {
 
   var FLAG_ERR = 1, FLAG_COLD = 2, FLAG_EMPTY = 4, FLAG_TIMINGS = 8, FLAG_SRC = 16, FLAG_INFL = 32, FLAG_TRUNC = 64, FLAG_SESSION = 128, FLAG_HOT = 256, FLAG_WAITING = 512;
   var INFLIGHT_KIND = 10, WAIT_CLIENT = 11, WAITED = 13;
-  var WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1, 14: 1, 15: 1 };   // kinds the "merge waits" toggle collapses into WAITED
+  var WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1, 14: 1, 15: 1 };
+  // One word for the UI: a series is a simulated user lane (rows on the timeline); it runs one replayed session after
+  // another (purple ticks mark session boundaries). Admission adds series, --ttft-retire retires them.
+  var SERIES_TIP = "A series is one simulated user lane (a timeline row): it runs one replayed session after another (purple ticks mark session boundaries). Admission adds series; --ttft-retire retires them.";   // kinds the "merge waits" toggle collapses into WAITED
   var AXIS_H = 34, RIGHT = 14, GAP = 2;
   var ROW_HEIGHTS = [1, 2, 3, 4, 6, 10, 14, 20];
 
@@ -66,6 +69,7 @@ var WekaiTimeline = (function () {
     host.classList.add("wtl");
     host.innerHTML =
       '<div class="wtl-bar">' +
+      '<button class="wtl-expand" title="Fill the window with the timeline (Esc or Back to return)">&#x2922; Expand</button>' +
       '<label class="wtl-armwrap" hidden>Arm <select class="wtl-arm"></select></label>' +
       '<label>Row height <select class="wtl-rowh"></select></label>' +
       '<label title="Collapse client wait, engine queue and unattributed wait into one colour"><input type="checkbox" class="wtl-merge"> Merge waits</label>' +
@@ -74,7 +78,7 @@ var WekaiTimeline = (function () {
       '<span class="wtl-info"></span>' +
       '<span class="wtl-hint">Drag to zoom &middot; double-click or Esc to reset &middot; Ctrl+wheel zooms, Shift+wheel pans</span>' +
       '</div><div class="wtl-state"></div><div class="wtl-legend"></div>' +
-      '<canvas class="wtl-strip wtl-strip-rate" hidden></canvas><canvas class="wtl-strip wtl-strip-ttft" hidden></canvas>' +
+      '<canvas class="wtl-strip wtl-strip-act" hidden></canvas><canvas class="wtl-strip wtl-strip-rate" hidden></canvas><canvas class="wtl-strip wtl-strip-ttft" hidden></canvas>' +
       '<div class="wtl-scroll"><div class="wtl-content"><canvas class="wtl-canvas"></canvas><canvas class="wtl-overlay"></canvas></div><div class="wtl-empty" hidden>No requests yet</div></div>' +
       '<div class="wtl-tip"></div>';
     var $ = function (c) { return host.querySelector(c); };
@@ -83,7 +87,20 @@ var WekaiTimeline = (function () {
     var elContent = $(".wtl-content"), canvas = $(".wtl-canvas"), tip = $(".wtl-tip"), elEmpty = $(".wtl-empty");
     var ctx = canvas.getContext("2d");
     var elState = $(".wtl-state");
-    var stripRate = $(".wtl-strip-rate"), stripTTFT = $(".wtl-strip-ttft");
+    var stripRate = $(".wtl-strip-rate"), stripTTFT = $(".wtl-strip-ttft"), stripAct = $(".wtl-strip-act");
+    var elExpand = $(".wtl-expand"), expanded = false;
+    // Expand: the timeline (with its own bar: arm, row height, zoom) takes the whole window; Back / Esc returns.
+    function setExpanded(on) {
+      expanded = on;
+      host.classList.toggle("wtl-expanded", on);
+      document.documentElement.classList.toggle("wtl-expanded-page", on);
+      elExpand.innerHTML = on ? "&#x2715; Back" : "&#x2922; Expand";
+      elExpand.title = on ? "Back to the full report (Esc)" : "Fill the window with the timeline (Esc or Back to return)";
+      sizeKey = ""; resize();
+    }
+    elExpand.addEventListener("click", function () { setExpanded(!expanded); });
+    window.addEventListener("keydown", function (e) { if (e.key === "Escape" && expanded && !isZoomed()) setExpanded(false); });
+    var hoverT = null;   // arm time under the cursor (offline state line)
     var STRIP_H = 56;
     var elMerge = $(".wtl-merge"), overlay = $(".wtl-overlay"), octx = overlay.getContext("2d");
     var merge = /[?&]merge=1/.test(location.search);
@@ -252,7 +269,7 @@ var WekaiTimeline = (function () {
       overlay.style.marginBottom = (-h) + "px";
       overlay.width = canvas.width; overlay.height = canvas.height;
       octx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      [stripRate, stripTTFT].forEach(function (c) {
+      [stripAct, stripRate, stripTTFT].forEach(function (c) {
         c.style.width = w + "px"; c.style.height = STRIP_H + "px";
         c.width = Math.round(w * dpr); c.height = Math.round(STRIP_H * dpr);
         c.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -332,7 +349,62 @@ var WekaiTimeline = (function () {
         x.strokeStyle = "#ff3b3b"; x.lineWidth = 1; x.setLineDash([4, 3]); x.beginPath(); x.moveTo(plotL, ly); x.lineTo(plotL + plotW, ly); x.stroke(); x.setLineDash([]);
       }
     }
-    function drawStrips(a, r) { drawRateStrip(a, r); drawTTFTStrip(a, r); }
+    // ---- activity: active series and requests in flight over time ----
+    // A series is one simulated user lane: it is active from its first request becoming due until its last request
+    // ends (a live one until now), running one session after another. In flight = sent and not yet finished.
+    function stepFrom(ev) {
+      ev.sort(function (x, y) { return x[0] - y[0] || x[1] - y[1]; });
+      var T = [], V = [], v = 0;
+      for (var i = 0; i < ev.length; i++) { v += ev[i][1]; if (T.length && T[T.length - 1] === ev[i][0]) V[V.length - 1] = v; else { T.push(ev[i][0]); V.push(v); } }
+      return { t: T, v: V };
+    }
+    function activity(a, now) {
+      var key = (a.ver || 0) + "|" + (opts.live ? Math.floor(now / 1000) : 0);
+      if (a.actKey === key) return a.act;
+      var sev = [], fev = [];
+      for (var g = 0; g < a.groups.length; g++) {
+        var grp = a.groups[g], lo = Infinity, hi = -Infinity;
+        for (var k = 0; k < grp.reqs.length; k++) {
+          var q = grp.reqs[k], end = q.t + q.e;
+          if (q.t < lo) lo = q.t; if (end > hi) hi = end;
+          fev.push([q.t + (q.cw || 0), 1], [end, -1]);
+        }
+        for (var j = 0; j < grp.infl.length; j++) {
+          var qi = grp.infl[j];
+          if (qi.t < lo) lo = qi.t; hi = Math.max(hi, now);
+          if (!(qi.x & FLAG_WAITING)) fev.push([qi.t + (qi.cw || 0), 1], [now, -1]);
+        }
+        if (lo < hi) sev.push([lo, 1], [hi, -1]);
+      }
+      a.act = { series: stepFrom(sev), inflight: stepFrom(fev) }; a.actKey = key;
+      return a.act;
+    }
+    function stepAt(st, t) {
+      var lo = 0, hi = st.t.length - 1, ans = -1;
+      while (lo <= hi) { var m = (lo + hi) >> 1; if (st.t[m] <= t) { ans = m; lo = m + 1; } else hi = m - 1; }
+      return ans < 0 ? 0 : st.v[ans];
+    }
+    function drawActStrip(a, r, now) {
+      var c = stripAct;
+      if (!a || !a.groups.length) { c.hidden = true; return; }
+      c.hidden = false;
+      var act = activity(a, now), ymax = 1;
+      [act.series, act.inflight].forEach(function (st) { for (var i = 0; i < st.t.length; i++) if (st.t[i] <= r[1] && st.v[i] > ymax) ymax = st.v[i]; });
+      ymax *= 1.1;
+      var x = stripFrame(c, "active series / in flight", ymax, function (v) { return Math.round(v) + ""; });
+      var base = STRIP_H - 15, hgt = STRIP_H - 26;
+      function step(st, color, width) {
+        x.strokeStyle = color; x.lineWidth = width; x.beginPath();
+        var y = base - stepAt(st, r[0]) / ymax * hgt; x.moveTo(plotL, y);
+        for (var i = 0; i < st.t.length; i++) {
+          if (st.t[i] <= r[0]) continue; if (st.t[i] > r[1]) break;
+          var xx = mapX(st.t[i], r); x.lineTo(xx, y); y = base - st.v[i] / ymax * hgt; x.lineTo(xx, y);
+        }
+        x.lineTo(plotL + plotW, y); x.stroke();
+      }
+      step(act.inflight, "#5f987d", 1); step(act.series, "#C79FF1", 1.6);
+    }
+    function drawStrips(a, r) { drawActStrip(a, r, opts.live ? curNow() : 0); drawRateStrip(a, r); drawTTFTStrip(a, r); }
 
     // ---- slot state header ----
     function setStateText(html) { if (elState.innerHTML !== html) elState.innerHTML = html; }
@@ -340,9 +412,9 @@ var WekaiTimeline = (function () {
     // Live: the server's counts and admission gate.
     function renderState(st) {
       if (!st) return;
-      var h = "series <b>" + st.slots + "</b> active" + (st.max ? " / <b>" + st.max + "</b> max" : "") +
+      var h = "<span title='" + SERIES_TIP + "'>active series</span> <b>" + st.slots + "</b>" + (st.max ? " / <b>" + st.max + "</b> max" : "") +
         " &middot; <span title='request outstanding at the engine'>in flight <b>" + st.in_flight + "</b></span>" +
-        " &middot; <span title='next turn due, waiting for a free concurrency slot'>waiting at gate <b>" + st.waiting + "</b></span>" +
+        " &middot; <span title='next turn due, waiting under the client concurrency limit'>waiting at gate <b>" + st.waiting + "</b></span>" +
         " &middot; <span title='pausing until the next turn is due'>think pause <b>" + st.think + "</b></span>" +
         " &middot; <span title='no turn pending: between sessions'>idle <b>" + st.idle + "</b></span>" +
         " <span class='wtl-dim'>(" + st.requests + " requests outstanding)</span>";
@@ -370,7 +442,7 @@ var WekaiTimeline = (function () {
           }
           if (g.retire_ms) {
             var shedding = g.value_ms > g.retire_ms;
-            h += " &middot; <span title='--ttft-retire: a slot whose session ends while the gate statistic is above this does not take another session'>retire above " + fmtSec(g.retire_ms / 1000) + " &rarr; <b class='" + (shedding ? "wtl-bad" : "wtl-gating") + "'>" + (shedding ? "SHRINKING" : "holding") + "</b>, retired <b>" + (g.retired || 0) + "</b></span>";
+            h += " &middot; <span title='--ttft-retire: a series whose session ends while the gate statistic is above this does not take another session'>retire above " + fmtSec(g.retire_ms / 1000) + " &rarr; <b class='" + (shedding ? "wtl-bad" : "wtl-gating") + "'>" + (shedding ? "SHRINKING" : "holding") + "</b>, retired <b>" + (g.retired || 0) + "</b></span>";
           }
         }
       }
@@ -379,7 +451,9 @@ var WekaiTimeline = (function () {
     // Offline: reconstruct from the requests at the right edge of the view.
     function renderOfflineState() {
       var a = arm(); if (!a || opts.live) return;
-      var T = range()[1], c = { f: 0, w: 0, t: 0, i: 0 };
+      var rr0 = range(), atCursor = hoverT !== null && hoverT >= rr0[0] && hoverT <= rr0[1];
+      var T = atCursor ? hoverT : rr0[1], c = { f: 0, w: 0, t: 0, i: 0 };
+      var act = activity(a, 0), activeAtT = stepAt(act.series, T);
       for (var g = 0; g < a.groups.length; g++) {
         var grp = a.groups[g]; ensureSorted(grp);
         var st = 3;   // 0 in flight, 1 waiting, 2 think, 3 idle
@@ -391,14 +465,15 @@ var WekaiTimeline = (function () {
           else continue;
           if (s2 < st) st = s2;
         }
-        if (st === 0) c.f++; else if (st === 1) c.w++; else if (st === 2) c.t++; else c.i++;
+        if (st === 0) c.f++; else if (st === 1) c.w++; else if (st === 2) c.t++;
       }
+      c.i = Math.max(0, activeAtT - c.f - c.w - c.t);
       var rate = "";
       if (a.rates && a.rates.in && a.rates.in.length) {
         var rr = range();
         rate = "<br>view average tokens/s: input <b>" + fmtRate(rateAt(a.rates, "in", rr[0], rr[1])) + "</b> &middot; output <b>" + fmtRate(rateAt(a.rates, "out", rr[0], rr[1])) + "</b>";
       }
-      setStateText("at <b>" + fmtElapsed(T, 1000) + "</b> (view end): <b>" + a.groups.length + "</b> slots &middot; in flight <b>" + c.f +
+      setStateText("at <b>" + fmtElapsed(T, 1000) + "</b> (" + (atCursor ? "cursor" : "view end") + "): <b><span title='" + SERIES_TIP + "'>" + activeAtT + "</span></b> active series <span class='wtl-dim'>(" + a.groups.length + " over the run)</span> &middot; in flight <b>" + c.f +
         "</b> &middot; waiting at gate <b>" + c.w + "</b> &middot; think pause <b>" + c.t + "</b> &middot; idle <b>" + c.i + "</b>" + rate);
     }
 
@@ -654,7 +729,7 @@ var WekaiTimeline = (function () {
       var infl = (q.x & FLAG_INFL) !== 0, e2e = infl ? Math.max(0, now - q.t) : q.e;
       var inst = q.gu || (a.guids && q.gi ? a.guids[q.gi - 1] : "");
       var ic = inst.indexOf(":"); if (ic >= 0) inst = inst.slice(ic + 1);
-      var head = q.sl ? "<b>" + ((q.x & FLAG_HOT) ? "hot slot " : "slot ") + q.sl + "</b> &middot; session " + q.s : "<b>series " + q.s + "</b>";
+      var head = q.sl ? "<b>" + ((q.x & FLAG_HOT) ? "hot series " : "series ") + q.sl + "</b> &middot; session " + q.s : "<b>series " + q.s + "</b>";
       var html = head + " turn " + q.n + ((q.x & FLAG_SESSION) ? " (first of session)" : "") + (inst ? " &middot; instance " + esc(inst.length > 24 ? inst.slice(0, 24) + "\u2026" : inst) : "") + (infl ? " <b>(in flight)</b>" : "") +
         ((q.x & FLAG_ERR) ? " <b style='color:#FF6B6B'>error</b>" : "") + ((q.x & FLAG_COLD) ? " cold start" : "") + ((q.x & FLAG_EMPTY) ? " empty" : "") + "<br>" +
         "start " + fmtClock(a.t0 + q.t, true) + " (+" + fmtDur(q.t) + ")<br>";
@@ -678,7 +753,7 @@ var WekaiTimeline = (function () {
         html += "<table>";
         if (q.rw > 0) html += "<tr><td><i style='background:" + colors[14] + "'></i>429 shed / backoff (" + (q.r4 || 0) + " retries)</td><td>" + fmtDur(q.rw) + "</td></tr>";
         if ((q.x & FLAG_WAITING)) html += "<tr><td><i style='background:" + colors[WAIT_CLIENT] + "'></i>client wait (still waiting)</td><td>" + fmtDur(Math.max(0, now - q.t)) + "</td></tr>";
-        else if (cw > 0) html += "<tr><td><i style='background:" + colors[WAIT_CLIENT] + "'></i>client wait (no free slot)</td><td>" + fmtDur(cw) + "</td></tr>";
+        else if (cw > 0) html += "<tr><td><i style='background:" + colors[WAIT_CLIENT] + "'></i>client wait (concurrency limit)</td><td>" + fmtDur(cw) + "</td></tr>";
         if (q.tm && q.tm[1] > 0) html += "<tr><td><i style='background:" + colors[0] + "'></i>engine queue: other</td><td>" + fmtDur(q.tm[1]) + "</td></tr>";
         if (q.tm && q.tm[0] > 0) html += "<tr><td><i style='background:" + colors[1] + "'></i>engine queue: no KV blocks</td><td>" + fmtDur(q.tm[0]) + "</td></tr>";
         if (unattr > 1) html += "<tr><td><i style='background:" + colors[12] + "'></i>unattributed (network / frontend)</td><td>" + fmtDur(unattr) + "</td></tr>";
@@ -721,6 +796,7 @@ var WekaiTimeline = (function () {
     });
     canvas.addEventListener("mousemove", function (e) {
       var p = pos(e);
+      if (!opts.live) { var nt = p.x >= plotL && p.x <= plotL + plotW ? unmapX(p.x, range()) : null; if (nt !== hoverT) { hoverT = nt; renderOfflineState(); } }
       if (drag) { drag.x1 = Math.max(plotL, Math.min(plotL + plotW, p.x)); scheduleOverlay(); return; }
       var h = pick(p);
       var g = rowAt(p);
@@ -737,7 +813,7 @@ var WekaiTimeline = (function () {
     }
     canvas.addEventListener("mouseup", endDrag);
     window.addEventListener("mouseup", endDrag);
-    canvas.addEventListener("mouseleave", function () { hover = null; hoverGroup = -1; tip.style.display = "none"; if (!drag) drawOverlay(); });
+    canvas.addEventListener("mouseleave", function () { hover = null; hoverGroup = -1; tip.style.display = "none"; if (!drag) drawOverlay(); if (hoverT !== null) { hoverT = null; renderOfflineState(); } });
     canvas.addEventListener("dblclick", function () { userZoom(null, null); });
     elReset.addEventListener("click", function () { userZoom(null, null); });
     if (opts.handleEsc) window.addEventListener("keydown", function (e) { if (e.key === "Escape" && isZoomed()) userZoom(null, null); });

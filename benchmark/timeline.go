@@ -64,7 +64,7 @@ type timelineKind struct {
 // report palette: cool slate for waiting, the weka purple for the external
 // tier, warm amber for computed work.
 var timelineKinds = []timelineKind{
-	{segWaitClient, "wait_client", "client wait (no free slot)", "#b8c0c8"},
+	{segWaitClient, "wait_client", "client wait (concurrency limit)", "#b8c0c8"},
 	{segRetry429, "wait_429", "429 shed / backoff", "#d65db1"},
 	{segDecodeHold, "wait_decode_hold", "held: decode rate below minimum", "#c9a227"},
 	{segWaitOther, "wait_other", "engine queue: other limits", "#5b646d"},

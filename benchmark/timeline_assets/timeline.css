@@ -30,3 +30,9 @@
 .wtl-tip td:last-child { text-align: right; padding-right: 0; font-variant-numeric: tabular-nums; }
 .wtl-tip i { display: inline-block; width: 9px; height: 9px; border-radius: 1px; margin-right: 5px; }
 .wtl-empty { position: absolute; inset: 40px 0 0 0; text-align: center; color: #8a9096; pointer-events: none; }
+
+/* Expand: the timeline fills the window; only its own bar (arm, row height, zoom, Back) stays. */
+.wtl.wtl-expanded { position: fixed; inset: 0; z-index: 1000; width: 100vw !important; height: 100vh !important; max-height: none !important; margin: 0; padding: 8px 14px; background: #0D1013; box-sizing: border-box; }
+.wtl.wtl-expanded .wtl-scroll { flex: 1 1 auto; }
+html.wtl-expanded-page, html.wtl-expanded-page body { overflow: hidden; }
+.wtl-bar .wtl-expand { font-weight: 500; }
