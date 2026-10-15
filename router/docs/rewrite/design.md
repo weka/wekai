@@ -1288,10 +1288,10 @@ Direct non-stdlib dependencies: **6** (client-go trio, prometheus, otel-api, gol
 
 ### Critical Files for Implementation
 
-- `/Users/ofer.kiselovnahman/workspace/wekai/benchmark/cache_sim.go` — the engine being extracted; source of `prefixTrie`, `hashMessage`, `estimateTokens`, `promptChunkBytes` and the `CU-2` provenance pin.
-- `/Users/ofer.kiselovnahman/workspace/wekai/benchmark/replay_router.go` — `BuildReplayRequestPrefix` at line 731; the `i == 0 && sb.Bytes < 200` skip and the system→tools→messages ordering that §D.5 must reproduce.
-- `/Users/ofer.kiselovnahman/workspace/wekai/benchmark/replay_router_post.go` — `dryRunDurations` (line 663) and `dryDo` (line 682); the cold/warm TTFT cost model behind §D.6's `predicted_time_saved` term.
-- `/Users/ofer.kiselovnahman/workspace/wllm-router/src/server.rs` lines 815–910 — the authoritative wire surface and the v1 middleware ordering that §E.1 deliberately inverts (CORS/auth, and the `fallback` that bypasses the chain).
-- `/private/tmp/claude-502/-Users-ofer-kiselovnahman-workspace-wllm-router/45cd3c2b-50d4-4b8d-9fa9-e44e82d8a3f8/scratchpad/requirements.md` and `/Users/ofer.kiselovnahman/.claude/plans/help-me-rewrite-vllm-router-silly-creek.md` — the binding requirement IDs cited throughout.
+- `benchmark/cache_sim.go` — the engine being extracted; source of `prefixTrie`, `hashMessage`, `estimateTokens`, `promptChunkBytes` and the `CU-2` provenance pin.
+- `benchmark/replay_router.go` — `BuildReplayRequestPrefix` at line 731; the `i == 0 && sb.Bytes < 200` skip and the system→tools→messages ordering that §D.5 must reproduce.
+- `benchmark/replay_router_post.go` — `dryRunDurations` (line 663) and `dryDo` (line 682); the cold/warm TTFT cost model behind §D.6's `predicted_time_saved` term.
+- `wllm-router/src/server.rs` lines 815–910 — the authoritative wire surface and the v1 middleware ordering that §E.1 deliberately inverts (CORS/auth, and the `fallback` that bypasses the chain).
+- `requirements.md` (this directory) — the binding requirement IDs cited throughout.
 
 **Three items need a requirements amendment before implementation starts** (all flagged in §J risks): `CU-8`'s 500k-node default (unachievable within `NFR-5` at N=64 — propose 100k), the `HLT-N1` acceptance criterion vs. a small bounded health pool, and `STR-10`'s "where possible" becoming a firm commitment with the §A.4 retry-glue caveat recorded.

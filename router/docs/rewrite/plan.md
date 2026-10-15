@@ -2,7 +2,7 @@
 
 ## Context
 
-The current router (`/Users/ofer.kiselovnahman/workspace/wllm-router`) is ~36k LOC of Rust derived from the SGLang router. Three drivers:
+The current router (`wllm-router`) is ~36k LOC of Rust derived from the SGLang router. Three drivers:
 
 1. **Over-complication** — PyO3 bindings, a Python CLI, `mini_lb.py`, a ~2,100 LOC tokenizer subsystem routing never calls, PD disaggregation (~4,600 LOC), and ~5,000 LOC of dead files not even declared in `src/lib.rs`.
 2. **Structurally broken policies** — in-flight load is incremented on exactly one code path, decremented on three, and wiped wholesale by the health checker every 10 cycles. Every load-sensitive decision is made on noise, including v1's cache-aware imbalance guard.

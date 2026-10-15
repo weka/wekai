@@ -222,12 +222,10 @@ beginning under the default; the other strategies need v5.
 chart is published as a scratch image holding just `/replay.jsonl`, pulled
 anonymously with `curl` — no Docker engine, no registry client (~1.3 GB
 download, ~9 GB on disk). `Dockerfile`'s `REPLAY_IMAGE` ARG is the source
-of truth for the tag. The current capture is
-`replay-7-jul-2027-58d-weka-index.jsonl` (replay-v5: the 2026-05-12 →
-2026-07-07 dataset — 5,441 sessions / 522,332 requests — with per-request
+of truth for the tag. The current capture is replay-v5: per-request
 `total_ms` and `think_ms`, so `--replay-realtime` keeps the original think
-time between turns, and the session index; older v3 captures fall back to
-the absolute schedule):
+time between turns, plus the session index; older v3 captures fall back to
+the absolute schedule:
 
 ```
 REPO=weka.io/wekai; TAG=replay-a5a97a8ac620

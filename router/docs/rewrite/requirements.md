@@ -34,7 +34,7 @@
 > **Deployment dependency:** `usage.prompt_tokens_details.cached_tokens` requires `--enable-prompt-tokens-details` on the vLLM nodes (default **off**). Without it there is no feedback signal and `prefix-cache-aware` is unfalsifiable — this gates whether that policy ships at all.
 
 **Status:** Draft for review, amended post-review
-**Supersedes:** `vllm_router_rs` v0.1.14 (Rust), `/Users/ofer.kiselovnahman/workspace/wllm-router`
+**Supersedes:** `vllm_router_rs` v0.1.14 (Rust), `wllm-router`
 **Target:** `github.com/weka/wllm-router` — Go binary + container image, owned end-to-end by the team
 
 ---
@@ -301,7 +301,7 @@ This is the **rebuilt** prefix policy. It is not a port of `src/tree.rs` (2,320 
 
 ### 11.1 Naming correction
 
-The user referred to this as `wekai benchmark analyze`. The actual command is **`wekai router analyze`**, implemented in `/Users/ofer.kiselovnahman/workspace/wekai/cli/command_router_analyze.go` (736 LOC). The reusable engine is `/Users/ofer.kiselovnahman/workspace/wekai/benchmark/cache_sim.go` (281 LOC).
+The user referred to this as `wekai benchmark analyze`. The actual command is **`wekai router analyze`**, implemented in `cli/command_router_analyze.go` (736 LOC). The reusable engine is `benchmark/cache_sim.go` (281 LOC).
 
 ### 11.2 What wekai actually gives us (verified)
 
@@ -561,10 +561,10 @@ Each area is signed off only when all listed checks pass in CI.
 
 Reference material the implementation will be read against (all read-only inputs; v2 is a new tree):
 
-- `/Users/ofer.kiselovnahman/workspace/wekai/benchmark/cache_sim.go` — the engine to extract (`prefixTrie`, `cacheEstimator`, `estimateTokens`, `promptChunkBytes`); CU-1, CU-2, CU-5.
-- `/Users/ofer.kiselovnahman/workspace/wekai/benchmark/replay_router.go` — `BuildReplayRequestPrefix` at line 731, including the `i == 0 && sb.Bytes < 200` skip rule; CU-3.
-- `/Users/ofer.kiselovnahman/workspace/wekai/benchmark/replay_router_post.go` — the cold/warm TTFT cost model at lines 692–716 and the `Observe` hot-path call site at line 307; CU-6.
-- `/Users/ofer.kiselovnahman/workspace/wllm-router/src/server.rs` — the authoritative HTTP surface (routes at lines 825–901); GW-1..GW-13, COMPAT-1.
-- `/Users/ofer.kiselovnahman/workspace/wllm-router/src/policies/cache_aware.rs` — the imbalance formula at line 253 and thresholds at 314/342, plus the unkillable eviction thread at 96–122 and the comment at 467; CACHE-2, CACHE-3, CACHE-N3.
-- `/Users/ofer.kiselovnahman/workspace/wllm-router/src/core/circuit_breaker.rs` — the unused `window_duration` at line 16/25 and the half-open handling; HLT-7, HLT-8.
-- `/Users/ofer.kiselovnahman/workspace/wllm-router/src/service_discovery.rs` — current pod-IP-only discovery (`PodInfo::from_pod`, `worker_url`); SD-1, SD-9.
+- `benchmark/cache_sim.go` — the engine to extract (`prefixTrie`, `cacheEstimator`, `estimateTokens`, `promptChunkBytes`); CU-1, CU-2, CU-5.
+- `benchmark/replay_router.go` — `BuildReplayRequestPrefix` at line 731, including the `i == 0 && sb.Bytes < 200` skip rule; CU-3.
+- `benchmark/replay_router_post.go` — the cold/warm TTFT cost model at lines 692–716 and the `Observe` hot-path call site at line 307; CU-6.
+- `wllm-router/src/server.rs` — the authoritative HTTP surface (routes at lines 825–901); GW-1..GW-13, COMPAT-1.
+- `wllm-router/src/policies/cache_aware.rs` — the imbalance formula at line 253 and thresholds at 314/342, plus the unkillable eviction thread at 96–122 and the comment at 467; CACHE-2, CACHE-3, CACHE-N3.
+- `wllm-router/src/core/circuit_breaker.rs` — the unused `window_duration` at line 16/25 and the half-open handling; HLT-7, HLT-8.
+- `wllm-router/src/service_discovery.rs` — current pod-IP-only discovery (`PodInfo::from_pod`, `worker_url`); SD-1, SD-9.
