@@ -4588,13 +4588,30 @@ const V3 = (() => {
   // Built on first show: the report script also runs headless (tests, public
   // export), where nothing should touch this view's DOM.
   const host = document.getElementById("v3Host");
-  let cv, cx, tip, elY, elZ, elArms, elSm, built = false, expanded = false;
+  let cv, cx, tip, elY, elZ, elArms, elSm, elFill, built = false, expanded = false;
   const BINS = 240, CAM = 4;
   const TTFT_MAX = 20000;   // ms: dots are fully red at and above this
   const LINE_DOT_EVERY = 6;  // one TTFT dot per this many bins (~40 per arm)
+  // Cache-mix fill: input tokens by source, stacked bottom to top. Colours are
+  // the arm colours of the tier (hbm green, dram orange, weka purple); compute
+  // is neutral. An arm's external tier takes its own class's colour, the way
+  // series colours are assigned from the arm name.
+  const MIX_CATS = ["compute", "hbm", "dram", "weka"];
+  const MIX_CAT_COLOR = { compute: "#8a95a3", hbm: GPU_VARIANTS[0], dram: DRAM_VARIANTS[0], weka: WEKA_VARIANTS[0] };
+  const MIX_CAT_LABEL = { compute: "compute", hbm: "GPU cache (hbm)", dram: "DRAM", weka: "weka" };
+  function mixCat(band, armClass) {
+    switch (band) {
+      case "local_compute": case "compute": return "compute";
+      case "local_cache_hit": case "device": return "hbm";
+      case "host": return "dram";
+      case "external_kv_transfer": case "storage": return armClass === "dram" ? "dram" : "weka";
+    }
+    return "compute";
+  }
   const VIEWS = { iso: [-0.62, 0.38], front: [0, 0], top: [0, Math.PI / 2 - 0.001], side: [-Math.PI / 2, 0] };
   let yaw = VIEWS.iso[0], pitch = VIEWS.iso[1], zoom = 1;
   let cw = 0, ch = 0, enabled = new Set(DATA.map((_, i) => i)), shown = false, proj = [];   // every arm on by default
+  let fillLayer = null;   // offscreen layer for the cache-mix fill
 
   // ---- data ----
   // Per arm over [t0, t1] (elapsed ms): Y per bin and active series per bin.
@@ -4680,7 +4697,33 @@ const V3 = (() => {
     if (elZ.value === "infl") smooth(zs);   // a rate-like mean; the step counts stay exact
     // The arm's output rate over the part of the window it actually ran.
     const dur = Math.max(1, Math.min(t1, end) - t0) / 1000;
-    return { y, z: zs, ttft, hasZ, bw, end, outRate: outTot / dur };
+    // Cache mix per bin: band tokens of the overlapping sample intervals, pro
+    // rata by overlap, smoothed like Y, then normalised to fractions. A bin no
+    // sample covers carries the previous bin's mix.
+    const armClass = classifyAlias(getAlias(s.name));
+    const mixTok = {}; MIX_CATS.forEach(c => { mixTok[c] = new Float64Array(BINS); });
+    const segs = s.mix || [];
+    for (const m of segs) {
+      const span = m.t1 - m.t0; if (span <= 0) continue;
+      for (let b = Math.max(0, bin(m.t0)); b < BINS && t0 + b * bw < m.t1; b++) {
+        const a = Math.max(m.t0, t0 + b * bw), c2 = Math.min(m.t1, t0 + (b + 1) * bw);
+        if (c2 <= a) continue;
+        const f = (c2 - a) / span;
+        (m.bands || []).forEach(bd => { mixTok[mixCat(bd.n, armClass)][b] += (bd.v || 0) * f; });
+      }
+    }
+    MIX_CATS.forEach(c => smooth(mixTok[c]));
+    let mix = null;
+    if (segs.length) {
+      mix = MIX_CATS.map(() => new Float64Array(BINS));
+      let prev = null;
+      for (let b = 0; b < BINS; b++) {
+        const tot = MIX_CATS.reduce((n, c) => n + mixTok[c][b], 0);
+        if (tot > 0) prev = MIX_CATS.map(c => mixTok[c][b] / tot);
+        if (prev) MIX_CATS.forEach((c, k) => { mix[k][b] = prev[k]; });
+      }
+    }
+    return { y, z: zs, ttft, mix, hasZ, bw, end, outRate: outTot / dur };
   }
 
   // ---- colour ----
@@ -4760,7 +4803,7 @@ const V3 = (() => {
     if (zoomed) { t0 = viewTMin; t1 = viewTMax; }
     else arms.forEach(i => DATA[i].records.forEach(r => { const e = r.t + Math.max(r.resp || 0, 0); if (e > t1) t1 = e; }));
     if (t1 <= t0) t1 = t0 + 1000;
-    const key = arms.join(",") + "|" + elY.value + "|" + elZ.value + "|" + elSm.value + "|" + t0 + "|" + t1;
+    const key = arms.join(",") + "|" + elY.value + "|" + elZ.value + "|" + elSm.value + "|" + t0 + "|" + t1;   // fill is drawn from the cached mix
     if (cache.key === key) return cache.data;
     const per = {};
     arms.forEach(i => { per[i] = armBins(DATA[i], elY.value, t0, t1); });
@@ -4820,6 +4863,35 @@ const V3 = (() => {
         pts.push([X(t), Y(p.y[b]), Z(p.z[b]), t, p.y[b], p.z[b], p.ttft[b]]);
       }
       if (!pts.length) return;
+      if (elFill.value === "mix" && p.mix) {
+        // vertical curtain from the floor to the curve, split by input-token
+        // source. Slices are painted opaque onto an offscreen layer (so adjacent
+        // ones meet without anti-aliasing seams, and an arm's sources, stacked,
+        // never overlap) and the layer is composited semi-transparent.
+        const dpr = window.devicePixelRatio || 1;
+        if (!fillLayer) fillLayer = document.createElement("canvas");
+        if (fillLayer.width !== cv.width || fillLayer.height !== cv.height) { fillLayer.width = cv.width; fillLayer.height = cv.height; }
+        const fx = fillLayer.getContext("2d");
+        fx.setTransform(1, 0, 0, 1, 0, 0); fx.clearRect(0, 0, fillLayer.width, fillLayer.height);
+        fx.setTransform(dpr, 0, 0, dpr, 0, 0); fx.lineJoin = "round"; fx.lineWidth = 0.8;
+        const b0 = Math.round((pts[0][3] - d.t0) / p.bw - 0.5);
+        for (let k = 0; k + 1 < pts.length; k++) {
+          const A = pts[k], B = pts[k + 1];
+          let la = -1, lb = -1;
+          for (let m = 0; m < MIX_CATS.length; m++) {
+            const fa = p.mix[m][b0 + k], fb = p.mix[m][b0 + k + 1];
+            const ha = la + (A[1] + 1) * fa, hb = lb + (B[1] + 1) * fb;
+            if (fa > 0 || fb > 0) {
+              const q1 = P(A[0], la, A[2]), q2 = P(B[0], lb, B[2]), q3 = P(B[0], hb, B[2]), q4 = P(A[0], ha, A[2]);
+              fx.fillStyle = fx.strokeStyle = MIX_CAT_COLOR[MIX_CATS[m]];
+              fx.beginPath(); fx.moveTo(q1[0], q1[1]); fx.lineTo(q2[0], q2[1]); fx.lineTo(q3[0], q3[1]); fx.lineTo(q4[0], q4[1]); fx.closePath();
+              fx.fill(); fx.stroke();   // the hairline stroke closes the gap to the next slice
+            }
+            la = ha; lb = hb;
+          }
+        }
+        cx.save(); cx.globalAlpha = 0.32; cx.setTransform(1, 0, 0, 1, 0, 0); cx.drawImage(fillLayer, 0, 0); cx.restore();
+      }
       line(pts.map(v => [v[0], -1, v[2]]), css(c, 0.28), 1.2);
       line(pts.map(v => [v[0], v[1], zBack]), css(c, 0.22), 1.2);
       line(pts, css(c), 2.2);
@@ -4830,7 +4902,7 @@ const V3 = (() => {
         cx.fillStyle = ttftColor(pts[k][6], 0.95); cx.fill();
         cx.lineWidth = 1; cx.strokeStyle = "rgba(13,16,19,0.9)"; cx.stroke();
       }
-      pts.forEach(v => { const s = P(v[0], v[1], v[2]); proj.push({ x: s[0], y: s[1], i, t: v[3], yv: v[4], zv: v[5], tt: v[6] }); });
+      pts.forEach((v, k) => { const s = P(v[0], v[1], v[2]); proj.push({ x: s[0], y: s[1], i, t: v[3], yv: v[4], zv: v[5], tt: v[6], b: Math.round((v[3] - d.t0) / p.bw - 0.5) }); });
     });
     // TTFT legend: a vertical colour bar beside the cube
     // Fixed beside the cube: just outside the furthest any corner can project at
@@ -4848,6 +4920,16 @@ const V3 = (() => {
       cx.fillRect(bx, by + k, bw2, 1);
     }
     cx.strokeStyle = "#42464A"; cx.lineWidth = 1; cx.strokeRect(bx - 0.5, by - 0.5, bw2 + 1, bh + 1);
+    if (elFill.value === "mix") {
+      cx.font = "11px sans-serif"; cx.textAlign = "left";
+      const lx = Math.min(bx - 6, cw - 120);   // keep the longest label inside the canvas
+      let ly = by + bh + 34;
+      cx.fillStyle = "#C9C9C9"; cx.fillText("input tokens", lx, ly); ly += 16;
+      MIX_CATS.slice().reverse().forEach(c => {
+        cx.fillStyle = css(rgb(MIX_CAT_COLOR[c]), 0.6); cx.fillRect(lx, ly - 9, 12, 10);
+        cx.fillStyle = "#b8bec4"; cx.fillText(MIX_CAT_LABEL[c], lx + 16, ly); ly += 15;
+      });
+    }
     cx.font = "10px monospace"; cx.textAlign = "left"; cx.fillStyle = "#b8bec4";
     for (let v = 0; v <= TTFT_MAX; v += 5000) {
       const y = by + bh * (1 - v / TTFT_MAX);
@@ -4868,6 +4950,8 @@ const V3 = (() => {
     '<option value="series">active series</option>' +
     '<option value="infl">requests in flight</option>' +
     '<option value="adt">active dataset (tokens)</option></select></label>' +
+    '<label title="Fill under each curve split by where its input tokens came from (the cache-mix samples)">Fill <select class="v3-fill">' +
+    '<option value="mix">cache mix</option><option value="off">off</option></select></label>' +
     '<label title="Moving average over Y (and over Z for requests in flight)">Smooth <select class="v3-smooth">' +
     '<option value="0">off</option><option value="60000">1 min</option><option value="120000" selected>2 min</option>' +
     '<option value="300000">5 min</option><option value="600000">10 min</option></select></label>' +
@@ -4879,7 +4963,7 @@ const V3 = (() => {
     '<span class="v3-hint">Drag to rotate &middot; wheel zooms &middot; double-click resets</span>' +
     '</div><canvas class="v3-canvas"></canvas><div class="v3-tip"></div>';
   const q = c => host.querySelector(c);
-  cv = q(".v3-canvas"); cx = cv.getContext("2d"); tip = q(".v3-tip"); elY = q(".v3-y"); elArms = q(".v3-arms"); elSm = q(".v3-smooth"); elZ = q(".v3-z");
+  cv = q(".v3-canvas"); cx = cv.getContext("2d"); tip = q(".v3-tip"); elY = q(".v3-y"); elArms = q(".v3-arms"); elSm = q(".v3-smooth"); elZ = q(".v3-z"); elFill = q(".v3-fill");
   // ---- interaction ----
   let drag = null;
   cv.addEventListener("mousedown", e => { drag = { x: e.clientX, y: e.clientY, yaw, pitch }; tip.style.display = "none"; });
@@ -4898,6 +4982,7 @@ const V3 = (() => {
     tip.innerHTML = "<b>" + getAlias(DATA[best.i].name) + "</b><br>at " + fmtT(best.t) +
       "<br>" + yLabel() + " <b>" + fmtN(best.yv) + "</b><br>" + zLabel() + " <b>" + fmtZ(best.zv) + "</b>" +
       "<br>TTFT <b>" + (best.tt / 1000).toFixed(1) + "s</b>" +
+      (st.mix ? "<br>input: " + MIX_CATS.map((c, m) => st.mix[m][best.b] > 0.005 ? MIX_CAT_LABEL[c] + " <b>" + Math.round(st.mix[m][best.b] * 100) + "%</b>" : "").filter(Boolean).join(" &middot; ") : "") +
       "<br><span class='v3-dim'>window output " + fmtN(st.outRate) + " tok/s</span>";
     tip.style.display = "block";
     tip.style.left = Math.min(e.clientX + 14, window.innerWidth - 240) + "px";
@@ -4913,6 +4998,7 @@ const V3 = (() => {
   elY.addEventListener("change", draw);
   elSm.addEventListener("change", draw);
   elZ.addEventListener("change", draw);
+  elFill.addEventListener("change", draw);
   const elExpand = q(".v3-expand");
   function setExpanded(on) {
     expanded = on;
