@@ -217,7 +217,7 @@ class WekaiCoreFlows:
         self,
         source: Annotated[dagger.Directory, Ignore(SOURCE_IGNORE)],
         registry: str = "quay.io/weka.io/wekai",
-        replay_image: str = "quay.io/weka.io/wekai:replay-676947ddc2a9",
+        replay_image: str = "quay.io/weka.io/wekai:replay-a5a97a8ac620",
         version: str = "",
     ) -> str:
         """Builds and publishes the wekai image from this repo's own Dockerfile.
@@ -248,7 +248,7 @@ class WekaiCoreFlows:
         helm_password: dagger.Secret,
         registry: str = "quay.io/weka.io/wekai",
         helm_registry: str = "quay.io/weka.io/helm",
-        replay_image: str = "quay.io/weka.io/wekai:replay-676947ddc2a9",
+        replay_image: str = "quay.io/weka.io/wekai:replay-a5a97a8ac620",
         version: str = "",
     ) -> str:
         """Publishes the wekai image, then packages and pushes

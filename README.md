@@ -231,7 +231,7 @@ time between turns, and the session index; its last week is sessions
 schedule):
 
 ```
-REPO=weka.io/wekai; TAG=replay-676947ddc2a9
+REPO=weka.io/wekai; TAG=replay-a5a97a8ac620
 TOKEN=$(curl -s "https://quay.io/v2/auth?service=quay.io&scope=repository:$REPO:pull" | jq -r .token)
 LAYER=$(curl -s -H "Authorization: Bearer $TOKEN" \
   -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
