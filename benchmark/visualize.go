@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -535,6 +536,27 @@ func renderVisualization(dir string, concurrency int, keepFileNames bool, maxEla
 		}
 	}
 
+	// Timelines ride outside RAW_DATA, as one JSON string the page parses
+	// only when the Timeline tab is first opened: they are most of a timeline
+	// report's bytes, and as part of RAW_DATA every page load paid to parse
+	// them whether or not anyone looked.
+	tlArms := make([]*timelineArm, len(allSeries))
+	hasTimeline := false
+	for i := range allSeries {
+		tlArms[i] = allSeries[i].Timeline
+		hasTimeline = hasTimeline || tlArms[i] != nil
+		allSeries[i].Timeline = nil
+	}
+	tlData := template.JS("")
+	if hasTimeline {
+		// json.Marshal escapes '<', so the payload can never close its <script>.
+		ab, err := json.Marshal(tlArms)
+		if err != nil {
+			return "", fmt.Errorf("marshal timelines: %w", err)
+		}
+		tlData = template.JS(ab)
+	}
+
 	seriesJSON, err := json.Marshal(allSeries)
 	if err != nil {
 		return "", fmt.Errorf("marshal series data: %w", err)
@@ -592,6 +614,8 @@ func renderVisualization(dir string, concurrency int, keepFileNames bool, maxEla
 		"TimelineJS":     tlJS,
 		"TimelineCSS":    tlCSS,
 		"TimelineKinds":  tlKinds,
+		"TimelineData":   tlData,
+		"HasTimeline":    template.JS(strconv.FormatBool(hasTimeline)),
 	}); err != nil {
 		return "", fmt.Errorf("execute template: %w", err)
 	}
@@ -4582,6 +4606,9 @@ document.getElementById("downloadPublicBtn").addEventListener("click", downloadP
 // ms from each arm's own start, which is exactly the timeline's time basis, so
 // zooming in either view is reflected in the other and in the Summary panel.
 const TIMELINE_KINDS = {{.TimelineKinds}};
+// Per-arm timelines (RAW_DATA order) sit unparsed in the #tlData JSON block
+// after this script until the Timeline tab is first opened.
+const HAS_TIMELINE = {{.HasTimeline}};
 var tlView = null;
 var timelineMode = false;
 function tlSyncFromReport() {
@@ -4874,8 +4901,7 @@ const V3 = (() => {
 // View switch: Metrics (the canvas above), Timeline (only with --timeline
 // data), 3D (always: it is built from the same records as Metrics).
 {
-  const withTl = DATA.filter(s => s.timeline);
-  const hasTl = withTl.length && typeof WekaiTimeline !== "undefined";
+  const hasTl = HAS_TIMELINE && typeof WekaiTimeline !== "undefined";
   const sw = document.getElementById("viewSwitch");
   const host = document.getElementById("tlHost");
   const btnM = document.getElementById("viewMetrics");
@@ -4908,7 +4934,9 @@ const V3 = (() => {
             draw();
           },
         });
-        tlView.setArms(withTl.map(s => s.timeline));
+        const tl = JSON.parse(document.getElementById("tlData").textContent);
+        RAW_DATA.forEach((s, i) => { if (tl[i]) s.timeline = tl[i]; });
+        tlView.setArms(DATA.filter(s => s.timeline).map(s => s.timeline));
       }
       sizeHost();
       tlView.resize();
@@ -4928,6 +4956,7 @@ window.addEventListener("resize", () => { resize(); draw(); });
 resize();
 draw();
 </script>
+<script type="application/json" id="tlData">{{.TimelineData}}</script>
 </body>
 </html>
 `))

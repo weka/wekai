@@ -263,7 +263,7 @@ func TestReportTimelineOptIn(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(p)
-	if !strings.Contains(string(b), `"timeline":{`) || !strings.Contains(string(b), `id="viewTimeline"`) {
+	if !strings.Contains(string(b), `id="tlData">[{`) || !strings.Contains(string(b), `id="viewTimeline"`) {
 		t.Error("timeline report lacks the embedded arm or the view switch")
 	}
 	p, err = GenerateVisualizationWithOverwrite(dir, 2, 0, true)
@@ -271,7 +271,7 @@ func TestReportTimelineOptIn(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ = os.ReadFile(p)
-	if strings.Contains(string(b), `"timeline":{`) {
+	if strings.Contains(string(b), `id="tlData">[{`) {
 		t.Error("default report must not embed timeline data")
 	}
 }
