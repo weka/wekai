@@ -4734,16 +4734,27 @@ const V3 = (() => {
   }
 
   // ---- arm picker ----
+  // Built once; a redraw only refreshes each row's swatch and rate. Rebuilding
+  // the rows on every draw replaced the checkbox under the user's click.
+  let armRows = null;
   function buildArms(stats) {
-    elArms.innerHTML = DATA.map((s, i) =>
-      '<label title="' + s.name.replace(/"/g, "&quot;") + '"><input type="checkbox" data-i="' + i + '"' + (enabled.has(i) ? " checked" : "") + '>' +
-      '<i style="background:' + css(stats[i] ? stats[i].color : rgb(seriesColors[i])) + '"></i>' + getAlias(s.name) +
-      (stats[i] ? ' <span class="v3-rate">' + fmtN(stats[i].outRate) + " out/s" + (stats[i].hasZ ? "" : ", no dataset samples") + "</span>" : "") + "</label>").join("");
-    elArms.querySelectorAll("input").forEach(el => el.addEventListener("change", () => {
-      const i = +el.getAttribute("data-i");
-      if (el.checked) enabled.add(i); else if (enabled.size > 1) enabled.delete(i); else el.checked = true;
-      draw();
-    }));
+    if (!armRows) {
+      elArms.innerHTML = DATA.map((s, i) =>
+        '<label title="' + s.name.replace(/"/g, "&quot;") + '"><input type="checkbox" data-i="' + i + '"' + (enabled.has(i) ? " checked" : "") + '>' +
+        '<i></i>' + getAlias(s.name) + ' <span class="v3-rate"></span></label>').join("");
+      armRows = [...elArms.querySelectorAll("label")].map(l => ({ cb: l.querySelector("input"), sw: l.querySelector("i"), rate: l.querySelector(".v3-rate") }));
+      armRows.forEach(row => row.cb.addEventListener("change", () => {
+        const i = +row.cb.getAttribute("data-i");
+        if (row.cb.checked) enabled.add(i); else if (enabled.size > 1) enabled.delete(i); else row.cb.checked = true;
+        draw();
+      }));
+    }
+    armRows.forEach((row, i) => {
+      row.cb.checked = enabled.has(i);
+      row.sw.style.background = css(rgb(seriesColors[i]));
+      const st = stats[i];
+      row.rate.textContent = st ? fmtN(st.outRate) + " out/s" + (st.hasZ ? "" : ", no dataset samples") : "";
+    });
   }
 
   // ---- draw ----
