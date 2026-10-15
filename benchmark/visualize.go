@@ -4592,6 +4592,7 @@ const V3 = (() => {
   let cv, cx, tip, elY, elZ, elArms, elSm, elTT, built = false, expanded = false;
   const BINS = 240, CAM = 4;
   const TTFT_MAX = 20000;   // ms: legs are fully red at and above this
+  const LINE_DOT_EVERY = 6;  // line dots: one per this many bins (~40 per arm)
   const VIEWS = { iso: [-0.62, 0.38], front: [0, 0], top: [0, Math.PI / 2 - 0.001], side: [-Math.PI / 2, 0] };
   let yaw = VIEWS.iso[0], pitch = VIEWS.iso[1], zoom = 1;
   let cw = 0, ch = 0, enabled = new Set([0]), shown = false, proj = [];
@@ -4858,27 +4859,43 @@ const V3 = (() => {
         }
         cx.lineCap = "butt";
       } else line(pts, css(c), 2.2);
+      if (elTT.value === "linedots") {
+        // dots on the curve itself, every LINE_DOT_EVERY steps, coloured by TTFT there
+        for (let k = 0; k < pts.length; k += LINE_DOT_EVERY) {
+          const a = P(pts[k][0], pts[k][1], pts[k][2]);
+          cx.beginPath(); cx.arc(a[0], a[1], 3.6, 0, 2 * Math.PI);
+          cx.fillStyle = legColor(pts[k][6], 0.95); cx.fill();
+          cx.lineWidth = 1; cx.strokeStyle = "rgba(13,16,19,0.9)"; cx.stroke();
+        }
+      }
       pts.forEach(v => { const s = P(v[0], v[1], v[2]); proj.push({ x: s[0], y: s[1], i, t: v[3], yv: v[4], zv: v[5], tt: v[6] }); });
     });
-    // key for the TTFT colours
+    // TTFT legend: a vertical colour bar beside the cube
     if (elTT.value === "off") return;
-    cx.font = "11px sans-serif"; cx.textAlign = "left";
-    if (elTT.value === "tint") {
-      let px = 12;
-      const head = "line tint = TTFT at that point:";
-      cx.fillStyle = "#8a9096"; cx.fillText(head, px, ch - 10); px += cx.measureText(head).width + 8;
-      [[GREEN, "< " + TINT_GREEN / 1000 + "s"], [null, TINT_GREEN / 1000 + "-" + TINT_RED / 1000 + "s arm colour"], [RED, "> " + TINT_RED / 1000 + "s"]].forEach(([c, t]) => {
-        if (c) { cx.fillStyle = css(c); cx.fillRect(px, ch - 18, 14, 3); px += 18; }
-        cx.fillStyle = "#b8bec4"; cx.fillText(t, px, ch - 10); px += cx.measureText(t).width + 14;
-      });
-      return;
+    // beside the cube: right of its projected outline, vertically centred on it
+    let cxMax = -Infinity, cyMin = Infinity, cyMax = -Infinity;
+    [-1, 1].forEach(x => [-1, 1].forEach(y => [-1, 1].forEach(z => {
+      const p = P(x, y, z); cxMax = Math.max(cxMax, p[0]); cyMin = Math.min(cyMin, p[1]); cyMax = Math.max(cyMax, p[1]);
+    })));
+    const bh = Math.min(260, ch * 0.45, Math.max(120, cyMax - cyMin)), bw2 = 12;
+    const bx = Math.min(cw - 60, cxMax + 70), by = Math.max(24, Math.min(ch - bh - 30, (cyMin + cyMax) / 2 - bh / 2));
+    cx.font = "11px sans-serif"; cx.textAlign = "center"; cx.fillStyle = "#C9C9C9";
+    cx.fillText("TTFT", bx + bw2 / 2, by - 12);
+    const tintAt = ms => elTT.value === "tint" ? css(ttftTint([150, 150, 150], ms)) : legColor(ms, 0.95);
+    for (let k = 0; k < bh; k++) {   // top = TTFT_MAX, bottom = 0
+      cx.fillStyle = tintAt(TTFT_MAX * (1 - k / bh));
+      cx.fillRect(bx, by + k, bw2, 1);
     }
-    const kx = 12, ky = ch - 10, kw = 160, kt = (elTT.value === "legs" ? "legs" : "floor dots") + " = TTFT at that point";
-    cx.fillStyle = "#8a9096"; cx.fillText(kt, kx, ky);
-    let gx = kx + cx.measureText(kt).width + 10;
-    cx.fillStyle = "#b8bec4"; cx.fillText("0s", gx, ky); gx += cx.measureText("0s").width + 6;
-    for (let k = 0; k < kw; k++) { cx.fillStyle = legColor(TTFT_MAX * k / kw, 0.9); cx.fillRect(gx + k, ky - 8, 1, 8); }
-    gx += kw + 6; cx.fillStyle = "#b8bec4"; cx.fillText(TTFT_MAX / 1000 + "s+", gx, ky);
+    cx.strokeStyle = "#42464A"; cx.lineWidth = 1; cx.strokeRect(bx - 0.5, by - 0.5, bw2 + 1, bh + 1);
+    cx.font = "10px monospace"; cx.textAlign = "left"; cx.fillStyle = "#b8bec4";
+    for (let v = 0; v <= TTFT_MAX; v += 5000) {
+      const y = by + bh * (1 - v / TTFT_MAX);
+      cx.fillRect(bx + bw2, y - 0.5, 4, 1);
+      cx.fillText(v / 1000 + "s" + (v === TTFT_MAX ? "+" : ""), bx + bw2 + 7, y + 3);
+    }
+    const what = { linedots: "line dots", dots: "floor dots", legs: "legs", tint: "line tint (grey = arm colour)" }[elTT.value];
+    cx.textAlign = "center"; cx.fillStyle = "#8a9096"; cx.font = "10px sans-serif";
+    cx.fillText(what, bx + bw2 / 2 + 10, by + bh + 18);
   }
 
   function init() {
@@ -4894,7 +4911,7 @@ const V3 = (() => {
     '<option value="infl">requests in flight</option>' +
     '<option value="adt">active dataset (tokens)</option></select></label>' +
     '<label title="How the TTFT at each point is shown: dots on the floor under the curve, or legs from the curve to the floor">TTFT <select class="v3-tt">' +
-    '<option value="dots">floor dots</option><option value="legs">legs</option><option value="tint">line tint</option><option value="off">off</option></select></label>' +
+    '<option value="linedots">line dots</option><option value="dots">floor dots</option><option value="legs">legs</option><option value="tint">line tint</option><option value="off">off</option></select></label>' +
     '<label title="Moving average over Y (and over Z for requests in flight)">Smooth <select class="v3-smooth">' +
     '<option value="0">off</option><option value="60000">1 min</option><option value="120000" selected>2 min</option>' +
     '<option value="300000">5 min</option><option value="600000">10 min</option></select></label>' +
