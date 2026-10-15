@@ -96,6 +96,12 @@ var WekaiTimeline = (function () {
       '<div class="wtl-scroll"><div class="wtl-content"><canvas class="wtl-canvas"></canvas><canvas class="wtl-overlay"></canvas></div><div class="wtl-empty" hidden>No requests yet</div></div>' +
       '<div class="wtl-tip"></div>';
     var $ = function (c) { return host.querySelector(c); };
+    if (opts.paneTitle) {
+      // A split pane: the split's own bar holds expand, replay and the arm choice.
+      host.classList.add("wtl-in-split");
+      var pt = document.createElement("span"); pt.className = "wtl-panetitle"; pt.textContent = opts.paneTitle; pt.title = opts.paneTitle;
+      $(".wtl-bar").insertBefore(pt, $(".wtl-bar").firstChild);
+    }
     var elArm = $(".wtl-arm"), elRowH = $(".wtl-rowh"), elReset = $(".wtl-reset"), elFollow = $(".wtl-follow");
     var elInfo = $(".wtl-info"), elLegend = $(".wtl-legend"), elScroll = $(".wtl-scroll");
     var elContent = $(".wtl-content"), canvas = $(".wtl-canvas"), tip = $(".wtl-tip"), elEmpty = $(".wtl-empty");
@@ -1048,7 +1054,11 @@ var WekaiTimeline = (function () {
         }, 50);
       },
       selectArm: selectArm,
-      setExpanded: function (on) { setExpanded(on); },
+      setExpanded: function (on, silent) { setExpanded(on, silent); },
+      // setReplay drives this pane's replay clock from outside (the split's bar):
+      // t in arm ms, or null to show the whole run.
+      setReplay: function (t, isPlaying) { cancelAnimationFrame(playRaf); playT = t; playing = !!isPlaying; updPlayUI(); draw(); },
+      span: function () { return arm() ? arm().span : 0; },
       currentArm: function () { return cur; },
       setView: function (a, b) { setView(a, b); },
       getView: function () { return range(); },
@@ -1123,38 +1133,115 @@ var WekaiTimeline = (function () {
     };
   }
 
-  // createSplit stacks 1..N timelines in host, one arm each by default, sharing
-  // zoom, expand and replay; each pane's bar has a Panes selector that rebuilds
-  // the stack. It exposes the subset of a timeline's API the pages use.
+  // createSplit lays out one timeline per chosen arm side by side under one
+  // bar that owns expand, the replay controls and the arm choice (all arms by
+  // default). Panes share zoom through a sync group; the replay clock runs
+  // here and drives every pane, so the arms replay in lockstep, each on its
+  // own elapsed clock. It exposes the subset of a timeline's API pages use.
   function createSplit(host, opts) {
+    var SPEEDS = [1, 2, 5, 10, 30, 60, 120, 300, 600, 1200, 3000];
     host.classList.add("wtl-split");
-    var arms = [], panes = [], count = 1, view = [null, null];
-    function build(n) {
-      count = Math.max(1, Math.min(n, Math.max(1, arms.length)));
-      var wasExpanded = host.classList.contains("wtl-expanded-host");
-      host.innerHTML = "";
-      host.classList.remove("wtl-expanded-host");
-      document.documentElement.classList.remove("wtl-expanded-page");
+    host.innerHTML =
+      '<div class="wtl-bar wtl-splitbar">' +
+      '<button class="wtl-expand" title="Fill the window with the timelines (Esc or Back to return)">&#x2922; Expand</button>' +
+      '<span class="wtl-armsel"></span>' +
+      '<span class="wtl-play" title="Replay the run: requests appear as they started and fill in stage by stage">' +
+      '<button class="wtl-restart" title="Replay from the start">&#x23EE;</button>' +
+      '<button class="wtl-playbtn" title="Play / pause">&#x25B6;</button>' +
+      '<button class="wtl-stop" title="Stop the replay and show the whole run" hidden>&#x25A0;</button>' +
+      '<input type="range" class="wtl-speed" min="0" max="10" step="1" value="5" title="Replay speed">' +
+      '<span class="wtl-speedv"></span><span class="wtl-playt"></span></span>' +
+      '</div><div class="wtl-panesrow"></div>';
+    var $ = function (c) { return host.querySelector(c); };
+    var row = $(".wtl-panesrow"), elArmSel = $(".wtl-armsel"), elExpand = $(".wtl-expand");
+    var elPlay = $(".wtl-playbtn"), elRestart = $(".wtl-restart"), elStop = $(".wtl-stop"), elSpeed = $(".wtl-speed");
+    var elSpeedV = $(".wtl-speedv"), elPlayT = $(".wtl-playt");
+    var arms = [], chosen = null, panes = [], view = [null, null], expanded = false;
+    var playT = null, playing = false, raf = 0, last = 0;
+    var me = { key: {}, apply: function (kind, v) { if (kind === "expand") markExpanded(v); else if (kind === "view") view = v; }, span: function () { return 0; } };
+
+    function markExpanded(on) {
+      expanded = on;
+      host.classList.toggle("wtl-expanded-host", on);
+      document.documentElement.classList.toggle("wtl-expanded-page", on);
+      elExpand.innerHTML = on ? "&#x2715; Back" : "&#x2922; Expand";
+    }
+    function setExpanded(on) {
+      markExpanded(on);
+      panes.forEach(function (t) { t.setExpanded(on, true); });
+    }
+    elExpand.addEventListener("click", function () { setExpanded(!expanded); });
+    window.addEventListener("keydown", function (e) { if (e.key === "Escape" && expanded) setExpanded(false); });
+
+    function end() { return panes.reduce(function (m, t) { return Math.max(m, t.span()); }, 0); }
+    function ui() {
+      elPlay.innerHTML = playing ? "&#x23F8;" : "&#x25B6;";
+      elStop.hidden = playT === null;
+      elSpeedV.textContent = SPEEDS[+elSpeed.value] + "×";
+      elPlayT.innerHTML = playT === null ? "" : "<b>" + fmtElapsed(playT, 1000) + "</b> / " + fmtElapsed(end(), 1000);
+    }
+    function push() { panes.forEach(function (t) { t.setReplay(playT, playing); }); ui(); }
+    function frame(now) {
+      if (!playing) return;
+      playT = Math.min(end(), playT + (now - last) * SPEEDS[+elSpeed.value]);
+      last = now;
+      if (playT >= end()) playing = false;
+      push();
+      if (playing) raf = requestAnimationFrame(frame);
+    }
+    function play(fromStart) {
+      if (playT === null || fromStart || playT >= end()) playT = 0;
+      playing = true; last = performance.now();
+      cancelAnimationFrame(raf); raf = requestAnimationFrame(frame);
+      push();
+    }
+    elPlay.addEventListener("click", function () { if (playing) { playing = false; cancelAnimationFrame(raf); push(); } else play(false); });
+    elRestart.addEventListener("click", function () { play(true); });
+    elStop.addEventListener("click", function () { playing = false; cancelAnimationFrame(raf); playT = null; push(); });
+    elSpeed.addEventListener("input", ui);
+    ui();
+
+    function buildArmSel() {
+      elArmSel.hidden = arms.length < 2;
+      elArmSel.innerHTML = "Arms " + arms.map(function (a, i) {
+        return '<label title="' + esc(a.name) + '"><input type="checkbox" data-i="' + i + '"' + (chosen[i] ? " checked" : "") + '> ' + esc(a.name) + "</label>";
+      }).join("");
+      [].forEach.call(elArmSel.querySelectorAll("input"), function (cb) {
+        cb.addEventListener("change", function () {
+          var i = +cb.getAttribute("data-i");
+          chosen[i] = cb.checked;
+          if (!chosen.some(Boolean)) { chosen[i] = true; cb.checked = true; return; }   // keep one
+          build();
+        });
+      });
+    }
+    function build() {
+      row.innerHTML = "";
       var hub = syncGroup();
+      hub.add(me);
       panes = [];
-      for (var i = 0; i < count; i++) {
+      arms.forEach(function (a, i) {
+        if (!chosen[i]) return;
         var d = document.createElement("div");
         d.className = "wtl-pane";
-        host.appendChild(d);
+        row.appendChild(d);
         var o = {};
         for (var k in opts) o[k] = opts[k];
-        o.sync = hub; o.expandHost = host; o.paneCount = count; o.maxPanes = arms.length; o.onPanes = build;
-        if (i > 0) o.onZoom = null;   // the page hears zoom once
+        o.sync = hub; o.expandHost = host; o.paneTitle = arms.length > 1 ? a.name : "";
+        if (panes.length > 0) o.onZoom = null;   // the page hears zoom once
         var t = create(d, o);
         t.setArms(arms, i);
         if (view[0] !== null) t.setView(view[0], view[1]);
         panes.push(t);
-      }
-      panes.forEach(function (t) { t.resize(); });
-      if (wasExpanded && panes[0]) panes[0].setExpanded(true);   // a rebuild keeps the view expanded
+      });
+      panes.forEach(function (t) { t.resize(); if (expanded) t.setExpanded(true, true); t.setReplay(playT, playing); });
     }
     return {
-      setArms: function (list) { arms = list; build(count); },
+      setArms: function (list) {
+        arms = list;
+        chosen = arms.map(function () { return true; });   // every arm by default
+        buildArmSel(); build();
+      },
       setView: function (a, b) { view = [a === undefined ? null : a, b]; if (panes[0]) panes[0].setView(a, b); },
       getView: function () { return panes[0] ? panes[0].getView() : [0, 1]; },
       resize: function () { panes.forEach(function (t) { t.resize(); }); },
