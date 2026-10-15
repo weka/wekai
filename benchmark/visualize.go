@@ -1343,8 +1343,8 @@ function applyCtxFilter(minTok, maxTok) {
 // --- Color assignment (official WEKA brand, neutral-first) ---
 // Multi-series palettes are restrained tints DERIVED from the brand set so
 // a 2-8 series report reads as one family: weka arms a purple ramp
-// (#7C03EC/#C79FF1 family), hbm/gpu a muted green ramp, dram a neutral
-// blue-grey ramp, the fallback dimmed yellow/green/slate tints. Position and the legend carry identity;
+// (#7C03EC/#C79FF1 family), hbm/gpu a muted green ramp, dram a muted cyan
+// ramp, the fallback dimmed yellow/green/slate tints. Position and the legend carry identity;
 // full saturation belongs to the external-KV accent alone, and #FF6B6B is
 // reserved for errors.
 const OTHER_PALETTE = [
@@ -1352,7 +1352,7 @@ const OTHER_PALETTE = [
   "#8d5fd6","#707c8a","#75b094","#d0b3f5","#9aa5b1","#c9b8e8",
 ];
 const GPU_VARIANTS = ["#5fae7a","#4c9466","#78c290","#3e7a54","#92d2a6"]; // hbm: muted green
-const DRAM_VARIANTS = ["#8a95a3","#76818f","#9eaab8","#646f7c","#b3bdc9"]; // dram: neutral blue-grey
+const DRAM_VARIANTS = ["#4fb3bf","#3e9aa6","#6cc6d0","#2f7f89","#8ad6de"]; // dram: muted cyan
 const WEKA_VARIANTS = [
   "#a678e8","#C79FF1","#8d5fd6","#b58ff0","#7745c0","#d0b3f5",
 ];
@@ -2188,8 +2188,8 @@ const MIX_EXTERNAL_COLOR = "#7C03EC"; // official primary purple — the single 
 // "local" into device (GPU radix cache, reuses MIX_LOCAL_COLOR) and host
 // (CPU/DRAM HiCache L2), which needs a color of its own. Muted teal-green
 // sits clearly apart from the compute/local/external triad above and from
-// GPU_VARIANTS' green family; it shares DRAM_VARIANTS' blue-grey, being DRAM.
-const MIX_HOST_COLOR = "#8a95a3"; // DRAM tier: the dram arm blue-grey
+// GPU_VARIANTS' green family; it shares DRAM_VARIANTS' cyan, being DRAM.
+const MIX_HOST_COLOR = "#4fb3bf"; // DRAM tier: the dram arm cyan
 const ADT_LINE_COLOR = "#F2F2EB";
 const MIX_BAND_H = 64;
 // Band fills sit on a solid-black backdrop; slightly translucent so the
@@ -4594,7 +4594,7 @@ const V3 = (() => {
   const TTFT_MAX = 20000;   // ms: dots are fully red at and above this
   const LINE_DOT_EVERY = 6;  // one TTFT dot per this many bins (~40 per arm)
   // Cache-mix fill: input tokens by source, stacked bottom to top. Colours are
-  // the arm colours of the tier (hbm green, dram blue-grey, weka purple);
+  // the arm colours of the tier (hbm green, dram cyan, weka purple);
   // compute is the report's compute red. An arm's external tier takes its own class's colour, the way
   // series colours are assigned from the arm name.
   const MIX_CATS = ["compute", "hbm", "dram", "weka"];

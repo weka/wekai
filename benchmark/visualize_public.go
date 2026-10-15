@@ -343,7 +343,7 @@ const MIX_COMPUTE_COLOR = "#c0504d";
 const MIX_LOCAL_COLOR = "#756a99";
 const MIX_EXTERNAL_COLOR = "#7C03EC";
 // See visualize.go's MIX_HOST_COLOR doc -- kept in lockstep.
-const MIX_HOST_COLOR = "#8a95a3";
+const MIX_HOST_COLOR = "#4fb3bf";
 const ADT_LINE_COLOR = "#F2F2EB";
 const MIX_BAND_H = 64;
 const MIX_FILL_ALPHA = 0.78;
