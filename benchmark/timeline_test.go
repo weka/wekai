@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -263,7 +264,7 @@ func TestReportTimelineOptIn(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(p)
-	if !strings.Contains(string(b), `id="tlData">[{`) || !strings.Contains(string(b), `id="viewTimeline"`) {
+	if !strings.Contains(string(b), `"tl":{`) || !strings.Contains(string(b), `id="viewTimeline"`) {
 		t.Error("timeline report lacks the embedded arm or the view switch")
 	}
 	p, err = GenerateVisualizationWithOverwrite(dir, 2, 0, true)
@@ -271,7 +272,7 @@ func TestReportTimelineOptIn(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ = os.ReadFile(p)
-	if strings.Contains(string(b), `id="tlData">[{`) {
+	if strings.Contains(string(b), `"tl":{`) {
 		t.Error("default report must not embed timeline data")
 	}
 }
@@ -529,4 +530,123 @@ func TestTimelineCarries429Fields(t *testing.T) {
 	if q.R4 != 3 || q.RW != 1800 || q.Segs[0] != segRetry429 || q.Segs[1] != 1800 {
 		t.Errorf("q = %+v", q)
 	}
+}
+
+// The report carries the timeline as extra columns of its request table, and
+// the page rebuilds the renderer's requests from them on first open. That
+// rebuild must equal buildTimelineArm field for field, across every kind of
+// value a request can carry.
+func TestReportTimelineMatchesBuilder(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	dir := t.TempDir()
+	w, _ := newRequestDataWriter(dir, "m", time.Now())
+	now := time.Now().Truncate(time.Millisecond)
+	var recs []requestDataRecord
+	for i := 0; i < 12; i++ {
+		st := now.Add(time.Duration(i*700) * time.Millisecond)
+		r := requestDataRecord{StartTime: st, EndTime: st.Add(900 * time.Millisecond), ResponseMs: 900, TTFT: 120, Model: "m",
+			SeriesNum: i%3 + 1, Turn: i/3 + 1, InputTokens: 100 + i, CachedTokens: 50 * i, OutputTokens: 10 + i,
+			Slot: i%2 + 1, SlotHot: i%4 == 0, SeriesGUID: map[bool]string{true: "s:a", false: "s:b"}[i%2 == 0]}
+		switch i % 6 {
+		case 0:
+			r.KV = goldenKV()
+		case 1:
+			r.KV = &llm.KVDetails{Recompute: &llm.KVRecompute{NumPreemptions: 1, PreemptDiscardedTokens: 7, NumExternalLoadFailures: 1, ExternalLoadRecomputeToks: 9}}
+			r.IsError = true
+		case 2:
+			r.ReadyMs, r.SentMs = st.UnixMilli()-40, st.UnixMilli() // client wait
+			r.ThinkPauseMs, r.DecodeHoldMs = 300, 20
+		case 3:
+			r.Retries429, r.RetryWaitMs = 2, 150
+		case 4:
+			r.ResponseMs = 0 // end time stands in for the latency
+			r.SeriesGUID = ""
+		}
+		recs = append(recs, r)
+		w.write(r)
+	}
+	w.close()
+	p, err := GenerateVisualizationTimeline(dir, 2, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	script := extractReportScript(t, string(b))
+	probe := `console.log("ARM=" + JSON.stringify(timelineArmOf(RAW_DATA[0])));`
+	jsPath := filepath.Join(dir, "tl_probe.js")
+	if err := os.WriteFile(jsPath, []byte(reportDOMStub+"\n"+script+"\n"+probe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(nodeBin, jsPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("node: %v\n%s", err, out)
+	}
+	line := string(out)[strings.Index(string(out), "ARM=")+4:]
+	line = line[:strings.IndexByte(line, '\n')]
+	var got struct {
+		Reqs []map[string]any `json:"reqs"`
+	}
+	if err := json.Unmarshal([]byte(line), &got); err != nil {
+		t.Fatal(err)
+	}
+	// The builder reads the same records back from the file, as the report did.
+	fileRecs, _, _, _, _, err := readJSONLFileWithParams(filepath.Join(dir, mustOneJSONL(t, dir)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	arm := buildTimelineArm("m", fileRecs)
+	wb, _ := json.Marshal(arm.Reqs)
+	var want []map[string]any
+	if err := json.Unmarshal(wb, &want); err != nil {
+		t.Fatal(err)
+	}
+	// Absent, zero and all-zero arrays are the same to the renderer.
+	norm := func(m map[string]any) map[string]any {
+		out := map[string]any{}
+		for k, v := range m {
+			switch x := v.(type) {
+			case float64:
+				if x == 0 {
+					continue
+				}
+			case []any:
+				zero := true
+				for _, e := range x {
+					if f, ok := e.(float64); !ok || f != 0 {
+						zero = false
+					}
+				}
+				if zero {
+					continue
+				}
+			case nil:
+				continue
+			}
+			out[k] = v
+		}
+		return out
+	}
+	if len(got.Reqs) != len(want) {
+		t.Fatalf("%d requests, want %d", len(got.Reqs), len(want))
+	}
+	for i := range want {
+		g, w := norm(got.Reqs[i]), norm(want[i])
+		gb, _ := json.Marshal(g)
+		wb, _ := json.Marshal(w)
+		if string(gb) != string(wb) {
+			t.Errorf("request %d:\n got %s\nwant %s", i, gb, wb)
+		}
+	}
+}
+
+func mustOneJSONL(t *testing.T, dir string) string {
+	t.Helper()
+	m, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	if len(m) != 1 {
+		t.Fatalf("want one .jsonl in %s, got %v", dir, m)
+	}
+	return filepath.Base(m[0])
 }

@@ -403,10 +403,8 @@ func TestPublicTemplateEscapingSurvivesEmbedding(t *testing.T) {
 	}
 	html := string(b)
 
-	// The report has two script elements: the page script and the (empty here)
-	// #tlData JSON block. Any extra literal </script> is an escape leak.
-	if n := strings.Count(html, "</script>"); n != 2 || strings.Count(html, "<script") != 2 {
-		t.Fatalf("expected exactly 2 script elements and 2 literal </script> in the outer report, got %d", n)
+	if n := strings.Count(html, "</script>"); n != 1 {
+		t.Fatalf("expected exactly 1 literal </script> in the outer report, got %d", n)
 	}
 	marker := "const PUBLIC_TEMPLATE = "
 	i := strings.Index(html, marker)

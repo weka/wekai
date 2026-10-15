@@ -459,46 +459,33 @@ console.log("ALL_OK");
 }
 
 // ---------------------------------------------------------------------------
-// BONUS (cheap, pure Go, no node needed): sparse UUID encoding round-trip.
+// BONUS (cheap, pure Go, no node needed): the request table's column rule.
 //
-// vizRecord.MarshalJSON omits the UUID validation quad entirely (not even a
-// zero placeholder) on a record with no UUID data, and additionally omits
-// the raw-detail slot unless there was an actual miss/leak. This directly
-// exercises that contract on the Go struct: a record with nothing to say
-// encodes strictly shorter than one carrying the quad, which in turn encodes
-// shorter than one that also carries miss/leak forensics -- and the content
-// that IS emitted round-trips losslessly.
+// A column is dropped only when it is empty in EVERY row of the arm; once any
+// row has a value, every row carries the column. So an arm with no UUID data
+// has no UUID columns at all, while one with a single miss carries the quad
+// and the raw-detail column on every row -- and the detail round-trips.
 // ---------------------------------------------------------------------------
 
-func TestVizRecordSparseUUIDEncoding(t *testing.T) {
-	base := vizRecord{T: 0, TTFT: 1, ResponseMs: 2, InputTokens: 3, CachedTokens: 4, OutputTokens: 5}
-
-	noUUID := base
-	marshalLen := func(t *testing.T, r vizRecord) []any {
-		t.Helper()
-		buf, err := json.Marshal(r)
-		if err != nil {
-			t.Fatal(err)
+func TestReportTableColumnRule(t *testing.T) {
+	base := vizRecord{T: 0, TTFT: 1, ResponseMs: 2, InputTokens: 3, CachedTokens: 4, OutputTokens: 5, GuidIdx: -1}
+	names := func(cols []reportCol) []string {
+		var out []string
+		for _, c := range cols {
+			out = append(out, c.Name)
 		}
-		var arr []any
-		if err := json.Unmarshal(buf, &arr); err != nil {
-			t.Fatal(err)
-		}
-		return arr
+		return out
 	}
 
-	arrNone := marshalLen(t, noUUID)
-	if len(arrNone) != 16 {
-		t.Errorf("no-UUID record: array len = %d, want 16 (positions 0-15 only)", len(arrNone))
+	cols, rows := buildReportTable([]vizRecord{base, base}, nil)
+	for _, n := range names(cols) {
+		switch n {
+		case "ue", "uf", "ul", "uem", "ux", "gi", "err":
+			t.Errorf("column %q is empty in every row and must be dropped; cols = %v", n, names(cols))
+		}
 	}
-
-	cleanMatch := base
-	cleanMatch.UUIDExpected = 2
-	cleanMatch.UUIDFound = 2
-	cleanMatch.UUIDExactMatch = true
-	arrQuad := marshalLen(t, cleanMatch)
-	if len(arrQuad) != 20 {
-		t.Errorf("clean-match record: array len = %d, want 20 (quad appended, no raw detail)", len(arrQuad))
+	if len(rows[0]) != len(cols) || len(rows[1]) != len(cols) {
+		t.Errorf("rows %d/%d wide, want %d", len(rows[0]), len(rows[1]), len(cols))
 	}
 
 	withMiss := base
@@ -507,13 +494,42 @@ func TestVizRecordSparseUUIDEncoding(t *testing.T) {
 	withMiss.ExpectedUUIDsRaw = []string{"uuid-a", "uuid-b"}
 	withMiss.FoundMask = []bool{true, false}
 	withMiss.LeakedUUIDsRaw = []string{"uuid(series=9)"}
-	arrMiss := marshalLen(t, withMiss)
-	if len(arrMiss) != 21 {
-		t.Fatalf("miss/leak record: array len = %d, want 21 (quad + raw detail slot)", len(arrMiss))
+	cols, rows = buildReportTable([]vizRecord{base, withMiss}, nil)
+	at := map[string]int{}
+	off := 0
+	for _, c := range cols {
+		at[c.Name] = off
+		if c.Width > 1 {
+			off += c.Width
+		} else {
+			off++
+		}
 	}
-	detail, ok := arrMiss[20].([]any)
-	if !ok || len(detail) != 3 {
-		t.Fatalf("slot 20 = %#v, want a 3-element [expected, foundMask, leaked] array", arrMiss[20])
+	for _, n := range []string{"ue", "uf", "ux"} {
+		if _, ok := at[n]; !ok {
+			t.Fatalf("column %q missing although one row has it; cols = %v", n, names(cols))
+		}
+	}
+	if len(rows[0]) != off || len(rows[1]) != off {
+		t.Fatalf("rows %d/%d wide, want %d: every row carries every column", len(rows[0]), len(rows[1]), off)
+	}
+	if rows[0][at["ue"]] != 0.0 || rows[1][at["ue"]] != 2.0 {
+		t.Errorf("ue = %v/%v, want 0/2", rows[0][at["ue"]], rows[1][at["ue"]])
+	}
+	buf, err := json.Marshal(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back [][]any
+	if err := json.Unmarshal(buf, &back); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := back[0][at["ux"]].([]any); len(d) != 0 {
+		t.Errorf("row without detail: ux = %v, want []", back[0][at["ux"]])
+	}
+	detail, _ := back[1][at["ux"]].([]any)
+	if len(detail) != 3 {
+		t.Fatalf("ux = %#v, want [expected, foundMask, leaked]", back[1][at["ux"]])
 	}
 	gotExpected, _ := detail[0].([]any)
 	gotMask, _ := detail[1].([]any)
@@ -521,7 +537,6 @@ func TestVizRecordSparseUUIDEncoding(t *testing.T) {
 	if len(gotExpected) != 2 || gotExpected[0] != "uuid-a" || gotExpected[1] != "uuid-b" {
 		t.Errorf("expected_uuids_raw round-trip = %v, want [uuid-a uuid-b]", gotExpected)
 	}
-	// FoundMask bools are encoded as 0/1 ints (see MarshalJSON's maskBits).
 	if len(gotMask) != 2 || gotMask[0] != float64(1) || gotMask[1] != float64(0) {
 		t.Errorf("found_mask round-trip = %v, want [1 0]", gotMask)
 	}

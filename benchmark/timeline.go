@@ -108,6 +108,7 @@ type timelineReq struct {
 	GI     int       `json:"gi,omitempty"`  // 1-based index into the arm's Guids (session:instance); static pages
 	GUID   string    `json:"gu,omitempty"`  // the same inline; live responses
 	Segs   []float64 `json:"g"`             // flattened (kind, durationMs) pairs, left to right
+	idx    int       // position in the records the arm was built from
 }
 
 // rowKey identifies a row group: the concurrency slot when the request carries
@@ -395,8 +396,9 @@ func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
 	}
 	arm.T0 = t0
 	guidIdx := map[string]int{}
-	for _, r := range recs {
+	for i, r := range recs {
 		tr := timelineFromRecord(r, t0)
+		tr.idx = i
 		if r.SeriesGUID != "" {
 			i, ok := guidIdx[r.SeriesGUID]
 			if !ok {

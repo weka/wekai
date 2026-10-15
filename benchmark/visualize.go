@@ -12,7 +12,6 @@ import (
 	"regexp"
 	"runtime/debug"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -217,88 +216,20 @@ type vizRecord struct {
 	LeakedUUIDsRaw   []string
 }
 
-// MarshalJSON emits vizRecord as a positional array — the first 16 slots,
-// always present, are
-// [t,ttft,resp,err,sn,rn,ch,in,ca,out,turn,scc,cs,ie,lcr,gi], matching
-// REC_FIELDS in the report template — instead of a JSON object. The object
-// shape repeats every key string per record; across the ~137k records a
-// typical merged report carries, that's several MB of pure key-name bytes.
-// The report's load-time rehydration shim (immediately after `const
-// RAW_DATA = {{.Data}}` in the template) converts each row back into a
-// plain object with an absolute t, so every downstream render/filter/
-// compute function is unchanged. Bool fields are emitted as 0/1 and
-// rehydrated back to real booleans by the shim. Field order here MUST match
-// REC_FIELDS in the template exactly. gi is GuidIdx, an index into the
-// series' GuidTable (see seriesData.GuidTable) or -1 when this record
-// carries no guid; cache_hit_ratio is deliberately NOT one of these 16 —
-// see the field doc on vizRecord for why it's derived client-side instead.
-//
-// Two further slots are trailing-optional, each omitted outright (not even
-// a zero/empty placeholder) when this record has nothing to say there:
-//   - 16-19, the UUID validation quad [ue,uf,ul,uem] — present only when
-//     this request actually carries UUID data (see hasUUIDData below).
-//   - 20, [expected_uuids_raw, found_mask, leaked_uuids_raw] — present only
-//     on an actual miss/leak, and only ever alongside 16-19.
-//
-// A JSON array can simply be shorter when trailing elements are absent, so
-// the report template's rehydration reads row[i] with an explicit default
-// rather than assuming a fixed length.
-func (r vizRecord) MarshalJSON() ([]byte, error) {
-	b := func(v bool) float64 {
-		if v {
-			return 1
-		}
-		return 0
-	}
-	// Positions 0-15 are always present. 16-19 (the UUID validation quad)
-	// are appended ONLY when this request actually carries UUID data —
-	// requestDataRecord's own doc says these are "0 when the feature is
-	// off", which for the overwhelming majority of runs (router-replay
-	// --verify not in use) means EVERY record's quad is the zero value.
-	// Rather than pay for four extra zeroed slots on every single record of
-	// every non-verify run, a record with nothing to say here simply ends
-	// at position 15 — the same "a trailing element can just be absent"
-	// convention the UUID detail slot below already relies on. A request
-	// carrying real UUID data (however that data reads) always gets the
-	// quad, so no information is lost — the omission only ever applies to
-	// records whose quad IS the zero value already.
-	row := []any{
-		r.T, r.TTFT, r.ResponseMs, b(r.IsError), float64(r.SeriesNum), float64(r.RequestNum),
-		b(r.CacheHit), float64(r.InputTokens), float64(r.CachedTokens), float64(r.OutputTokens),
-		float64(r.Turn), b(r.ServerCacheConfirmed), b(r.IsColdStart), b(r.IsEmpty),
-		r.LocalCacheRatio, float64(r.GuidIdx),
-	}
-	hasUUIDData := r.UUIDExpected != 0 || r.UUIDFound != 0 || r.UUIDLeaked != 0 || r.UUIDExactMatch
-	if hasUUIDData {
-		row = append(row, float64(r.UUIDExpected), float64(r.UUIDFound), float64(r.UUIDLeaked), b(r.UUIDExactMatch))
-		// A 21st slot carries [expected_uuids_raw, found_mask, leaked_uuids_raw],
-		// appended only on an actual miss/leak (by construction, whenever any
-		// of these is non-empty, UUIDExpected/UUIDLeaked are already non-zero,
-		// so hasUUIDData is guaranteed true here -- see the fields' doc on
-		// vizRecord).
-		if len(r.ExpectedUUIDsRaw) > 0 || len(r.FoundMask) > 0 || len(r.LeakedUUIDsRaw) > 0 {
-			maskBits := make([]int, len(r.FoundMask))
-			for i, v := range r.FoundMask {
-				if v {
-					maskBits[i] = 1
-				}
-			}
-			row = append(row, [3]any{r.ExpectedUUIDsRaw, maskBits, r.LeakedUUIDsRaw})
-		}
-	}
-	return json.Marshal(row)
-}
-
 // seriesData is one variant's data as embedded in a report.html's RAW_DATA.
 type seriesData struct {
 	Name string `json:"name"`
 	// T0 is the base epoch-ms timestamp (min over Records) that each
 	// Records[i].T is delta-encoded against — see vizRecord.T. Rehydrated
 	// client-side as t0 + delta to recover the absolute epoch value.
-	T0      float64            `json:"t0"`
-	Records []vizRecord        `json:"records"`
-	Mix     []vizSampleSegment `json:"mix,omitempty"`
-	Adt     []vizAdtPoint      `json:"adt,omitempty"`
+	T0      float64     `json:"t0"`
+	Records []vizRecord `json:"-"`
+	// Cols and Rows are Records (plus, with --timeline, each request's timeline
+	// fields) as one table; see report_table.go.
+	Cols []reportCol        `json:"cols"`
+	Rows [][]any            `json:"records"`
+	Mix  []vizSampleSegment `json:"mix,omitempty"`
+	Adt  []vizAdtPoint      `json:"adt,omitempty"`
 	// BandOrder names Mix's bands, in the order each vizSampleSegment.Bands
 	// entry appears (vllmBandOrder or sglangBandOrder — see vllm_metrics.go/
 	// sglang_metrics.go), so the report JS knows which color/label lookup and
@@ -325,7 +256,8 @@ type seriesData struct {
 	GuidTable []string `json:"guidTable,omitempty"`
 	// Timeline is this arm's request timeline (see timeline.go), present only
 	// when the report was generated with the timeline view enabled.
-	Timeline *timelineArm `json:"timeline,omitempty"`
+	Timeline *timelineArm  `json:"-"`
+	Tl       *timelineMeta `json:"tl,omitempty"`
 }
 
 // buildGuidTable interns each record's series_guid into a de-duplicated,
@@ -515,10 +447,16 @@ func renderVisualization(dir string, concurrency int, keepFileNames bool, maxEla
 			sd.Conc = params.effectiveConcurrency()
 			sd.Params = buildVizRunParams(params)
 		}
+		var tlByRec []*timelineReq
 		if withTimeline && len(records) > 0 {
 			tla := buildTimelineArm(name, records)
-			sd.Timeline = &tla
+			sd.Tl = &timelineMeta{Span: tla.Span, Groups: tla.Groups, Rates: tla.Rates, TTFT: tla.TTFT}
+			tlByRec = make([]*timelineReq, len(records))
+			for k := range tla.Reqs {
+				tlByRec[tla.Reqs[k].idx] = &tla.Reqs[k]
+			}
 		}
+		sd.Cols, sd.Rows = buildReportTable(vr, tlByRec)
 		allSeries = append(allSeries, sd)
 	}
 
@@ -534,27 +472,6 @@ func renderVisualization(dir string, concurrency int, keepFileNames bool, maxEla
 		if !found {
 			return "", fmt.Errorf("--baseline %q matches no arm; arms are: %s", baselineLabel, strings.Join(names, ", "))
 		}
-	}
-
-	// Timelines ride outside RAW_DATA, as one JSON string the page parses
-	// only when the Timeline tab is first opened: they are most of a timeline
-	// report's bytes, and as part of RAW_DATA every page load paid to parse
-	// them whether or not anyone looked.
-	tlArms := make([]*timelineArm, len(allSeries))
-	hasTimeline := false
-	for i := range allSeries {
-		tlArms[i] = allSeries[i].Timeline
-		hasTimeline = hasTimeline || tlArms[i] != nil
-		allSeries[i].Timeline = nil
-	}
-	tlData := template.JS("")
-	if hasTimeline {
-		// json.Marshal escapes '<', so the payload can never close its <script>.
-		ab, err := json.Marshal(tlArms)
-		if err != nil {
-			return "", fmt.Errorf("marshal timelines: %w", err)
-		}
-		tlData = template.JS(ab)
 	}
 
 	seriesJSON, err := json.Marshal(allSeries)
@@ -614,8 +531,6 @@ func renderVisualization(dir string, concurrency int, keepFileNames bool, maxEla
 		"TimelineJS":     tlJS,
 		"TimelineCSS":    tlCSS,
 		"TimelineKinds":  tlKinds,
-		"TimelineData":   tlData,
-		"HasTimeline":    template.JS(strconv.FormatBool(hasTimeline)),
 	}); err != nil {
 		return "", fmt.Errorf("execute template: %w", err)
 	}
@@ -1109,15 +1024,32 @@ const BASELINE_LABEL = {{.BaselineLabel}};
 const REC_FIELDS = ["t", "ttft", "resp", "err", "sn", "rn", "ch", "in", "ca", "out",
   "turn", "scc", "cs", "ie", "lcr", "gi", "ue", "uf", "ul", "uem"];
 const REC_BOOL_FIELDS = ["err", "ch", "scc", "cs", "ie", "uem"];
+const REC_DEFAULTS = { gi: -1 };
+// colIndex maps each column of an arm's table to [offset, width] in its rows
+// (width 1 scalar, >1 inline group, 0 one slot holding an array).
+function colIndex(cols) {
+  const m = {};
+  let off = 0;
+  (cols || []).forEach(c => { m[c[0]] = [off, c[1]]; off += c[1] > 1 ? c[1] : 1; });
+  return m;
+}
 RAW_DATA.forEach(s => {
   const t0 = s.t0 || 0;
   const guidTable = s.guidTable || [];
-  s.records = (s.records || []).map(row => {
+  const ix = colIndex(s.cols);
+  s.colIx = ix;
+  const pos = REC_FIELDS.map(k => ix[k] ? ix[k][0] : -1);
+  const dflt = REC_FIELDS.map(k => REC_DEFAULTS[k] !== undefined ? REC_DEFAULTS[k] : 0);
+  const ux = ix.ux ? ix.ux[0] : -1;
+  const rows = s.records || [];
+  // The timeline's columns stay in the raw rows until its tab is opened.
+  if (s.tl) s.rows = rows;
+  s.records = rows.map(row => {
     const o = {};
-    REC_FIELDS.forEach((k, i) => { o[k] = row[i] !== undefined ? row[i] : 0; });
+    for (let i = 0; i < REC_FIELDS.length; i++) o[REC_FIELDS[i]] = pos[i] >= 0 ? row[pos[i]] : dflt[i];
     o.t += t0;
     REC_BOOL_FIELDS.forEach(k => { o[k] = !!o[k]; });
-    const extra = row[20];
+    const extra = ux >= 0 ? row[ux] : null;
     o.exp = (extra && extra[0]) || [];
     o.fmask = ((extra && extra[1]) || []).map(Boolean);
     o.leak = (extra && extra[2]) || [];
@@ -1125,6 +1057,38 @@ RAW_DATA.forEach(s => {
     return o;
   });
 });
+
+// timelineArmOf builds the timeline renderer's arm from an arm's table, on
+// first open of the Timeline tab: report columns supply start, latency, TTFT,
+// tokens, series, turn and guid; the timeline columns the rest.
+function timelineArmOf(s) {
+  const ix = s.colIx, rows = s.rows || [];
+  const at = k => ix[k] ? ix[k][0] : -1;
+  const P = {};
+  ["t", "ttft", "resp", "sn", "turn", "in", "ca", "out", "gi", "r", "u", "sl", "tp", "rw", "r4", "cw", "x", "ef", "src", "rc", "tm", "g"].forEach(k => { P[k] = at(k); });
+  const v = (row, k, d) => P[k] >= 0 ? row[P[k]] : d;
+  const grp = (row, k, w) => P[k] >= 0 ? row.slice(P[k], P[k] + w) : null;
+  const FLAG_SOURCES = 16, FLAG_TIMINGS = 8;   // timeline.go flagSources, flagTimings
+  const reqs = rows.map(row => {
+    const cw = v(row, "cw", 0), ef = v(row, "ef", 0), x = v(row, "x", 0), gi = v(row, "gi", -1);
+    const q = {
+      r: v(row, "r", 0), u: v(row, "u", 0), s: v(row, "sn", 0), sl: v(row, "sl", 0), n: v(row, "turn", 0),
+      t: v(row, "t", 0) - cw, e: (ef || v(row, "resp", 0)) + cw, f: v(row, "ttft", 0),
+      i: v(row, "in", 0), c: v(row, "ca", 0), o: v(row, "out", 0),
+      tp: v(row, "tp", 0), rw: v(row, "rw", 0), r4: v(row, "r4", 0), cw: cw, x: x,
+      g: v(row, "g", []),
+    };
+    if (gi >= 0) q.gi = gi + 1;
+    if (x & FLAG_SOURCES) q.src = grp(row, "src", 4);
+    if (x & FLAG_TIMINGS) q.tm = grp(row, "tm", 7);
+    const rc = grp(row, "rc", 4);
+    if (rc) q.rc = rc;
+    return q;
+  });
+  reqs.sort((a, b) => a.t - b.t);
+  return { name: s.name, t0: s.t0 || 0, span: s.tl.span, groups: s.tl.groups, guids: s.guidTable || [],
+    reqs: reqs, rates: s.tl.rates, ttft: s.tl.ttft };
+}
 
 const CONCURRENCY = {{.Concurrency}};
 
@@ -4606,9 +4570,7 @@ document.getElementById("downloadPublicBtn").addEventListener("click", downloadP
 // ms from each arm's own start, which is exactly the timeline's time basis, so
 // zooming in either view is reflected in the other and in the Summary panel.
 const TIMELINE_KINDS = {{.TimelineKinds}};
-// Per-arm timelines (RAW_DATA order) sit unparsed in the #tlData JSON block
-// after this script until the Timeline tab is first opened.
-const HAS_TIMELINE = {{.HasTimeline}};
+const HAS_TIMELINE = RAW_DATA.some(s => s.tl);
 var tlView = null;
 var timelineMode = false;
 function tlSyncFromReport() {
@@ -4934,9 +4896,7 @@ const V3 = (() => {
             draw();
           },
         });
-        const tl = JSON.parse(document.getElementById("tlData").textContent);
-        RAW_DATA.forEach((s, i) => { if (tl[i]) s.timeline = tl[i]; });
-        tlView.setArms(DATA.filter(s => s.timeline).map(s => s.timeline));
+        tlView.setArms(DATA.filter(s => s.tl).map(timelineArmOf));
       }
       sizeHost();
       tlView.resize();
@@ -4956,7 +4916,6 @@ window.addEventListener("resize", () => { resize(); draw(); });
 resize();
 draw();
 </script>
-<script type="application/json" id="tlData">{{.TimelineData}}</script>
 </body>
 </html>
 `))
