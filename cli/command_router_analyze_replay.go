@@ -174,7 +174,7 @@ func (c *RouterAnalyzeReplayCommand) collectReplayV3(path string) ([]replayReque
 		return nil, fmt.Errorf("parse header: %w", err)
 	}
 	if !benchmark.SupportedReplaySchema(hdr.Schema) {
-		return nil, fmt.Errorf("expected replay-v3 or replay-v4, got %q", hdr.Schema)
+		return nil, fmt.Errorf("expected replay-v3, replay-v4 or replay-v5, got %q", hdr.Schema)
 	}
 
 	var out []replayRequestWithModel
@@ -184,7 +184,7 @@ func (c *RouterAnalyzeReplayCommand) collectReplayV3(path string) ([]replayReque
 			if line[len(line)-1] == '\n' {
 				line = line[:len(line)-1]
 			}
-			if len(line) > 0 {
+			if len(line) > 0 && !benchmark.IsReplayIndexLine(line) {
 				var sess benchmark.RouterReplaySession
 				if err := json.Unmarshal(line, &sess); err == nil {
 					for _, inst := range sess.Instances {

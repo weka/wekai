@@ -195,6 +195,10 @@ type AutoBenchmarkConfig struct {
 	// first, and it would still produce a cache hit rate — just a meaningless
 	// one. That is why the stamp is per pass and never per session.
 	ReplayReuseSessions bool
+	// ReplayStrategy and ReplayFrom choose which sessions each lap over the
+	// corpus dispatches and in what order; see routerReplayStreamOpts.
+	ReplayStrategy string
+	ReplayFrom     string
 	// UUID-based cache-coherency validation (--verify). ROUTER
 	// PATH ONLY (cfg.RouterReplayFile != ""); the CLI rejects this combined
 	// with --from-dataset (see cli/benchmark_commands.go). One deterministic
@@ -2367,6 +2371,8 @@ func runSingleModelBenchmark(
 			AllowedIndices:        cfg.RouterReplaySeriesIndices,
 			Reuse:                 cfg.ReplayReuseSessions,
 			MaxRequestsPerSession: cfg.ReplayMaxRequestsPerSession,
+			Strategy:              cfg.ReplayStrategy,
+			From:                  cfg.ReplayFrom,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[auto][%s] open router-replay file: %v\n",

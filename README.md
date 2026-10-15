@@ -175,9 +175,10 @@ Helm equivalents: `replay.realtime=true`, `replay.admitCount=32`, and
 
 **Where the replay file comes from.** `wekai router serve` proxies live
 LLM traffic and captures it (redacted); `wekai router replay-prepare`
-compiles those captures into a single replay-v4 JSONL file (replay-v3 still loads) — one header
-line plus one session per line, so the replayer streams it with a bounded
-queue regardless of file size. Each request embeds the original structured
+compiles those captures into a single replay-v5 JSONL file (replay-v4 and
+v3 still load) — one header line, one session per line in start-time order,
+and a final index line, so the replayer streams it with a bounded queue
+regardless of file size. Each request embeds the original structured
 spec (system blocks, tools, messages) with content regenerated
 deterministically from each block's hash: same hash → same bytes → the
 server's prefix cache hits exactly the way the original traffic did,
@@ -195,15 +196,39 @@ keeps the captured-offset schedule. `replay-prepare --since/--until/
 --complete-by` bound the capture by request time when a corpus is rebuilt
 from a directory that has grown.
 
+**Session index and selection (replay-v5).** The last line of the file is
+`{"_schema":"replay-index-v1","sessions":[…]}`: per session its byte
+`offset` and `length`, `start_ts`, `end_ts` (when its last request finished)
+and `requests`. The replayer finds it by reading the file's last 2 MiB
+(doubling until the window holds the whole line) and then reads each session
+at its offset, which is what lets a run choose its sessions instead of
+reading front to back. `--replay-selection-strategy`:
+
+- `last-week` (default): the first lap plays the capture's final seven days,
+  then every lap is the whole corpus in file order. A run needing 10,000
+  sessions from a 5,000-session corpus whose last week starts at 3,500 plays
+  3,500→5,000, then 1→5,000, then 1→5,000 again…
+- `beginning`: whole corpus in file order every lap.
+- `reverse-from-end`: whole corpus newest first every lap.
+- `random`: a fresh (per-lap seeded) permutation of the whole corpus every
+  lap, so no session repeats before every other one has played.
+
+`--replay-from=<index|RFC3339>` moves where the first lap of `beginning`,
+`reverse-from-end` or `last-week` starts. Every lap gets its own content
+stamp (see `--replay-reuse-sessions`). An unindexed v3/v4 file plays from the
+beginning under the default; the other strategies need v5.
+
 **Downloading it.** The capture embedded in the image and run by the Helm
 chart is published as a scratch image holding just `/replay.jsonl`, pulled
 anonymously with `curl` — no Docker engine, no registry client (~1.3 GB
 download, ~9 GB on disk). `Dockerfile`'s `REPLAY_IMAGE` ARG is the source
 of truth for the tag. The current capture is
-`replay-7-jul-2027-58d-weka-timings.jsonl` (replay-v4: the 2026-05-12 →
+`replay-7-jul-2027-58d-weka-index.jsonl` (replay-v5: the 2026-05-12 →
 2026-07-07 dataset — 5,441 sessions / 522,332 requests — with per-request
 `total_ms` and `think_ms`, so `--replay-realtime` keeps the original think
-time between turns; older v3 captures fall back to the absolute schedule):
+time between turns, and the session index; its last week is sessions
+4,316–5,440, 48,780 requests; older v3 captures fall back to the absolute
+schedule):
 
 ```
 REPO=weka.io/wekai; TAG=replay-676947ddc2a9

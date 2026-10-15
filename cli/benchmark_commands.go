@@ -281,6 +281,8 @@ func (c *BenchmarkAutoCommand) Execute(args []string) error {
 		SGLangMetricsURLs:             c.SGLangMetricsURLs,
 		TTFTLimitStat:                 c.TTFTLimitStat,
 		ReplayReuseSessions:           c.ReuseSessions(),
+		ReplayStrategy:                c.ReplayStrategy,
+		ReplayFrom:                    c.ReplayFrom,
 		ReplayAllowUnderfill:          c.ReplayAllowUnderfill,
 		ReplayRealtime:                c.ReplayRealtime,
 		ReplayTiming:                  c.ReplayTiming,

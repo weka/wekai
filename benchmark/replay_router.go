@@ -42,6 +42,7 @@ import (
 // replay-v3 is a JSONL file:
 //   line 1: header (RouterReplayHeader)
 //   line 2..N+1: one RouterReplaySession per line
+// replay-v5 appends line N+2: the session index (ReplayIndex).
 //
 // Each ReplayRequest embeds the full per-request structured spec
 // (system_blocks, tools, messages) — so the replayer can materialize
@@ -58,8 +59,11 @@ const (
 )
 
 // SupportedReplaySchema reports whether the replayer can read a file with this
-// header schema. v4 only adds fields to v3.
-func SupportedReplaySchema(s string) bool { return s == "replay-v3" || s == "replay-v4" }
+// header schema. v4 only adds fields to v3; v5 adds the index trailer line
+// (replay_index.go).
+func SupportedReplaySchema(s string) bool {
+	return s == "replay-v3" || s == "replay-v4" || s == "replay-v5"
+}
 
 // RouterReplayHeader is the first-line metadata of a replay-v3 file.
 type RouterReplayHeader struct {
@@ -215,6 +219,11 @@ type routerReplayStream struct {
 	reuse          bool
 	pass           atomic.Int64
 	allowedIndices map[int]bool // nil = allow all; non-nil = only emit sessions at these 0-based line indices
+	// index and laps, when the file carries an index trailer, replace the
+	// sequential read: each lap dispatches the file indices laps produces,
+	// reading each session line at its indexed offset.
+	index *ReplayIndex
+	laps  replayLaps
 	// maxRequests > 0 truncates every session to its first N requests in
 	// capture order. Counters are reported so a run says how much of the
 	// corpus it actually replayed — a truncated run is not comparable with an
@@ -247,7 +256,7 @@ func readRouterReplayHeader(path string) (RouterReplayHeader, error) {
 		return RouterReplayHeader{}, fmt.Errorf("parse header: %w", err)
 	}
 	if !SupportedReplaySchema(hdr.Schema) {
-		return RouterReplayHeader{}, fmt.Errorf("unsupported replay schema %q (expected replay-v3 or replay-v4)", hdr.Schema)
+		return RouterReplayHeader{}, fmt.Errorf("unsupported replay schema %q (expected replay-v3, replay-v4 or replay-v5)", hdr.Schema)
 	}
 	return hdr, nil
 }
@@ -294,6 +303,12 @@ type routerReplayStreamOpts struct {
 	// the requests it drops become garbage before the session reaches a worker,
 	// and a worker holds its whole session for as long as the session runs.
 	MaxRequestsPerSession int
+	// Strategy is a ReplayStrategy* name; empty is last-week. Every strategy
+	// but beginning needs the file's index trailer, and so does From; an
+	// unindexed file under the default plays from the beginning.
+	Strategy string
+	// From moves where the first lap starts (see replayFirstStart).
+	From string
 }
 
 // openRouterReplayStream parses the header line, then starts a producer
@@ -321,13 +336,56 @@ func openRouterReplayStream(path string, opts routerReplayStreamOpts) (*routerRe
 	}
 	if !SupportedReplaySchema(hdr.Schema) {
 		f.Close()
-		return nil, fmt.Errorf("unsupported replay schema %q (expected replay-v3 or replay-v4)", hdr.Schema)
+		return nil, fmt.Errorf("unsupported replay schema %q (expected replay-v3, replay-v4 or replay-v5)", hdr.Schema)
 	}
 	if chanCap < 1 {
 		chanCap = 4
 	}
+	strategy := opts.Strategy
+	if strategy != "" && !ValidReplayStrategy(strategy) {
+		f.Close()
+		return nil, fmt.Errorf("unknown replay selection strategy %q", strategy)
+	}
+	index, err := readReplayIndex(f)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if strategy == "" {
+		strategy = ReplayStrategyLastWeek
+		if index == nil && opts.From == "" {
+			strategy = ReplayStrategyBeginning
+			fmt.Fprintf(os.Stderr, "[router-replay] %s (%s) has no session index; replaying it from the beginning\n",
+				path, hdr.Schema)
+		}
+	}
+	if index == nil && (strategy != ReplayStrategyBeginning || opts.From != "") {
+		f.Close()
+		return nil, fmt.Errorf("replay selection %s / from %q needs a replay-v5 file with an index trailer; %s is %s",
+			strategy, opts.From, path, hdr.Schema)
+	}
+	var laps replayLaps
+	if index != nil {
+		if len(index.Sessions) != hdr.Summary.Sessions {
+			f.Close()
+			return nil, fmt.Errorf("replay index lists %d sessions, header says %d", len(index.Sessions), hdr.Summary.Sessions)
+		}
+		first, err := replayFirstStart(index, strategy, opts.From)
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		laps = replayLaps{n: len(index.Sessions), strategy: strategy, first: first, allowed: allowedIndices}
+		fmt.Fprintf(os.Stderr, "[router-replay] index: %d sessions; selection %s, first lap from session %d (start %s), %d sessions\n",
+			len(index.Sessions), strategy, first, index.Sessions[first].StartTs, len(laps.lap(0)))
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	total := effectiveSessionCount(hdr.Summary.Sessions, len(allowedIndices), sessionLimit, reuse)
+	if index != nil && !reuse {
+		// Without reuse the run is the first lap, which last-week and
+		// --replay-from shorten.
+		total = effectiveSessionCount(len(laps.lap(0)), 0, sessionLimit, false)
+	}
 	s := &routerReplayStream{
 		header:         hdr,
 		f:              f,
@@ -338,12 +396,83 @@ func openRouterReplayStream(path string, opts routerReplayStreamOpts) (*routerRe
 		allowedIndices: allowedIndices,
 		reuse:          reuse,
 		maxRequests:    opts.MaxRequestsPerSession,
+		index:          index,
+		laps:           laps,
 		done:           make(chan struct{}),
 		ctx:            ctx,
 		cancel:         cancel,
 	}
-	go s.produce()
+	if index != nil {
+		go s.produceIndexed()
+	} else {
+		go s.produce()
+	}
 	return s, nil
+}
+
+// produceIndexed is produce for an indexed file: lap k dispatches
+// s.laps.lap(k), reading every session line at its indexed span. ReadAt keeps
+// no file position, so laps need no rewind.
+func (s *routerReplayStream) produceIndexed() {
+	defer close(s.done)
+	defer close(s.ch)
+	var buf []byte
+	for k := 0; ; k++ {
+		thisPass := 0
+		for _, fileIdx := range s.laps.lap(k) {
+			if s.ctx.Err() != nil {
+				return
+			}
+			if s.limit > 0 && s.produced.Load() >= int64(s.limit) {
+				return
+			}
+			ent := s.index.Sessions[fileIdx]
+			if int64(cap(buf)) < ent.Length {
+				buf = make([]byte, ent.Length)
+			}
+			line := buf[:ent.Length]
+			if _, err := s.f.ReadAt(line, ent.Offset); err != nil {
+				fmt.Fprintf(os.Stderr, "[router-replay] read session %d at %d+%d: %v\n", fileIdx, ent.Offset, ent.Length, err)
+				return
+			}
+			var sess RouterReplaySession
+			if err := json.Unmarshal(line, &sess); err != nil {
+				fmt.Fprintf(os.Stderr, "[router-replay] parse session %d at %d+%d: %v\n", fileIdx, ent.Offset, ent.Length, err)
+				continue
+			}
+			if sess.SessionID != ent.SessionID {
+				fmt.Fprintf(os.Stderr, "[router-replay] index entry %d names session %s but the line holds %s; stopping\n",
+					fileIdx, ent.SessionID, sess.SessionID)
+				return
+			}
+			if dropped := truncateSessionRequests(&sess, s.maxRequests); dropped > 0 {
+				s.truncatedSessions.Add(1)
+				s.droppedRequests.Add(int64(dropped))
+			}
+			thisPass++
+			sess.pass = int(s.pass.Load())
+			sess.fileIdx = fileIdx
+			select {
+			case <-s.ctx.Done():
+				return
+			case s.ch <- sess:
+				s.produced.Add(1)
+			}
+		}
+		if !s.reuse {
+			return
+		}
+		// Lap 0 may be a short or filtered-out slice; a whole lap that emits
+		// nothing will emit nothing next time either.
+		if thisPass == 0 && k > 0 {
+			fmt.Fprintf(os.Stderr, "[router-replay] no sessions parsed from %s; stopping instead of "+
+				"replaying an empty corpus\n", s.f.Name())
+			return
+		}
+		if thisPass > 0 {
+			s.pass.Add(1)
+		}
+	}
 }
 
 // produce reads session lines and pushes them into ch. Closes ch on EOF or
@@ -382,7 +511,7 @@ func (s *routerReplayStream) produce() {
 		line, err := s.br.ReadBytes('\n')
 		if len(line) > 0 {
 			line = trimNL(line)
-			if len(line) > 0 {
+			if len(line) > 0 && !IsReplayIndexLine(line) {
 				currentIdx := lineIdx
 				lineIdx++
 				// Skip lines not in the allowed set (when a filter is active).

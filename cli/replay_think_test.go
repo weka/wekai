@@ -163,3 +163,16 @@ func TestFilterRecordsByTime(t *testing.T) {
 		t.Error("bad --since accepted")
 	}
 }
+
+// The index entry counts every request and ends the session when its
+// last-finishing request finished, which need not be the last one started.
+func TestSessionIndexEntry(t *testing.T) {
+	rs := &ReplaySession{SessionID: "s", StartTs: "2026-05-12T08:00:00Z", Instances: []ReplayInstance{
+		{Requests: []ReplayRequest{{Ts: "2026-05-12T08:00:00Z", TotalMs: 600_000}, {Ts: "2026-05-12T08:01:00Z", TotalMs: 1_000}}},
+		{Requests: []ReplayRequest{{Ts: "2026-05-12T08:02:00Z"}}},
+	}}
+	e := sessionIndexEntry(rs, 42)
+	if e.SessionID != "s" || e.Length != 42 || e.Requests != 3 || e.StartTs != rs.StartTs || e.EndTs != "2026-05-12T08:10:00Z" {
+		t.Errorf("entry = %+v", e)
+	}
+}

@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/weka/wekai/benchmark"
 )
 
 // RouterReplayPrepareCommand transforms a directory of redacted JSONL captures
@@ -32,11 +34,16 @@ type RouterReplayPrepareCommand struct {
 	} `positional-args:"yes"`
 }
 
-// ReplayHeader is the first line of a replay JSONL file (schema replay-v4;
-// readers also accept replay-v3, which has no think_ms / think_ref). The remaining
-// lines are one ReplaySession per line — this lets producers stream output
-// and consumers stream input with a bounded queue, instead of holding the
-// full file (and its decoded objects) in memory.
+// ReplayHeader is the first line of a replay JSONL file (schema replay-v5;
+// readers also accept replay-v4, which has no index trailer, and replay-v3,
+// which also has no think_ms / think_ref). The following lines are one
+// ReplaySession per line — this lets producers stream output and consumers
+// stream input with a bounded queue, instead of holding the full file (and its
+// decoded objects) in memory.
+//
+// v5 (vs v4) ends with one more line, the session index (benchmark.ReplayIndex):
+// each session's byte offset and length, start/end time and request count, so a
+// reader can seek to any session and play the corpus newest-first.
 //
 // v4 (vs v3) adds per-request think_ms / think_ref and a header timing
 // summary: see replay_think.go. upstream_latency_ms and total_ms are now
@@ -48,7 +55,7 @@ type RouterReplayPrepareCommand struct {
 // from each block's hash (same hash → same content → server prefix-cache
 // hits the same way the original capture did).
 type ReplayHeader struct {
-	Schema      string        `json:"_schema"` // "replay-v4"
+	Schema      string        `json:"_schema"` // "replay-v5"
 	Name        string        `json:"name"`
 	GeneratedAt string        `json:"generated_at"`
 	Source      string        `json:"source"`
@@ -276,7 +283,7 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 	defer bw.Flush()
 
 	header := ReplayHeader{
-		Schema:      "replay-v4",
+		Schema:      "replay-v5",
 		Name:        name,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		// Base name only: replay files get published as artifacts, and a full
@@ -364,6 +371,7 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 	// we'd have to write the header last; sticking it on line 1 wins on
 	// readability.
 	var sessionLines [][]byte
+	var indexEntries []benchmark.ReplayIndexSession
 	for _, sid := range sessIDs {
 		sess := rep.Sessions[sid]
 		rs := ReplaySession{
@@ -430,6 +438,7 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 			return fmt.Errorf("marshal session %s: %w", sid, err)
 		}
 		sessionLines = append(sessionLines, line)
+		indexEntries = append(indexEntries, sessionIndexEntry(&rs, int64(len(line))))
 	}
 	header.Summary.Requests = totalReqs
 	header.Summary.RepairedParents = totalRepaired
@@ -446,7 +455,10 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 	if err := bw.WriteByte('\n'); err != nil {
 		return err
 	}
-	for _, ln := range sessionLines {
+	offset := int64(len(hb)) + 1
+	for i, ln := range sessionLines {
+		indexEntries[i].Offset = offset
+		offset += int64(len(ln)) + 1
 		if _, err := bw.Write(ln); err != nil {
 			return err
 		}
@@ -454,9 +466,46 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 			return err
 		}
 	}
-	fmt.Printf("wrote %d sessions / %d instances / %d requests / %d repaired_parents / %d cycles_broken -> %s\n",
-		emittedSessions, emittedInstances, totalReqs, totalRepaired, totalCyclesBroken, dst)
+	// Last line: the session index (replay-v5). Written after the sessions so
+	// the offsets are known; readers find it by reading the file's tail.
+	ib, err := json.Marshal(&benchmark.ReplayIndex{Schema: benchmark.ReplayIndexSchema, Sessions: indexEntries})
+	if err != nil {
+		return err
+	}
+	if _, err := bw.Write(ib); err != nil {
+		return err
+	}
+	if err := bw.WriteByte('\n'); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %d sessions / %d instances / %d requests / %d repaired_parents / %d cycles_broken / index %d bytes -> %s\n",
+		emittedSessions, emittedInstances, totalReqs, totalRepaired, totalCyclesBroken, len(ib), dst)
 	return nil
+}
+
+// sessionIndexEntry describes one session line for the index trailer; the
+// writer fills in Offset. EndTs is when the session's last request finished in
+// the capture (ts + total_ms), falling back to its last start when a request
+// has no recorded duration.
+func sessionIndexEntry(rs *ReplaySession, length int64) benchmark.ReplayIndexSession {
+	e := benchmark.ReplayIndexSession{SessionID: rs.SessionID, Length: length, StartTs: rs.StartTs}
+	var end time.Time
+	for _, inst := range rs.Instances {
+		for _, r := range inst.Requests {
+			e.Requests++
+			t, err := time.Parse(time.RFC3339Nano, r.Ts)
+			if err != nil {
+				continue
+			}
+			if fin := t.Add(time.Duration(r.TotalMs) * time.Millisecond); fin.After(end) {
+				end = fin
+			}
+		}
+	}
+	if !end.IsZero() {
+		e.EndTs = end.UTC().Format(time.RFC3339Nano)
+	}
+	return e
 }
 
 // parseTreeFile is a thin wrapper around RouterTreeCommand.parseFile so we
