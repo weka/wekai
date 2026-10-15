@@ -4580,15 +4580,16 @@ function tlSyncFromReport() {
 // --- 3D view: time (X) x throughput (Y, up) x active series (Z, depth) ---
 // One curve per enabled arm, from the same records the metrics view plots, on
 // each arm's own elapsed clock (so arms line up like the metrics view's) and
-// over the report's zoom window. Each arm keeps its palette colour, blended
-// toward green or red by its output tok/s relative to the other enabled arms
-// over that window, so the best and worst arms read at a glance.
+// over the report's zoom window. Each arm keeps its report colour (weka purple,
+// GPU and DRAM their own), and the curve is tinted along its length by the
+// TTFT at that point: toward red above TTFT_RED, toward green below TTFT_GREEN.
 const V3 = (() => {
   // Built on first show: the report script also runs headless (tests, public
   // export), where nothing should touch this view's DOM.
   const host = document.getElementById("v3Host");
   let cv, cx, tip, elY, elZ, elArms, elSm, built = false;
   const BINS = 240, CAM = 4;
+  const TTFT_GREEN = 5000, TTFT_RED = 10000, TTFT_FULL = 20000;   // ms
   const VIEWS = { iso: [-0.62, 0.38], front: [0, 0], top: [0, Math.PI / 2 - 0.001], side: [-Math.PI / 2, 0] };
   let yaw = VIEWS.iso[0], pitch = VIEWS.iso[1], zoom = 1;
   let cw = 0, ch = 0, enabled = new Set([0]), shown = false, proj = [];
@@ -4664,10 +4665,20 @@ const V3 = (() => {
       }
     };
     smooth(y);
+    // TTFT at each bin: mean over the requests that started in it, carried
+    // forward across empty bins, smoothed like Y.
+    const ts = new Float64Array(BINS), tn = new Float64Array(BINS);
+    for (const r of s.records) {
+      const b = bin(r.t);
+      if (b >= 0 && b < BINS && r.ttft > 0) { ts[b] += r.ttft; tn[b]++; }
+    }
+    const ttft = new Float64Array(BINS);
+    for (let b = 0, last = 0; b < BINS; b++) { if (tn[b]) last = ts[b] / tn[b]; ttft[b] = last; }
+    smooth(ttft);
     if (elZ.value === "infl") smooth(zs);   // a rate-like mean; the step counts stay exact
     // The arm's output rate over the part of the window it actually ran.
     const dur = Math.max(1, Math.min(t1, end) - t0) / 1000;
-    return { y, z: zs, hasZ, bw, end, outRate: outTot / dur };
+    return { y, z: zs, ttft, hasZ, bw, end, outRate: outTot / dur };
   }
 
   // ---- colour ----
@@ -4678,16 +4689,16 @@ const V3 = (() => {
     if (h[0] === "#") return [1, 3, 5].map(i => parseInt(h.substr(i, 2), 16));
     const m = h.match(/[\d.]+/g); return m ? m.slice(0, 3).map(Number) : [200, 200, 200];
   }
-  function hsl2rgb(h, s, l) {
-    const k = n => (n + h / 30) % 12, a = s * Math.min(l, 1 - l);
-    const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1));
-    return [f(0) * 255, f(8) * 255, f(4) * 255];
-  }
-  function armColor(i, score) {
-    const base = rgb(seriesColors[i]);
-    if (score === null) return base;
-    const sc = hsl2rgb(score * 125, 0.75, 0.5);   // 0 red .. 1 green
-    return base.map((v, k) => Math.round(v * 0.45 + sc[k] * 0.55));
+  const RED = [235, 70, 70], GREEN = [70, 205, 110];
+  // The arm's colour tinted by TTFT: unchanged between TTFT_GREEN and TTFT_RED,
+  // toward red above (fully tinted at TTFT_FULL), toward green below (fully at 0).
+  function ttftTint(base, ms) {
+    let to = null, w = 0;
+    if (ms > TTFT_RED) { to = RED; w = Math.min(1, (ms - TTFT_RED) / (TTFT_FULL - TTFT_RED)); }
+    else if (ms < TTFT_GREEN) { to = GREEN; w = (TTFT_GREEN - ms) / TTFT_GREEN; }
+    if (!to) return base;
+    w *= 0.7;   // keep the arm recognisable under the tint
+    return base.map((v, k) => Math.round(v * (1 - w) + to[k] * w));
   }
   const css = (c, a) => "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + (a === undefined ? 1 : a) + ")";
 
@@ -4748,8 +4759,7 @@ const V3 = (() => {
     if (cache.key === key) return cache.data;
     const per = {};
     arms.forEach(i => { per[i] = armBins(DATA[i], elY.value, t0, t1); });
-    const rates = arms.map(i => per[i].outRate), lo = Math.min(...rates), hi = Math.max(...rates);
-    arms.forEach(i => { per[i].score = arms.length > 1 ? (hi > lo ? (per[i].outRate - lo) / (hi - lo) : 0.5) : null; per[i].color = armColor(i, per[i].score); });
+    arms.forEach(i => { per[i].color = rgb(seriesColors[i]); });
     let ymax = 1, zmax = 1;
     arms.forEach(i => { per[i].y.forEach(v => { if (v > ymax) ymax = v; }); per[i].z.forEach(v => { if (v > zmax) zmax = v; }); });
     cache = { key, data: { arms, per, t0, t1, ymax: ymax * 1.05, zmax: zmax * 1.05 } };
@@ -4802,7 +4812,7 @@ const V3 = (() => {
       for (let b = 0; b < BINS; b++) {
         const t = d.t0 + (b + 0.5) * p.bw;
         if (!isZoomed() && t > p.end) break;
-        pts.push([X(t), Y(p.y[b]), Z(p.z[b]), t, p.y[b], p.z[b]]);
+        pts.push([X(t), Y(p.y[b]), Z(p.z[b]), t, p.y[b], p.z[b], p.ttft[b]]);
       }
       if (!pts.length) return;
       line(pts.map(v => [v[0], -1, v[2]]), css(c, 0.28), 1.2);
@@ -4810,14 +4820,25 @@ const V3 = (() => {
       cx.strokeStyle = css(c, 0.10); cx.lineWidth = 1; cx.beginPath();
       for (let k = 0; k < pts.length; k += 6) { const a = P(pts[k][0], -1, pts[k][2]), b2 = P(pts[k][0], pts[k][1], pts[k][2]); cx.moveTo(a[0], a[1]); cx.lineTo(b2[0], b2[1]); }
       cx.stroke();
-      line(pts, css(c), 2.2);
-      pts.forEach(v => { const s = P(v[0], v[1], v[2]); proj.push({ x: s[0], y: s[1], i, t: v[3], yv: v[4], zv: v[5] }); });
+      // the curve, segment by segment in the arm colour tinted by TTFT
+      cx.lineWidth = 2.2; cx.lineCap = "round";
+      for (let k = 1; k < pts.length; k++) {
+        const a = P(pts[k - 1][0], pts[k - 1][1], pts[k - 1][2]), b2 = P(pts[k][0], pts[k][1], pts[k][2]);
+        cx.strokeStyle = css(ttftTint(c, (pts[k - 1][6] + pts[k][6]) / 2));
+        cx.beginPath(); cx.moveTo(a[0], a[1]); cx.lineTo(b2[0], b2[1]); cx.stroke();
+      }
+      cx.lineCap = "butt";
+      pts.forEach(v => { const s = P(v[0], v[1], v[2]); proj.push({ x: s[0], y: s[1], i, t: v[3], yv: v[4], zv: v[5], tt: v[6] }); });
     });
-    // legend: score colours
-    if (d.arms.length > 1) {
-      cx.font = "11px sans-serif"; cx.textAlign = "left"; cx.fillStyle = "#8a9096";
-      cx.fillText("colour: arm palette blended toward green (highest output tok/s over the window) or red (lowest)", 12, ch - 10);
-    }
+    // key for the TTFT tint
+    cx.font = "11px sans-serif"; cx.textAlign = "left";
+    const kx = 12, ky = ch - 10;
+    cx.fillStyle = "#8a9096"; cx.fillText("curve tint = TTFT at that point:", kx, ky);
+    let px = kx + cx.measureText("curve tint = TTFT at that point:").width + 8;
+    [[GREEN, "< " + TTFT_GREEN / 1000 + "s"], [null, TTFT_GREEN / 1000 + "-" + TTFT_RED / 1000 + "s arm colour"], [RED, "> " + TTFT_RED / 1000 + "s"]].forEach(([c, t]) => {
+      if (c) { cx.fillStyle = css(c); cx.fillRect(px, ky - 8, 14, 3); px += 18; }
+      cx.fillStyle = "#b8bec4"; cx.fillText(t, px, ky); px += cx.measureText(t).width + 14;
+    });
   }
 
   function init() {
@@ -4860,6 +4881,7 @@ const V3 = (() => {
     const st = cache.data.per[best.i];
     tip.innerHTML = "<b>" + getAlias(DATA[best.i].name) + "</b><br>at " + fmtT(best.t) +
       "<br>" + yLabel() + " <b>" + fmtN(best.yv) + "</b><br>" + zLabel() + " <b>" + fmtZ(best.zv) + "</b>" +
+      "<br>TTFT <b>" + (best.tt / 1000).toFixed(1) + "s</b>" +
       "<br><span class='v3-dim'>window output " + fmtN(st.outRate) + " tok/s</span>";
     tip.style.display = "block";
     tip.style.left = Math.min(e.clientX + 14, window.innerWidth - 240) + "px";
