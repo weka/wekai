@@ -75,6 +75,13 @@ var WekaiTimeline = (function () {
       '<label title="Collapse client wait, engine queue and unattributed wait into one colour"><input type="checkbox" class="wtl-merge"> Merge waits</label>' +
       '<button class="wtl-reset" hidden>Reset zoom</button>' +
       '<label class="wtl-followwrap" hidden><input type="checkbox" class="wtl-follow"> Follow latest</label>' +
+      '<span class="wtl-panels">Show' +
+      '<button data-p="state" title="Run state: series, in flight, gate">State</button>' +
+      '<button data-p="legend" title="Colour legend">Legend</button>' +
+      '<button data-p="act" title="Active series / in flight over time">Activity</button>' +
+      '<button data-p="rate" title="Input and output tokens/s over time">Tokens/s</button>' +
+      '<button data-p="ttft" title="TTFT over time">TTFT</button></span>' +
+      '<span class="wtl-at"></span>' +
       '<span class="wtl-info"></span>' +
       '<span class="wtl-hint">Drag to zoom &middot; double-click or Esc to reset &middot; Ctrl+wheel zooms, Shift+wheel pans</span>' +
       '</div><div class="wtl-state"></div><div class="wtl-legend"></div>' +
@@ -88,7 +95,7 @@ var WekaiTimeline = (function () {
     var ctx = canvas.getContext("2d");
     var elState = $(".wtl-state");
     var stripRate = $(".wtl-strip-rate"), stripTTFT = $(".wtl-strip-ttft"), stripAct = $(".wtl-strip-act");
-    var elExpand = $(".wtl-expand"), expanded = false;
+    var elExpand = $(".wtl-expand"), expanded = false, elAt = $(".wtl-at");
     // Expand: the timeline (with its own bar: arm, row height, zoom) takes the whole window; Back / Esc returns.
     function setExpanded(on) {
       expanded = on;
@@ -96,8 +103,25 @@ var WekaiTimeline = (function () {
       document.documentElement.classList.toggle("wtl-expanded-page", on);
       elExpand.innerHTML = on ? "&#x2715; Back" : "&#x2922; Expand";
       elExpand.title = on ? "Back to the full report (Esc)" : "Fill the window with the timeline (Esc or Back to return)";
+      applyPanels();
       sizeKey = ""; resize();
     }
+    // Panels around the rows. The report view shows them all; Expand starts with
+    // none, so the rows get the window and everything else is the one-line
+    // readout in the bar. Each mode remembers its own toggles.
+    var PANELS = ["state", "legend", "act", "rate", "ttft"];
+    var panelsOn = { normal: { state: 1, legend: 1, act: 1, rate: 1, ttft: 1 }, expanded: {} };
+    var panelBtns = host.querySelectorAll(".wtl-panels button");
+    function applyPanels() {
+      var on = panelsOn[expanded ? "expanded" : "normal"];
+      PANELS.forEach(function (p) { host.classList.toggle("wtl-hide-" + p, !on[p]); });
+      for (var i = 0; i < panelBtns.length; i++) panelBtns[i].classList.toggle("on", !!on[panelBtns[i].getAttribute("data-p")]);
+      renderAt();
+    }
+    for (var pb = 0; pb < panelBtns.length; pb++) panelBtns[pb].addEventListener("click", function (e) {
+      var on = panelsOn[expanded ? "expanded" : "normal"], p = e.currentTarget.getAttribute("data-p");
+      on[p] = !on[p]; applyPanels(); sizeKey = ""; resize();
+    });
     elExpand.addEventListener("click", function () { setExpanded(!expanded); });
     window.addEventListener("keydown", function (e) { if (e.key === "Escape" && expanded && !isZoomed()) setExpanded(false); });
     var hoverT = null;   // arm time under the cursor (offline state line)
@@ -407,7 +431,37 @@ var WekaiTimeline = (function () {
     function drawStrips(a, r) { drawActStrip(a, r, opts.live ? curNow() : 0); drawRateStrip(a, r); drawTTFTStrip(a, r); }
 
     // ---- slot state header ----
-    function setStateText(html) { if (elState.innerHTML !== html) elState.innerHTML = html; }
+    function setStateText(html) {
+      if (elState.innerHTML === html) return;
+      elState.innerHTML = html;
+      elAt.title = elState.textContent;   // the full state, on hover over the one-line readout
+    }
+    // One-line readout at the cursor (or the view end / now): what the State,
+    // Activity, Tokens/s and TTFT panels say at that instant, so a view without
+    // them still answers "what was happening here".
+    function renderAt() {
+      var a = arm();
+      if (!a || !host.classList.contains("wtl-hide-state")) { if (elAt.innerHTML) elAt.innerHTML = ""; return; }
+      var rr = range(), now = opts.live ? curNow() : 0;
+      var cursor = hoverT !== null && hoverT >= rr[0] && hoverT <= rr[1];
+      var T = cursor ? hoverT : opts.live ? Math.min(rr[1], now) : rr[1];
+      var act = activity(a, now);
+      var h = "<span class='wtl-dim'>" + (cursor ? "at" : opts.live ? "now" : "view end") + "</span> <b>" + fmtElapsed(T, 1000) + "</b>" +
+        " &middot; series <b>" + stepAt(act.series, T) + "</b> &middot; in flight <b>" + stepAt(act.inflight, T) + "</b>";
+      if (a.rates && a.rates.in && a.rates.in.length) {
+        // A short window around the point: a few pixels of the view, never under two buckets or 10 s.
+        var w = Math.max(2 * a.rates.bw, 6 * (rr[1] - rr[0]) / plotW, 10000);
+        var t0 = Math.max(0, cursor ? T - w / 2 : T - w), t1 = t0 + w;
+        h += " &middot; in <b>" + fmtRate(rateAt(a.rates, "in", t0, t1)) + "</b> &middot; out <b>" + fmtRate(rateAt(a.rates, "out", t0, t1)) + "</b> tok/s";
+      }
+      var tt = a.ttft;
+      if (tt && tt.t && tt.t.length) {
+        var lo = 0, hi = tt.t.length - 1, k = -1;
+        while (lo <= hi) { var m = (lo + hi) >> 1; if (tt.t[m] <= T) { k = m; lo = m + 1; } else hi = m - 1; }
+        if (k >= 0) h += " &middot; TTFT mean <b>" + fmtSec(tt.mean[k] / 1000) + "</b> p95 <b>" + fmtSec(tt.p95[k] / 1000) + "</b>";
+      }
+      if (elAt.innerHTML !== h) elAt.innerHTML = h;
+    }
     function fmtSec(s) { return s >= 100 ? Math.round(s) + "s" : s.toFixed(s >= 10 ? 1 : 2) + "s"; }
     // Live: the server's counts and admission gate.
     function renderState(st) {
@@ -447,6 +501,7 @@ var WekaiTimeline = (function () {
         }
       }
       setStateText(h);
+      renderAt();
     }
     // Offline: reconstruct from the requests at the right edge of the view.
     function renderOfflineState() {
@@ -473,6 +528,7 @@ var WekaiTimeline = (function () {
         var rr = range();
         rate = "<br>view average tokens/s: input <b>" + fmtRate(rateAt(a.rates, "in", rr[0], rr[1])) + "</b> &middot; output <b>" + fmtRate(rateAt(a.rates, "out", rr[0], rr[1])) + "</b>";
       }
+      renderAt();
       setStateText("at <b>" + fmtElapsed(T, 1000) + "</b> (" + (atCursor ? "cursor" : "view end") + "): <b><span title='" + SERIES_TIP + "'>" + activeAtT + "</span></b> active series <span class='wtl-dim'>(" + a.groups.length + " over the run)</span> &middot; in flight <b>" + c.f +
         "</b> &middot; waiting at gate <b>" + c.w + "</b> &middot; think pause <b>" + c.t + "</b> &middot; idle <b>" + c.i + "</b>" + rate);
     }
@@ -591,7 +647,7 @@ var WekaiTimeline = (function () {
       }
       drawOverlay();
       drawStrips(a, r);
-      if (!opts.live) renderOfflineState();
+      if (!opts.live) renderOfflineState(); else renderAt();
     }
 
     // The overlay is a second canvas holding what changes on every mouse move
@@ -796,7 +852,8 @@ var WekaiTimeline = (function () {
     });
     canvas.addEventListener("mousemove", function (e) {
       var p = pos(e);
-      if (!opts.live) { var nt = p.x >= plotL && p.x <= plotL + plotW ? unmapX(p.x, range()) : null; if (nt !== hoverT) { hoverT = nt; renderOfflineState(); } }
+      var nt = p.x >= plotL && p.x <= plotL + plotW ? unmapX(p.x, range()) : null;
+      if (nt !== hoverT) { hoverT = nt; if (opts.live) renderAt(); else renderOfflineState(); }
       if (drag) { drag.x1 = Math.max(plotL, Math.min(plotL + plotW, p.x)); scheduleOverlay(); return; }
       var h = pick(p);
       var g = rowAt(p);
@@ -813,7 +870,7 @@ var WekaiTimeline = (function () {
     }
     canvas.addEventListener("mouseup", endDrag);
     window.addEventListener("mouseup", endDrag);
-    canvas.addEventListener("mouseleave", function () { hover = null; hoverGroup = -1; tip.style.display = "none"; if (!drag) drawOverlay(); if (hoverT !== null) { hoverT = null; renderOfflineState(); } });
+    canvas.addEventListener("mouseleave", function () { hover = null; hoverGroup = -1; tip.style.display = "none"; if (!drag) drawOverlay(); if (hoverT !== null) { hoverT = null; if (opts.live) renderAt(); else renderOfflineState(); } });
     canvas.addEventListener("dblclick", function () { userZoom(null, null); });
     elReset.addEventListener("click", function () { userZoom(null, null); });
     if (opts.handleEsc) window.addEventListener("keydown", function (e) { if (e.key === "Escape" && isZoomed()) userZoom(null, null); });
@@ -840,10 +897,12 @@ var WekaiTimeline = (function () {
     elFollow.addEventListener("change", function () { draw(); });
     if (typeof ResizeObserver !== "undefined") new ResizeObserver(function () { resize(); }).observe(elScroll);
     else window.addEventListener("resize", resize);
+    applyPanels();
 
     function selectArm(i) {
       cur = Math.max(0, Math.min(arms.length - 1, i));
       elArm.value = cur;
+      elArm.title = arms[cur] ? arms[cur].name : "";
       hover = null; hoverGroup = -1; elScroll.scrollTop = 0;
       applyArm();
     }

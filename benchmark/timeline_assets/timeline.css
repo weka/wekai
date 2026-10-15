@@ -36,3 +36,19 @@
 .wtl.wtl-expanded .wtl-scroll { flex: 1 1 auto; }
 html.wtl-expanded-page, html.wtl-expanded-page body { overflow: hidden; }
 .wtl-bar .wtl-expand { font-weight: 500; }
+
+/* Panel toggles; a hidden panel takes no space. */
+.wtl-bar .wtl-panels { display: inline-flex; align-items: center; gap: 3px; color: #8a9096; }
+.wtl-bar .wtl-panels button { padding: 1px 6px; color: #8a9096; }
+.wtl-bar .wtl-panels button.on { color: #F2F2EB; border-color: #7C03EC; background: #241433; }
+.wtl-hide-state .wtl-state, .wtl-hide-legend .wtl-legend,
+.wtl-hide-act .wtl-strip-act, .wtl-hide-rate .wtl-strip-rate, .wtl-hide-ttft .wtl-strip-ttft { display: none !important; }
+/* One-line readout at the cursor, shown while the State panel is hidden; hover it for the full state. */
+.wtl-bar .wtl-at { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: default; }
+.wtl-bar .wtl-at:empty { display: none; }
+.wtl.wtl-expanded .wtl-bar { flex-wrap: nowrap; white-space: nowrap; }
+.wtl.wtl-expanded .wtl-bar > * { flex: 0 0 auto; }
+.wtl.wtl-expanded .wtl-bar .wtl-at { flex: 1 1 auto; }
+.wtl.wtl-expanded .wtl-hint { display: none; }
+/* Long arm names would squeeze the readout out of the one-line bar; the select keeps the full name as its tooltip. */
+.wtl.wtl-expanded .wtl-arm { max-width: 220px; text-overflow: ellipsis; }
