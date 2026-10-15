@@ -47,9 +47,9 @@ type ReplayIndexSession struct {
 // trailer rather than a session.
 func IsReplayIndexLine(line []byte) bool { return bytes.HasPrefix(line, replayIndexMarker) }
 
-// replayIndexInitialRead is the first tail window readReplayIndex tries. The
-// 5,441-session corpus has a 1.0 MB index, so 2 MiB reads it in one go with
-// room to grow; a larger index costs one more read per doubling.
+// replayIndexInitialRead is the first tail window readReplayIndex tries. An
+// index costs ~190 bytes per session, so 2 MiB covers ~10k sessions in one
+// read; a larger index costs one more read per doubling.
 var replayIndexInitialRead int64 = 2 << 20
 
 // readReplayIndex loads the index trailer of a replay file. It reads the last

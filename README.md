@@ -226,9 +226,8 @@ of truth for the tag. The current capture is
 `replay-7-jul-2027-58d-weka-index.jsonl` (replay-v5: the 2026-05-12 →
 2026-07-07 dataset — 5,441 sessions / 522,332 requests — with per-request
 `total_ms` and `think_ms`, so `--replay-realtime` keeps the original think
-time between turns, and the session index; its last week is sessions
-4,316–5,440, 48,780 requests; older v3 captures fall back to the absolute
-schedule):
+time between turns, and the session index; older v3 captures fall back to
+the absolute schedule):
 
 ```
 REPO=weka.io/wekai; TAG=replay-a5a97a8ac620
