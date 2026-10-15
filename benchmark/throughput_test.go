@@ -116,6 +116,84 @@ func TestNoCacheDataObserved(t *testing.T) {
 	}
 }
 
+// TestNoCacheEverObservedUnitCases locks down noCacheEverObserved's own
+// all-time semantics in isolation, mirroring TestNoCacheDataObserved's table
+// shape for the windowed function it replaces as the cacheWarning signal.
+func TestNoCacheEverObservedUnitCases(t *testing.T) {
+	cases := []struct {
+		name      string
+		tt        tokenTotals
+		nonErrors int64
+		min       int
+		want      bool
+	}{
+		{"neither signal ever fired, enough records", tokenTotals{inputWarm: 0, cached: 0}, 20, 10, true},
+		{"below minCount — too early to tell", tokenTotals{inputWarm: 0, cached: 0}, 5, 10, false},
+		{"server reported cached tokens", tokenTotals{inputWarm: 0, cached: 500}, 20, 10, false},
+		{"heuristic found warm tokens", tokenTotals{inputWarm: 500, cached: 0}, 20, 10, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := noCacheEverObserved(c.tt, c.nonErrors, c.min); got != c.want {
+				t.Errorf("noCacheEverObserved(%+v, %d, %d) = %v, want %v", c.tt, c.nonErrors, c.min, got, c.want)
+			}
+		})
+	}
+}
+
+// TestNoCacheEverObservedSurvivesColdStartWindow is the regression test for
+// the sticky-latch bug: a windowed check (noCacheDataObserved/CacheMetrics)
+// can see an all-cold-start window first — e.g. right after a series
+// scale-up, or at a pass boundary under --replay-reuse-sessions — and that
+// window alone genuinely has hitRate==0 and serverReported==false, because a
+// cold start is always a structural miss. The old code latched cacheWarning
+// true the moment that happened and never cleared it, even once later
+// windows showed the server caching normally. noCacheEverObserved reads the
+// all-time running counters instead, so once real cache activity has
+// accumulated anywhere in the run, it must report false — regardless of what
+// an early window looked like.
+func TestNoCacheEverObservedSurvivesColdStartWindow(t *testing.T) {
+	s := newCompletionStream(500)
+	const minCount = 10
+
+	// An all-cold-start window: minCount requests, each a structural miss,
+	// server reporting nothing yet. This is exactly the window shape that
+	// used to latch cacheWarning permanently.
+	for i := 0; i < minCount; i++ {
+		s.Add(completionRecord{
+			completedAt: time.Now(),
+			isColdStart: true,
+			inputTokens: 1000,
+		})
+	}
+
+	tt := s.TokenTotals()
+	if !noCacheEverObserved(tt, minCount, minCount) {
+		t.Fatal("expected noCacheEverObserved=true right after an all-cold-start window with no cache signal yet")
+	}
+
+	// The run continues and the server starts reporting real cache hits —
+	// both the TTFT heuristic (localCacheRatio>0, driving globalInputWarm)
+	// and explicit server-reported cached_tokens.
+	for i := 0; i < minCount; i++ {
+		s.Add(completionRecord{
+			completedAt:          time.Now(),
+			isColdStart:          false,
+			cacheHit:             true,
+			serverCacheConfirmed: true,
+			cachedTokens:         800,
+			inputTokens:          200,
+			localCacheRatio:      0.8,
+		})
+	}
+
+	tt = s.TokenTotals()
+	if noCacheEverObserved(tt, 2*minCount, minCount) {
+		t.Error("expected noCacheEverObserved=false once the run-wide counters show real cache activity — " +
+			"the warning must not stay latched from the earlier all-cold-start window")
+	}
+}
+
 // TestCacheWarningMessage locks down that the warning names the actual
 // server-launch flag for vLLM/SGLang, rather than a generic message that
 // leaves the operator to guess between "server doesn't cache at all" and

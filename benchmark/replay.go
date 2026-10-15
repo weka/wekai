@@ -284,6 +284,12 @@ func runReplayConversation(
 			}
 			metrics.CachedDetails = response.Usage.CachedDetails
 			metrics.KV = response.Usage.KV
+			// See usageCountsReported: this path never sees a raw "usage" JSON
+			// key to nil-check, so "at least one usage count is nonzero" is the
+			// best available stand-in for "the server actually reported usage".
+			metrics.UsageObserved = usageCountsReported(
+				response.Usage.PromptTokens, response.Usage.CompletionTokens,
+				response.Usage.CachedTokens, response.Usage.ReasoningTokens)
 		}
 		if err == nil && strings.TrimSpace(metrics.Response) == "" {
 			metrics.IsEmpty = true
@@ -400,15 +406,7 @@ func recordReplayRequest(
 	isErr := metrics.Error != nil
 	explicitCache := metrics.UsageData.CachedTokens.Count > 0
 
-	// See autoState.sawResponseEver/sawUsageEver's doc: only a request that
-	// actually completed counts as evidence either way — a run that got no
-	// responses at all has a different, already-surfaced problem.
-	if !isErr && !metrics.Skipped {
-		st.sawResponseEver.Store(true)
-		if metrics.UsageObserved {
-			st.sawUsageEver.Store(true)
-		}
-	}
+	trackUsageObserved(st, isErr, metrics.Skipped, metrics.UsageObserved)
 
 	// UUID validation tallies (--verify only). metrics.ExpectedUUIDs
 	// is nil/empty for every request when the feature is off (default), so this

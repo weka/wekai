@@ -143,3 +143,16 @@ type RequestMetrics struct {
 	LeakedUUIDs    []string // "uuid(series=N)" entries for any OTHER session's UUID found here
 	ExactMatch     bool     // content OR reasoning opens with the ordered, comma-joined ExpectedUUIDs list (output conformity)
 }
+
+// usageCountsReported reports whether at least one of a response's usage
+// counts is nonzero. It exists for callers that, unlike
+// consumeOpenAISSE/consumeOpenAIPlain, never see a raw "usage" JSON key they
+// can nil-check for presence: the dataset-replay path (replay.go) and the
+// synthetic path (bench_prompts.go) both go through llm.Chat.Request, whose
+// Response.Usage is a plain value that's always "present" at the zero value
+// even when the server never reported usage at all. For those paths, "the
+// server actually reported something" is the best available stand-in for
+// "the usage object was present" when setting RequestMetrics.UsageObserved.
+func usageCountsReported(promptTokens, completionTokens, cachedTokens, reasoningTokens int) bool {
+	return promptTokens > 0 || completionTokens > 0 || cachedTokens > 0 || reasoningTokens > 0
+}

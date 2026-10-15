@@ -310,6 +310,12 @@ func runSingleRequest(ctx context.Context, model, cachedPrompt, question string,
 			},
 			RequestCount: 1,
 		}
+		// See usageCountsReported: llm.Response.Usage is always "present" at
+		// its zero value, so a nonzero usage count is the signal that the
+		// server actually reported usage (vs. a deployment that never does).
+		metrics.UsageObserved = usageCountsReported(
+			response.Usage.PromptTokens, response.Usage.CompletionTokens,
+			response.Usage.CachedTokens, response.Usage.ReasoningTokens)
 
 		logger.Info("Request completed",
 			"requestNum", requestNum,
