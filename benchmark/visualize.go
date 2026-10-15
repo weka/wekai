@@ -4872,13 +4872,13 @@ const V3 = (() => {
     });
     // TTFT legend: a vertical colour bar beside the cube
     if (elTT.value === "off") return;
-    // beside the cube: right of its projected outline, vertically centred on it
-    let cxMax = -Infinity, cyMin = Infinity, cyMax = -Infinity;
-    [-1, 1].forEach(x => [-1, 1].forEach(y => [-1, 1].forEach(z => {
-      const p = P(x, y, z); cxMax = Math.max(cxMax, p[0]); cyMin = Math.min(cyMin, p[1]); cyMax = Math.max(cyMax, p[1]);
-    })));
-    const bh = Math.min(260, ch * 0.45, Math.max(120, cyMax - cyMin)), bw2 = 12;
-    const bx = Math.min(cw - 60, cxMax + 70), by = Math.max(24, Math.min(ch - bh - 30, (cyMin + cyMax) / 2 - bh / 2));
+    // Fixed beside the cube: just outside the furthest any corner can project at
+    // the default zoom under any rotation (a corner is sqrt(3) from the centre;
+    // nearest to the camera it is magnified by CAM / (CAM - sqrt(3))), so the bar
+    // never moves while the cube turns.
+    const reach = Math.sqrt(3) * Math.min(cw, ch) * 0.29 * CAM / (CAM - Math.sqrt(3));
+    const bh = Math.min(260, ch * 0.45), bw2 = 12;
+    const bx = Math.min(cw - 60, cw / 2 + reach + 24), by = ch / 2 + 10 - bh / 2;
     cx.font = "11px sans-serif"; cx.textAlign = "center"; cx.fillStyle = "#C9C9C9";
     cx.fillText("TTFT", bx + bw2 / 2, by - 12);
     const tintAt = ms => elTT.value === "tint" ? css(ttftTint([150, 150, 150], ms)) : legColor(ms, 0.95);
