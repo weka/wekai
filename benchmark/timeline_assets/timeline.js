@@ -584,7 +584,7 @@ var WekaiTimeline = (function () {
     // the clock passes them. One pane drives the clock (requestAnimationFrame)
     // and the others follow its ticks, so split panes stay in lockstep.
     var SPEEDS = [1, 2, 5, 10, 30, 60, 120, 300, 600, 1200, 3000];
-    var playT = null, playing = false, playRaf = 0, playLast = 0;
+    var playT = null, playing = false, playRaf = 0, playLast = 0, extSpeed = 0;   // extSpeed: the split's speed when it drives
     var elPlay = $(".wtl-playbtn"), elRestart = $(".wtl-restart"), elStop = $(".wtl-stop"), elSpeed = $(".wtl-speed");
     var elSpeedV = $(".wtl-speedv"), elPlayT = $(".wtl-playt");
     if (opts.live) $(".wtl-play").hidden = true;
@@ -638,6 +638,43 @@ var WekaiTimeline = (function () {
         cancelAnimationFrame(playRaf);
         playT = v.t; playing = v.playing; updPlayUI(); draw();
       }
+    }
+
+    // Replay highlights (the overlay, repainted every frame): requests still
+    // running at the clock washed in the live view's in-flight colour up to the
+    // clock with a solid tip at the running edge,
+    // and requests that just finished flashing and fading over FLASH_WALL_MS of
+    // real time at the current speed. Rows are at least 2px tall here so the
+    // highlights read at 1px row height.
+    var FLASH_WALL_MS = 1500;
+    function drawReplayHighlights(a, scrollTop, rh) {
+      var r = range(), fade = FLASH_WALL_MS * (extSpeed || speed()), hh = Math.max(rh, 2);
+      var cIn = colors[INFLIGHT_KIND] || "#d0b3f5";
+      layout(a);
+      for (var g = Math.max(0, groupAt(a, scrollTop)); g < a.groups.length; g++) {
+        var gy = AXIS_H + groupTop(a, g) - scrollTop;
+        if (gy > H) break;
+        var grp = a.groups[g];
+        ensureSorted(grp);
+        for (var k = firstAtOrAfter(grp.reqs, playT - fade - grp.maxE); k < grp.reqs.length && grp.reqs[k].t <= playT; k++) {
+          var q = grp.reqs[k], end = q.t + q.e, y = gy + (q.u || 0) * rowH - (hh - rh) / 2;
+          var x0 = Math.max(mapX(q.t, r), plotL);
+          if (end > playT) {
+            var x1 = Math.min(mapX(playT, r), plotL + plotW);
+            if (x1 < plotL) continue;
+            // a light wash keeps the stages readable; a solid tip marks the running edge
+            octx.fillStyle = cIn;
+            octx.globalAlpha = 0.35; octx.fillRect(x0, y, Math.max(1.5, x1 - x0), hh);
+            octx.globalAlpha = 1; octx.fillRect(Math.max(x0, x1 - 3), y, Math.min(3, Math.max(1.5, x1 - x0)), hh);
+          } else if (playT - end < fade) {
+            var x2 = Math.min(mapX(end, r), plotL + plotW);
+            if (x2 < plotL) continue;
+            octx.globalAlpha = 0.85 * (1 - (playT - end) / fade); octx.fillStyle = "#F2F2EB";
+            octx.fillRect(x0, y, Math.max(1.5, x2 - x0), hh);
+          }
+        }
+      }
+      octx.globalAlpha = 1;
     }
 
     // ---- tile cache ----
@@ -789,6 +826,7 @@ var WekaiTimeline = (function () {
         octx.strokeStyle = "#F2F2EB"; octx.lineWidth = 1;
         octx.strokeRect(Math.round(hx0) - 0.5, hy - 0.5, Math.max(2, hx1 - hx0) + 1, rh + 1);
       }
+      if (playT !== null) drawReplayHighlights(a, scrollTop, rh);
       octx.restore();
       if (drag) {
         var dx0 = Math.min(drag.x0, drag.x1), dx1 = Math.max(drag.x0, drag.x1);
@@ -1057,7 +1095,7 @@ var WekaiTimeline = (function () {
       setExpanded: function (on, silent) { setExpanded(on, silent); },
       // setReplay drives this pane's replay clock from outside (the split's bar):
       // t in arm ms, or null to show the whole run.
-      setReplay: function (t, isPlaying) { cancelAnimationFrame(playRaf); playT = t; playing = !!isPlaying; updPlayUI(); draw(); },
+      setReplay: function (t, isPlaying, spd) { cancelAnimationFrame(playRaf); playT = t; playing = !!isPlaying; if (spd) extSpeed = spd; updPlayUI(); draw(); },
       span: function () { return arm() ? arm().span : 0; },
       // Shared controls of a split view (the split's bar sets every pane).
       setRowH: function (h) {   // 0 = this arm's own default
@@ -1245,7 +1283,7 @@ var WekaiTimeline = (function () {
       elSpeedV.textContent = SPEEDS[+elSpeed.value] + "×";
       elPlayT.innerHTML = playT === null ? "" : "<b>" + fmtElapsed(playT, 1000) + "</b> / " + fmtElapsed(end(), 1000);
     }
-    function push() { panes.forEach(function (t) { t.setReplay(playT, playing); }); ui(); }
+    function push() { var sp = SPEEDS[+elSpeed.value]; panes.forEach(function (t) { t.setReplay(playT, playing, sp); }); ui(); }
     function frame(now) {
       if (!playing) return;
       playT = Math.min(end(), playT + (now - last) * SPEEDS[+elSpeed.value]);
