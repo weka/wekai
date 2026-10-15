@@ -865,6 +865,8 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   .v3-rate { color: #8a9096; }
   .v3-views { display: inline-flex; align-items: center; gap: 3px; }
   .v3-hint { margin-left: auto; }
+  #v3Host.v3-expanded { position: fixed; inset: 0; z-index: 1000; padding: 8px 14px; background: #0D1013; box-sizing: border-box; }
+  .v3-bar .v3-expand { font-weight: 500; }
   .v3-canvas { display: block; cursor: grab; background: #0D1013; border: 1px solid #42464A; border-radius: 6px; }
   .v3-tip { position: fixed; z-index: 50; display: none; padding: 6px 9px; background: #1E2429; color: #F2F2EB; border: 1px solid #42464A; border-radius: 6px; font-size: 12px; line-height: 1.45; pointer-events: none; }
   .v3-tip b { color: #C79FF1; font-weight: 500; }
@@ -1340,17 +1342,16 @@ function applyCtxFilter(minTok, maxTok) {
 // --- Color assignment (official WEKA brand, neutral-first) ---
 // Multi-series palettes are restrained tints DERIVED from the brand set so
 // a 2-8 series report reads as one family: weka arms a purple ramp
-// (#7C03EC/#C79FF1 family), hbm/gpu neutral slate (the brand has no blue,
-// so it stays desaturated), dram a dimmed #6BE0A0 green, the fallback
-// dimmed yellow/green/slate tints. Position and the legend carry identity;
+// (#7C03EC/#C79FF1 family), hbm/gpu a muted green ramp, dram a muted orange
+// ramp, the fallback dimmed yellow/green/slate tints. Position and the legend carry identity;
 // full saturation belongs to the external-KV accent alone, and #FF6B6B is
 // reserved for errors.
 const OTHER_PALETTE = [
   "#ab9a64","#8a95a3","#a678e8","#5f987d","#b98f83","#c2b078",
   "#8d5fd6","#707c8a","#75b094","#d0b3f5","#9aa5b1","#c9b8e8",
 ];
-const GPU_VARIANTS = ["#8094b5","#68809f","#9cb0cb","#54687f","#aec3da"]; // muted slate-BLUE (perceptible cool lean, restraint kept)
-const DRAM_VARIANTS = ["#5f987d","#4d8069","#75b094","#3f6a57","#8cc4a9"];
+const GPU_VARIANTS = ["#5fae7a","#4c9466","#78c290","#3e7a54","#92d2a6"]; // hbm: muted green
+const DRAM_VARIANTS = ["#d08a4a","#b9763a","#e0a066","#9c6230","#ecb787"]; // dram: muted orange
 const WEKA_VARIANTS = [
   "#a678e8","#C79FF1","#8d5fd6","#b58ff0","#7745c0","#d0b3f5",
 ];
@@ -2186,7 +2187,7 @@ const MIX_EXTERNAL_COLOR = "#7C03EC"; // official primary purple — the single 
 // "local" into device (GPU radix cache, reuses MIX_LOCAL_COLOR) and host
 // (CPU/DRAM HiCache L2), which needs a color of its own. Muted teal-green
 // sits clearly apart from the compute/local/external triad above and from
-// GPU_VARIANTS' cooler slate-blue and DRAM_VARIANTS' own green family below.
+// GPU_VARIANTS' green and DRAM_VARIANTS' orange families below.
 const MIX_HOST_COLOR = "#4a9d8f";
 const ADT_LINE_COLOR = "#F2F2EB";
 const MIX_BAND_H = 64;
@@ -4580,16 +4581,16 @@ function tlSyncFromReport() {
 // --- 3D view: time (X) x throughput (Y, up) x active series (Z, depth) ---
 // One curve per enabled arm, from the same records the metrics view plots, on
 // each arm's own elapsed clock (so arms line up like the metrics view's) and
-// over the report's zoom window. Each arm keeps its report colour (weka purple,
-// GPU and DRAM their own), and the curve is tinted along its length by the
-// TTFT at that point: toward red above TTFT_RED, toward green below TTFT_GREEN.
+// over the report's zoom window. Each arm keeps its report colour (hbm green,
+// dram orange, weka purple); half-transparent legs from the curve to the floor
+// carry the TTFT at that point, green at 0 s to red at TTFT_MAX.
 const V3 = (() => {
   // Built on first show: the report script also runs headless (tests, public
   // export), where nothing should touch this view's DOM.
   const host = document.getElementById("v3Host");
-  let cv, cx, tip, elY, elZ, elArms, elSm, built = false;
+  let cv, cx, tip, elY, elZ, elArms, elSm, built = false, expanded = false;
   const BINS = 240, CAM = 4;
-  const TTFT_GREEN = 5000, TTFT_RED = 10000, TTFT_FULL = 20000;   // ms
+  const TTFT_MAX = 20000;   // ms: legs are fully red at and above this
   const VIEWS = { iso: [-0.62, 0.38], front: [0, 0], top: [0, Math.PI / 2 - 0.001], side: [-Math.PI / 2, 0] };
   let yaw = VIEWS.iso[0], pitch = VIEWS.iso[1], zoom = 1;
   let cw = 0, ch = 0, enabled = new Set([0]), shown = false, proj = [];
@@ -4689,17 +4690,9 @@ const V3 = (() => {
     if (h[0] === "#") return [1, 3, 5].map(i => parseInt(h.substr(i, 2), 16));
     const m = h.match(/[\d.]+/g); return m ? m.slice(0, 3).map(Number) : [200, 200, 200];
   }
-  const RED = [235, 70, 70], GREEN = [70, 205, 110];
-  // The arm's colour tinted by TTFT: unchanged between TTFT_GREEN and TTFT_RED,
-  // toward red above (fully tinted at TTFT_FULL), toward green below (fully at 0).
-  function ttftTint(base, ms) {
-    let to = null, w = 0;
-    if (ms > TTFT_RED) { to = RED; w = Math.min(1, (ms - TTFT_RED) / (TTFT_FULL - TTFT_RED)); }
-    else if (ms < TTFT_GREEN) { to = GREEN; w = (TTFT_GREEN - ms) / TTFT_GREEN; }
-    if (!to) return base;
-    w *= 0.7;   // keep the arm recognisable under the tint
-    return base.map((v, k) => Math.round(v * (1 - w) + to[k] * w));
-  }
+  // Leg colour for a TTFT: hue 120 (green) at 0 s down to 0 (red) at TTFT_MAX.
+  const ttftHue = ms => 120 * (1 - Math.min(Math.max(ms, 0), TTFT_MAX) / TTFT_MAX);
+  const legColor = (ms, a) => "hsla(" + ttftHue(ms).toFixed(0) + ",75%,52%," + a + ")";
   const css = (c, a) => "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + (a === undefined ? 1 : a) + ")";
 
   // ---- format ----
@@ -4828,28 +4821,24 @@ const V3 = (() => {
       if (!pts.length) return;
       line(pts.map(v => [v[0], -1, v[2]]), css(c, 0.28), 1.2);
       line(pts.map(v => [v[0], v[1], zBack]), css(c, 0.22), 1.2);
-      cx.strokeStyle = css(c, 0.10); cx.lineWidth = 1; cx.beginPath();
-      for (let k = 0; k < pts.length; k += 6) { const a = P(pts[k][0], -1, pts[k][2]), b2 = P(pts[k][0], pts[k][1], pts[k][2]); cx.moveTo(a[0], a[1]); cx.lineTo(b2[0], b2[1]); }
-      cx.stroke();
-      // the curve, segment by segment in the arm colour tinted by TTFT
-      cx.lineWidth = 2.2; cx.lineCap = "round";
-      for (let k = 1; k < pts.length; k++) {
-        const a = P(pts[k - 1][0], pts[k - 1][1], pts[k - 1][2]), b2 = P(pts[k][0], pts[k][1], pts[k][2]);
-        cx.strokeStyle = css(ttftTint(c, (pts[k - 1][6] + pts[k][6]) / 2));
+      // legs: curve to floor, half transparent, coloured by TTFT at that point
+      cx.lineWidth = 1.6;
+      for (let k = 0; k < pts.length; k += 2) {
+        const a = P(pts[k][0], -1, pts[k][2]), b2 = P(pts[k][0], pts[k][1], pts[k][2]);
+        cx.strokeStyle = legColor(pts[k][6], 0.45);
         cx.beginPath(); cx.moveTo(a[0], a[1]); cx.lineTo(b2[0], b2[1]); cx.stroke();
       }
-      cx.lineCap = "butt";
+      line(pts, css(c), 2.2);
       pts.forEach(v => { const s = P(v[0], v[1], v[2]); proj.push({ x: s[0], y: s[1], i, t: v[3], yv: v[4], zv: v[5], tt: v[6] }); });
     });
-    // key for the TTFT tint
+    // key for the leg colours
     cx.font = "11px sans-serif"; cx.textAlign = "left";
-    const kx = 12, ky = ch - 10;
-    cx.fillStyle = "#8a9096"; cx.fillText("curve tint = TTFT at that point:", kx, ky);
-    let px = kx + cx.measureText("curve tint = TTFT at that point:").width + 8;
-    [[GREEN, "< " + TTFT_GREEN / 1000 + "s"], [null, TTFT_GREEN / 1000 + "-" + TTFT_RED / 1000 + "s arm colour"], [RED, "> " + TTFT_RED / 1000 + "s"]].forEach(([c, t]) => {
-      if (c) { cx.fillStyle = css(c); cx.fillRect(px, ky - 8, 14, 3); px += 18; }
-      cx.fillStyle = "#b8bec4"; cx.fillText(t, px, ky); px += cx.measureText(t).width + 14;
-    });
+    const kx = 12, ky = ch - 10, kw = 160;
+    cx.fillStyle = "#8a9096"; cx.fillText("legs = TTFT at that point", kx, ky);
+    let gx = kx + cx.measureText("legs = TTFT at that point").width + 10;
+    cx.fillStyle = "#b8bec4"; cx.fillText("0s", gx, ky); gx += cx.measureText("0s").width + 6;
+    for (let k = 0; k < kw; k++) { cx.fillStyle = legColor(TTFT_MAX * k / kw, 0.9); cx.fillRect(gx + k, ky - 8, 1, 8); }
+    gx += kw + 6; cx.fillStyle = "#b8bec4"; cx.fillText(TTFT_MAX / 1000 + "s+", gx, ky);
   }
 
   function init() {
@@ -4871,6 +4860,7 @@ const V3 = (() => {
     '<button class="v3-all" title="Enable every arm">All arms</button>' +
     '<span class="v3-views">View <button data-v="iso">3D</button><button data-v="front">time &times; Y</button>' +
     '<button data-v="top">time &times; Z</button><button data-v="side">Z &times; Y</button></span>' +
+    '<button class="v3-expand" title="Fill the window with the 3D view (Esc or Back to return)">&#x2922; Expand</button>' +
     '<span class="v3-hint">Drag to rotate &middot; wheel zooms &middot; double-click resets</span>' +
     '</div><canvas class="v3-canvas"></canvas><div class="v3-tip"></div>';
   const q = c => host.querySelector(c);
@@ -4908,12 +4898,29 @@ const V3 = (() => {
   elY.addEventListener("change", draw);
   elSm.addEventListener("change", draw);
   elZ.addEventListener("change", draw);
+  const elExpand = q(".v3-expand");
+  function setExpanded(on) {
+    expanded = on;
+    host.classList.toggle("v3-expanded", on);
+    document.documentElement.classList.toggle("wtl-expanded-page", on);
+    elExpand.innerHTML = on ? "&#x2715; Back" : "&#x2922; Expand";
+    resize();
+  }
+  elExpand.addEventListener("click", () => setExpanded(!expanded));
+  window.addEventListener("keydown", e => { if (e.key === "Escape" && expanded) setExpanded(false); });
+  window.addEventListener("resize", () => { if (expanded) resize(); });
 
   }
   function resize() {
     const dpr = window.devicePixelRatio || 1;
-    host.style.width = W + "px";
-    cw = W; ch = Math.max(H, 480) - 40;
+    if (expanded) {
+      host.style.width = "";
+      cw = window.innerWidth - 28;
+      ch = window.innerHeight - host.querySelector(".v3-bar").offsetHeight - 24;
+    } else {
+      host.style.width = W + "px";
+      cw = W; ch = Math.max(H, 480) - 40;
+    }
     cv.style.width = cw + "px"; cv.style.height = ch + "px";
     cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr);
     draw();
