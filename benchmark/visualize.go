@@ -4587,7 +4587,7 @@ const V3 = (() => {
   // Built on first show: the report script also runs headless (tests, public
   // export), where nothing should touch this view's DOM.
   const host = document.getElementById("v3Host");
-  let cv, cx, tip, elY, elArms, elSm, built = false;
+  let cv, cx, tip, elY, elZ, elArms, elSm, built = false;
   const BINS = 240, CAM = 4;
   const VIEWS = { iso: [-0.62, 0.38], front: [0, 0], top: [0, Math.PI / 2 - 0.001], side: [-Math.PI / 2, 0] };
   let yaw = VIEWS.iso[0], pitch = VIEWS.iso[1], zoom = 1;
@@ -4624,26 +4624,50 @@ const V3 = (() => {
       }
     }
     if (ymode !== "out") outTot = s.records.reduce((n, r) => { const e = r.t + Math.max(r.resp || 0, 0); return e >= t0 && e <= t1 ? n + (r.out || 0) : n; }, 0);
-    for (const [, L] of life) {
-      const a = Math.max(0, bin(L[0])), b = Math.min(BINS - 1, bin(L[1]));
-      if (b < 0 || a >= BINS || a > b) continue;
-      z[a] += 1; z[b + 1] -= 1;
-    }
+    // Z: active series (step count), requests in flight (mean concurrency over
+    // each bin) or the active dataset (last sample at or before the bin's middle).
     const zs = new Float64Array(BINS);
-    for (let b = 0, run = 0; b < BINS; b++) { run += z[b]; zs[b] = run; }
+    let hasZ = true;
+    if (elZ.value === "infl") {
+      for (const r of s.records) {
+        const lo = Math.max(r.t, t0), hi = Math.min(r.t + Math.max(r.resp || 0, 0), t1);
+        for (let b = Math.max(0, bin(lo)); b < BINS && t0 + b * bw < hi; b++) {
+          const a = Math.max(lo, t0 + b * bw), c = Math.min(hi, t0 + (b + 1) * bw);
+          if (c > a) zs[b] += (c - a) / bw;
+        }
+      }
+    } else if (elZ.value === "adt") {
+      const pts = s.adt || [];
+      hasZ = pts.length > 0;
+      for (let b = 0, k = -1; b < BINS; b++) {
+        const tm = t0 + (b + 0.5) * bw;
+        while (k + 1 < pts.length && pts[k + 1].t <= tm) k++;
+        zs[b] = k >= 0 ? pts[k].v : 0;
+      }
+    } else {
+      for (const [, L] of life) {
+        const a = Math.max(0, bin(L[0])), b = Math.min(BINS - 1, bin(L[1]));
+        if (b < 0 || a >= BINS || a > b) continue;
+        z[a] += 1; z[b + 1] -= 1;
+      }
+      for (let b = 0, run = 0; b < BINS; b++) { run += z[b]; zs[b] = run; }
+    }
     for (let b = 0; b < BINS; b++) y[b] /= bw / 1000;
     const half = Math.floor(+elSm.value / bw / 2);
-    if (half > 0) {
-      const src = y.slice();
+    const smooth = arr => {
+      if (half <= 0) return;
+      const src = arr.slice();
       for (let b = 0; b < BINS; b++) {
         let n = 0, sum = 0;
         for (let k = Math.max(0, b - half); k <= Math.min(BINS - 1, b + half); k++) { sum += src[k]; n++; }
-        y[b] = sum / n;
+        arr[b] = sum / n;
       }
-    }
+    };
+    smooth(y);
+    if (elZ.value === "infl") smooth(zs);   // a rate-like mean; the step counts stay exact
     // The arm's output rate over the part of the window it actually ran.
     const dur = Math.max(1, Math.min(t1, end) - t0) / 1000;
-    return { y, z: zs, bw, end, outRate: outTot / dur };
+    return { y, z: zs, hasZ, bw, end, outRate: outTot / dur };
   }
 
   // ---- colour ----
@@ -4678,6 +4702,8 @@ const V3 = (() => {
     return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
   }
   const yLabel = () => elY.options[elY.selectedIndex].text;
+  const zLabel = () => elZ.options[elZ.selectedIndex].text;
+  const fmtZ = v => elZ.value === "series" ? String(Math.round(v)) : fmtN(v);
 
   // ---- projection: world [-1,1]^3, y up; yaw about y, then pitch about x ----
   function P(x, y, z) {
@@ -4701,7 +4727,7 @@ const V3 = (() => {
     elArms.innerHTML = DATA.map((s, i) =>
       '<label title="' + s.name.replace(/"/g, "&quot;") + '"><input type="checkbox" data-i="' + i + '"' + (enabled.has(i) ? " checked" : "") + '>' +
       '<i style="background:' + css(stats[i] ? stats[i].color : rgb(seriesColors[i])) + '"></i>' + getAlias(s.name) +
-      (stats[i] ? ' <span class="v3-rate">' + fmtN(stats[i].outRate) + " out/s</span>" : "") + "</label>").join("");
+      (stats[i] ? ' <span class="v3-rate">' + fmtN(stats[i].outRate) + " out/s" + (stats[i].hasZ ? "" : ", no dataset samples") + "</span>" : "") + "</label>").join("");
     elArms.querySelectorAll("input").forEach(el => el.addEventListener("change", () => {
       const i = +el.getAttribute("data-i");
       if (el.checked) enabled.add(i); else if (enabled.size > 1) enabled.delete(i); else el.checked = true;
@@ -4718,7 +4744,7 @@ const V3 = (() => {
     if (zoomed) { t0 = viewTMin; t1 = viewTMax; }
     else arms.forEach(i => DATA[i].records.forEach(r => { const e = r.t + Math.max(r.resp || 0, 0); if (e > t1) t1 = e; }));
     if (t1 <= t0) t1 = t0 + 1000;
-    const key = arms.join(",") + "|" + elY.value + "|" + elSm.value + "|" + t0 + "|" + t1;
+    const key = arms.join(",") + "|" + elY.value + "|" + elZ.value + "|" + elSm.value + "|" + t0 + "|" + t1;
     if (cache.key === key) return cache.data;
     const per = {};
     arms.forEach(i => { per[i] = armBins(DATA[i], elY.value, t0, t1); });
@@ -4742,7 +4768,7 @@ const V3 = (() => {
     const zBack = P(0, 0, 1)[2] > P(0, 0, -1)[2] ? 1 : -1, xBack = P(1, 0, 0)[2] > P(-1, 0, 0)[2] ? 1 : -1;
     const zFront = -zBack, xFront = -xBack;
     // grid: time ticks on floor + back wall, series ticks on floor + side wall, Y ticks on both walls
-    const tStep = nice((d.t1 - d.t0), 8), yStep = nice(d.ymax, 5), zStep = Math.max(1, nice(d.zmax, 5));
+    const tStep = nice((d.t1 - d.t0), 8), yStep = nice(d.ymax, 5), zStep = elZ.value === "series" ? Math.max(1, nice(d.zmax, 5)) : nice(d.zmax, 5);
     for (let t = Math.ceil(d.t0 / tStep) * tStep; t <= d.t1; t += tStep) {
       const x = X(t);
       line([[x, -1, -1], [x, -1, 1]], "#1c2226", 1); line([[x, -1, zBack], [x, 1, zBack]], "#1c2226", 1);
@@ -4756,7 +4782,7 @@ const V3 = (() => {
     for (let v = 0; v <= d.zmax; v += zStep) {
       const z = Z(v);
       line([[-1, -1, z], [1, -1, z]], "#1c2226", 1); line([[xBack, -1, z], [xBack, 1, z]], "#1c2226", 1);
-      text(String(Math.round(v)), xFront + 0.06 * Math.sign(xFront || 1), -1.04, z, xFront < 0 ? "right" : "left");
+      text(fmtZ(v), xFront + 0.06 * Math.sign(xFront || 1), -1.04, z, xFront < 0 ? "right" : "left");
     }
     // box edges
     const E = "#42464A";
@@ -4766,12 +4792,13 @@ const V3 = (() => {
     cx.font = "12px sans-serif";
     text("time", 0, -1.2, zFront, "center", "#C9C9C9");
     text(yLabel(), xFront, 1.1, zBack, "center", "#C9C9C9");
-    text("active series", xFront * 1.25, -1, 0, "center", "#C9C9C9");
+    text(zLabel(), xFront * 1.25, -1, 0, "center", "#C9C9C9");
     cx.font = "11px monospace";
     // curves: floor shadow (time x series), back-wall shadow (time x Y), drop lines, then the curve itself
     proj = [];
     d.arms.forEach(i => {
       const p = d.per[i], c = p.color, pts = [];
+      if (!p.hasZ) return;   // no dataset samples for this arm
       for (let b = 0; b < BINS; b++) {
         const t = d.t0 + (b + 0.5) * p.bw;
         if (!isZoomed() && t > p.end) break;
@@ -4801,17 +4828,21 @@ const V3 = (() => {
     '<option value="out">output tok/s</option>' +
     '<option value="in">input tok/s (incl. cached)</option>' +
     '<option value="req">requests/s</option></select></label>' +
-    '<label title="Moving average over Y">Smooth <select class="v3-smooth">' +
+    '<label>Z <select class="v3-z">' +
+    '<option value="series">active series</option>' +
+    '<option value="infl">requests in flight</option>' +
+    '<option value="adt">active dataset (tokens)</option></select></label>' +
+    '<label title="Moving average over Y (and over Z for requests in flight)">Smooth <select class="v3-smooth">' +
     '<option value="0">off</option><option value="60000">1 min</option><option value="120000" selected>2 min</option>' +
     '<option value="300000">5 min</option><option value="600000">10 min</option></select></label>' +
     '<span class="v3-arms"></span>' +
     '<button class="v3-all" title="Enable every arm">All arms</button>' +
     '<span class="v3-views">View <button data-v="iso">3D</button><button data-v="front">time &times; Y</button>' +
-    '<button data-v="top">time &times; series</button><button data-v="side">series &times; Y</button></span>' +
+    '<button data-v="top">time &times; Z</button><button data-v="side">Z &times; Y</button></span>' +
     '<span class="v3-hint">Drag to rotate &middot; wheel zooms &middot; double-click resets</span>' +
     '</div><canvas class="v3-canvas"></canvas><div class="v3-tip"></div>';
   const q = c => host.querySelector(c);
-  cv = q(".v3-canvas"); cx = cv.getContext("2d"); tip = q(".v3-tip"); elY = q(".v3-y"); elArms = q(".v3-arms"); elSm = q(".v3-smooth");
+  cv = q(".v3-canvas"); cx = cv.getContext("2d"); tip = q(".v3-tip"); elY = q(".v3-y"); elArms = q(".v3-arms"); elSm = q(".v3-smooth"); elZ = q(".v3-z");
   // ---- interaction ----
   let drag = null;
   cv.addEventListener("mousedown", e => { drag = { x: e.clientX, y: e.clientY, yaw, pitch }; tip.style.display = "none"; });
@@ -4828,7 +4859,7 @@ const V3 = (() => {
     if (!best) { tip.style.display = "none"; return; }
     const st = cache.data.per[best.i];
     tip.innerHTML = "<b>" + getAlias(DATA[best.i].name) + "</b><br>at " + fmtT(best.t) +
-      "<br>" + yLabel() + " <b>" + fmtN(best.yv) + "</b><br>active series <b>" + Math.round(best.zv) + "</b>" +
+      "<br>" + yLabel() + " <b>" + fmtN(best.yv) + "</b><br>" + zLabel() + " <b>" + fmtZ(best.zv) + "</b>" +
       "<br><span class='v3-dim'>window output " + fmtN(st.outRate) + " tok/s</span>";
     tip.style.display = "block";
     tip.style.left = Math.min(e.clientX + 14, window.innerWidth - 240) + "px";
@@ -4843,6 +4874,7 @@ const V3 = (() => {
   q(".v3-all").addEventListener("click", () => { DATA.forEach((_, i) => enabled.add(i)); draw(); });
   elY.addEventListener("change", draw);
   elSm.addEventListener("change", draw);
+  elZ.addEventListener("change", draw);
 
   }
   function resize() {
