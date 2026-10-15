@@ -228,10 +228,10 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 	// max_completion_tokens, and SGLang's return_cached_tokens_details) but
 	// replay requests carry their own max_tokens and opt into cached-token
 	// reporting explicitly below, so the type only selects that behavior.
-	switch dyn.Type {
-	case "anthropic":
+	switch {
+	case dyn.Type == "anthropic":
 		// OK — existing behaviour.
-	case "openai", "openai_vllm", "openai_sglang":
+	case llm.IsOpenAIChatWire(dyn.Type):
 		// OK — new path.
 	default:
 		return nil, fmt.Errorf("router-replay supports type=anthropic, type=openai, type=openai_vllm, or type=openai_sglang (got %q)", dyn.Type)
@@ -251,7 +251,7 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 	// local endpoints); OpenAI targets use Bearer auth with the OpenAI key
 	// (or dummy-key for local endpoints).
 	apiKey := keys.Anthropic
-	if dyn.Type == "openai" || dyn.Type == "openai_vllm" || dyn.Type == "openai_sglang" {
+	if llm.IsOpenAIChatWire(dyn.Type) {
 		apiKey = keys.OpenAI
 	}
 	if apiKey == "" {
@@ -262,7 +262,7 @@ func newReplayPoster(modelSpec string, keys llm.APIKeys, endpointOverride string
 	// The primary attempt appends it to the operator's base verbatim; the
 	// fallback inserts /v1 (see the struct comment for the contract).
 	leaf := "/messages"
-	if dyn.Type == "openai" || dyn.Type == "openai_vllm" || dyn.Type == "openai_sglang" {
+	if llm.IsOpenAIChatWire(dyn.Type) {
 		leaf = "/chat/completions"
 	}
 	epPrimary := base + leaf
@@ -598,10 +598,9 @@ func (p *replayPoster) do(
 	var bodyBytes []byte
 	var canonical string
 	var err error
-	switch p.apiType {
-	case "openai", "openai_vllm", "openai_sglang":
+	if llm.IsOpenAIChatWire(p.apiType) {
 		bodyBytes, canonical, err = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.minOutputTokens, p.forceVolume, p.replayCharsPerToken, inj, p.reasoningEffort, p.thinking, p.apiType == "openai_sglang")
-	default:
+	} else {
 		bodyBytes, canonical, err = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.minOutputTokens, p.forceVolume, p.replayCharsPerToken, inj)
 	}
 	// --limit-context uses the capture's production-measured token counts
@@ -761,7 +760,7 @@ func (p *replayPoster) do(
 	// consumers compute must describe the attempt the server actually ran, so
 	// that backoff cannot make a healthy fleet look slow. The client-side wait
 	// is added back into TotalResponseTime below, where it belongs.
-	if p.apiType == "openai" || p.apiType == "openai_vllm" || p.apiType == "openai_sglang" {
+	if llm.IsOpenAIChatWire(p.apiType) {
 		if req.Stream {
 			consumeOpenAISSE(respReader, attemptStart, &m)
 		} else {
@@ -1344,10 +1343,9 @@ func (p *replayPoster) dryDo(
 	// response to validate.
 	inj := p.buildInjection(req, su)
 	var canonical string
-	switch p.apiType {
-	case "openai", "openai_vllm", "openai_sglang":
+	if llm.IsOpenAIChatWire(p.apiType) {
 		_, canonical, _ = buildOpenAIChatCompletionsBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.minOutputTokens, p.forceVolume, p.replayCharsPerToken, inj, p.reasoningEffort, p.thinking, p.apiType == "openai_sglang")
-	default:
+	} else {
 		_, canonical, _ = buildAnthropicMessagesBody(req, docs, p.model, stampFor(p, req), p.outputRatio, p.minOutputTokens, p.forceVolume, p.replayCharsPerToken, inj)
 	}
 	var ratio float64

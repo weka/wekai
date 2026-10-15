@@ -593,7 +593,7 @@ func TestReportTimelineMatchesBuilder(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The builder reads the same records back from the file, as the report did.
-	fileRecs, _, _, _, _, err := readJSONLFileWithParams(filepath.Join(dir, mustOneJSONL(t, dir)))
+	fileRecs, _, _, _, err := readJSONLFileWithParams(filepath.Join(dir, mustOneJSONL(t, dir)))
 	if err != nil {
 		t.Fatal(err)
 	}

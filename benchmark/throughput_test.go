@@ -116,6 +116,157 @@ func TestNoCacheDataObserved(t *testing.T) {
 	}
 }
 
+// TestNoCacheEverObservedUnitCases locks down noCacheEverObserved's own
+// all-time semantics in isolation, mirroring TestNoCacheDataObserved's table
+// shape for the windowed function it replaces as the cacheWarning signal.
+func TestNoCacheEverObservedUnitCases(t *testing.T) {
+	cases := []struct {
+		name      string
+		tt        tokenTotals
+		nonErrors int64
+		min       int
+		want      bool
+	}{
+		{"neither signal ever fired, enough records", tokenTotals{inputWarm: 0, cached: 0, cacheHits: 0}, 20, 10, true},
+		{"below minCount — too early to tell", tokenTotals{inputWarm: 0, cached: 0, cacheHits: 0}, 5, 10, false},
+		{"server reported cached tokens", tokenTotals{inputWarm: 0, cached: 500, cacheHits: 0}, 20, 10, false},
+		{"heuristic-only warm tokens, no confirmed hits — must still warn", tokenTotals{inputWarm: 500, cached: 0, cacheHits: 0}, 20, 10, true},
+		{"confirmed cache hits, no estimator warm — must not warn", tokenTotals{inputWarm: 0, cached: 0, cacheHits: 5}, 20, 10, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := noCacheEverObserved(c.tt, c.nonErrors, c.min); got != c.want {
+				t.Errorf("noCacheEverObserved(%+v, %d, %d) = %v, want %v", c.tt, c.nonErrors, c.min, got, c.want)
+			}
+		})
+	}
+}
+
+// TestNoCacheEverObservedSurvivesColdStartWindow is the regression test for
+// the sticky-latch bug: a windowed check (noCacheDataObserved/CacheMetrics)
+// can see an all-cold-start window first — e.g. right after a series
+// scale-up, or at a pass boundary under --replay-reuse-sessions — and that
+// window alone genuinely has hitRate==0 and serverReported==false, because a
+// cold start is always a structural miss. The old code latched cacheWarning
+// true the moment that happened and never cleared it, even once later
+// windows showed the server caching normally. noCacheEverObserved reads the
+// all-time running counters instead, so once real cache activity has
+// accumulated anywhere in the run, it must report false — regardless of what
+// an early window looked like.
+func TestNoCacheEverObservedSurvivesColdStartWindow(t *testing.T) {
+	s := newCompletionStream(500)
+	const minCount = 10
+
+	// An all-cold-start window: minCount requests, each a structural miss,
+	// server reporting nothing yet. This is exactly the window shape that
+	// used to latch cacheWarning permanently.
+	for i := 0; i < minCount; i++ {
+		s.Add(completionRecord{
+			completedAt: time.Now(),
+			isColdStart: true,
+			inputTokens: 1000,
+		})
+	}
+
+	tt := s.TokenTotals()
+	if !noCacheEverObserved(tt, minCount, minCount) {
+		t.Fatal("expected noCacheEverObserved=true right after an all-cold-start window with no cache signal yet")
+	}
+
+	// The run continues and the server starts reporting real cache hits —
+	// both the TTFT heuristic (localCacheRatio>0, driving globalInputWarm)
+	// and explicit server-reported cached_tokens.
+	for i := 0; i < minCount; i++ {
+		s.Add(completionRecord{
+			completedAt:          time.Now(),
+			isColdStart:          false,
+			cacheHit:             true,
+			serverCacheConfirmed: true,
+			cachedTokens:         800,
+			inputTokens:          200,
+			localCacheRatio:      0.8,
+		})
+	}
+
+	tt = s.TokenTotals()
+	if noCacheEverObserved(tt, 2*minCount, minCount) {
+		t.Error("expected noCacheEverObserved=false once the run-wide counters show real cache activity — " +
+			"the warning must not stay latched from the earlier all-cold-start window")
+	}
+}
+
+// TestNoCacheEverObservedFailureMode1EstimatorWarmNeverConfirmed is the
+// regression test for failure mode 1: a repeated prompt can make the
+// client-side content estimator (localCacheRatio, driving globalInputWarm)
+// report warm reuse even though the server never actually caches anything —
+// cacheHit stays false and cachedTokens stays 0 on every record. Before this
+// fix, tt.inputWarm alone was enough to suppress the warning, so this exact
+// shape — real 0% server-reported hit rate, estimator convinced otherwise —
+// went unflagged. The fix drops inputWarm from the check entirely, so the
+// warning must still fire here.
+func TestNoCacheEverObservedFailureMode1EstimatorWarmNeverConfirmed(t *testing.T) {
+	s := newCompletionStream(500)
+	const minCount = 10
+
+	for i := 0; i < minCount; i++ {
+		s.Add(completionRecord{
+			completedAt:     time.Now(),
+			isColdStart:     i == 0,
+			cacheHit:        false,
+			cachedTokens:    0,
+			inputTokens:     1000,
+			localCacheRatio: 0.9, // estimator convinced this prompt is mostly cached...
+		})
+	}
+
+	tt := s.TokenTotals()
+	if tt.inputWarm == 0 {
+		t.Fatal("test setup bug: expected globalInputWarm to be nonzero from the high localCacheRatio")
+	}
+	if !noCacheEverObserved(tt, minCount, minCount) {
+		t.Error("expected noCacheEverObserved=true: estimator-only warm reuse with cacheHit never true and " +
+			"cachedTokens always 0 must not suppress the warning")
+	}
+}
+
+// TestNoCacheEverObservedFailureMode2TTFTConfirmedWithoutEstimatorWarm is the
+// regression test for failure mode 2: a server that is genuinely fast via
+// real caching (cacheHit true via the TTFT heuristic) but with the
+// content-level estimator seeing no repeated/warm prompt volume
+// (localCacheRatio 0, so globalInputWarm never grows) and no explicit
+// cachedTokens reported either. Before this fix, tt.inputWarm == 0 and
+// tt.cached == 0 here meant the warning fired right next to real, confirmed
+// cache activity — the exact "sticky latch" bug this function exists to
+// avoid. The fix's tt.cacheHits counter is incremented from cacheHit
+// directly, so the warning must not fire.
+func TestNoCacheEverObservedFailureMode2TTFTConfirmedWithoutEstimatorWarm(t *testing.T) {
+	s := newCompletionStream(500)
+	const minCount = 10
+
+	for i := 0; i < minCount; i++ {
+		s.Add(completionRecord{
+			completedAt:     time.Now(),
+			isColdStart:     i == 0,
+			cacheHit:        i != 0, // every non-cold request is a confirmed TTFT hit
+			cachedTokens:    0,
+			inputTokens:     1000,
+			localCacheRatio: 0, // estimator sees no repeated content at all
+		})
+	}
+
+	tt := s.TokenTotals()
+	if tt.inputWarm != 0 {
+		t.Fatal("test setup bug: expected globalInputWarm to stay zero with localCacheRatio always 0")
+	}
+	if tt.cacheHits == 0 {
+		t.Fatal("test setup bug: expected globalCacheHits to be nonzero from the confirmed TTFT hits")
+	}
+	if noCacheEverObserved(tt, minCount, minCount) {
+		t.Error("expected noCacheEverObserved=false: confirmed TTFT cache hits with no estimator-detected " +
+			"warm reuse and no server-reported cachedTokens must not trigger the warning")
+	}
+}
+
 // TestCacheWarningMessage locks down that the warning names the actual
 // server-launch flag for vLLM/SGLang, rather than a generic message that
 // leaves the operator to guess between "server doesn't cache at all" and

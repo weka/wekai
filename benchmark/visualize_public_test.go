@@ -33,7 +33,7 @@ func pubDynamicModel(alias string) string {
 // first errCount of nReq records are marked as errors, so OK/Err aggregate
 // counts are independently checkable per arm. Every record carries a
 // distinct series_guid built from pubSecretGUIDFrag.
-func buildPublicFixtureArm(alias string, base time.Time, nReq, errCount int) ([]requestDataRecord, []vllmMetricsSample) {
+func buildPublicFixtureArm(alias string, base time.Time, nReq, errCount int) ([]requestDataRecord, []cacheMetricsSample) {
 	model := pubDynamicModel(alias)
 	var records []requestDataRecord
 	for i := 0; i < nReq; i++ {
@@ -57,13 +57,18 @@ func buildPublicFixtureArm(alias string, base time.Time, nReq, errCount int) ([]
 		}
 		records = append(records, rec)
 	}
-	var samples []vllmMetricsSample
+	var samples []cacheMetricsSample
 	for i := 0; i < 3; i++ {
-		samples = append(samples, vllmMetricsSample{
-			RecordType:          recordTypeVLLMMetricsSample,
-			TS:                  base.Add(time.Duration(i) * 60 * time.Second),
-			Model:               model,
-			Sources:             vllmSourceCounters{Compute: int64(1000 * (i + 1)), LocalCache: int64(300 * i), ExternalCache: int64(100 * i)},
+		samples = append(samples, cacheMetricsSample{
+			RecordType: recordTypeCacheMetricsSample,
+			TS:         base.Add(time.Duration(i) * 60 * time.Second),
+			Model:      model,
+			Engine:     "vllm",
+			Bands: map[string]int64{
+				"compute":  int64(1000 * (i + 1)),
+				"host":     int64(300 * i),
+				"external": int64(100 * i),
+			},
 			ActiveDatasetTokens: int64(4000 * (i + 1)),
 			ActiveSeries:        i + 1,
 		})
@@ -75,7 +80,7 @@ func buildPublicFixtureArm(alias string, base time.Time, nReq, errCount int) ([]
 // header carrying runID and the arm's (sensitive) endpoint+alias model
 // string -- exactly what a real `benchmark auto --save-request-data` run
 // writes -- followed by its records and samples.
-func writePublicFixtureFile(t *testing.T, dir, name string, records []requestDataRecord, samples []vllmMetricsSample, runID string) {
+func writePublicFixtureFile(t *testing.T, dir, name string, records []requestDataRecord, samples []cacheMetricsSample, runID string) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)

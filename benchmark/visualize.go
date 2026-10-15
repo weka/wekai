@@ -76,15 +76,15 @@ func GenerateVisualizationTimeline(dir string, concurrency int, maxElapsed time.
 	return renderVisualization(dir, concurrency, false, maxElapsed, "", overwrite, true)
 }
 
-// truncateToElapsed drops request records and metrics samples whose elapsed
-// time from the run's own start exceeds maxElapsed, so a crashed run's
-// terminal error-storm can be excluded from a report. t0 is the earliest
-// request StartTime in the set (falling back to the earliest sample when a
-// file somehow has no request rows); the boundary is inclusive — a record
-// exactly AT the cutoff is kept. Samples truncate against the same t0 so
-// the cache-mix overlay and ingest volume all stop at the
-// cutoff consistently with the request data. maxElapsed <= 0 is a no-op.
-func truncateToElapsed(records []requestDataRecord, samples []vllmMetricsSample, maxElapsed time.Duration) ([]requestDataRecord, []vllmMetricsSample) {
+// truncateToElapsed drops request records and cache-metrics samples whose
+// elapsed time from the run's own start exceeds maxElapsed, so a crashed
+// run's terminal error-storm can be excluded from a report. t0 is the
+// earliest request StartTime in the set (falling back to the earliest sample
+// when a file somehow has no request rows); the boundary is inclusive — a
+// record exactly AT the cutoff is kept. Samples truncate against the same t0
+// so the cache-mix overlay and ingest volume all stop at the cutoff
+// consistently with the request data. maxElapsed <= 0 is a no-op.
+func truncateToElapsed(records []requestDataRecord, samples []cacheMetricsSample, maxElapsed time.Duration) ([]requestDataRecord, []cacheMetricsSample) {
 	if maxElapsed <= 0 || (len(records) == 0 && len(samples) == 0) {
 		return records, samples
 	}
@@ -108,46 +108,13 @@ func truncateToElapsed(records []requestDataRecord, samples []vllmMetricsSample,
 			outR = append(outR, r)
 		}
 	}
-	var outS []vllmMetricsSample
+	var outS []cacheMetricsSample
 	for _, s := range samples {
 		if !s.TS.After(cutoff) {
 			outS = append(outS, s)
 		}
 	}
 	return outR, outS
-}
-
-// truncateSGLangToElapsed mirrors truncateToElapsed for sglangMetricsSample —
-// kept as a separate function rather than folded into it (or a shared
-// generic) because the two sample types are otherwise unrelated and a series
-// carries samples from at most one of them. t0 is derived from records (or,
-// absent those, this same sample set) exactly as truncateToElapsed does, so
-// the two truncations agree on the same cutoff for one series.
-func truncateSGLangToElapsed(records []requestDataRecord, samples []sglangMetricsSample, maxElapsed time.Duration) []sglangMetricsSample {
-	if maxElapsed <= 0 || len(samples) == 0 {
-		return samples
-	}
-	var t0 time.Time
-	for _, r := range records {
-		if t0.IsZero() || r.StartTime.Before(t0) {
-			t0 = r.StartTime
-		}
-	}
-	if t0.IsZero() {
-		for _, s := range samples {
-			if t0.IsZero() || s.TS.Before(t0) {
-				t0 = s.TS
-			}
-		}
-	}
-	cutoff := t0.Add(maxElapsed)
-	var out []sglangMetricsSample
-	for _, s := range samples {
-		if !s.TS.After(cutoff) {
-			out = append(out, s)
-		}
-	}
-	return out
 }
 
 // vizRecord is one request's data as embedded in a report.html's RAW_DATA.
@@ -231,8 +198,8 @@ type seriesData struct {
 	Mix  []vizSampleSegment `json:"mix,omitempty"`
 	Adt  []vizAdtPoint      `json:"adt,omitempty"`
 	// BandOrder names Mix's bands, in the order each vizSampleSegment.Bands
-	// entry appears (vllmBandOrder or sglangBandOrder — see vllm_metrics.go/
-	// sglang_metrics.go), so the report JS knows which color/label lookup and
+	// entry appears (a subset of canonicalBandOrder — see sampleBandNames in
+	// cache_metrics.go), so the report JS knows which color/label lookup and
 	// legend to render for this series without guessing from Mix's shape.
 	// Omitted when Mix is empty.
 	BandOrder []string `json:"bandOrder,omitempty"`
@@ -372,12 +339,11 @@ func renderVisualization(dir string, concurrency int, keepFileNames bool, maxEla
 	var allSeries []seriesData
 	for _, f := range files {
 		name := strings.TrimSuffix(filepath.Base(f), ".jsonl")
-		records, samples, sglangSamples, params, hasParams, err := readJSONLFileWithParams(f)
+		records, samples, params, hasParams, err := readJSONLFileWithParams(f)
 		if err != nil {
 			return "", fmt.Errorf("read %s: %w", f, err)
 		}
 		records, samples = truncateToElapsed(records, samples, maxElapsed)
-		sglangSamples = truncateSGLangToElapsed(records, sglangSamples, maxElapsed)
 		// Prefer the clean model alias (e.g. "DS3H_weka-64r8w") over the raw
 		// sanitized filename (e.g. "dynamic_http___..._alias_DS3H_weka-64r8w")
 		// when the file's records unambiguously identify one model — unless
@@ -427,20 +393,19 @@ func renderVisualization(dir string, concurrency int, keepFileNames bool, maxEla
 				LeakedUUIDsRaw:       r.LeakedUUIDsRaw,
 			})
 		}
-		// A series carries samples from at most one sampler (vLLM and sglang
-		// eligibility are mutually exclusive per model spec type=), so vLLM
-		// samples win if somehow both are present rather than silently
-		// dropping either.
+		// Every series now carries one unified cacheMetricsSample list
+		// regardless of which engine produced it (vLLM and sglang eligibility
+		// are mutually exclusive per model spec type=, so in practice a file
+		// has samples from at most one engine) — buildSampleViz/
+		// sampleBandNames read the band set directly off the samples' own
+		// Bands maps, so there is no engine to pick between and nothing is
+		// ever silently dropped.
 		var mix []vizSampleSegment
 		var adt []vizAdtPoint
 		var bandOrder []string
-		switch {
-		case len(samples) > 0:
-			mix, adt = buildSampleVizVLLM(samples)
-			bandOrder = vllmBandOrder
-		case len(sglangSamples) > 0:
-			mix, adt = buildSampleVizSGLang(sglangSamples)
-			bandOrder = sglangBandOrder
+		if len(samples) > 0 {
+			mix, adt = buildSampleViz(samples)
+			bandOrder = sampleBandNames(samples)
 		}
 		sd := seriesData{Name: name, T0: t0, Records: vr, Mix: mix, Adt: adt, BandOrder: bandOrder, GuidTable: guidTable}
 		if hasParams {
@@ -559,40 +524,39 @@ func resolveRecordsAlias(records []requestDataRecord) string {
 // readJSONLFile reads a request-data JSONL file, discarding any run-params
 // header. Callers that can make use of the recorded run parameters should use
 // readJSONLFileWithParams instead.
-func readJSONLFile(path string) ([]requestDataRecord, []vllmMetricsSample, error) {
-	records, samples, _, _, _, err := readJSONLFileWithParams(path)
+func readJSONLFile(path string) ([]requestDataRecord, []cacheMetricsSample, error) {
+	records, samples, _, _, err := readJSONLFileWithParams(path)
 	return records, samples, err
 }
 
 // readJSONLFileWithParams reads a request-data JSONL file, routing lines by
 // their record_type: absent/empty = a request row (legacy files predate the
-// field), "vllm_metrics_sample" = a vLLM metrics sample, "sglang_metrics_sample"
-// = an sglang metrics sample, "run_params" = the header describing the run.
-// Unknown record types and malformed lines are skipped — a new record type
-// must never corrupt request parsing (unmarshalling a sample into
-// requestDataRecord would otherwise "succeed" as an all-zero phantom
-// request), which is also what lets a file written by a NEWER wekai stay
-// readable by an older one.
-//
-// A series carries samples from at most one of the two metrics samplers
-// (vLLM and sglang sampling are mutually exclusive per model spec type — see
-// vllmMetricsEndpoints/sglangMetricsEndpoints), so callers pick whichever of
-// sglangSamples is non-empty to decide which buildSampleViz* to call.
+// field), "cache_metrics_sample" = a cache-metrics sample in the current
+// unified shape, "vllm_metrics_sample"/"sglang_metrics_sample" = a sample in
+// one of the two LEGACY per-engine shapes a pre-unification wekai wrote —
+// translated into the unified cacheMetricsSample shape on read (see
+// legacyVLLMMetricsSample.toUnified/legacySGLangMetricsSample.toUnified in
+// cache_metrics.go) so a report regenerated from an old trace directory
+// renders identically to one from a new one. "run_params" = the header
+// describing the run. Unknown record types and malformed lines are skipped —
+// a new record type must never corrupt request parsing (unmarshalling a
+// sample into requestDataRecord would otherwise "succeed" as an all-zero
+// phantom request), which is also what lets a file written by a NEWER wekai
+// stay readable by an older one.
 //
 // hasParams is false for every file written before run_params existed; callers
 // must keep working in that case rather than treating the zero record as a run
 // that was configured with zeroes.
-func readJSONLFileWithParams(path string) ([]requestDataRecord, []vllmMetricsSample, []sglangMetricsSample, runParamsRecord, bool, error) {
+func readJSONLFileWithParams(path string) ([]requestDataRecord, []cacheMetricsSample, runParamsRecord, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, nil, runParamsRecord{}, false, err
+		return nil, nil, runParamsRecord{}, false, err
 	}
 	defer f.Close()
 	// Sized from the line count so appending never doubles a 100MB+ slice (the
 	// copy is what dominates the peak when a report is built over 300k rows).
 	records := make([]requestDataRecord, 0, countLines(path))
-	var samples []vllmMetricsSample
-	var sglangSamples []sglangMetricsSample
+	var samples []cacheMetricsSample
 	var params runParamsRecord
 	var hasParams bool
 	// Every row repeats the (long) model spec and a session GUID that recurs
@@ -624,18 +588,24 @@ func readJSONLFileWithParams(path string) ([]requestDataRecord, []vllmMetricsSam
 			}
 			r.Model, r.SeriesGUID = canon(r.Model), canon(r.SeriesGUID)
 			records = append(records, r)
-		case recordTypeVLLMMetricsSample:
-			var s vllmMetricsSample
+		case recordTypeCacheMetricsSample:
+			var s cacheMetricsSample
 			if err := json.Unmarshal(sc.Bytes(), &s); err != nil {
 				continue
 			}
 			samples = append(samples, s)
-		case recordTypeSGLangMetricsSample:
-			var s sglangMetricsSample
+		case legacyRecordTypeVLLMMetricsSample:
+			var s legacyVLLMMetricsSample
 			if err := json.Unmarshal(sc.Bytes(), &s); err != nil {
 				continue
 			}
-			sglangSamples = append(sglangSamples, s)
+			samples = append(samples, s.toUnified())
+		case legacyRecordTypeSGLangMetricsSample:
+			var s legacySGLangMetricsSample
+			if err := json.Unmarshal(sc.Bytes(), &s); err != nil {
+				continue
+			}
+			samples = append(samples, s.toUnified())
 		case recordTypeRunParams:
 			// First header wins: a merged per-source JSONL can concatenate
 			// files, and the first one describes the run the rows came from.
@@ -644,7 +614,7 @@ func readJSONLFileWithParams(path string) ([]requestDataRecord, []vllmMetricsSam
 			}
 		}
 	}
-	return records, samples, sglangSamples, params, hasParams, sc.Err()
+	return records, samples, params, hasParams, sc.Err()
 }
 
 // countLines returns the number of newline-terminated lines in path, 0 on error.
@@ -2179,44 +2149,13 @@ function tickStats(tickTime) {
 // (calm dominant mass), compute = dimmed #FF8569 warning orange (the cost
 // signal). Passes lightness/CVD/contrast checks on #000; the two muted
 // fills sit below the chroma floor by design.
-const MIX_COMPUTE_COLOR = "#a86853";
-const MIX_LOCAL_COLOR = "#756a99";
-const MIX_EXTERNAL_COLOR = "#7C03EC"; // official primary purple — the single high-chroma accent
-// MIX_HOST_COLOR is sglang-only: its 4-way breakdown splits vLLM's implicit
-// "local" into device (GPU radix cache, reuses MIX_LOCAL_COLOR) and host
-// (CPU/DRAM HiCache L2), which needs a color of its own. Muted teal-green
-// sits clearly apart from the compute/local/external triad above and from
-// GPU_VARIANTS' cooler slate-blue and DRAM_VARIANTS' own green family below.
-const MIX_HOST_COLOR = "#4a9d8f";
-const ADT_LINE_COLOR = "#F2F2EB";
-const MIX_BAND_H = 64;
-// Band fills sit on a solid-black backdrop; slightly translucent so the
-// (muted) band mass sits visually behind the latency lines — the plot reads
-// first, the band second.
-const MIX_FILL_ALPHA = 0.78;
-
-// MIX_BAND_STYLE maps a band name (see vllmBandOrder/sglangBandOrder in
-// vllm_metrics.go/sglang_metrics.go) to its report color, legend/tooltip
-// label, and fill alpha, so the drawing and tooltip code can iterate any
-// series' seg.bands without knowing ahead of time whether it's a vLLM or
-// sglang series. sglang's outermost tier is labeled "storage" (its own
-// terminology for a 4-way breakdown) where vLLM's is labeled "external KV"
-// (a 2-way local/external split) — both share MIX_EXTERNAL_COLOR and the
-// near-opaque accent alpha, since each is that series' single vivid class.
-const MIX_BAND_STYLE = {
-  local_compute:        { color: MIX_COMPUTE_COLOR,  label: "compute",     alpha: MIX_FILL_ALPHA },
-  compute:              { color: MIX_COMPUTE_COLOR,  label: "compute",     alpha: MIX_FILL_ALPHA },
-  local_cache_hit:      { color: MIX_LOCAL_COLOR,    label: "local cache", alpha: MIX_FILL_ALPHA },
-  device:               { color: MIX_LOCAL_COLOR,    label: "device",      alpha: MIX_FILL_ALPHA },
-  host:                 { color: MIX_HOST_COLOR,     label: "host",        alpha: MIX_FILL_ALPHA },
-  external_kv_transfer: { color: MIX_EXTERNAL_COLOR, label: "external KV", alpha: 0.95 },
-  storage:              { color: MIX_EXTERNAL_COLOR, label: "storage",     alpha: 0.95 },
-};
+` + mixBandStyleJS + `
 // MIX_LEGEND_ORDER fixes the swatch order when building the shared Cache Mix
 // legend (drawn once for the whole report, not per series — see the
 // showCacheMix construction below), which only shows swatches for bands that
-// at least one visible series actually carries.
-const MIX_LEGEND_ORDER = ["local_compute", "compute", "local_cache_hit", "device", "host", "external_kv_transfer", "storage"];
+// at least one visible series actually carries. Mirrors canonicalBandOrder
+// (cache_metrics.go).
+const MIX_LEGEND_ORDER = ["compute", "gpu", "host", "storage", "external"];
 
 // DOM-free helpers (fmtTokens/mixAt/adtAt/mixTotalMax/mixStackHeight/
 // mixRate/placeTooltip): unit-tested under node by
@@ -2780,10 +2719,11 @@ function drawCacheMix() {
     // ingested delta against the report-wide MIX_TOTAL_MAX (shared across
     // all series), anchored at the band bottom so quiet minutes render
     // mostly empty. Within the stack the split stays proportional by
-    // band, in the order the sampler emitted them (see vllmBandOrder/
-    // sglangBandOrder). The muted fills stay translucent; each series' one
-    // vivid class (external KV / storage) renders near-opaque so it keeps
-    // its punch — see MIX_BAND_STYLE.
+    // band, in the order the sample's own band set carries them (see
+    // canonicalBandOrder/sampleBandNames in cache_metrics.go). The muted
+    // fills stay translucent; each series' one vivid class (storage /
+    // external) renders near-opaque so it keeps its punch — see
+    // MIX_BAND_STYLE.
     (s.mix || []).forEach(seg => {
       if (seg.t1 < viewTMin || seg.t0 > viewTMax) return;
       const total = mixSegTotal(seg);
@@ -3536,9 +3476,10 @@ function cacheMixDefaultOn(seriesCount) { return seriesCount <= CACHE_MIX_DEFAUL
 if (HAS_CACHE_MIX) {
   const lbl = document.createElement("label");
   // Swatches cover the UNION of band names actually present across DATA
-  // (each series carries its own bandOrder — vllmBandOrder or
-  // sglangBandOrder), so a vLLM-only report shows 3, an sglang-only report
-  // shows 4, and a mixed comparison shows both engines' bands.
+  // (each series carries its own bandOrder — a subset of canonicalBandOrder,
+  // see sampleBandNames in cache_metrics.go), so a vLLM-only report shows 3,
+  // an sglang-only report shows 4, and a mixed comparison shows both
+  // engines' bands.
   const presentBands = new Set();
   DATA.forEach(s => (s.bandOrder || []).forEach(n => presentBands.add(n)));
   let swatches = "";
@@ -4184,7 +4125,7 @@ function pubDownsamplePts(pts, intervalMs) {
 // origin (see pubArmOrigin) instead of this page's own per-arm-relative
 // axis. Bands are summed by position (bands[i] to bands[i]), which is safe
 // because every segment for one series carries the same fixed band set in
-// the same order (see vllmBandOrder/sglangBandOrder).
+// the same order (see canonicalBandOrder/sampleBandNames in cache_metrics.go).
 function pubDownsampleMix(mix, origin, intervalMs) {
   if (!mix || !mix.length) return [];
   const sorted = mix.slice().sort((a, b) => a.t0 - b.t0);

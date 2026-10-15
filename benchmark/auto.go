@@ -494,7 +494,7 @@ func (w *requestDataWriter) write(rec requestDataRecord) error {
 	return w.enc.Encode(rec)
 }
 
-// writeAny encodes a non-request record (e.g. vllmMetricsSample) into the
+// writeAny encodes a non-request record (e.g. cacheMetricsSample) into the
 // same JSONL stream. Safe for concurrent use with write(); same silent
 // no-op after close.
 func (w *requestDataWriter) writeAny(v any) error {
@@ -567,6 +567,7 @@ type completionStream struct {
 	globalInputWarm    int64 // full prompt tokens (non-cached + server-cached) from warm (non-cold) requests
 	globalOutputTokens int64 // output tokens from all non-error requests
 	globalCachedTokens int64 // server-reported cached prompt tokens (all non-error requests)
+	globalCacheHits    int64 // non-cold-start, non-error records where cacheHit was true (TTFT-heuristic or explicit) — run-wide version of cacheMetrics.hitRate's numerator
 }
 
 func newCompletionStream(maxKeep int) *completionStream {
@@ -606,6 +607,9 @@ func (s *completionStream) Add(r completionRecord) {
 		s.globalInputCold += full - warm
 		s.globalOutputTokens += int64(r.outputTokens)
 		s.globalCachedTokens += int64(r.cachedTokens)
+		if !r.isColdStart && r.cacheHit {
+			s.globalCacheHits++
+		}
 	}
 }
 
@@ -702,6 +706,42 @@ func noCacheDataObserved(m cacheMetrics, minCount int) bool {
 	return m.count >= minCount && m.hitRate == 0 && !m.serverReported
 }
 
+// noCacheEverObserved is the run-wide analog of noCacheDataObserved: it
+// answers "has this run EVER shown cache activity" from the all-time running
+// counters in tokenTotals, rather than from one CacheWindowSize-sized window.
+//
+// This distinction matters because noCacheDataObserved is windowed, and the
+// cacheWarning it used to latch was sticky: a window made entirely of
+// cold-start requests (common right after a series scale-up, or at a pass
+// boundary under --replay-reuse-sessions) is, by construction, a window
+// where hitRate is 0 and serverReported is false — cold starts are a
+// structural miss, never a hit — even on a server that is caching perfectly
+// on every later request.
+// Checking that single window and latching true forever meant a run could
+// finish with a clearly non-zero DisplayHitRate right next to a "server may
+// not support prompt caching" warning.
+//
+// tt.cached and tt.cacheHits (see TokenTotals) are running totals that only
+// grow, so this can only ever go from true to false as real cache activity
+// accumulates — never the other way — which is exactly the "once real
+// activity is seen, stop warning" behavior the windowed latch was supposed
+// to have and didn't.
+//
+// tt.inputWarm is deliberately NOT part of this check even though it was
+// originally: it's purely the client-side content estimator's guess
+// (localCacheRatio) at how much of the prompt volume looks like repeated,
+// cacheable content, computed with zero server feedback. A repeated prompt
+// inflates inputWarm even when the server never actually caches anything,
+// which let this warning stay silent next to a genuine 0% server-reported
+// hit rate. tt.cacheHits is the confirmed signal instead: it's incremented
+// only for non-cold-start records where cacheHit is true — itself true on
+// either an explicit server-reported cachedTokens>0 or the TTFT heuristic
+// (TTFT <= 50% of the cold baseline) — the same basis the windowed
+// CacheMetrics/hitRate check already trusts.
+func noCacheEverObserved(tt tokenTotals, nonErrorCount int64, minCount int) bool {
+	return nonErrorCount >= int64(minCount) && tt.cached == 0 && tt.cacheHits == 0
+}
+
 // cacheWarningMessage tailors the cacheWarning explanation to what the model
 // spec's type= actually names, when it names one of the two backends known
 // to gate cached_tokens reporting behind a server-launch flag: vLLM's
@@ -777,6 +817,7 @@ type tokenTotals struct {
 	inputWarm int64
 	output    int64
 	cached    int64
+	cacheHits int64
 }
 
 func (s *completionStream) TokenTotals() tokenTotals {
@@ -786,6 +827,7 @@ func (s *completionStream) TokenTotals() tokenTotals {
 		inputWarm: s.globalInputWarm,
 		output:    s.globalOutputTokens,
 		cached:    s.globalCachedTokens,
+		cacheHits: s.globalCacheHits,
 	}
 	s.mu.Unlock()
 	return t
@@ -1182,15 +1224,20 @@ type autoState struct {
 	climbDirection  int     // +1 climbing, -1 retreating, 0 holding
 	stallCount      int     // consecutive evals where RPS didn't meaningfully change
 
-	seriesDone   bool
-	cacheWarning bool // server doesn't appear to support caching
+	seriesDone bool
+	// cacheWarning is no longer stored here: it used to be a sticky latch set
+	// by a periodic windowed check (noCacheDataObserved) and never cleared,
+	// which meant one all-cold-start window could flag a run that was caching
+	// fine for the rest of its life. It's now recomputed on demand from the
+	// all-time counters in completionStream — see noCacheEverObserved.
 
 	// sawResponseEver/sawUsageEver track whether ANY completed (non-error,
 	// non-skipped) response ever carried a usage object, over the whole run —
-	// see recordReplayRequest and the openai_sglang "no usage ever observed"
-	// warning in printAutoSummary. Atomics: recordReplayRequest runs on every
-	// series' own goroutine, and this is a monotonic latch, not a counter
-	// needing st.mu's broader critical section.
+	// see trackUsageObserved (called from both recordReplayRequest and the
+	// synthetic path's recording block) and the openai_sglang "no usage ever
+	// observed" warning in printAutoSummary. Atomics: both call sites run on
+	// every series' own goroutine, and this is a monotonic latch, not a
+	// counter needing st.mu's broader critical section.
 	sawResponseEver atomic.Bool
 	sawUsageEver    atomic.Bool
 
@@ -1342,6 +1389,23 @@ type autoState struct {
 	// Hot-pool gate: nil when no hot series configured; when non-nil, the first
 	// H workers use this dedicated gate sized H × hotGateFanoutMultiplier.
 	hotGate *concurrencyGate
+}
+
+// trackUsageObserved updates st.sawResponseEver/sawUsageEver for one
+// completed request. Shared by recordReplayRequest (replay.go, used by both
+// dataset-replay and router-replay) and the synthetic path's inline
+// recording block in runSingleModelBenchmark, so every run type feeds the
+// same openai_sglang "no usage ever observed" signal — only a request that
+// actually completed (non-error, non-skipped) counts as evidence either way;
+// see the field doc comment on autoState.
+func trackUsageObserved(st *autoState, isErr, skipped, usageObserved bool) {
+	if isErr || skipped {
+		return
+	}
+	st.sawResponseEver.Store(true)
+	if usageObserved {
+		st.sawUsageEver.Store(true)
+	}
 }
 
 // earlyColdStartTTFT returns the average TTFT of the first min(16, n/3) cold-start samples.
@@ -2096,7 +2160,6 @@ func runSingleModelBenchmark(
 		concurrency := st.concurrency
 		concEvalAfter := st.concEvalAfter
 		seriesDone := st.seriesDone
-		cacheWarning := st.cacheWarning
 		allTimePeakRPS := st.allTimePeakRPS
 		allTimePeakConc := st.allTimePeakConc
 		allTimePeakSeries := st.allTimePeakSeries
@@ -2112,6 +2175,11 @@ func runSingleModelBenchmark(
 		cm := st.stream.CacheMetrics(cfg.CacheWindowSize, cfg.MinStabilization)
 		tm := st.stream.ThroughputMetricsByCount(cfg.CacheWindowSize)
 		tt := st.stream.TokenTotals()
+
+		// Run-wide, not windowed — see noCacheEverObserved — so this can't
+		// latch true from one unlucky cold-start-only window and then stay
+		// true after the server starts actually reporting cache hits.
+		cacheWarning := noCacheEverObserved(tt, total-errors, cfg.MinStabilization)
 
 		var seriesStatus string
 		switch {
@@ -2602,6 +2670,12 @@ func runSingleModelBenchmark(
 				isErr := metrics.Error != nil
 				explicitCache := metrics.UsageData.CachedTokens.Count > 0
 
+				// Previously only wired for replay paths (recordReplayRequest),
+				// so a synthetic run against a server that never reports usage
+				// never surfaced the openai_sglang no-usage warning. See
+				// trackUsageObserved's doc.
+				trackUsageObserved(st, isErr, metrics.Skipped, metrics.UsageObserved)
+
 				earlyColdBaseline := st.earlyColdStartTTFT()
 
 				st.mu.Lock()
@@ -3050,14 +3124,6 @@ func runSingleModelBenchmark(
 		cm2 := st.stream.CacheMetrics(cfg.CacheWindowSize, cfg.MinStabilization)
 		hitRate := cm2.hitRate
 
-		// Latch cacheWarning once neither signal has ever shown a hit over a
-		// large-enough window — see noCacheDataObserved.
-		if noCacheDataObserved(cm2, cfg.MinStabilization) {
-			st.mu.Lock()
-			st.cacheWarning = true
-			st.mu.Unlock()
-		}
-
 		if cfg.VerboseCache && cm2.count > 0 && math.Abs(hitRate-lastVerboseHitRate) >= 0.03 {
 			lastVerboseHitRate = hitRate
 			frozenBaseline := st.earlyColdStartTTFT()
@@ -3284,7 +3350,6 @@ func runSingleModelBenchmark(
 		cacheHitRate:      cm.DisplayHitRate(),
 		inputTokPerSec:    tm.inputTokPerSec,
 		outputTokPerSec:   tm.outputTokPerSec,
-		cacheWarning:      st.cacheWarning,
 	}
 	st.mu.Unlock()
 
@@ -3309,6 +3374,10 @@ func runSingleModelBenchmark(
 	res.totalInputWarm = tt.inputWarm
 	res.totalOutput = tt.output
 	res.totalCachedTokens = tt.cached
+	// Run-wide, not windowed — see noCacheEverObserved — so a single
+	// all-cold-start window early in the run can no longer latch this true
+	// for a run that went on to show real cache hits.
+	res.cacheWarning = noCacheEverObserved(tt, res.totalCompleted-res.totalErrors, cfg.MinStabilization)
 	res.valReqs = st.valReqs.Load()
 	res.valUUIDChecks = st.valUUIDChecks.Load()
 	res.valUUIDFound = st.valUUIDFound.Load()
@@ -3340,13 +3409,15 @@ func runSingleModelBenchmark(
 		st.mu.Lock()
 		series := st.series
 		concurrency := st.concurrency
-		cacheWarning := st.cacheWarning
 		allTimePeakRPS := st.allTimePeakRPS
 		allTimePeakConc := st.allTimePeakConc
 		allTimePeakSeries := st.allTimePeakSeries
 		st.mu.Unlock()
 		total := st.totalCompleted.Load()
 		errors := st.totalErrors.Load()
+		// Already computed run-wide above (see noCacheEverObserved) — reuse
+		// rather than re-deriving from the stale per-window latch.
+		cacheWarning := res.cacheWarning
 		gateActive, gateColdWaiting, gateNormalWait := st.gate.GateStats()
 		gateHotActive := 0
 		if st.hotGate != nil {
