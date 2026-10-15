@@ -4582,20 +4582,19 @@ function tlSyncFromReport() {
 // One curve per enabled arm, from the same records the metrics view plots, on
 // each arm's own elapsed clock (so arms line up like the metrics view's) and
 // over the report's zoom window. Each arm keeps its report colour (hbm green,
-// dram orange, weka purple). The TTFT selector shows the TTFT at each point as
-// a dot on the floor under it, a half-transparent leg from the curve to the
-// floor (both green at 0 s to red at TTFT_MAX), or a tint of the line itself.
+// dram orange, weka purple). Dots along each curve carry the TTFT there, green
+// at 0 s to red at TTFT_MAX, keyed by a colour bar beside the cube.
 const V3 = (() => {
   // Built on first show: the report script also runs headless (tests, public
   // export), where nothing should touch this view's DOM.
   const host = document.getElementById("v3Host");
-  let cv, cx, tip, elY, elZ, elArms, elSm, elTT, built = false, expanded = false;
+  let cv, cx, tip, elY, elZ, elArms, elSm, built = false, expanded = false;
   const BINS = 240, CAM = 4;
-  const TTFT_MAX = 20000;   // ms: legs are fully red at and above this
-  const LINE_DOT_EVERY = 6;  // line dots: one per this many bins (~40 per arm)
+  const TTFT_MAX = 20000;   // ms: dots are fully red at and above this
+  const LINE_DOT_EVERY = 6;  // one TTFT dot per this many bins (~40 per arm)
   const VIEWS = { iso: [-0.62, 0.38], front: [0, 0], top: [0, Math.PI / 2 - 0.001], side: [-Math.PI / 2, 0] };
   let yaw = VIEWS.iso[0], pitch = VIEWS.iso[1], zoom = 1;
-  let cw = 0, ch = 0, enabled = new Set([0]), shown = false, proj = [];
+  let cw = 0, ch = 0, enabled = new Set(DATA.map((_, i) => i)), shown = false, proj = [];   // every arm on by default
 
   // ---- data ----
   // Per arm over [t0, t1] (elapsed ms): Y per bin and active series per bin.
@@ -4692,20 +4691,9 @@ const V3 = (() => {
     if (h[0] === "#") return [1, 3, 5].map(i => parseInt(h.substr(i, 2), 16));
     const m = h.match(/[\d.]+/g); return m ? m.slice(0, 3).map(Number) : [200, 200, 200];
   }
-  // Leg colour for a TTFT: hue 120 (green) at 0 s down to 0 (red) at TTFT_MAX.
+  // Dot colour for a TTFT: hue 120 (green) at 0 s down to 0 (red) at TTFT_MAX.
   const ttftHue = ms => 120 * (1 - Math.min(Math.max(ms, 0), TTFT_MAX) / TTFT_MAX);
-  const legColor = (ms, a) => "hsla(" + ttftHue(ms).toFixed(0) + ",75%,52%," + a + ")";
-  // Line tint variant: the arm colour unchanged between 5 s and 10 s TTFT, toward
-  // red above (fully at 20 s), toward green below (fully at 0).
-  const TINT_GREEN = 5000, TINT_RED = 10000, RED = [235, 70, 70], GREEN = [70, 205, 110];
-  function ttftTint(base, ms) {
-    let to = null, w = 0;
-    if (ms > TINT_RED) { to = RED; w = Math.min(1, (ms - TINT_RED) / (TTFT_MAX - TINT_RED)); }
-    else if (ms < TINT_GREEN) { to = GREEN; w = (TINT_GREEN - ms) / TINT_GREEN; }
-    if (!to) return base;
-    w *= 0.7;   // keep the arm recognisable under the tint
-    return base.map((v, k) => Math.round(v * (1 - w) + to[k] * w));
-  }
+  const ttftColor = (ms, a) => "hsla(" + ttftHue(ms).toFixed(0) + ",75%,52%," + a + ")";
   const css = (c, a) => "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + (a === undefined ? 1 : a) + ")";
 
   // ---- format ----
@@ -4834,44 +4822,17 @@ const V3 = (() => {
       if (!pts.length) return;
       line(pts.map(v => [v[0], -1, v[2]]), css(c, 0.28), 1.2);
       line(pts.map(v => [v[0], v[1], zBack]), css(c, 0.22), 1.2);
-      if (elTT.value === "legs") {
-        // legs: curve to floor, half transparent, coloured by TTFT at that point
-        cx.lineWidth = 1.6;
-        for (let k = 0; k < pts.length; k += 2) {
-          const a = P(pts[k][0], -1, pts[k][2]), b2 = P(pts[k][0], pts[k][1], pts[k][2]);
-          cx.strokeStyle = legColor(pts[k][6], 0.45);
-          cx.beginPath(); cx.moveTo(a[0], a[1]); cx.lineTo(b2[0], b2[1]); cx.stroke();
-        }
-      } else if (elTT.value === "dots") {
-        // dots on the floor under each point, coloured by TTFT at that point
-        for (let k = 0; k < pts.length; k++) {
-          const a = P(pts[k][0], -1, pts[k][2]);
-          cx.fillStyle = legColor(pts[k][6], 0.8);
-          cx.beginPath(); cx.arc(a[0], a[1], 2.6, 0, 2 * Math.PI); cx.fill();
-        }
-      }
-      if (elTT.value === "tint") {
-        cx.lineWidth = 2.2; cx.lineCap = "round";
-        for (let k = 1; k < pts.length; k++) {
-          const a = P(pts[k - 1][0], pts[k - 1][1], pts[k - 1][2]), b2 = P(pts[k][0], pts[k][1], pts[k][2]);
-          cx.strokeStyle = css(ttftTint(c, (pts[k - 1][6] + pts[k][6]) / 2));
-          cx.beginPath(); cx.moveTo(a[0], a[1]); cx.lineTo(b2[0], b2[1]); cx.stroke();
-        }
-        cx.lineCap = "butt";
-      } else line(pts, css(c), 2.2);
-      if (elTT.value === "linedots") {
-        // dots on the curve itself, every LINE_DOT_EVERY steps, coloured by TTFT there
-        for (let k = 0; k < pts.length; k += LINE_DOT_EVERY) {
-          const a = P(pts[k][0], pts[k][1], pts[k][2]);
-          cx.beginPath(); cx.arc(a[0], a[1], 3.6, 0, 2 * Math.PI);
-          cx.fillStyle = legColor(pts[k][6], 0.95); cx.fill();
-          cx.lineWidth = 1; cx.strokeStyle = "rgba(13,16,19,0.9)"; cx.stroke();
-        }
+      line(pts, css(c), 2.2);
+      // TTFT: dots on the curve every LINE_DOT_EVERY steps, coloured by TTFT there
+      for (let k = 0; k < pts.length; k += LINE_DOT_EVERY) {
+        const a = P(pts[k][0], pts[k][1], pts[k][2]);
+        cx.beginPath(); cx.arc(a[0], a[1], 3.6, 0, 2 * Math.PI);
+        cx.fillStyle = ttftColor(pts[k][6], 0.95); cx.fill();
+        cx.lineWidth = 1; cx.strokeStyle = "rgba(13,16,19,0.9)"; cx.stroke();
       }
       pts.forEach(v => { const s = P(v[0], v[1], v[2]); proj.push({ x: s[0], y: s[1], i, t: v[3], yv: v[4], zv: v[5], tt: v[6] }); });
     });
     // TTFT legend: a vertical colour bar beside the cube
-    if (elTT.value === "off") return;
     // Fixed beside the cube: just outside the furthest any corner can project at
     // the default zoom under any rotation (a corner is sqrt(3) from the centre;
     // nearest to the camera it is magnified by CAM / (CAM - sqrt(3))), so the bar
@@ -4881,7 +4842,7 @@ const V3 = (() => {
     const bx = Math.min(cw - 60, cw / 2 + reach + 24), by = ch / 2 + 10 - bh / 2;
     cx.font = "11px sans-serif"; cx.textAlign = "center"; cx.fillStyle = "#C9C9C9";
     cx.fillText("TTFT", bx + bw2 / 2, by - 12);
-    const tintAt = ms => elTT.value === "tint" ? css(ttftTint([150, 150, 150], ms)) : legColor(ms, 0.95);
+    const tintAt = ms => ttftColor(ms, 0.95);
     for (let k = 0; k < bh; k++) {   // top = TTFT_MAX, bottom = 0
       cx.fillStyle = tintAt(TTFT_MAX * (1 - k / bh));
       cx.fillRect(bx, by + k, bw2, 1);
@@ -4893,9 +4854,6 @@ const V3 = (() => {
       cx.fillRect(bx + bw2, y - 0.5, 4, 1);
       cx.fillText(v / 1000 + "s" + (v === TTFT_MAX ? "+" : ""), bx + bw2 + 7, y + 3);
     }
-    const what = { linedots: "line dots", dots: "floor dots", legs: "legs", tint: "line tint (grey = arm colour)" }[elTT.value];
-    cx.textAlign = "center"; cx.fillStyle = "#8a9096"; cx.font = "10px sans-serif";
-    cx.fillText(what, bx + bw2 / 2 + 10, by + bh + 18);
   }
 
   function init() {
@@ -4910,8 +4868,6 @@ const V3 = (() => {
     '<option value="series">active series</option>' +
     '<option value="infl">requests in flight</option>' +
     '<option value="adt">active dataset (tokens)</option></select></label>' +
-    '<label title="How the TTFT at each point is shown: dots on the floor under the curve, or legs from the curve to the floor">TTFT <select class="v3-tt">' +
-    '<option value="linedots">line dots</option><option value="dots">floor dots</option><option value="legs">legs</option><option value="tint">line tint</option><option value="off">off</option></select></label>' +
     '<label title="Moving average over Y (and over Z for requests in flight)">Smooth <select class="v3-smooth">' +
     '<option value="0">off</option><option value="60000">1 min</option><option value="120000" selected>2 min</option>' +
     '<option value="300000">5 min</option><option value="600000">10 min</option></select></label>' +
@@ -4923,7 +4879,7 @@ const V3 = (() => {
     '<span class="v3-hint">Drag to rotate &middot; wheel zooms &middot; double-click resets</span>' +
     '</div><canvas class="v3-canvas"></canvas><div class="v3-tip"></div>';
   const q = c => host.querySelector(c);
-  cv = q(".v3-canvas"); cx = cv.getContext("2d"); tip = q(".v3-tip"); elY = q(".v3-y"); elArms = q(".v3-arms"); elSm = q(".v3-smooth"); elZ = q(".v3-z"); elTT = q(".v3-tt");
+  cv = q(".v3-canvas"); cx = cv.getContext("2d"); tip = q(".v3-tip"); elY = q(".v3-y"); elArms = q(".v3-arms"); elSm = q(".v3-smooth"); elZ = q(".v3-z");
   // ---- interaction ----
   let drag = null;
   cv.addEventListener("mousedown", e => { drag = { x: e.clientX, y: e.clientY, yaw, pitch }; tip.style.display = "none"; });
@@ -4957,7 +4913,6 @@ const V3 = (() => {
   elY.addEventListener("change", draw);
   elSm.addEventListener("change", draw);
   elZ.addEventListener("change", draw);
-  elTT.addEventListener("change", draw);
   const elExpand = q(".v3-expand");
   function setExpanded(on) {
     expanded = on;
