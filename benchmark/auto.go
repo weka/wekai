@@ -567,6 +567,7 @@ type completionStream struct {
 	globalInputWarm    int64 // full prompt tokens (non-cached + server-cached) from warm (non-cold) requests
 	globalOutputTokens int64 // output tokens from all non-error requests
 	globalCachedTokens int64 // server-reported cached prompt tokens (all non-error requests)
+	globalCacheHits    int64 // non-cold-start, non-error records where cacheHit was true (TTFT-heuristic or explicit) — run-wide version of cacheMetrics.hitRate's numerator
 }
 
 func newCompletionStream(maxKeep int) *completionStream {
@@ -606,6 +607,9 @@ func (s *completionStream) Add(r completionRecord) {
 		s.globalInputCold += full - warm
 		s.globalOutputTokens += int64(r.outputTokens)
 		s.globalCachedTokens += int64(r.cachedTokens)
+		if !r.isColdStart && r.cacheHit {
+			s.globalCacheHits++
+		}
 	}
 }
 
@@ -717,13 +721,25 @@ func noCacheDataObserved(m cacheMetrics, minCount int) bool {
 // finish with a clearly non-zero DisplayHitRate right next to a "server may
 // not support prompt caching" warning.
 //
-// tt.cached and tt.inputWarm (see TokenTotals/GlobalLocalCacheRate) are
-// running totals that only grow, so this can only ever go from true to
-// false as real cache activity accumulates — never the other way — which is
-// exactly the "once real activity is seen, stop warning" behavior the
-// windowed latch was supposed to have and didn't.
+// tt.cached and tt.cacheHits (see TokenTotals) are running totals that only
+// grow, so this can only ever go from true to false as real cache activity
+// accumulates — never the other way — which is exactly the "once real
+// activity is seen, stop warning" behavior the windowed latch was supposed
+// to have and didn't.
+//
+// tt.inputWarm is deliberately NOT part of this check even though it was
+// originally: it's purely the client-side content estimator's guess
+// (localCacheRatio) at how much of the prompt volume looks like repeated,
+// cacheable content, computed with zero server feedback. A repeated prompt
+// inflates inputWarm even when the server never actually caches anything,
+// which let this warning stay silent next to a genuine 0% server-reported
+// hit rate. tt.cacheHits is the confirmed signal instead: it's incremented
+// only for non-cold-start records where cacheHit is true — itself true on
+// either an explicit server-reported cachedTokens>0 or the TTFT heuristic
+// (TTFT <= 50% of the cold baseline) — the same basis the windowed
+// CacheMetrics/hitRate check already trusts.
 func noCacheEverObserved(tt tokenTotals, nonErrorCount int64, minCount int) bool {
-	return nonErrorCount >= int64(minCount) && tt.cached == 0 && tt.inputWarm == 0
+	return nonErrorCount >= int64(minCount) && tt.cached == 0 && tt.cacheHits == 0
 }
 
 // cacheWarningMessage tailors the cacheWarning explanation to what the model
@@ -801,6 +817,7 @@ type tokenTotals struct {
 	inputWarm int64
 	output    int64
 	cached    int64
+	cacheHits int64
 }
 
 func (s *completionStream) TokenTotals() tokenTotals {
@@ -810,6 +827,7 @@ func (s *completionStream) TokenTotals() tokenTotals {
 		inputWarm: s.globalInputWarm,
 		output:    s.globalOutputTokens,
 		cached:    s.globalCachedTokens,
+		cacheHits: s.globalCacheHits,
 	}
 	s.mu.Unlock()
 	return t
