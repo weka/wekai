@@ -916,6 +916,20 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   .view-switch button { font: inherit; padding: 3px 12px; background: #171C20; color: #C9C9C9; border: 1px solid #42464A; border-radius: 4px; cursor: pointer; }
   .view-switch button.on { background: #2A3038; color: #F2F2EB; border-color: #7C03EC; }
   #tlHost { display: none; }
+  #v3Host { display: none; position: relative; }
+  .v3-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 0 0 6px; font-size: 0.8em; color: #8a9096; }
+  .v3-bar select, .v3-bar button { font: inherit; padding: 2px 8px; background: #171C20; color: #F2F2EB; border: 1px solid #42464A; border-radius: 4px; cursor: pointer; }
+  .v3-bar button:hover { background: #2A3038; }
+  .v3-arms { display: inline-flex; flex-wrap: wrap; gap: 4px 12px; }
+  .v3-arms label { display: inline-flex; align-items: center; gap: 4px; color: #C9C9C9; cursor: pointer; }
+  .v3-arms i { display: inline-block; width: 12px; height: 8px; border-radius: 1px; }
+  .v3-rate { color: #8a9096; }
+  .v3-views { display: inline-flex; align-items: center; gap: 3px; }
+  .v3-hint { margin-left: auto; }
+  .v3-canvas { display: block; cursor: grab; background: #0D1013; border: 1px solid #42464A; border-radius: 6px; }
+  .v3-tip { position: fixed; z-index: 50; display: none; padding: 6px 9px; background: #1E2429; color: #F2F2EB; border: 1px solid #42464A; border-radius: 6px; font-size: 12px; line-height: 1.45; pointer-events: none; }
+  .v3-tip b { color: #C79FF1; font-weight: 500; }
+  .v3-dim { color: #8a9096; }
 {{.TimelineCSS}}
 </style>
 </head>
@@ -960,10 +974,12 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
 </div>
 <div class="view-switch" id="viewSwitch" hidden>View:
   <button id="viewMetrics" class="on">Metrics</button>
-  <button id="viewTimeline">Timeline</button>
+  <button id="viewTimeline" hidden>Timeline</button>
+  <button id="view3D" title="Time x throughput x active series, per arm">3D</button>
 </div>
 <canvas id="chart"></canvas>
 <div id="tlHost"></div>
+<div id="v3Host"></div>
 <div id="tooltip"></div>
 <div id="helpTip" class="help-tip" role="tooltip"></div>
 <div id="ctxModal" class="modal-backdrop">
@@ -4572,46 +4588,340 @@ function tlSyncFromReport() {
   if (!timelineMode || !tlView) return;
   if (isZoomed()) tlView.setView(viewTMin, viewTMax); else tlView.setView(null, null);
 }
+// --- 3D view: time (X) x throughput (Y, up) x active series (Z, depth) ---
+// One curve per enabled arm, from the same records the metrics view plots, on
+// each arm's own elapsed clock (so arms line up like the metrics view's) and
+// over the report's zoom window. Each arm keeps its palette colour, blended
+// toward green or red by its output tok/s relative to the other enabled arms
+// over that window, so the best and worst arms read at a glance.
+const V3 = (() => {
+  // Built on first show: the report script also runs headless (tests, public
+  // export), where nothing should touch this view's DOM.
+  const host = document.getElementById("v3Host");
+  let cv, cx, tip, elY, elArms, elSm, built = false;
+  const BINS = 240, CAM = 4;
+  const VIEWS = { iso: [-0.62, 0.38], front: [0, 0], top: [0, Math.PI / 2 - 0.001], side: [-Math.PI / 2, 0] };
+  let yaw = VIEWS.iso[0], pitch = VIEWS.iso[1], zoom = 1;
+  let cw = 0, ch = 0, enabled = new Set([0]), shown = false, proj = [];
+
+  // ---- data ----
+  // Per arm over [t0, t1] (elapsed ms): Y per bin and active series per bin.
+  // Output tokens are spread over each request's decode interval (first token
+  // to completion), input tokens land at first token, requests at completion.
+  // A series is active from its first request's start to its last's end.
+  function armBins(s, ymode, t0, t1) {
+    const bw = (t1 - t0) / BINS, y = new Float64Array(BINS), z = new Float64Array(BINS + 1);
+    const bin = t => Math.floor((t - t0) / bw);
+    const add = (t, v) => { const b = bin(t); if (b >= 0 && b < BINS) y[b] += v; };
+    const life = new Map();
+    let end = 0, outTot = 0;
+    for (const r of s.records) {
+      const resp = Math.max(r.resp || 0, 0), e = r.t + resp;
+      if (e > end) end = e;
+      const L = life.get(r.sn);
+      if (!L) life.set(r.sn, [r.t, e]); else { if (r.t < L[0]) L[0] = r.t; if (e > L[1]) L[1] = e; }
+      if (ymode === "req") { add(e, 1); continue; }
+      const ft = r.t + Math.min(Math.max(r.ttft || 0, 0), resp);
+      if (ymode === "in") { add(ft, (r.in || 0) + (r.ca || 0)); continue; }
+      const out = r.out || 0;
+      if (e >= t0 && e <= t1) outTot += out;
+      if (!out) continue;
+      if (e - ft < 1) { add(e, out); continue; }
+      // pro rata over the bins the decode interval overlaps
+      const lo = Math.max(ft, t0), hi = Math.min(e, t1);
+      for (let b = Math.max(0, bin(lo)); b < BINS && t0 + b * bw < hi; b++) {
+        const a = Math.max(lo, t0 + b * bw), c = Math.min(hi, t0 + (b + 1) * bw);
+        if (c > a) y[b] += out * (c - a) / (e - ft);
+      }
+    }
+    if (ymode !== "out") outTot = s.records.reduce((n, r) => { const e = r.t + Math.max(r.resp || 0, 0); return e >= t0 && e <= t1 ? n + (r.out || 0) : n; }, 0);
+    for (const [, L] of life) {
+      const a = Math.max(0, bin(L[0])), b = Math.min(BINS - 1, bin(L[1]));
+      if (b < 0 || a >= BINS || a > b) continue;
+      z[a] += 1; z[b + 1] -= 1;
+    }
+    const zs = new Float64Array(BINS);
+    for (let b = 0, run = 0; b < BINS; b++) { run += z[b]; zs[b] = run; }
+    for (let b = 0; b < BINS; b++) y[b] /= bw / 1000;
+    const half = Math.floor(+elSm.value / bw / 2);
+    if (half > 0) {
+      const src = y.slice();
+      for (let b = 0; b < BINS; b++) {
+        let n = 0, sum = 0;
+        for (let k = Math.max(0, b - half); k <= Math.min(BINS - 1, b + half); k++) { sum += src[k]; n++; }
+        y[b] = sum / n;
+      }
+    }
+    // The arm's output rate over the part of the window it actually ran.
+    const dur = Math.max(1, Math.min(t1, end) - t0) / 1000;
+    return { y, z: zs, bw, end, outRate: outTot / dur };
+  }
+
+  // ---- colour ----
+  const probe = document.createElement("canvas").getContext("2d");
+  function rgb(c) {
+    probe.fillStyle = "#000"; probe.fillStyle = c;
+    const h = probe.fillStyle;
+    if (h[0] === "#") return [1, 3, 5].map(i => parseInt(h.substr(i, 2), 16));
+    const m = h.match(/[\d.]+/g); return m ? m.slice(0, 3).map(Number) : [200, 200, 200];
+  }
+  function hsl2rgb(h, s, l) {
+    const k = n => (n + h / 30) % 12, a = s * Math.min(l, 1 - l);
+    const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1));
+    return [f(0) * 255, f(8) * 255, f(4) * 255];
+  }
+  function armColor(i, score) {
+    const base = rgb(seriesColors[i]);
+    if (score === null) return base;
+    const sc = hsl2rgb(score * 125, 0.75, 0.5);   // 0 red .. 1 green
+    return base.map((v, k) => Math.round(v * 0.45 + sc[k] * 0.55));
+  }
+  const css = (c, a) => "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + (a === undefined ? 1 : a) + ")";
+
+  // ---- format ----
+  function fmtT(ms) {
+    const s = Math.round(ms / 1000), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), ss = s % 60;
+    return h ? h + "h" + (m ? (m < 10 ? "0" : "") + m + "m" : "") : m ? m + "m" + (ss ? ss + "s" : "") : ss + "s";
+  }
+  function fmtN(v) { return v >= 1e6 ? (v / 1e6).toFixed(2) + "M" : v >= 1e4 ? (v / 1e3).toFixed(1) + "k" : v >= 1e3 ? (v / 1e3).toFixed(2) + "k" : v >= 10 ? Math.round(v) + "" : v.toFixed(1); }
+  function nice(max, n) {
+    const raw = max / n, p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / p;
+    return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
+  }
+  const yLabel = () => elY.options[elY.selectedIndex].text;
+
+  // ---- projection: world [-1,1]^3, y up; yaw about y, then pitch about x ----
+  function P(x, y, z) {
+    const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const x1 = x * cy + z * sy, z1 = -x * sy + z * cy;
+    const y2 = y * cp - z1 * sp, z2 = y * sp + z1 * cp;
+    const k = Math.min(cw, ch) * 0.29 * zoom * CAM / (CAM + z2);
+    return [cw / 2 + x1 * k, ch / 2 - y2 * k + 10, z2];
+  }
+  function line(pts, color, width) {
+    cx.strokeStyle = color; cx.lineWidth = width; cx.beginPath();
+    pts.forEach((p, i) => { const s = P(p[0], p[1], p[2]); if (i) cx.lineTo(s[0], s[1]); else cx.moveTo(s[0], s[1]); });
+    cx.stroke();
+  }
+  function text(s, x, y, z, align, color) {
+    const p = P(x, y, z); cx.fillStyle = color || "#8a9096"; cx.textAlign = align || "center"; cx.fillText(s, p[0], p[1]);
+  }
+
+  // ---- arm picker ----
+  function buildArms(stats) {
+    elArms.innerHTML = DATA.map((s, i) =>
+      '<label title="' + s.name.replace(/"/g, "&quot;") + '"><input type="checkbox" data-i="' + i + '"' + (enabled.has(i) ? " checked" : "") + '>' +
+      '<i style="background:' + css(stats[i] ? stats[i].color : rgb(seriesColors[i])) + '"></i>' + getAlias(s.name) +
+      (stats[i] ? ' <span class="v3-rate">' + fmtN(stats[i].outRate) + " out/s</span>" : "") + "</label>").join("");
+    elArms.querySelectorAll("input").forEach(el => el.addEventListener("change", () => {
+      const i = +el.getAttribute("data-i");
+      if (el.checked) enabled.add(i); else if (enabled.size > 1) enabled.delete(i); else el.checked = true;
+      draw();
+    }));
+  }
+
+  // ---- draw ----
+  let cache = { key: "", data: null };
+  function compute() {
+    const zoomed = isZoomed();
+    const arms = [...enabled].sort((a, b) => a - b);
+    let t0 = 0, t1 = 0;
+    if (zoomed) { t0 = viewTMin; t1 = viewTMax; }
+    else arms.forEach(i => DATA[i].records.forEach(r => { const e = r.t + Math.max(r.resp || 0, 0); if (e > t1) t1 = e; }));
+    if (t1 <= t0) t1 = t0 + 1000;
+    const key = arms.join(",") + "|" + elY.value + "|" + elSm.value + "|" + t0 + "|" + t1;
+    if (cache.key === key) return cache.data;
+    const per = {};
+    arms.forEach(i => { per[i] = armBins(DATA[i], elY.value, t0, t1); });
+    const rates = arms.map(i => per[i].outRate), lo = Math.min(...rates), hi = Math.max(...rates);
+    arms.forEach(i => { per[i].score = arms.length > 1 ? (hi > lo ? (per[i].outRate - lo) / (hi - lo) : 0.5) : null; per[i].color = armColor(i, per[i].score); });
+    let ymax = 1, zmax = 1;
+    arms.forEach(i => { per[i].y.forEach(v => { if (v > ymax) ymax = v; }); per[i].z.forEach(v => { if (v > zmax) zmax = v; }); });
+    cache = { key, data: { arms, per, t0, t1, ymax: ymax * 1.05, zmax: zmax * 1.05 } };
+    return cache.data;
+  }
+  function draw() {
+    if (!shown) return;
+    const d = compute(), dpr = window.devicePixelRatio || 1;
+    const stats = {}; d.arms.forEach(i => { stats[i] = d.per[i]; });
+    buildArms(stats);
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    cx.fillStyle = "#0D1013"; cx.fillRect(0, 0, cw, ch);
+    cx.font = "11px monospace";
+    const X = t => (t - d.t0) / (d.t1 - d.t0) * 2 - 1, Y = v => v / d.ymax * 2 - 1, Z = v => v / d.zmax * 2 - 1;
+    // Which faces are at the back: the floor is always y=-1; walls go on the far side of z and x.
+    const zBack = P(0, 0, 1)[2] > P(0, 0, -1)[2] ? 1 : -1, xBack = P(1, 0, 0)[2] > P(-1, 0, 0)[2] ? 1 : -1;
+    const zFront = -zBack, xFront = -xBack;
+    // grid: time ticks on floor + back wall, series ticks on floor + side wall, Y ticks on both walls
+    const tStep = nice((d.t1 - d.t0), 8), yStep = nice(d.ymax, 5), zStep = Math.max(1, nice(d.zmax, 5));
+    for (let t = Math.ceil(d.t0 / tStep) * tStep; t <= d.t1; t += tStep) {
+      const x = X(t);
+      line([[x, -1, -1], [x, -1, 1]], "#1c2226", 1); line([[x, -1, zBack], [x, 1, zBack]], "#1c2226", 1);
+      text(fmtT(t), x, -1.08, zFront, "center");
+    }
+    for (let v = 0; v <= d.ymax; v += yStep) {
+      const y = Y(v);
+      line([[-1, y, zBack], [1, y, zBack]], "#1c2226", 1); line([[xBack, y, -1], [xBack, y, 1]], "#1c2226", 1);
+      text(fmtN(v), xFront - 0.04 * Math.sign(xFront || 1), y, zBack, xFront < 0 ? "right" : "left");
+    }
+    for (let v = 0; v <= d.zmax; v += zStep) {
+      const z = Z(v);
+      line([[-1, -1, z], [1, -1, z]], "#1c2226", 1); line([[xBack, -1, z], [xBack, 1, z]], "#1c2226", 1);
+      text(String(Math.round(v)), xFront + 0.06 * Math.sign(xFront || 1), -1.04, z, xFront < 0 ? "right" : "left");
+    }
+    // box edges
+    const E = "#42464A";
+    [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([a, b]) => { line([[a, -1, b], [a, 1, b]], E, 1); });
+    [-1, 1].forEach(y => { line([[-1, y, -1], [1, y, -1], [1, y, 1], [-1, y, 1], [-1, y, -1]], E, 1); });
+    // axis titles
+    cx.font = "12px sans-serif";
+    text("time", 0, -1.2, zFront, "center", "#C9C9C9");
+    text(yLabel(), xFront, 1.1, zBack, "center", "#C9C9C9");
+    text("active series", xFront * 1.25, -1, 0, "center", "#C9C9C9");
+    cx.font = "11px monospace";
+    // curves: floor shadow (time x series), back-wall shadow (time x Y), drop lines, then the curve itself
+    proj = [];
+    d.arms.forEach(i => {
+      const p = d.per[i], c = p.color, pts = [];
+      for (let b = 0; b < BINS; b++) {
+        const t = d.t0 + (b + 0.5) * p.bw;
+        if (!isZoomed() && t > p.end) break;
+        pts.push([X(t), Y(p.y[b]), Z(p.z[b]), t, p.y[b], p.z[b]]);
+      }
+      if (!pts.length) return;
+      line(pts.map(v => [v[0], -1, v[2]]), css(c, 0.28), 1.2);
+      line(pts.map(v => [v[0], v[1], zBack]), css(c, 0.22), 1.2);
+      cx.strokeStyle = css(c, 0.10); cx.lineWidth = 1; cx.beginPath();
+      for (let k = 0; k < pts.length; k += 6) { const a = P(pts[k][0], -1, pts[k][2]), b2 = P(pts[k][0], pts[k][1], pts[k][2]); cx.moveTo(a[0], a[1]); cx.lineTo(b2[0], b2[1]); }
+      cx.stroke();
+      line(pts, css(c), 2.2);
+      pts.forEach(v => { const s = P(v[0], v[1], v[2]); proj.push({ x: s[0], y: s[1], i, t: v[3], yv: v[4], zv: v[5] }); });
+    });
+    // legend: score colours
+    if (d.arms.length > 1) {
+      cx.font = "11px sans-serif"; cx.textAlign = "left"; cx.fillStyle = "#8a9096";
+      cx.fillText("colour: arm palette blended toward green (highest output tok/s over the window) or red (lowest)", 12, ch - 10);
+    }
+  }
+
+  function init() {
+    built = true;
+  host.innerHTML =
+    '<div class="v3-bar">' +
+    '<label>Y <select class="v3-y">' +
+    '<option value="out">output tok/s</option>' +
+    '<option value="in">input tok/s (incl. cached)</option>' +
+    '<option value="req">requests/s</option></select></label>' +
+    '<label title="Moving average over Y">Smooth <select class="v3-smooth">' +
+    '<option value="0">off</option><option value="60000">1 min</option><option value="120000" selected>2 min</option>' +
+    '<option value="300000">5 min</option><option value="600000">10 min</option></select></label>' +
+    '<span class="v3-arms"></span>' +
+    '<button class="v3-all" title="Enable every arm">All arms</button>' +
+    '<span class="v3-views">View <button data-v="iso">3D</button><button data-v="front">time &times; Y</button>' +
+    '<button data-v="top">time &times; series</button><button data-v="side">series &times; Y</button></span>' +
+    '<span class="v3-hint">Drag to rotate &middot; wheel zooms &middot; double-click resets</span>' +
+    '</div><canvas class="v3-canvas"></canvas><div class="v3-tip"></div>';
+  const q = c => host.querySelector(c);
+  cv = q(".v3-canvas"); cx = cv.getContext("2d"); tip = q(".v3-tip"); elY = q(".v3-y"); elArms = q(".v3-arms"); elSm = q(".v3-smooth");
+  // ---- interaction ----
+  let drag = null;
+  cv.addEventListener("mousedown", e => { drag = { x: e.clientX, y: e.clientY, yaw, pitch }; tip.style.display = "none"; });
+  window.addEventListener("mouseup", () => { drag = null; });
+  cv.addEventListener("mousemove", e => {
+    if (drag) {
+      yaw = drag.yaw + (e.clientX - drag.x) * 0.008;
+      pitch = Math.max(-Math.PI / 2 + 0.001, Math.min(Math.PI / 2 - 0.001, drag.pitch + (e.clientY - drag.y) * 0.008));
+      draw(); return;
+    }
+    const b = cv.getBoundingClientRect(), mx = e.clientX - b.left, my = e.clientY - b.top;
+    let best = null, bd = 144;
+    for (const p of proj) { const dd = (p.x - mx) * (p.x - mx) + (p.y - my) * (p.y - my); if (dd < bd) { bd = dd; best = p; } }
+    if (!best) { tip.style.display = "none"; return; }
+    const st = cache.data.per[best.i];
+    tip.innerHTML = "<b>" + getAlias(DATA[best.i].name) + "</b><br>at " + fmtT(best.t) +
+      "<br>" + yLabel() + " <b>" + fmtN(best.yv) + "</b><br>active series <b>" + Math.round(best.zv) + "</b>" +
+      "<br><span class='v3-dim'>window output " + fmtN(st.outRate) + " tok/s</span>";
+    tip.style.display = "block";
+    tip.style.left = Math.min(e.clientX + 14, window.innerWidth - 240) + "px";
+    tip.style.top = (e.clientY + 14) + "px";
+  });
+  cv.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  cv.addEventListener("wheel", e => { e.preventDefault(); zoom = Math.max(0.4, Math.min(4, zoom * Math.exp(-e.deltaY * 0.001))); draw(); }, { passive: false });
+  cv.addEventListener("dblclick", () => { yaw = VIEWS.iso[0]; pitch = VIEWS.iso[1]; zoom = 1; draw(); });
+  q(".v3-views").querySelectorAll("button").forEach(btn => btn.addEventListener("click", () => {
+    const v = VIEWS[btn.getAttribute("data-v")]; yaw = v[0]; pitch = v[1]; draw();
+  }));
+  q(".v3-all").addEventListener("click", () => { DATA.forEach((_, i) => enabled.add(i)); draw(); });
+  elY.addEventListener("change", draw);
+  elSm.addEventListener("change", draw);
+
+  }
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    host.style.width = W + "px";
+    cw = W; ch = Math.max(H, 480) - 40;
+    cv.style.width = cw + "px"; cv.style.height = ch + "px";
+    cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr);
+    draw();
+  }
+  return {
+    show(on) { if (on && !built) init(); shown = on; host.style.display = on ? "block" : "none"; if (on) resize(); },
+    resize() { if (shown) resize(); },
+    redraw() { if (shown) draw(); },
+  };
+})();
+
+// View switch: Metrics (the canvas above), Timeline (only with --timeline
+// data), 3D (always: it is built from the same records as Metrics).
 {
   const withTl = DATA.filter(s => s.timeline);
-  if (withTl.length && typeof WekaiTimeline !== "undefined") {
-    const sw = document.getElementById("viewSwitch");
-    const host = document.getElementById("tlHost");
-    const btnM = document.getElementById("viewMetrics");
-    const btnT = document.getElementById("viewTimeline");
-    sw.hidden = false;
-    const sizeHost = () => {
-      host.style.width = W + "px";
-      host.style.height = Math.max(H, 480) + "px";
-    };
-    const setMode = on => {
-      timelineMode = on;
-      btnM.classList.toggle("on", !on);
-      btnT.classList.toggle("on", on);
-      canvas.style.display = on ? "none" : "";
-      host.style.display = on ? "flex" : "none";
-      if (on) {
-        if (!tlView) {
-          tlView = WekaiTimeline.create(host, {
-            kinds: TIMELINE_KINDS,
-            onZoom: (a, b) => {
-              if (a === null) { resetZoomView(); return; }
-              viewTMin = a; viewTMax = b;
-              recalcYMax();
-              draw();
-            },
-          });
-          tlView.setArms(withTl.map(s => s.timeline));
-        }
-        sizeHost();
-        tlView.resize();
-        tlSyncFromReport();
+  const hasTl = withTl.length && typeof WekaiTimeline !== "undefined";
+  const sw = document.getElementById("viewSwitch");
+  const host = document.getElementById("tlHost");
+  const btnM = document.getElementById("viewMetrics");
+  const btnT = document.getElementById("viewTimeline");
+  const btn3 = document.getElementById("view3D");
+  sw.hidden = false;
+  btnT.hidden = !hasTl;
+  const sizeHost = () => {
+    host.style.width = W + "px";
+    host.style.height = Math.max(H, 480) + "px";
+  };
+  let mode = "metrics";
+  const setMode = m => {
+    mode = m;
+    timelineMode = m === "timeline";
+    btnM.classList.toggle("on", m === "metrics");
+    btnT.classList.toggle("on", m === "timeline");
+    btn3.classList.toggle("on", m === "3d");
+    canvas.style.display = m === "metrics" ? "" : "none";
+    host.style.display = m === "timeline" ? "flex" : "none";
+    V3.show(m === "3d");
+    if (m === "timeline") {
+      if (!tlView) {
+        tlView = WekaiTimeline.create(host, {
+          kinds: TIMELINE_KINDS,
+          onZoom: (a, b) => {
+            if (a === null) { resetZoomView(); return; }
+            viewTMin = a; viewTMax = b;
+            recalcYMax();
+            draw();
+          },
+        });
+        tlView.setArms(withTl.map(s => s.timeline));
       }
-    };
-    btnM.addEventListener("click", () => setMode(false));
-    btnT.addEventListener("click", () => setMode(true));
-    window.addEventListener("resize", () => { if (timelineMode) { sizeHost(); tlView.resize(); } });
-  }
+      sizeHost();
+      tlView.resize();
+      tlSyncFromReport();
+    }
+  };
+  btnM.addEventListener("click", () => setMode("metrics"));
+  btnT.addEventListener("click", () => setMode("timeline"));
+  btn3.addEventListener("click", () => setMode("3d"));
+  window.addEventListener("resize", () => {
+    if (mode === "timeline") { sizeHost(); tlView.resize(); }
+    if (mode === "3d") V3.resize();
+  });
 }
 
 window.addEventListener("resize", () => { resize(); draw(); });

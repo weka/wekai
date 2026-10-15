@@ -322,7 +322,19 @@ var WekaiTimeline = (function () {
       x.beginPath(); x.moveTo(plotL, STRIP_H - 14.5); x.lineTo(plotL + plotW, STRIP_H - 14.5); x.stroke();
       x.font = "10px monospace"; x.fillStyle = "#8a9096"; x.textAlign = "right";
       x.fillText(yfmt(ymax), plotL - 4, 10); x.fillText("0", plotL - 4, STRIP_H - 16);
-      x.textAlign = "left"; x.fillStyle = "#6f767d"; x.fillText(title, plotL + 4, 10);
+      // title: a string, or [name, then {t, c, line?} keys]: each key is a colour
+      // swatch (a bar, or a line for line series) followed by its label.
+      x.textAlign = "left";
+      if (typeof title === "string") { x.fillStyle = "#6f767d"; x.fillText(title, plotL + 4, 10); return x; }
+      var px = plotL + 4;
+      title.forEach(function (it, i) {
+        if (typeof it === "string") { x.fillStyle = "#8a9096"; x.fillText(it, px, 10); px += x.measureText(it).width + 10; return; }
+        if (it.line) {
+          x.strokeStyle = it.c; x.lineWidth = it.w || 1.6; if (it.dash) x.setLineDash([4, 3]);
+          x.beginPath(); x.moveTo(px, 6.5); x.lineTo(px + 12, 6.5); x.stroke(); x.setLineDash([]);
+        } else { x.fillStyle = it.c; x.globalAlpha = 0.85; x.fillRect(px, 3, 10, 7); x.globalAlpha = 1; }
+        px += 15; x.fillStyle = "#b8bec4"; x.fillText(it.t, px, 10); px += x.measureText(it.t).width + 12;
+      });
       return x;
     }
     function drawRateStrip(a, r) {
@@ -336,7 +348,8 @@ var WekaiTimeline = (function () {
         cols.push([tot, comp, ext, gpu, out]);
         if (tot > ymax) ymax = tot; if (out > ymax) ymax = out;
       }
-      var x = stripFrame(c, "tokens/s  input (computed / external / GPU cache)  output", ymax, fmtRate);
+      var x = stripFrame(c, ["tokens/s", { t: "input computed", c: "#d9b73a" }, { t: "input external (offload)", c: "#a678e8" },
+        { t: "input GPU cache", c: "#8094b5" }, { t: "input other", c: "#9aa5b1" }, { t: "output", c: "#6BE0A0", line: true, w: 1.5 }], ymax, fmtRate);
       var base = STRIP_H - 15, hgt = STRIP_H - 26, w = plotW / n;
       for (i = 0; i < n; i++) {
         var col = cols[i], px = plotL + i * w, y = base;
@@ -356,7 +369,9 @@ var WekaiTimeline = (function () {
       c.hidden = false;
       var lim = t.limit_ms || 0, ymax = lim * 1.15 || 1;
       for (var i = 0; i < t.t.length; i++) if (t.t[i] >= r[0] && t.t[i] <= r[1]) { if (t.p95[i] * 1.1 > ymax) ymax = t.p95[i] * 1.1; if (t.mean[i] > ymax) ymax = t.mean[i]; }
-      var x = stripFrame(c, "TTFT over a " + fmtSec((t.window_s || 30)) + " window  mean / p95" + (lim ? " / limit" : ""), ymax, function (v) { return fmtSec(v / 1000); });
+      var key = ["TTFT, " + fmtSec((t.window_s || 30)) + " window", { t: "mean", c: "#C79FF1", line: true }, { t: "p95", c: "#f08a3c", line: true, w: 1 }];
+      if (lim) key.push({ t: "limit", c: "#ff3b3b", line: true, w: 1, dash: true });
+      var x = stripFrame(c, key, ymax, function (v) { return fmtSec(v / 1000); });
       var base = STRIP_H - 15, hgt = STRIP_H - 26;
       function line(arr, color, width) {
         x.strokeStyle = color; x.lineWidth = width; x.beginPath(); var first = true;
@@ -415,7 +430,7 @@ var WekaiTimeline = (function () {
       var act = activity(a, now), ymax = 1;
       [act.series, act.inflight].forEach(function (st) { for (var i = 0; i < st.t.length; i++) if (st.t[i] <= r[1] && st.v[i] > ymax) ymax = st.v[i]; });
       ymax *= 1.1;
-      var x = stripFrame(c, "active series / in flight", ymax, function (v) { return Math.round(v) + ""; });
+      var x = stripFrame(c, [{ t: "active series", c: "#C79FF1", line: true }, { t: "requests in flight", c: "#5f987d", line: true, w: 1 }], ymax, function (v) { return Math.round(v) + ""; });
       var base = STRIP_H - 15, hgt = STRIP_H - 26;
       function step(st, color, width) {
         x.strokeStyle = color; x.lineWidth = width; x.beginPath();
