@@ -66,6 +66,8 @@ html.wtl-expanded-page, html.wtl-expanded-page body { overflow: hidden; }
 .wtl-in-split .wtl-bar .wtl-info { order: 1; }
 .wtl-in-split .wtl-bar .wtl-at { order: 2; flex: 1 0 100%; min-width: 0; }   /* the readout gets its own line */
 .wtl-splitbar { flex-wrap: wrap; }
+.wtl-in-split .wtl-legend { display: none !important; }   /* the split shows one legend for all panes */
+.wtl-splitlegend[hidden] { display: none; }
 .wtl-bar .wtl-panetitle { color: #F2F2EB; font-weight: 500; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Replay controls. */
 .wtl-bar .wtl-play { display: inline-flex; align-items: center; gap: 4px; }

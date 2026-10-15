@@ -1169,9 +1169,9 @@ var WekaiTimeline = (function () {
       '<button class="wtl-stop" title="Stop the replay and show the whole run" hidden>&#x25A0;</button>' +
       '<input type="range" class="wtl-speed" min="0" max="10" step="1" value="5" title="Replay speed">' +
       '<span class="wtl-speedv"></span><span class="wtl-playt"></span></span>' +
-      '</div><div class="wtl-panesrow"></div>';
+      '</div><div class="wtl-legend wtl-splitlegend"></div><div class="wtl-panesrow"></div>';
     var $ = function (c) { return host.querySelector(c); };
-    var row = $(".wtl-panesrow"), elArmSel = $(".wtl-armsel"), elExpand = $(".wtl-expand");
+    var row = $(".wtl-panesrow"), elLegend = $(".wtl-splitlegend"), elArmSel = $(".wtl-armsel"), elExpand = $(".wtl-expand");
     var elPlay = $(".wtl-playbtn"), elRestart = $(".wtl-restart"), elStop = $(".wtl-stop"), elSpeed = $(".wtl-speed");
     var elSpeedV = $(".wtl-speedv"), elPlayT = $(".wtl-playt");
     var arms = [], chosen = null, panes = [], view = [null, null], expanded = false;
@@ -1184,17 +1184,45 @@ var WekaiTimeline = (function () {
     elRowH.value = 1;   // dense by default: the panes show whole runs side by side
     elRowH.addEventListener("change", function () { panes.forEach(function (t) { t.setRowH(+elRowH.value); }); });
     elMerge.addEventListener("change", function () { panes.forEach(function (t) { t.setMerge(elMerge.checked); }); });
+    // One legend for every pane, under the bar; the Legend toggle is the split's
+    // own (per mode, like the panes' panels).
+    var legendOn = { normal: true, expanded: false };
+    function buildLegend() {
+      var kinds = opts.kinds || [], merge = elMerge.checked;
+      elLegend.innerHTML = kinds.filter(function (k) {
+        if (k.id === INFLIGHT_KIND) return !!opts.live;
+        if (k.id === WAITED) return merge;
+        if (WAIT_KINDS[k.id]) return !merge;
+        return true;
+      }).map(function (k) {
+        return '<span><i style="background:' + k.color + '"></i>' + esc(k.label) + "</span>";
+      }).join("") + '<span><i style="background:rgba(124,150,190,0.35)"></i>think pause (idle by design)</span>';
+      elLegend.hidden = !legendOn[expanded ? "expanded" : "normal"];
+    }
     function syncPanelBtns() {
       var on = panes[0] ? panes[0].panels() : {};
-      [].forEach.call(panelBtns, function (b) { b.classList.toggle("on", !!on[b.getAttribute("data-p")]); });
+      [].forEach.call(panelBtns, function (b) {
+        var p = b.getAttribute("data-p");
+        b.classList.toggle("on", p === "legend" ? !!legendOn[expanded ? "expanded" : "normal"] : !!on[p]);
+      });
+      elLegend.hidden = !legendOn[expanded ? "expanded" : "normal"];
     }
     [].forEach.call(panelBtns, function (b) {
       b.addEventListener("click", function () {
-        var p = b.getAttribute("data-p"), on = !(panes[0] && panes[0].panels()[p]);
-        panes.forEach(function (t) { t.setPanel(p, on); });
+        var p = b.getAttribute("data-p");
+        if (p === "legend") {
+          var m = expanded ? "expanded" : "normal";
+          legendOn[m] = !legendOn[m];
+        } else {
+          var on = !(panes[0] && panes[0].panels()[p]);
+          panes.forEach(function (t) { t.setPanel(p, on); });
+        }
         syncPanelBtns();
+        panes.forEach(function (t) { t.resize(); });
       });
     });
+    elMerge.addEventListener("change", buildLegend);
+    buildLegend();
 
     function markExpanded(on) {
       expanded = on;
