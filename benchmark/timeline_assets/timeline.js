@@ -1059,6 +1059,16 @@ var WekaiTimeline = (function () {
       // t in arm ms, or null to show the whole run.
       setReplay: function (t, isPlaying) { cancelAnimationFrame(playRaf); playT = t; playing = !!isPlaying; updPlayUI(); draw(); },
       span: function () { return arm() ? arm().span : 0; },
+      // Shared controls of a split view (the split's bar sets every pane).
+      setRowH: function (h) {   // 0 = this arm's own default
+        if (h > 0) { rowH = h; userRowH = true; } else { userRowH = false; if (arm()) rowH = defaultRowH(arm()); }
+        elRowH.value = rowH; resize();
+      },
+      setMerge: function (on) { merge = !!on; elMerge.checked = merge; buildLegend(); draw(); },
+      setPanel: function (p, on) {   // in the current mode (normal / expanded)
+        panelsOn[expanded ? "expanded" : "normal"][p] = on ? 1 : 0; applyPanels(); sizeKey = ""; resize();
+      },
+      panels: function () { return panelsOn[expanded ? "expanded" : "normal"]; },
       currentArm: function () { return cur; },
       setView: function (a, b) { setView(a, b); },
       getView: function () { return range(); },
@@ -1145,6 +1155,14 @@ var WekaiTimeline = (function () {
       '<div class="wtl-bar wtl-splitbar">' +
       '<button class="wtl-expand" title="Fill the window with the timelines (Esc or Back to return)">&#x2922; Expand</button>' +
       '<span class="wtl-armsel"></span>' +
+      '<label>Row height <select class="wtl-rowh"><option value="0">auto</option></select></label>' +
+      '<label title="Collapse client wait, engine queue and unattributed wait into one colour"><input type="checkbox" class="wtl-merge"> Merge waits</label>' +
+      '<span class="wtl-panels">Show' +
+      '<button data-p="state" title="Run state: sessions, in flight, gate">State</button>' +
+      '<button data-p="legend" title="Colour legend">Legend</button>' +
+      '<button data-p="act" title="Active sessions / in flight over time">Activity</button>' +
+      '<button data-p="rate" title="Input and output tokens/s over time">Tokens/s</button>' +
+      '<button data-p="ttft" title="TTFT over time">TTFT</button></span>' +
       '<span class="wtl-play" title="Replay the run: requests appear as they started and fill in stage by stage">' +
       '<button class="wtl-restart" title="Replay from the start">&#x23EE;</button>' +
       '<button class="wtl-playbtn" title="Play / pause">&#x25B6;</button>' +
@@ -1159,6 +1177,24 @@ var WekaiTimeline = (function () {
     var arms = [], chosen = null, panes = [], view = [null, null], expanded = false;
     var playT = null, playing = false, raf = 0, last = 0;
     var me = { key: {}, apply: function (kind, v) { if (kind === "expand") markExpanded(v); else if (kind === "view") view = v; }, span: function () { return 0; } };
+    // Shared pane controls: row height (auto = each arm's default), merge waits,
+    // panel toggles (per mode, read back from the first pane).
+    var elRowH = $(".wtl-rowh"), elMerge = $(".wtl-merge"), panelBtns = host.querySelectorAll(".wtl-splitbar .wtl-panels button");
+    ROW_HEIGHTS.forEach(function (h) { var o = document.createElement("option"); o.value = h; o.textContent = h + "px"; elRowH.appendChild(o); });
+    elRowH.value = 1;   // dense by default: the panes show whole runs side by side
+    elRowH.addEventListener("change", function () { panes.forEach(function (t) { t.setRowH(+elRowH.value); }); });
+    elMerge.addEventListener("change", function () { panes.forEach(function (t) { t.setMerge(elMerge.checked); }); });
+    function syncPanelBtns() {
+      var on = panes[0] ? panes[0].panels() : {};
+      [].forEach.call(panelBtns, function (b) { b.classList.toggle("on", !!on[b.getAttribute("data-p")]); });
+    }
+    [].forEach.call(panelBtns, function (b) {
+      b.addEventListener("click", function () {
+        var p = b.getAttribute("data-p"), on = !(panes[0] && panes[0].panels()[p]);
+        panes.forEach(function (t) { t.setPanel(p, on); });
+        syncPanelBtns();
+      });
+    });
 
     function markExpanded(on) {
       expanded = on;
@@ -1169,6 +1205,7 @@ var WekaiTimeline = (function () {
     function setExpanded(on) {
       markExpanded(on);
       panes.forEach(function (t) { t.setExpanded(on, true); });
+      syncPanelBtns();
     }
     elExpand.addEventListener("click", function () { setExpanded(!expanded); });
     window.addEventListener("keydown", function (e) { if (e.key === "Escape" && expanded) setExpanded(false); });
@@ -1234,7 +1271,12 @@ var WekaiTimeline = (function () {
         if (view[0] !== null) t.setView(view[0], view[1]);
         panes.push(t);
       });
-      panes.forEach(function (t) { t.resize(); if (expanded) t.setExpanded(true, true); t.setReplay(playT, playing); });
+      panes.forEach(function (t) {
+        t.resize(); if (expanded) t.setExpanded(true, true); t.setReplay(playT, playing);
+        if (+elRowH.value) t.setRowH(+elRowH.value);
+        if (elMerge.checked) t.setMerge(true);
+      });
+      syncPanelBtns();
     }
     return {
       setArms: function (list) {

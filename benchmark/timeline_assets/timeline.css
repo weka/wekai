@@ -60,8 +60,12 @@ html.wtl-expanded-page, html.wtl-expanded-page body { overflow: hidden; }
 .wtl-split > .wtl-panesrow > .wtl-pane { flex: 1 1 0; min-width: 0; min-height: 0; }
 .wtl-splitbar .wtl-armsel { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; color: #8a9096; }
 .wtl-splitbar .wtl-armsel label { color: #C9C9C9; max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.wtl-in-split .wtl-expand, .wtl-in-split .wtl-play, .wtl-in-split .wtl-paneswrap, .wtl-in-split .wtl-armwrap { display: none !important; }
-.wtl-in-split .wtl-bar { flex-wrap: wrap !important; }
+.wtl-in-split .wtl-bar > :not(.wtl-panetitle):not(.wtl-at):not(.wtl-info) { display: none !important; }
+.wtl-in-split .wtl-bar { flex-wrap: wrap !important; row-gap: 2px; }
+.wtl-in-split .wtl-bar .wtl-panetitle { flex: 1 1 0; min-width: 0; }
+.wtl-in-split .wtl-bar .wtl-info { order: 1; }
+.wtl-in-split .wtl-bar .wtl-at { order: 2; flex: 1 0 100%; min-width: 0; }   /* the readout gets its own line */
+.wtl-splitbar { flex-wrap: wrap; }
 .wtl-bar .wtl-panetitle { color: #F2F2EB; font-weight: 500; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Replay controls. */
 .wtl-bar .wtl-play { display: inline-flex; align-items: center; gap: 4px; }
