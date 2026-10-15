@@ -865,6 +865,7 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   .v3-rate { color: #8a9096; }
   .v3-views { display: inline-flex; align-items: center; gap: 3px; }
   .v3-hint { margin-left: auto; }
+  .v3-bar input[type=range] { width: 90px; vertical-align: middle; accent-color: #7C03EC; }
   #v3Host.v3-expanded { position: fixed; inset: 0; z-index: 1000; padding: 8px 14px; background: #0D1013; box-sizing: border-box; }
   .v3-bar .v3-expand { font-weight: 500; }
   .v3-canvas { display: block; cursor: grab; background: #0D1013; border: 1px solid #42464A; border-radius: 6px; }
@@ -1342,8 +1343,8 @@ function applyCtxFilter(minTok, maxTok) {
 // --- Color assignment (official WEKA brand, neutral-first) ---
 // Multi-series palettes are restrained tints DERIVED from the brand set so
 // a 2-8 series report reads as one family: weka arms a purple ramp
-// (#7C03EC/#C79FF1 family), hbm/gpu a muted green ramp, dram a muted orange
-// ramp, the fallback dimmed yellow/green/slate tints. Position and the legend carry identity;
+// (#7C03EC/#C79FF1 family), hbm/gpu a muted green ramp, dram a neutral
+// blue-grey ramp, the fallback dimmed yellow/green/slate tints. Position and the legend carry identity;
 // full saturation belongs to the external-KV accent alone, and #FF6B6B is
 // reserved for errors.
 const OTHER_PALETTE = [
@@ -1351,7 +1352,7 @@ const OTHER_PALETTE = [
   "#8d5fd6","#707c8a","#75b094","#d0b3f5","#9aa5b1","#c9b8e8",
 ];
 const GPU_VARIANTS = ["#5fae7a","#4c9466","#78c290","#3e7a54","#92d2a6"]; // hbm: muted green
-const DRAM_VARIANTS = ["#d08a4a","#b9763a","#e0a066","#9c6230","#ecb787"]; // dram: muted orange
+const DRAM_VARIANTS = ["#8a95a3","#76818f","#9eaab8","#646f7c","#b3bdc9"]; // dram: neutral blue-grey
 const WEKA_VARIANTS = [
   "#a678e8","#C79FF1","#8d5fd6","#b58ff0","#7745c0","#d0b3f5",
 ];
@@ -2180,15 +2181,15 @@ function tickStats(tickTime) {
 // (calm dominant mass), compute = dimmed #FF8569 warning orange (the cost
 // signal). Passes lightness/CVD/contrast checks on #000; the two muted
 // fills sit below the chroma floor by design.
-const MIX_COMPUTE_COLOR = "#a86853";
+const MIX_COMPUTE_COLOR = "#c0504d"; // compute: muted red (not the #FF6B6B error red)
 const MIX_LOCAL_COLOR = "#756a99";
 const MIX_EXTERNAL_COLOR = "#7C03EC"; // official primary purple — the single high-chroma accent
 // MIX_HOST_COLOR is sglang-only: its 4-way breakdown splits vLLM's implicit
 // "local" into device (GPU radix cache, reuses MIX_LOCAL_COLOR) and host
 // (CPU/DRAM HiCache L2), which needs a color of its own. Muted teal-green
 // sits clearly apart from the compute/local/external triad above and from
-// GPU_VARIANTS' green and DRAM_VARIANTS' orange families below.
-const MIX_HOST_COLOR = "#4a9d8f";
+// GPU_VARIANTS' green family; it shares DRAM_VARIANTS' blue-grey, being DRAM.
+const MIX_HOST_COLOR = "#8a95a3"; // DRAM tier: the dram arm blue-grey
 const ADT_LINE_COLOR = "#F2F2EB";
 const MIX_BAND_H = 64;
 // Band fills sit on a solid-black backdrop; slightly translucent so the
@@ -4588,16 +4589,16 @@ const V3 = (() => {
   // Built on first show: the report script also runs headless (tests, public
   // export), where nothing should touch this view's DOM.
   const host = document.getElementById("v3Host");
-  let cv, cx, tip, elY, elZ, elArms, elSm, elFill, built = false, expanded = false;
+  let cv, cx, tip, elY, elZ, elArms, elSm, elFill, elAlpha, built = false, expanded = false;
   const BINS = 240, CAM = 4;
   const TTFT_MAX = 20000;   // ms: dots are fully red at and above this
   const LINE_DOT_EVERY = 6;  // one TTFT dot per this many bins (~40 per arm)
   // Cache-mix fill: input tokens by source, stacked bottom to top. Colours are
-  // the arm colours of the tier (hbm green, dram orange, weka purple); compute
-  // is neutral. An arm's external tier takes its own class's colour, the way
+  // the arm colours of the tier (hbm green, dram blue-grey, weka purple);
+  // compute is the report's compute red. An arm's external tier takes its own class's colour, the way
   // series colours are assigned from the arm name.
   const MIX_CATS = ["compute", "hbm", "dram", "weka"];
-  const MIX_CAT_COLOR = { compute: "#8a95a3", hbm: GPU_VARIANTS[0], dram: DRAM_VARIANTS[0], weka: WEKA_VARIANTS[0] };
+  const MIX_CAT_COLOR = { compute: MIX_COMPUTE_COLOR, hbm: GPU_VARIANTS[0], dram: DRAM_VARIANTS[0], weka: WEKA_VARIANTS[0] };
   const MIX_CAT_LABEL = { compute: "compute", hbm: "GPU cache (hbm)", dram: "DRAM", weka: "weka" };
   function mixCat(band, armClass) {
     switch (band) {
@@ -4890,7 +4891,7 @@ const V3 = (() => {
             la = ha; lb = hb;
           }
         }
-        cx.save(); cx.globalAlpha = 0.32; cx.setTransform(1, 0, 0, 1, 0, 0); cx.drawImage(fillLayer, 0, 0); cx.restore();
+        cx.save(); cx.globalAlpha = +elAlpha.value / 100; cx.setTransform(1, 0, 0, 1, 0, 0); cx.drawImage(fillLayer, 0, 0); cx.restore();
       }
       line(pts.map(v => [v[0], -1, v[2]]), css(c, 0.28), 1.2);
       line(pts.map(v => [v[0], v[1], zBack]), css(c, 0.22), 1.2);
@@ -4952,6 +4953,7 @@ const V3 = (() => {
     '<option value="adt">active dataset (tokens)</option></select></label>' +
     '<label title="Fill under each curve split by where its input tokens came from (the cache-mix samples)">Fill <select class="v3-fill">' +
     '<option value="mix">cache mix</option><option value="off">off</option></select></label>' +
+    '<label title="Opacity of the cache-mix fill">Opacity <input type="range" class="v3-alpha" min="5" max="100" step="1" value="52"> <span class="v3-alpha-v">52%</span></label>' +
     '<label title="Moving average over Y (and over Z for requests in flight)">Smooth <select class="v3-smooth">' +
     '<option value="0">off</option><option value="60000">1 min</option><option value="120000" selected>2 min</option>' +
     '<option value="300000">5 min</option><option value="600000">10 min</option></select></label>' +
@@ -4963,7 +4965,7 @@ const V3 = (() => {
     '<span class="v3-hint">Drag to rotate &middot; wheel zooms &middot; double-click resets</span>' +
     '</div><canvas class="v3-canvas"></canvas><div class="v3-tip"></div>';
   const q = c => host.querySelector(c);
-  cv = q(".v3-canvas"); cx = cv.getContext("2d"); tip = q(".v3-tip"); elY = q(".v3-y"); elArms = q(".v3-arms"); elSm = q(".v3-smooth"); elZ = q(".v3-z"); elFill = q(".v3-fill");
+  cv = q(".v3-canvas"); cx = cv.getContext("2d"); tip = q(".v3-tip"); elY = q(".v3-y"); elArms = q(".v3-arms"); elSm = q(".v3-smooth"); elZ = q(".v3-z"); elFill = q(".v3-fill"); elAlpha = q(".v3-alpha");
   // ---- interaction ----
   let drag = null;
   cv.addEventListener("mousedown", e => { drag = { x: e.clientX, y: e.clientY, yaw, pitch }; tip.style.display = "none"; });
@@ -4999,6 +5001,7 @@ const V3 = (() => {
   elSm.addEventListener("change", draw);
   elZ.addEventListener("change", draw);
   elFill.addEventListener("change", draw);
+  elAlpha.addEventListener("input", () => { q(".v3-alpha-v").textContent = elAlpha.value + "%"; draw(); });
   const elExpand = q(".v3-expand");
   function setExpanded(on) {
     expanded = on;
