@@ -158,6 +158,9 @@ func TestRealtimeIsACompleteRecipe(t *testing.T) {
 	}
 	c := BenchmarkAutoCommand{BenchmarkAutoOptions: &opts}
 	c.applyRealtimeDefaults()
+	if opts.DecodeRateMin != 20 {
+		t.Fatalf("realtime default --decode-rate-min = %v, want 20", opts.DecodeRateMin)
+	}
 	if opts.StartSeries != 32 || opts.AdmitCount != 16 || opts.AdmitEvery != time.Minute || opts.MaxSeries != 0 ||
 		opts.TTFTLimit != 10*time.Second || !opts.ReuseSessions() || !opts.Retire() || !opts.Timeline {
 		t.Fatalf("defaults: start=%d admit=%d/%v max=%d ttft=%v reuse=%v retire=%v timeline=%v", opts.StartSeries, opts.AdmitCount,
@@ -178,7 +181,7 @@ func TestRealtimeIsACompleteRecipe(t *testing.T) {
 	}
 	c3 := BenchmarkAutoCommand{BenchmarkAutoOptions: &o3}
 	c3.applyRealtimeDefaults()
-	if o3.AdmitEvery != 0 || o3.Timeline {
+	if o3.AdmitEvery != 0 || o3.Timeline || o3.DecodeRateMin != 0 {
 		t.Fatal("non-realtime runs must not pick up realtime defaults")
 	}
 }
@@ -191,7 +194,8 @@ func TestDecodeRateFlags(t *testing.T) {
 	}{
 		{[]string{"--replay-realtime", "--decode-rate-min=20"}, false},
 		{[]string{"--decode-rate-min=20"}, true},
-		{[]string{"--replay-realtime", "--decode-rate-min=-1"}, true},
+		{[]string{"--replay-realtime", "--decode-rate-min=0"}, false},  // explicit off
+		{[]string{"--replay-realtime", "--decode-rate-min=-2"}, false}, // any negative = unset -> realtime default
 		{[]string{"--replay-realtime", "--decode-rate-min=20", "--decode-rate-window=0s"}, true},
 	} {
 		var opts BenchmarkAutoOptions

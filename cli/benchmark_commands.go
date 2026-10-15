@@ -748,11 +748,15 @@ func (c *BenchmarkThroughputCommand) Execute(args []string) error {
 // applyRealtimeDefaults makes --replay-realtime a complete recipe on its own:
 // the TTFT-gated ramp (start 32, +16 every minute, uncapped), session reuse
 // (the run keeps going until --timeout instead of running out of corpus),
-// --ttft-retire with its 15% margin, and the request timeline in the report.
+// --ttft-retire with its 15% margin, --decode-rate-min=20 (30s window), and the
+// request timeline in the report.
 // Every one of them stays overridable by passing the flag explicitly;
 // --replay-timing already resolves to think when the file carries think_ms.
 func (c *BenchmarkAutoCommand) applyRealtimeDefaults() {
 	if !c.ReplayRealtime {
+		if c.DecodeRateMin < 0 {
+			c.DecodeRateMin = 0 // the decode gate is a realtime-replay feature
+		}
 		return
 	}
 	if c.AdmitEvery == 0 {
@@ -763,6 +767,9 @@ func (c *BenchmarkAutoCommand) applyRealtimeDefaults() {
 	}
 	if c.StartSeries == 0 && c.Series == 0 {
 		c.StartSeries = 32
+	}
+	if c.DecodeRateMin < 0 {
+		c.DecodeRateMin = 20
 	}
 	c.Timeline = true
 }
