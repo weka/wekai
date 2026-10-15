@@ -32,8 +32,8 @@
 .wtl-empty { position: absolute; inset: 40px 0 0 0; text-align: center; color: #8a9096; pointer-events: none; }
 
 /* Expand: the timeline fills the window; only its own bar (arm, row height, zoom, Back) stays. */
-.wtl.wtl-expanded { position: fixed; inset: 0; z-index: 1000; width: 100vw !important; height: 100vh !important; max-height: none !important; margin: 0; padding: 8px 14px; background: #0D1013; box-sizing: border-box; }
-.wtl.wtl-expanded .wtl-scroll { flex: 1 1 auto; }
+.wtl-expanded-host { position: fixed; inset: 0; z-index: 1000; width: 100vw !important; height: 100vh !important; max-height: none !important; margin: 0; padding: 8px 14px; background: #0D1013; box-sizing: border-box; }
+.wtl-x .wtl-scroll { flex: 1 1 auto; }
 html.wtl-expanded-page, html.wtl-expanded-page body { overflow: hidden; }
 .wtl-bar .wtl-expand { font-weight: 500; }
 
@@ -46,9 +46,21 @@ html.wtl-expanded-page, html.wtl-expanded-page body { overflow: hidden; }
 /* One-line readout at the cursor, shown while the State panel is hidden; hover it for the full state. */
 .wtl-bar .wtl-at { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: default; }
 .wtl-bar .wtl-at:empty { display: none; }
-.wtl.wtl-expanded .wtl-bar { flex-wrap: nowrap; white-space: nowrap; }
-.wtl.wtl-expanded .wtl-bar > * { flex: 0 0 auto; }
-.wtl.wtl-expanded .wtl-bar .wtl-at { flex: 1 1 auto; }
-.wtl.wtl-expanded .wtl-hint { display: none; }
+.wtl-x .wtl-bar { flex-wrap: nowrap; white-space: nowrap; }
+.wtl-x .wtl-bar > * { flex: 0 0 auto; }
+.wtl-x .wtl-bar .wtl-at { flex: 1 1 auto; }
+.wtl-x .wtl-hint { display: none; }
 /* Long arm names would squeeze the readout out of the one-line bar; the select keeps the full name as its tooltip. */
-.wtl.wtl-expanded .wtl-arm { max-width: 220px; text-overflow: ellipsis; }
+.wtl-x .wtl-arm { max-width: 220px; text-overflow: ellipsis; }
+
+/* Split view: panes stacked, sharing the height; each pane is a full timeline. */
+.wtl-split { display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+.wtl-split > .wtl-pane { flex: 1 1 0; min-height: 0; }
+.wtl-split.wtl-expanded-host { display: flex; flex-direction: column; gap: 6px; }
+/* Replay controls. */
+.wtl-bar .wtl-play { display: inline-flex; align-items: center; gap: 4px; }
+.wtl-bar .wtl-play button { padding: 1px 7px; }
+.wtl-bar .wtl-speed { width: 90px; accent-color: #7C03EC; }
+.wtl-bar .wtl-speedv { color: #C9C9C9; min-width: 42px; }
+.wtl-bar .wtl-playt { color: #C9C9C9; }
+.wtl-bar .wtl-playt b { color: #F2F2EB; font-weight: 500; }

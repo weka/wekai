@@ -31,7 +31,7 @@
   var sub = document.getElementById("sub");
   if (!CFG.live) {
     var P = {{.Data}};
-    var tl = WekaiTimeline.create(host, { kinds: P.kinds, handleEsc: true });
+    var tl = WekaiTimeline.createSplit(host, { kinds: P.kinds, handleEsc: true });
     var t0 = performance.now();
     tl.setArms(P.arms);
     var initialRender = +(performance.now() - t0).toFixed(1);

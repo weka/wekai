@@ -5076,7 +5076,7 @@ const V3 = (() => {
     V3.show(m === "3d");
     if (m === "timeline") {
       if (!tlView) {
-        tlView = WekaiTimeline.create(host, {
+        tlView = WekaiTimeline.createSplit(host, {
           kinds: TIMELINE_KINDS,
           onZoom: (a, b) => {
             if (a === null) { resetZoomView(); return; }
