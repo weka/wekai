@@ -23,7 +23,7 @@ var WekaiTimeline = (function () {
   var WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1, 14: 1, 15: 1 };
   // One word for the UI: a series is a simulated user lane (rows on the timeline); it runs one replayed session after
   // another (purple ticks mark session boundaries). Admission adds series, --ttft-retire retires them.
-  var SERIES_TIP = "A series is one simulated user lane (a timeline row): it runs one replayed session after another (purple ticks mark session boundaries). Admission adds series; --ttft-retire retires them.";   // kinds the "merge waits" toggle collapses into WAITED
+  var SERIES_TIP = "Active sessions: replayed user sessions in progress. Each timeline row is one simulated user replaying one session after another (purple ticks mark session boundaries). Admission adds rows; --ttft-retire retires them.";   // kinds the "merge waits" toggle collapses into WAITED
   var AXIS_H = 34, RIGHT = 14, GAP = 2;
   var ROW_HEIGHTS = [1, 2, 3, 4, 6, 10, 14, 20];
 
@@ -76,9 +76,9 @@ var WekaiTimeline = (function () {
       '<button class="wtl-reset" hidden>Reset zoom</button>' +
       '<label class="wtl-followwrap" hidden><input type="checkbox" class="wtl-follow"> Follow latest</label>' +
       '<span class="wtl-panels">Show' +
-      '<button data-p="state" title="Run state: series, in flight, gate">State</button>' +
+      '<button data-p="state" title="Run state: sessions, in flight, gate">State</button>' +
       '<button data-p="legend" title="Colour legend">Legend</button>' +
-      '<button data-p="act" title="Active series / in flight over time">Activity</button>' +
+      '<button data-p="act" title="Active sessions / in flight over time">Activity</button>' +
       '<button data-p="rate" title="Input and output tokens/s over time">Tokens/s</button>' +
       '<button data-p="ttft" title="TTFT over time">TTFT</button></span>' +
       '<span class="wtl-at"></span>' +
@@ -430,7 +430,7 @@ var WekaiTimeline = (function () {
       var act = activity(a, now), ymax = 1;
       [act.series, act.inflight].forEach(function (st) { for (var i = 0; i < st.t.length; i++) if (st.t[i] <= r[1] && st.v[i] > ymax) ymax = st.v[i]; });
       ymax *= 1.1;
-      var x = stripFrame(c, [{ t: "active series", c: "#C79FF1", line: true }, { t: "requests in flight", c: "#5f987d", line: true, w: 1 }], ymax, function (v) { return Math.round(v) + ""; });
+      var x = stripFrame(c, [{ t: "active sessions", c: "#C79FF1", line: true }, { t: "requests in flight", c: "#5f987d", line: true, w: 1 }], ymax, function (v) { return Math.round(v) + ""; });
       var base = STRIP_H - 15, hgt = STRIP_H - 26;
       function step(st, color, width) {
         x.strokeStyle = color; x.lineWidth = width; x.beginPath();
@@ -462,7 +462,7 @@ var WekaiTimeline = (function () {
       var T = cursor ? hoverT : opts.live ? Math.min(rr[1], now) : rr[1];
       var act = activity(a, now);
       var h = "<span class='wtl-dim'>" + (cursor ? "at" : opts.live ? "now" : "view end") + "</span> <b>" + fmtElapsed(T, 1000) + "</b>" +
-        " &middot; series <b>" + stepAt(act.series, T) + "</b> &middot; in flight <b>" + stepAt(act.inflight, T) + "</b>";
+        " &middot; sessions <b>" + stepAt(act.series, T) + "</b> &middot; in flight <b>" + stepAt(act.inflight, T) + "</b>";
       if (a.rates && a.rates.in && a.rates.in.length) {
         // A short window around the point: a few pixels of the view, never under two buckets or 10 s.
         var w = Math.max(2 * a.rates.bw, 6 * (rr[1] - rr[0]) / plotW, 10000);
@@ -481,7 +481,7 @@ var WekaiTimeline = (function () {
     // Live: the server's counts and admission gate.
     function renderState(st) {
       if (!st) return;
-      var h = "<span title='" + SERIES_TIP + "'>active series</span> <b>" + st.slots + "</b>" + (st.max ? " / <b>" + st.max + "</b> max" : "") +
+      var h = "<span title='" + SERIES_TIP + "'>active sessions</span> <b>" + st.slots + "</b>" + (st.max ? " / <b>" + st.max + "</b> max" : "") +
         " &middot; <span title='request outstanding at the engine'>in flight <b>" + st.in_flight + "</b></span>" +
         " &middot; <span title='next turn due, waiting under the client concurrency limit'>waiting at gate <b>" + st.waiting + "</b></span>" +
         " &middot; <span title='pausing until the next turn is due'>think pause <b>" + st.think + "</b></span>" +
@@ -504,14 +504,14 @@ var WekaiTimeline = (function () {
         if (!g.enabled) h += "<br>admission: ungated" + (g.admit_count ? ", +" + g.admit_count + " every " + fmtSec(g.every_s) : "");
         else {
           h += " &mdash; gate: " + g.stat + " &lt; " + fmtSec(g.limit_ms / 1000) + " &rarr; <b class='" + (g.open ? "wtl-gating" : "wtl-bad") + "'>" + (g.open ? "OPEN" : "CLOSED") + "</b>";
-          h += g.capped ? " (at the series cap, no more admissions)" : g.every_s ? (g.open ? " (next +" + g.admit_count + " in " + fmtSec(g.next_in_s) + ")" : " (admissions held; next check in " + fmtSec(g.next_in_s) + ")") : "";
+          h += g.capped ? " (at the session cap, no more admissions)" : g.every_s ? (g.open ? " (next +" + g.admit_count + " in " + fmtSec(g.next_in_s) + ")" : " (admissions held; next check in " + fmtSec(g.next_in_s) + ")") : "";
           if (g.decode_min) {
             var slow = (g.decode_rate || 0) < g.decode_min;
             h += " &middot; <span title='--decode-rate-min: due requests are held while the per-request decode rate over the window is below the minimum'>decode <b class='" + (slow ? "wtl-bad" : "wtl-gating") + "'>" + (g.decode_rate || 0).toFixed(1) + "</b> / " + g.decode_min + " tok/s per request, held <b>" + (g.decode_holding || 0) + "</b></span>";
           }
           if (g.retire_ms) {
             var shedding = g.value_ms > g.retire_ms;
-            h += " &middot; <span title='--ttft-retire: a series whose session ends while the gate statistic is above this does not take another session'>retire above " + fmtSec(g.retire_ms / 1000) + " &rarr; <b class='" + (shedding ? "wtl-bad" : "wtl-gating") + "'>" + (shedding ? "SHRINKING" : "holding") + "</b>, retired <b>" + (g.retired || 0) + "</b></span>";
+            h += " &middot; <span title='--ttft-retire: a row whose session ends while the gate statistic is above this does not take another session'>retire above " + fmtSec(g.retire_ms / 1000) + " &rarr; <b class='" + (shedding ? "wtl-bad" : "wtl-gating") + "'>" + (shedding ? "SHRINKING" : "holding") + "</b>, retired <b>" + (g.retired || 0) + "</b></span>";
           }
         }
       }
@@ -544,7 +544,7 @@ var WekaiTimeline = (function () {
         rate = "<br>view average tokens/s: input <b>" + fmtRate(rateAt(a.rates, "in", rr[0], rr[1])) + "</b> &middot; output <b>" + fmtRate(rateAt(a.rates, "out", rr[0], rr[1])) + "</b>";
       }
       renderAt();
-      setStateText("at <b>" + fmtElapsed(T, 1000) + "</b> (" + (atCursor ? "cursor" : "view end") + "): <b><span title='" + SERIES_TIP + "'>" + activeAtT + "</span></b> active series <span class='wtl-dim'>(" + a.groups.length + " over the run)</span> &middot; in flight <b>" + c.f +
+      setStateText("at <b>" + fmtElapsed(T, 1000) + "</b> (" + (atCursor ? "cursor" : "view end") + "): <b><span title='" + SERIES_TIP + "'>" + activeAtT + "</span></b> active sessions <span class='wtl-dim'>(" + a.groups.length + " rows over the run)</span> &middot; in flight <b>" + c.f +
         "</b> &middot; waiting at gate <b>" + c.w + "</b> &middot; think pause <b>" + c.t + "</b> &middot; idle <b>" + c.i + "</b>" + rate);
     }
 
@@ -800,7 +800,7 @@ var WekaiTimeline = (function () {
       var infl = (q.x & FLAG_INFL) !== 0, e2e = infl ? Math.max(0, now - q.t) : q.e;
       var inst = q.gu || (a.guids && q.gi ? a.guids[q.gi - 1] : "");
       var ic = inst.indexOf(":"); if (ic >= 0) inst = inst.slice(ic + 1);
-      var head = q.sl ? "<b>" + ((q.x & FLAG_HOT) ? "hot series " : "series ") + q.sl + "</b> &middot; session " + q.s : "<b>series " + q.s + "</b>";
+      var head = q.sl ? "<b>" + ((q.x & FLAG_HOT) ? "hot row " : "row ") + q.sl + "</b> &middot; session " + q.s : "<b>session " + q.s + "</b>";
       var html = head + " turn " + q.n + ((q.x & FLAG_SESSION) ? " (first of session)" : "") + (inst ? " &middot; instance " + esc(inst.length > 24 ? inst.slice(0, 24) + "\u2026" : inst) : "") + (infl ? " <b>(in flight)</b>" : "") +
         ((q.x & FLAG_ERR) ? " <b style='color:#FF6B6B'>error</b>" : "") + ((q.x & FLAG_COLD) ? " cold start" : "") + ((q.x & FLAG_EMPTY) ? " empty" : "") + "<br>" +
         "start " + fmtClock(a.t0 + q.t, true) + " (+" + fmtDur(q.t) + ")<br>";

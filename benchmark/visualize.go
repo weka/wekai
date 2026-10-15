@@ -4855,7 +4855,20 @@ const V3 = (() => {
     cx.font = "11px monospace";
     // curves: floor shadow (time x series), back-wall shadow (time x Y), drop lines, then the curve itself
     proj = [];
-    d.arms.forEach(i => {
+    // Painter's order: farthest arm first, so a nearer arm's fill, line and dots
+    // land on top whatever the rotation (arm order alone let a later arm's fill
+    // cover a nearer one). Depth is the projected depth of the arm's centroid.
+    const depthOf = i => {
+      const p = d.per[i];
+      let sx = 0, sy = 0, sz = 0, n = 0;
+      for (let b = 0; b < BINS; b++) {
+        const t = d.t0 + (b + 0.5) * p.bw;
+        if (!isZoomed() && t > p.end) break;
+        sx += X(t); sy += Y(p.y[b]); sz += Z(p.z[b]); n++;
+      }
+      return n ? P(sx / n, sy / n, sz / n)[2] : 0;
+    };
+    d.arms.map(i => [i, depthOf(i)]).sort((a, b) => b[1] - a[1]).map(e => e[0]).forEach(i => {
       const p = d.per[i], c = p.color, pts = [];
       if (!p.hasZ) return;   // no dataset samples for this arm
       for (let b = 0; b < BINS; b++) {
@@ -4948,7 +4961,7 @@ const V3 = (() => {
     '<option value="in">input tok/s (incl. cached)</option>' +
     '<option value="req">requests/s</option></select></label>' +
     '<label>Z <select class="v3-z">' +
-    '<option value="series">active series</option>' +
+    '<option value="series">active sessions</option>' +
     '<option value="infl">requests in flight</option>' +
     '<option value="adt">active dataset (tokens)</option></select></label>' +
     '<label title="Fill under each curve split by where its input tokens came from (the cache-mix samples)">Fill <select class="v3-fill">' +
