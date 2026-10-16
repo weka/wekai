@@ -1,7 +1,6 @@
 package benchmark
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,11 +13,20 @@ var openAIContinuousUsage atomic.Bool
 // decodeRate is the fleet's per-request decode speed over a trailing window:
 // output tokens streamed during the window divided by the request-seconds spent
 // decoding in it (time between a request's first token and its end, or now
-// while it still runs). It is a time-weighted mean of each streaming request's
+// while it still runs). It is a time-weighted mean of each in-flight decode's
 // tokens/s, so ten requests at 30 tok/s read 30 whatever their lengths.
 //
-// Completed requests count with their exact output tokens (final usage),
-// spread evenly over their decode span. Running requests count the tokens
+// Only the decode phase counts: a request enters it at its first token and
+// counts from there whatever happens next, a timeout or error included; one
+// that never produced a token was never decoding and says nothing here.
+//
+// It gates sessions, never requests: below --decode-rate-min no session is
+// admitted and a session that ends is not replaced (admitOpen,
+// shouldRetireSlot). Requests are always sent when due.
+//
+// Completed requests count with their exact output tokens (final usage, or the
+// streamed count when the request ended without one), spread evenly over their
+// decode span. Running requests count the tokens
 // streamed so far: exact when the server sends per-chunk usage
 // (stream_options.continuous_usage_stats, requested whenever this gate is on),
 // else one per content delta, which undercounts multi-token chunks.
@@ -97,10 +105,14 @@ func (d *decodeRate) rate(now time.Time) (tokPerSec, reqSeconds float64) {
 	if d == nil {
 		return 0, 0
 	}
-	nowNs := now.UnixNano()
-	from := nowNs - int64(d.window)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.rateLocked(now)
+}
+
+func (d *decodeRate) rateLocked(now time.Time) (tokPerSec, reqSeconds float64) {
+	nowNs := now.UnixNano()
+	from := nowNs - int64(d.window)
 	d.pruneLocked(nowNs)
 	var tok, secs float64
 	add := func(first, end int64, tokens float64) {
@@ -130,34 +142,17 @@ func (d *decodeRate) rate(now time.Time) (tokPerSec, reqSeconds float64) {
 }
 
 // decodeGateMinSeconds is how much decoding the window must hold before the
-// gate trusts its rate: with less, nothing is decoding and holding requests
-// back could only stall the run.
+// gate trusts its rate; with less, too little is streaming to judge and the
+// TTFT gate alone decides.
 const decodeGateMinSeconds = 5.0
 
-// open reports whether a request may be sent: the gate is off, there is too
-// little decoding in the window to judge, or the rate is at or above min.
-func (d *decodeRate) open(now time.Time, min float64) bool {
+// slow reports whether the window holds enough decoding to judge and its rate
+// is below min: the fleet is decoding too slowly for more load. Admission stops
+// and finished sessions are not replaced while it holds.
+func (d *decodeRate) slow(now time.Time, min float64) bool {
 	if d == nil || min <= 0 {
-		return true
+		return false
 	}
 	r, secs := d.rate(now)
-	return secs < decodeGateMinSeconds || r >= min
-}
-
-// hold blocks until the gate is open (or ctx ends) and returns how long it held.
-func (d *decodeRate) hold(ctx context.Context, min float64) time.Duration {
-	if d == nil || min <= 0 {
-		return 0
-	}
-	start := time.Now()
-	for !d.open(time.Now(), min) {
-		t := time.NewTimer(250 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return time.Since(start)
-		case <-t.C:
-		}
-	}
-	return time.Since(start)
+	return secs >= decodeGateMinSeconds && r < min
 }

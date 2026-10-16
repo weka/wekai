@@ -161,12 +161,15 @@ starting the next session (between the limit and that threshold sessions are
 replaced but none added; below it admission adds batches). Every default can be
 overridden with the explicit flag (`--ttft-retire=false`, `--max-series=N`, ...).
 
-`--decode-rate-min=N` (default 20 with `--replay-realtime`, `0` to turn off) holds back due requests while the average
-per-request decode rate (output tokens/s of streaming requests over
-`--decode-rate-window`, default 30s; exact per-chunk counts via vLLM's
-`continuous_usage_stats`) is below N, and sends them when it recovers. The hold
-is reported as `decode_hold_ms` and its own timeline segment, outside `ttft_ms`,
-but it is added to the TTFT the admission gate and `--ttft-retire` see.
+`--decode-rate-min=N` (default 20 with `--replay-realtime`, `0` to turn off) is a
+second session-level gate next to TTFT: while the average per-request decode
+rate is below N, no session is admitted and a session that ends is not replaced
+(with `--ttft-retire`). The rate is output tokens/s of requests in their decode
+phase -- from the first token on, whatever their outcome -- over
+`--decode-rate-window` (default 30s; exact per-chunk counts via vLLM's
+`continuous_usage_stats`). Requests are always sent when due; nothing is held.
+An empty TTFT window does not open admission while a due request has waited
+past `--ttft-limit` for its first token.
 Without real-time replay, admission depends only on the interval.
 Omitting `--admit-count` preserves one series per tick. Add `--replay-realtime`
 to preserve captured think times; without it, sessions run back-to-back.

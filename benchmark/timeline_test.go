@@ -558,7 +558,7 @@ func TestReportTimelineMatchesBuilder(t *testing.T) {
 			r.IsError = true
 		case 2:
 			r.ReadyMs, r.SentMs = st.UnixMilli()-40, st.UnixMilli() // client wait
-			r.ThinkPauseMs, r.DecodeHoldMs = 300, 20
+			r.ThinkPauseMs = 300
 		case 3:
 			r.Retries429, r.RetryWaitMs = 2, 150
 		case 4:

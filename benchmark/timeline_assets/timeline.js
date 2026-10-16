@@ -537,7 +537,7 @@ var WekaiTimeline = (function () {
           h += g.capped ? " (at the session cap, no more admissions)" : g.every_s ? (g.open ? " (next +" + g.admit_count + " in " + fmtSec(g.next_in_s) + ")" : " (admissions held; next check in " + fmtSec(g.next_in_s) + ")") : "";
           if (g.decode_min) {
             var slow = (g.decode_rate || 0) < g.decode_min;
-            h += " &middot; <span title='--decode-rate-min: due requests are held while the per-request decode rate over the window is below the minimum'>decode <b class='" + (slow ? "wtl-bad" : "wtl-gating") + "'>" + (g.decode_rate || 0).toFixed(1) + "</b> / " + g.decode_min + " tok/s per request, held <b>" + (g.decode_holding || 0) + "</b></span>";
+            h += " &middot; <span title='--decode-rate-min: below it no session is admitted and an ending session is not replaced'>decode <b class='" + (slow ? "wtl-bad" : "wtl-gating") + "'>" + (g.decode_rate || 0).toFixed(1) + "</b> / " + g.decode_min + " tok/s per request</span>";
           }
           if (g.retire_ms) {
             var shedding = g.value_ms > g.retire_ms;

@@ -837,10 +837,11 @@ func runRouterReplaySeriesLoop(
 		// Session slot retired — drop its active-dataset snapshot.
 		st.datasetTracker.Reset(seriesNum)
 		st.seriesReplayCompleted.Add(1)
-		if shouldRetireSlot(cfg, st.ttft, time.Now()) {
-			// --ttft-retire: the fleet is over the limit by more than the
-			// margin, so this slot stops here instead of adding the next
-			// session's load; admission re-adds slots once TTFT recovers.
+		if shouldRetireSlot(cfg, st.ttft, st.decode, time.Now()) {
+			// --ttft-retire: the fleet is over the TTFT limit by more than
+			// the margin or decoding below --decode-rate-min, so this slot
+			// stops here instead of adding the next session's load;
+			// admission re-adds slots once the fleet recovers.
 			st.seriesRetired.Add(1)
 			updateSnap(st)
 			return
@@ -1186,26 +1187,25 @@ func runRouterReplayInstance(
 
 		slot := slotOf(ctx)
 		liveTok := st.live.begin(seriesNum, ti+1, sessionID+":"+inst.InstanceID, slot, readyAt)
-		// --decode-rate-min: hold the request while streaming requests decode
-		// too slowly. Client-side time like the slot wait, recorded on its own.
-		var decodeHold time.Duration
-		if st.decode != nil {
-			st.decodeHolding.Add(1)
-			decodeHold = st.decode.hold(ctx, cfg.DecodeRateMin)
-			st.decodeHolding.Add(-1)
-			if ctx.Err() != nil {
-				st.live.abandon(liveTok)
-				return
-			}
+		prog := liveTok.prog
+		if prog == nil && (st.decode != nil || st.ttft != nil) {
+			prog = &liveProgress{} // the decode tracker and TTFT gate need one even without the live view
+		}
+		// Due and unanswered from here: the TTFT gate counts its wait while
+		// nothing completes (ttftWindow.Open).
+		st.ttft.wait(prog, readyAt)
+		abandon := func() {
+			st.ttft.settle(prog)
+			st.live.abandon(liveTok)
 		}
 		if isFirstRequest {
 			if gerr := gate.AcquireCold(ctx); gerr != nil {
-				st.live.abandon(liveTok)
+				abandon()
 				return
 			}
 		} else {
 			if gerr := gate.Acquire(ctx); gerr != nil {
-				st.live.abandon(liveTok)
+				abandon()
 				return
 			}
 		}
@@ -1231,10 +1231,6 @@ func runRouterReplayInstance(
 			}
 		}
 
-		prog := liveTok.prog
-		if prog == nil && st.decode != nil {
-			prog = &liveProgress{} // the decode tracker needs one even without the live view
-		}
 		st.decode.begin(prog)
 		reqCtx, reqCancel := context.WithTimeout(withProgress(ctx, prog), reqTimeout)
 		var metrics RequestMetrics
@@ -1262,13 +1258,13 @@ func runRouterReplayInstance(
 		st.skipClk.AddInflight(-1)
 		endAt := pacer.clk.Now()
 		st.decode.end(prog, time.Now(), int64(metrics.UsageData.OutputTokens.Count))
+		st.ttft.settle(prog)
 		picker.release(epIdx)
 		reqCancel()
 		gate.Release()
 		metrics.live = liveTok
 		metrics.Slot = slot
 		metrics.ReadyAt, metrics.SentAt = readyAt, sentAt
-		metrics.DecodeHold = decodeHold
 		if cfg.ReplayRealtime {
 			metrics.ThinkPause = thinkPause
 		}

@@ -75,24 +75,33 @@ func retireThreshold(cfg AutoBenchmarkConfig) time.Duration {
 
 // shouldRetireSlot reports whether a slot whose session just ended should stop
 // instead of pulling the next one. Only with --ttft-retire on a realtime run,
-// and only while the windowed statistic is above the retire threshold; between
-// the limit and the threshold sessions are still replaced (the gate merely
-// stops adding), and an empty window never retires.
-func shouldRetireSlot(cfg AutoBenchmarkConfig, window *ttftWindow, now time.Time) bool {
-	if !cfg.TTFTRetire || !cfg.ReplayRealtime || window == nil {
+// and only while the fleet is over one of the two limits: the windowed TTFT
+// statistic above the retire threshold, or the per-request decode rate below
+// --decode-rate-min. Between the TTFT limit and the threshold sessions are
+// still replaced (the gate merely stops adding), and an empty TTFT window
+// never retires.
+func shouldRetireSlot(cfg AutoBenchmarkConfig, window *ttftWindow, decode *decodeRate, now time.Time) bool {
+	if !cfg.TTFTRetire || !cfg.ReplayRealtime {
+		return false
+	}
+	if decode.slow(now, cfg.DecodeRateMin) {
+		return true
+	}
+	if window == nil {
 		return false
 	}
 	s := window.Stats(now)
 	return s.N > 0 && s.pick(cfg.TTFTLimitStat) > retireThreshold(cfg)
 }
 
-// admitSeries adds --admit-count slots every --admit-every while the TTFT gate
-// is open. spawn gets the new slot's 1-based number. Without --ttft-retire
+// admitSeries adds --admit-count slots every --admit-every while the gate is
+// open: the TTFT window under --ttft-limit and, with --decode-rate-min, the
+// per-request decode rate not below it. spawn gets the new slot's 1-based number. Without --ttft-retire
 // slots only ever grow, so --max-series caps the number spawned and admission
 // ends there (capped). With it, retired slots free room: active(), the slots
 // still running, is what --max-series caps, and admission keeps ticking so the
 // run can regrow after TTFT recovers.
-func admitSeries(ctx context.Context, cfg AutoBenchmarkConfig, window *ttftWindow, spawn func(int), capped func(), active func() int) {
+func admitSeries(ctx context.Context, cfg AutoBenchmarkConfig, window *ttftWindow, decode *decodeRate, spawn func(int), capped func(), active func() int) {
 	if cfg.AdmitEvery <= 0 {
 		return
 	}
@@ -117,7 +126,7 @@ func admitSeries(ctx context.Context, cfg AutoBenchmarkConfig, window *ttftWindo
 			capped()
 			return
 		}
-		if cfg.ReplayRealtime && !window.Open(time.Now(), cfg.TTFTLimit, cfg.TTFTLimitStat) {
+		if cfg.ReplayRealtime && !admitOpen(cfg, window, decode, time.Now()) {
 			continue
 		}
 		count := max(1, cfg.AdmitCount)
@@ -132,6 +141,15 @@ func admitSeries(ctx context.Context, cfg AutoBenchmarkConfig, window *ttftWindo
 			spawn(next)
 		}
 	}
+}
+
+// admitOpen is the realtime admission gate: TTFT under its limit and, with
+// --decode-rate-min, in-flight decodes streaming at least that fast.
+func admitOpen(cfg AutoBenchmarkConfig, window *ttftWindow, decode *decodeRate, now time.Time) bool {
+	if decode.slow(now, cfg.DecodeRateMin) {
+		return false
+	}
+	return window.Open(now, cfg.TTFTLimit, cfg.TTFTLimitStat)
 }
 
 // ttftWindow is the ARITHMETIC MEAN TTFT over a trailing wall-clock window.
@@ -155,6 +173,9 @@ type ttftWindow struct {
 	at     []time.Time
 	val    []time.Duration
 	sum    time.Duration
+	// due requests not yet answered, by when they became due; one counts as
+	// waiting until its first token (see stalledLocked)
+	pending map[*liveProgress]time.Time
 }
 
 func newTTFTWindow(window time.Duration) *ttftWindow {
@@ -162,6 +183,40 @@ func newTTFTWindow(window time.Duration) *ttftWindow {
 		window = 30 * time.Second
 	}
 	return &ttftWindow{window: window}
+}
+
+// wait records that p became due at due and has no answer yet; settle takes it
+// out once it ends. Both are no-ops on a nil window or progress.
+func (w *ttftWindow) wait(p *liveProgress, due time.Time) {
+	if w == nil || p == nil {
+		return
+	}
+	w.mu.Lock()
+	if w.pending == nil {
+		w.pending = map[*liveProgress]time.Time{}
+	}
+	w.pending[p] = due
+	w.mu.Unlock()
+}
+
+func (w *ttftWindow) settle(p *liveProgress) {
+	if w == nil || p == nil {
+		return
+	}
+	w.mu.Lock()
+	delete(w.pending, p)
+	w.mu.Unlock()
+}
+
+// stalledLocked reports whether some due request has waited at least limit
+// for its first token.
+func (w *ttftWindow) stalledLocked(now time.Time, limit time.Duration) bool {
+	for p, due := range w.pending {
+		if p.firstNs.Load() == 0 && now.Sub(due) >= limit {
+			return true
+		}
+	}
+	return false
 }
 
 // Observe records one completed request's TTFT.
@@ -265,14 +320,20 @@ func (s ttftStats) String(gating string) string {
 
 // Open reports whether the admission gate should let another session in.
 //
-// An empty window opens it. On an idle fleet that is plainly right, and on a
-// stalled one the sessions already admitted are the evidence — holding the gate
-// shut because nothing has COMPLETED would let one slow request freeze the ramp
-// for the rest of the run, which reports the stall as a capacity ceiling.
+// An empty window opens it unless a request already due has waited past the
+// limit for its first token. Nothing completing is no evidence either way on
+// an idle fleet, but on a stalled one the requests still waiting are: once
+// TTFTs run to minutes nothing lands in the window for long stretches, and an
+// empty window read as "open" admitted sessions into exactly the fleet that
+// could not answer. A single slow request does not freeze the ramp this way --
+// it closes the gate only while the window is empty, and the window refills
+// as soon as anything completes.
 func (w *ttftWindow) Open(now time.Time, limit time.Duration, stat string) bool {
 	s := w.Stats(now)
 	if s.N == 0 {
-		return true
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return !w.stalledLocked(now, limit)
 	}
 	return s.pick(stat) < limit
 }
@@ -772,14 +833,13 @@ func admissionGate(cfg AutoBenchmarkConfig, st *autoState, admitStart time.Time)
 	g.MeanMs, g.P50Ms = float64(s.Mean.Milliseconds()), float64(s.P50.Milliseconds())
 	g.P95Ms, g.P99Ms = float64(s.P95.Milliseconds()), float64(s.P99.Milliseconds())
 	g.ValueMs = float64(s.pick(stat).Milliseconds())
-	g.Open = !cfg.ReplayRealtime || s.N == 0 || s.pick(stat) < cfg.TTFTLimit
+	g.Open = !cfg.ReplayRealtime || admitOpen(cfg, st.ttft, st.decode, now)
 	st.mu.Lock()
 	g.Capped = cfg.MaxSeries > 0 && st.series >= cfg.MaxSeries
 	st.mu.Unlock()
 	if st.decode != nil {
 		g.DecodeRate, _ = st.decode.rate(now)
 		g.DecodeMin = cfg.DecodeRateMin
-		g.DecodeHolding = st.decodeHolding.Load()
 	}
 	if cfg.TTFTRetire {
 		g.RetireMs = float64(retireThreshold(cfg).Milliseconds())

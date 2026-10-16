@@ -139,10 +139,10 @@ type AutoBenchmarkConfig struct {
 	// slots at MaxSeries and keeps ticking, so a recovered fleet regrows.
 	TTFTRetire       bool
 	TTFTRetireMargin float64
-	// DecodeRateMin (opt-in, tokens/s per streaming request) holds new requests
-	// while the fleet's per-request decode rate over DecodeRateWindow is below
-	// it; see decodeRate. The hold is reported apart from TTFT but is added to
-	// the TTFT the admission gate and retire decisions see.
+	// DecodeRateMin (tokens/s per in-flight decode; 0 = off) gates sessions:
+	// while the per-request decode rate over DecodeRateWindow is below it no
+	// session is admitted and, with TTFTRetire, an ending session is not
+	// replaced. Requests are never held; see decodeRate.
 	DecodeRateMin    float64
 	DecodeRateWindow time.Duration
 	// TTFTLimitStat is which statistic over that window the gate compares
@@ -347,9 +347,6 @@ type requestDataRecord struct {
 	// turn became eligible (real-time replay: previous turn's end to its due
 	// time). Idle by design, as opposed to idle for want of a session.
 	ThinkPauseMs int64 `json:"think_pause_ms,omitempty"`
-	// DecodeHoldMs is the part of the ready -> sent wait spent held back by
-	// --decode-rate-min (not part of ttft_ms; the admission gate adds it).
-	DecodeHoldMs int64 `json:"decode_hold_ms,omitempty"`
 	// Retries429 / RetryWaitMs: 429 sheds this request backed off and retried,
 	// and the time slept doing so. Included in response_time_ms and ttft_ms.
 	Retries429  int   `json:"retries_429,omitempty"`
@@ -1268,10 +1265,8 @@ type autoState struct {
 	// retire threshold, so the slot did not take another session).
 	seriesRetired atomic.Int64
 
-	// decode is the --decode-rate-min tracker (nil when the gate is off);
-	// decodeHolding counts requests currently held back by it.
-	decode        *decodeRate
-	decodeHolding atomic.Int64
+	// decode is the --decode-rate-min tracker (nil when the gate is off).
+	decode *decodeRate
 
 	// Content-level cache estimator (*cacheEstimator) that estimates repeated
 	// (warm) prompt tokens client-side across all modes (synthetic/step/replay).
@@ -1525,7 +1520,6 @@ type displaySnapshot struct {
 	replayActive    int64   // worker goroutines still alive (effective concurrency cap)
 	seriesRetired   int64   // slots retired by --ttft-retire
 	decodeRate      float64 // --decode-rate-min: per-request decode tok/s now (0 = gate off / no data)
-	decodeHolding   int64   // --decode-rate-min: requests held right now
 	decodeOn        bool
 }
 
@@ -1842,7 +1836,7 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 				snap.replayCompleted, snap.replayTotal, snap.replayRemaining, snap.replayActive, snap.seriesRetired)
 		}
 		if snap.decodeOn {
-			replayPrefix += fmt.Sprintf("dec=%.1ft/s held=%d ", snap.decodeRate, snap.decodeHolding)
+			replayPrefix += fmt.Sprintf("dec=%.1ft/s ", snap.decodeRate)
 		}
 	}
 	// Two counts, because they answer different questions and were being read
@@ -2181,7 +2175,6 @@ func runSingleModelBenchmark(
 			if st.decode != nil {
 				snap.decodeOn = true
 				snap.decodeRate, _ = st.decode.rate(time.Now())
-				snap.decodeHolding = st.decodeHolding.Load()
 			}
 		}
 		if st.routerReplay != nil {
@@ -2193,7 +2186,6 @@ func runSingleModelBenchmark(
 			if st.decode != nil {
 				snap.decodeOn = true
 				snap.decodeRate, _ = st.decode.rate(time.Now())
-				snap.decodeHolding = st.decodeHolding.Load()
 			}
 		}
 		snap.globalLocalCacheRate = st.stream.GlobalLocalCacheRate()
@@ -2821,7 +2813,7 @@ func runSingleModelBenchmark(
 		}, func() *liveGate { return admissionGate(cfg, st, admitStart) })
 	}
 	if cfg.AdmitEvery > 0 {
-		go admitSeries(benchCtx, cfg, st.ttft, func(next int) {
+		go admitSeries(benchCtx, cfg, st.ttft, st.decode, func(next int) {
 			st.mu.Lock()
 			st.series = next
 			if next > st.allTimePeakSeries {
