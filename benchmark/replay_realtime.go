@@ -94,9 +94,14 @@ func shouldRetireSlot(cfg AutoBenchmarkConfig, window *ttftWindow, decode *decod
 	return s.N > 0 && s.pick(cfg.TTFTLimitStat) > retireThreshold(cfg)
 }
 
-// admitSeries adds --admit-count slots every --admit-every while the gate is
-// open: the TTFT window under --ttft-limit and, with --decode-rate-min, the
-// per-request decode rate not below it. spawn gets the new slot's 1-based number. Without --ttft-retire
+// admitSampleEvery is how often a realtime run samples the admission gate
+// between admissions.
+const admitSampleEvery = 5 * time.Second
+
+// admitSeries adds --admit-count slots every --admit-every when the gate was
+// open throughout the interval before it: the TTFT window under --ttft-limit
+// and, with --decode-rate-min, the per-request decode rate not below it, at
+// every admitSampleEvery sample and at the tick itself. spawn gets the new slot's 1-based number. Without --ttft-retire
 // slots only ever grow, so --max-series caps the number spawned and admission
 // ends there (capped). With it, retired slots free room: active(), the slots
 // still running, is what --max-series caps, and admission keeps ticking so the
@@ -107,14 +112,32 @@ func admitSeries(ctx context.Context, cfg AutoBenchmarkConfig, window *ttftWindo
 	}
 	ticker := time.NewTicker(cfg.AdmitEvery)
 	defer ticker.Stop()
+	// A realtime run admits only on a gate that stayed open for the whole
+	// interval, sampled every admitSampleEvery: one moment above the decode
+	// floor or under the TTFT limit is not capacity, and a batch admitted on
+	// it pushes the fleet straight back over.
+	var samples <-chan time.Time // nil (never fires) when the interval is no longer than a sample
+	if cfg.ReplayRealtime && cfg.AdmitEvery > admitSampleEvery {
+		sample := time.NewTicker(admitSampleEvery)
+		defer sample.Stop()
+		samples = sample.C
+	}
+	sustained := true
 	next := cfg.StartSeries
 	retire := cfg.TTFTRetire && active != nil
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-samples:
+			if !admitOpen(cfg, window, decode, time.Now()) {
+				sustained = false
+			}
+			continue
 		case <-ticker.C:
 		}
+		held := !sustained
+		sustained = true
 		running := next
 		if retire {
 			running = active()
@@ -126,7 +149,7 @@ func admitSeries(ctx context.Context, cfg AutoBenchmarkConfig, window *ttftWindo
 			capped()
 			return
 		}
-		if cfg.ReplayRealtime && !admitOpen(cfg, window, decode, time.Now()) {
+		if cfg.ReplayRealtime && (held || !admitOpen(cfg, window, decode, time.Now())) {
 			continue
 		}
 		count := max(1, cfg.AdmitCount)

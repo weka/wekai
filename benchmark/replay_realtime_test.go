@@ -1124,10 +1124,35 @@ func TestAdmissionStopsWhileDecodeIsSlow(t *testing.T) {
 			t.Fatalf("admitted slot %d while decoding at ~1 tok/s", last.Load())
 		}
 		d.end(p, time.Now(), 60*100) // the same span at 100 tok/s
-		time.Sleep(time.Minute)
+		time.Sleep(2 * time.Minute)  // the first full interval after recovery admits
+		synctest.Wait()
+		if last.Load() < 2 {
+			t.Fatalf("decode recovered: last=%d, want slot 2 admitted", last.Load())
+		}
+	})
+}
+
+func TestAdmissionNeedsTheGateOpenForTheWholeInterval(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := AutoBenchmarkConfig{StartSeries: 1, MaxSeries: 100, AdmitCount: 1, AdmitEvery: time.Minute,
+			TTFTLimit: 10 * time.Second, ReplayRealtime: true}
+		w := newTTFTWindow(10 * time.Second)
+		var last atomic.Int64
+		go admitSeries(ctx, cfg, w, nil, func(n int) { last.Store(int64(n)) }, func() {}, nil)
+		// A 10s dip above the limit in the middle of the first interval.
+		time.Sleep(20 * time.Second)
+		w.Observe(time.Now(), time.Minute)
+		time.Sleep(41 * time.Second) // the sample has aged out by the tick at 60s
+		synctest.Wait()
+		if last.Load() != 0 {
+			t.Fatalf("admitted slot %d after a dip inside the interval", last.Load())
+		}
+		time.Sleep(time.Minute) // open for the whole next interval
 		synctest.Wait()
 		if last.Load() != 2 {
-			t.Fatalf("decode recovered: last=%d, want slot 2 admitted", last.Load())
+			t.Fatalf("last=%d, want slot 2 after a sustained interval", last.Load())
 		}
 	})
 }
