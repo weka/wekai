@@ -117,7 +117,12 @@ func TestAdmissionPausesWithoutAccumulatingMissedBatches(t *testing.T) {
 		if count.Load() != 0 {
 			t.Fatal("admitted a batch while TTFT gate was closed")
 		}
-		time.Sleep(time.Second)
+		time.Sleep(2 * time.Second) // two open intervals after the block: not yet
+		synctest.Wait()
+		if count.Load() != 0 {
+			t.Fatalf("admitted %d within 2 open intervals of a block", count.Load())
+		}
+		time.Sleep(time.Second) // the third
 		synctest.Wait()
 		if count.Load() != 32 {
 			t.Fatalf("reopened gate admitted %d, want one batch of 32", count.Load())
@@ -1124,7 +1129,7 @@ func TestAdmissionStopsWhileDecodeIsSlow(t *testing.T) {
 			t.Fatalf("admitted slot %d while decoding at ~1 tok/s", last.Load())
 		}
 		d.end(p, time.Now(), 60*100) // the same span at 100 tok/s
-		time.Sleep(2 * time.Minute)  // the first full interval after recovery admits
+		time.Sleep(4 * time.Minute)  // three full open intervals after the block admit
 		synctest.Wait()
 		if last.Load() < 2 {
 			t.Fatalf("decode recovered: last=%d, want slot 2 admitted", last.Load())
@@ -1149,10 +1154,50 @@ func TestAdmissionNeedsTheGateOpenForTheWholeInterval(t *testing.T) {
 		if last.Load() != 0 {
 			t.Fatalf("admitted slot %d after a dip inside the interval", last.Load())
 		}
-		time.Sleep(time.Minute) // open for the whole next interval
+		time.Sleep(2 * time.Minute) // two open intervals: not yet
+		synctest.Wait()
+		if last.Load() != 0 {
+			t.Fatalf("admitted slot %d within 2 open intervals of a block", last.Load())
+		}
+		time.Sleep(time.Minute) // the third
 		synctest.Wait()
 		if last.Load() != 2 {
-			t.Fatalf("last=%d, want slot 2 after a sustained interval", last.Load())
+			t.Fatalf("last=%d, want slot 2 after three sustained intervals", last.Load())
+		}
+	})
+}
+
+func TestAdmissionAfterABlockNeedsThreeOpenIntervals(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg := AutoBenchmarkConfig{StartSeries: 1, MaxSeries: 100, AdmitCount: 1, AdmitEvery: time.Minute,
+			TTFTLimit: 10 * time.Second, ReplayRealtime: true}
+		w := newTTFTWindow(10 * time.Second)
+		var last atomic.Int64
+		go admitSeries(ctx, cfg, w, nil, func(n int) { last.Store(int64(n)) }, func() {}, nil)
+		step := func() { time.Sleep(time.Minute); synctest.Wait() }
+		step() // 1m: open -> slot 2
+		step() // 2m: open -> slot 3
+		if last.Load() != 3 {
+			t.Fatalf("before any block: last=%d, want one slot per open interval (3)", last.Load())
+		}
+		time.Sleep(20 * time.Second)
+		w.Observe(time.Now(), time.Minute) // blocks the third interval
+		time.Sleep(40 * time.Second)
+		synctest.Wait()
+		step() // 4m: 1st open interval after the block
+		step() // 5m: 2nd
+		if last.Load() != 3 {
+			t.Fatalf("admitted slot %d within 2 open intervals of a block", last.Load())
+		}
+		step() // 6m: 3rd -> admit
+		if last.Load() != 4 {
+			t.Fatalf("after 3 open intervals: last=%d, want 4", last.Load())
+		}
+		step() // 7m: unblocked again, one interval per batch
+		if last.Load() != 5 {
+			t.Fatalf("after unblocking: last=%d, want 5", last.Load())
 		}
 	})
 }
