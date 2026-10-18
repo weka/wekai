@@ -650,3 +650,45 @@ func mustOneJSONL(t *testing.T, dir string) string {
 	}
 	return filepath.Base(m[0])
 }
+
+func TestTimelineOneRowPerSession(t *testing.T) {
+	t0 := time.Now()
+	rec := func(run, series int, at time.Duration) requestDataRecord {
+		return requestDataRecord{SessionRun: run, SeriesNum: series, StartTime: t0.Add(at), EndTime: t0.Add(at + time.Second), ResponseMs: 1000}
+	}
+	// Runs 1 and 2 are consecutive sessions; run 3 replays series 1 on a later pass.
+	arm := buildTimelineArm("a", []requestDataRecord{
+		rec(1, 1, 0), rec(1, 1, 2*time.Second), rec(2, 2, 4*time.Second), rec(3, 1, 6*time.Second),
+	})
+	if arm.Groups != 3 {
+		t.Fatalf("%d rows, want one per session run (3)", arm.Groups)
+	}
+	for _, q := range arm.Reqs {
+		if q.Row != q.Sess-1 {
+			t.Errorf("session run %d drawn on row %d", q.Sess, q.Row)
+		}
+		if q.Flags&flagSession != 0 {
+			t.Errorf("session boundary flagged on a row that holds one session: %+v", q)
+		}
+	}
+}
+
+func TestLiveEndedSessionLeavesTheCount(t *testing.T) {
+	a := newLiveArm("a", 100)
+	s1, s2 := slotInfo{N: 1, Session: true}, slotInfo{N: 2, Session: true}
+	t1 := a.begin(1, 1, "s1:i0", s1, time.Now())
+	a.sent(t1, time.Now())
+	a.begin(2, 1, "s2:i0", s2, time.Now())
+	if st := a.state(); st.Sessions != 2 {
+		t.Fatalf("active sessions %d, want 2", st.Sessions)
+	}
+	a.complete(t1, requestDataRecord{SessionRun: 1, SeriesNum: 1, StartTime: time.Now(), EndTime: time.Now()})
+	a.endLine(s1)
+	if st := a.state(); st.Sessions != 1 || st.Idle != 0 {
+		t.Fatalf("after session 1 ended: active %d idle %d, want 1 and 0", st.Sessions, st.Idle)
+	}
+	a.endLine(slotInfo{N: 2}) // a fixed-pool worker line carries on
+	if st := a.state(); st.Sessions != 1 {
+		t.Fatalf("a worker line was ended: active %d", st.Sessions)
+	}
+}

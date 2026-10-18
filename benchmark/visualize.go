@@ -1068,14 +1068,14 @@ function timelineArmOf(s) {
   const ix = s.colIx, rows = s.rows || [];
   const at = k => ix[k] ? ix[k][0] : -1;
   const P = {};
-  ["t", "ttft", "resp", "sn", "turn", "in", "ca", "out", "gi", "r", "u", "sl", "tp", "rw", "r4", "cw", "x", "ef", "src", "rc", "tm", "g"].forEach(k => { P[k] = at(k); });
+  ["t", "ttft", "resp", "sn", "turn", "in", "ca", "out", "gi", "r", "u", "sl", "ss", "tp", "rw", "r4", "cw", "x", "ef", "src", "rc", "tm", "g"].forEach(k => { P[k] = at(k); });
   const v = (row, k, d) => P[k] >= 0 ? row[P[k]] : d;
   const grp = (row, k, w) => P[k] >= 0 ? row.slice(P[k], P[k] + w) : null;
   const FLAG_SOURCES = 16, FLAG_TIMINGS = 8;   // timeline.go flagSources, flagTimings
   const reqs = rows.map(row => {
     const cw = v(row, "cw", 0), ef = v(row, "ef", 0), x = v(row, "x", 0), gi = v(row, "gi", -1);
     const q = {
-      r: v(row, "r", 0), u: v(row, "u", 0), s: v(row, "sn", 0), sl: v(row, "sl", 0), n: v(row, "turn", 0),
+      r: v(row, "r", 0), u: v(row, "u", 0), s: v(row, "sn", 0), sl: v(row, "sl", 0), ss: v(row, "ss", 0), n: v(row, "turn", 0),
       t: v(row, "t", 0) - cw, e: (ef || v(row, "resp", 0)) + cw, f: v(row, "ttft", 0),
       i: v(row, "in", 0), c: v(row, "ca", 0), o: v(row, "out", 0),
       tp: v(row, "tp", 0), rw: v(row, "rw", 0), r4: v(row, "r4", 0), cw: cw, x: x,

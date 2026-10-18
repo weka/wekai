@@ -360,7 +360,7 @@ func TestLiveStateCounts(t *testing.T) {
 		t.Error("a pause that is already over must not register")
 	}
 	st := a.state()
-	if st.Slots != 8 || st.Max != 64 || st.InFlight != 1 || st.Waiting != 1 || st.Think != 1 || st.Requests != 1 {
+	if st.Sessions != 8 || st.Max != 64 || st.InFlight != 1 || st.Waiting != 1 || st.Think != 1 || st.Requests != 1 {
 		t.Fatalf("state = %+v", st)
 	}
 	// 8 admitted: 4 have rows (1 in flight, 1 waiting, 1 think, 1 idle) + 4 never ran.
@@ -382,12 +382,12 @@ func TestLiveStateEndpoint(t *testing.T) {
 	s.arms[0].setSources(func() (int, int) { return 3, 9 }, func() *liveGate { return &liveGate{Enabled: true, Open: false, Stat: "p95"} })
 	var st liveState
 	getJSON(t, "http://"+s.Addr()+"/api/state?arm=a", &st)
-	if st.Slots != 3 || st.Max != 9 || st.Gate == nil || st.Gate.Open || st.Gate.Stat != "p95" {
+	if st.Sessions != 3 || st.Max != 9 || st.Gate == nil || st.Gate.Open || st.Gate.Stat != "p95" {
 		t.Errorf("state = %+v", st)
 	}
 	var d liveData
 	getJSON(t, "http://"+s.Addr()+"/api/data?arm=0&since=0", &d)
-	if d.State == nil || d.State.Slots != 3 {
+	if d.State == nil || d.State.Sessions != 3 {
 		t.Errorf("data.state = %+v", d.State)
 	}
 }

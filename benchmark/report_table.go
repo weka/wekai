@@ -135,6 +135,7 @@ func buildReportTable(vr []vizRecord, tl []*timelineReq) ([]reportCol, [][]any) 
 			colDef{name: "r", get: func(i int) any { return float64(q(i).Row) }},
 			colDef{name: "u", get: func(i int) any { return float64(q(i).Sub) }},
 			colDef{name: "sl", get: func(i int) any { return float64(q(i).Slot) }},
+			colDef{name: "ss", get: func(i int) any { return float64(q(i).Sess) }},
 			colDef{name: "tp", get: func(i int) any { return q(i).TP }},
 			colDef{name: "rw", get: func(i int) any { return q(i).RW }},
 			colDef{name: "r4", get: func(i int) any { return float64(q(i).R4) }},

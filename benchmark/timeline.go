@@ -87,7 +87,8 @@ type timelineReq struct {
 	Row    int       `json:"r"`            // series group, in order of the series' first request
 	Sub    int       `json:"u,omitempty"`  // sub-row within the group (overlapping requests of one series)
 	Series int       `json:"s"`            // series_num: the replay session this request belongs to
-	Slot   int       `json:"sl,omitempty"` // concurrency slot (worker lane); the row group when present
+	Slot   int       `json:"sl,omitempty"` // fixed-pool modes: the worker; the row group when present
+	Sess   int       `json:"ss,omitempty"` // router replay: the session run; the row group when present
 	Turn   int       `json:"n"`
 	Start  float64   `json:"t"`
 	E2E    float64   `json:"e"`
@@ -109,9 +110,9 @@ type timelineReq struct {
 	idx    int       // position in the records the arm was built from
 }
 
-// rowKey identifies a row group: the concurrency slot when the request carries
-// one, else (files written before slots were recorded) its series_num.
-type rowKey struct{ slot, series int }
+// rowKey identifies a row group: one session (router replay), one worker
+// (fixed-pool modes), or, when neither was recorded, a series_num.
+type rowKey struct{ session, slot, series int }
 
 func rowKeyOf(slot, series int) rowKey {
 	if slot > 0 {
@@ -329,7 +330,7 @@ func timelineFromRecord(r requestDataRecord, t0 int64) timelineReq {
 			}
 		}
 	}
-	tr.Slot = r.Slot
+	tr.Slot, tr.Sess = r.Slot, r.SessionRun
 	if r.SlotHot {
 		tr.Flags |= flagHot
 	}
@@ -376,10 +377,11 @@ func (p *subRowPacker) release(u int, end float64) {
 	}
 }
 
-// buildTimelineArm builds an arm with one row group per concurrency slot (per
-// series_num for data recorded without slots), ordered by the group's first
-// request. A slot replays sessions one after another, so the first request of
-// each new session is flagged for a boundary marker. Time zero is the earliest start in recs.
+// buildTimelineArm builds an arm with one row group per session (router
+// replay), per worker (fixed-pool modes), or per series_num when neither was
+// recorded, ordered by the group's first request. A worker plays sessions one
+// after another, so on its row the first request of each new session is
+// flagged for a boundary marker. Time zero is the earliest start in recs.
 func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
 	arm := timelineArm{Name: name, Reqs: make([]timelineReq, 0, len(recs))}
 	if len(recs) == 0 {
@@ -413,14 +415,14 @@ func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
 	lastSeries := map[rowKey]int{}
 	for i := range arm.Reqs {
 		q := &arm.Reqs[i]
-		k := rowKeyOf(q.Slot, q.Series)
+		k := lineOf(recs[q.idx])
 		g, ok := groups[k]
 		if !ok {
 			g = len(groups)
 			groups[k] = g
 			packers[k] = &subRowPacker{}
 		}
-		if prev, seen := lastSeries[k]; !seen || prev != q.Series {
+		if prev, seen := lastSeries[k]; k.session == 0 && (!seen || prev != q.Series) {
 			q.Flags |= flagSession
 			lastSeries[k] = q.Series
 		}

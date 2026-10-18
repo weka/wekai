@@ -23,7 +23,7 @@ var WekaiTimeline = (function () {
   var WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1, 14: 1, 15: 1 };
   // One word for the UI: a series is a simulated user lane (rows on the timeline); it runs one replayed session after
   // another (purple ticks mark session boundaries). Admission adds series, --ttft-retire retires them.
-  var SERIES_TIP = "Active sessions: replayed user sessions in progress. Each timeline row is one simulated user replaying one session after another (purple ticks mark session boundaries). Admission adds rows; --ttft-retire retires them.";   // kinds the "merge waits" toggle collapses into WAITED
+  var SERIES_TIP = "Active sessions: replayed user sessions in progress. Each timeline row is one session, from its first request to its last; a session with subagents spreads over several sub-rows while they overlap. Admission starts new sessions; while the fleet is over its TTFT or decode limit, a session that ends is not replaced.";   // kinds the "merge waits" toggle collapses into WAITED
   var AXIS_H = 34, RIGHT = 14, GAP = 2;
   var ROW_HEIGHTS = [1, 2, 3, 4, 6, 10, 14, 20];
 
@@ -511,11 +511,11 @@ var WekaiTimeline = (function () {
     // Live: the server's counts and admission gate.
     function renderState(st) {
       if (!st) return;
-      var h = "<span title='" + SERIES_TIP + "'>active sessions</span> <b>" + st.slots + "</b>" + (st.max ? " / <b>" + st.max + "</b> max" : "") +
+      var h = "<span title='" + SERIES_TIP + "'>active sessions</span> <b>" + st.sessions + "</b>" + (st.max ? " / <b>" + st.max + "</b> max" : "") +
         " &middot; <span title='request outstanding at the engine'>in flight <b>" + st.in_flight + "</b></span>" +
         " &middot; <span title='next turn due, waiting under the client concurrency limit'>waiting at gate <b>" + st.waiting + "</b></span>" +
         " &middot; <span title='pausing until the next turn is due'>think pause <b>" + st.think + "</b></span>" +
-        " &middot; <span title='no turn pending: between sessions'>idle <b>" + st.idle + "</b></span>" +
+        (st.idle ? " &middot; <span title='no turn pending'>idle <b>" + st.idle + "</b></span>" : "") +
         " <span class='wtl-dim'>(" + st.requests + " requests outstanding)</span>";
       if (st.rates) {
         var rt = st.rates;
@@ -711,7 +711,7 @@ var WekaiTimeline = (function () {
         var grp = a.groups[g];
         ensureSorted(grp);
         if (g > 0 && rowH >= 6) { c.fillStyle = "#13181b"; c.fillRect(0, gy - 1, W, 1); }
-        // Session boundaries inside the window: the slot moved on to a new session.
+        // Session boundaries inside the window: a fixed-pool worker moved on to a new session.
         c.fillStyle = "rgba(199,159,241,0.45)";
         var gh = grp.subs * rowH;
         var bEnd = playT === null ? r[1] : Math.min(r[1], playT);
@@ -784,7 +784,7 @@ var WekaiTimeline = (function () {
         for (var u = 0; u < grp.subs; u++) flushLod(u, gy + u * rowH, rh);
         if (rowH >= 8) {
           var any = grp.reqs[0] || grp.infl[0];
-          if (any) { ctx.fillStyle = "#6f767d"; ctx.textAlign = "right"; ctx.font = "10px monospace"; ctx.fillText(any.sl ? ((any.x & FLAG_HOT) ? "h" : "s") + any.sl : "s" + any.s, plotL - 5, gy + rh - 3); }
+          if (any) { ctx.fillStyle = "#6f767d"; ctx.textAlign = "right"; ctx.font = "10px monospace"; ctx.fillText(any.ss ? "#" + any.ss : any.sl ? ((any.x & FLAG_HOT) ? "h" : "w") + any.sl : "s" + any.s, plotL - 5, gy + rh - 3); }
         }
       }
       ctx.restore();
@@ -940,7 +940,7 @@ var WekaiTimeline = (function () {
       var infl = (q.x & FLAG_INFL) !== 0, e2e = infl ? Math.max(0, now - q.t) : q.e;
       var inst = q.gu || (a.guids && q.gi ? a.guids[q.gi - 1] : "");
       var ic = inst.indexOf(":"); if (ic >= 0) inst = inst.slice(ic + 1);
-      var head = q.sl ? "<b>" + ((q.x & FLAG_HOT) ? "hot row " : "row ") + q.sl + "</b> &middot; session " + q.s : "<b>session " + q.s + "</b>";
+      var head = q.ss ? "<b>session " + q.s + "</b> &middot; run #" + q.ss : q.sl ? "<b>" + ((q.x & FLAG_HOT) ? "hot worker " : "worker ") + q.sl + "</b> &middot; session " + q.s : "<b>session " + q.s + "</b>";
       var html = head + " turn " + q.n + ((q.x & FLAG_SESSION) ? " (first of session)" : "") + (inst ? " &middot; instance " + esc(inst.length > 24 ? inst.slice(0, 24) + "\u2026" : inst) : "") + (infl ? " <b>(in flight)</b>" : "") +
         ((q.x & FLAG_ERR) ? " <b style='color:#FF6B6B'>error</b>" : "") + ((q.x & FLAG_COLD) ? " cold start" : "") + ((q.x & FLAG_EMPTY) ? " empty" : "") + "<br>" +
         "start " + fmtClock(a.t0 + q.t, true) + " (+" + fmtDur(q.t) + ")<br>";

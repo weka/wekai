@@ -387,7 +387,7 @@ func TestReuseOnAnEmptyCorpusStops(t *testing.T) {
 // The live view's rows are the slots, not the sessions: with more slots than
 // sessions (the corpus cycling), each slot that holds a request shows up as its
 // own row, tagged with its slot number.
-func TestReplayRequestsCarryTheirSlot(t *testing.T) {
+func TestReplayRequestsCarryTheirSessionRun(t *testing.T) {
 	const sessions, slots = 3, 5
 	path := oversubscribeCorpus(t, sessions)
 	bf := newBlockingFleet()
@@ -421,14 +421,23 @@ func TestReplayRequestsCarryTheirSlot(t *testing.T) {
 	bf.close()
 	wg.Wait()
 
-	rows := map[int]int{}
+	// Router replay draws sessions, never workers: each in-flight session on
+	// its own row, numbered by run, with no worker number; the hot worker's
+	// session keeps the hot flag.
+	rows, runs, hot := map[int]bool{}, map[int]bool{}, 0
 	for _, f := range in {
-		rows[f.Row] = f.Slot
-		if (f.Slot == 1) != (f.Flags&flagHot != 0) {
-			t.Errorf("hot flag wrong on %+v", f)
+		rows[f.Row], runs[f.Sess] = true, true
+		if f.Slot != 0 || f.Sess <= 0 {
+			t.Errorf("request carries worker %d / session run %d, want no worker and a run: %+v", f.Slot, f.Sess, f)
+		}
+		if f.Flags&flagHot != 0 {
+			hot++
 		}
 	}
-	if len(in) != slots || len(rows) != slots {
-		t.Fatalf("%d in-flight requests on %d rows, want %d slots each on its own row", len(in), len(rows), slots)
+	if len(in) != slots || len(rows) != slots || len(runs) != slots {
+		t.Fatalf("%d in-flight requests on %d rows with %d session runs, want %d sessions each on its own row", len(in), len(rows), len(runs), slots)
+	}
+	if hot != 1 {
+		t.Errorf("%d in-flight sessions flagged hot, want the hot worker's one", hot)
 	}
 }

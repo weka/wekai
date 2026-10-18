@@ -156,9 +156,12 @@ and resumes with one batch per tick, without catching up on skipped ticks.
 `--ttft-limit` (10s), no session cap, sessions reused from the top of the file
 (so the run lasts until `--timeout`), and the request timeline in the report.
 `--ttft-retire` is on by default: when a session ends while TTFT is more than
-`--ttft-retire-margin` (0.15) above the limit, its slot retires instead of
-starting the next session (between the limit and that threshold sessions are
-replaced but none added; below it admission adds batches). Every default can be
+`--ttft-retire-margin` (0.15) above the limit, or the decode rate is below the
+floor, no new session replaces it (between the limit and that threshold sessions are
+replaced but none added; below it admission adds batches). The unit is the
+session throughout: admission starts sessions, active sessions are those started
+and not yet ended, and the status line reports
+`sessions=<active>(started=,ended=,unreplaced=,corpus=)`. Every default can be
 overridden with the explicit flag (`--ttft-retire=false`, `--max-series=N`, ...).
 
 `--decode-rate-min=N` (default 20 with `--replay-realtime`, `0` to turn off) is a
@@ -295,12 +298,15 @@ already ask for `stream_options.include_usage`, which is how vLLM delivers them.
 
 - `wekai benchmark visualize <dir> --timeline` (also `visualize-merge`, and
   `benchmark auto --timeline` for the end-of-run report) adds a Metrics/Timeline
-  switch to the report. Timeline: one row per concurrency SLOT (`--series N` gives N
-  rows; hot-pool slots are labelled `h<N>`), x = time (zoom shared with the
-  report). The sessions a slot replays follow one another along its row with a
-  thin marker where a new session starts, and overlapping requests (sub-agent
-  fan-out) are packed into sub-rows under it. Reqdata records `slot`/`slot_hot`
-  per request; files without them group by `series_num` (the session) instead.
+  switch to the report. Timeline: router replay draws one row per SESSION, from
+  its first request to its last (labelled `#<run>`, the order sessions started
+  in; a corpus session replayed on a later pass is a new run), and overlapping
+  requests of that session (subagent fan-out) are packed into sub-rows under it.
+  The fixed-pool modes (`--series N`) draw one row per worker instead (`w<N>`,
+  hot-pool workers `h<N>`), with a thin marker where the worker moves on to its
+  next session. x = time (zoom shared with the report). Reqdata records
+  `session_run` (router replay) or `slot`/`slot_hot` (fixed pool) per request;
+  files with neither group by `series_num`.
   Rows are ordered by first request. Each request bar, left to right = waits, separated by where they
   happened: client wait (the turn was due but no concurrency slot was free;
   `ready_ms` -> `sent_ms` in reqdata), engine queue (other limits, then no free
@@ -308,10 +314,10 @@ already ask for `stream_options.include_usage`, which is how vLLM delivers them.
   prefill split by token share into computed / external / host / GPU cache
   (kv_fetch counted in the external share), preempted, decode. Requests with no
   engine details use client timestamps with one "prefill (unknown source)" colour.
-  Under the toolbar a state line counts the admitted slots (live: from the run;
+  Under the toolbar a state line counts the active sessions (live: from the run;
   offline: reconstructed from reqdata at the view's right edge) as in flight /
   waiting at gate / think pause / idle, and, live, the admission gate (stat over
-  window vs limit, open or closed, next admit). A slot's think pause is shaded
+  window vs limit, open or closed, next admit). A session's think pause is shaded
   faintly (`think_pause_ms` in reqdata). Live `/api/state` serves the same counts.
   Above the rows, strips show token throughput (input stacked by source,
   output as a line) and the gate's TTFT (mean / p95 against the limit) on the
@@ -322,7 +328,7 @@ already ask for `stream_options.include_usage`, which is how vLLM delivers them.
   Time spent backing off after a 429 is its own wait (`retries_429`,
   `retry_wait_ms`). Live: `/api/series` serves the strips' history.
   "Merge waits" collapses all wait kinds into one colour. Hovering anywhere on a
-  row outlines that whole slot row.
+  row outlines that whole row.
 - `wekai benchmark timeline <dir> -o timeline.html` renders just that view.
 - `wekai benchmark auto --live-port 8088` serves the same view live while the
   run executes: same per-series rows, in-flight requests growing, polled every 2s.

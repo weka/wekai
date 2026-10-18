@@ -832,16 +832,18 @@ func runRouterReplaySeriesLoop(
 			return
 		}
 		seriesNum := idx + 1
-		runRouterReplaySession(benchCtx, cfg, st, rdw,
+		sessCtx := withSession(benchCtx, int(st.sessionsStarted.Add(1)))
+		runRouterReplaySession(sessCtx, cfg, st, rdw,
 			sess, seriesNum, picker, reqTimeout, docs, gate)
-		// Session slot retired — drop its active-dataset snapshot.
+		st.live.endLine(slotOf(sessCtx))
+		// The session ended: drop its active-dataset snapshot.
 		st.datasetTracker.Reset(seriesNum)
 		st.seriesReplayCompleted.Add(1)
 		if shouldRetireSlot(cfg, st.ttft, st.decode, time.Now()) {
 			// --ttft-retire: the fleet is over the TTFT limit by more than
-			// the margin or decoding below --decode-rate-min, so this slot
-			// stops here instead of adding the next session's load;
-			// admission re-adds slots once the fleet recovers.
+			// the margin or decoding below --decode-rate-min, so the ended
+			// session is not replaced; admission starts new sessions once
+			// the fleet recovers.
 			st.seriesRetired.Add(1)
 			updateSnap(st)
 			return
