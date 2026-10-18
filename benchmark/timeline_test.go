@@ -280,47 +280,55 @@ func TestReportTimelineOptIn(t *testing.T) {
 // Slots are the row groups; the sessions a slot replays follow one another along
 // its row, each new session flagged. Data recorded without slots falls back to
 // grouping by series_num.
-func TestBuildTimelineArmSlotGrouping(t *testing.T) {
+func TestBuildTimelineArmWorkerSessionsGetTheirOwnRows(t *testing.T) {
 	base := time.Unix(1_800_000_000, 0)
 	mk := func(startSec float64, slot, series int, hot bool) requestDataRecord {
 		return requestDataRecord{StartTime: base.Add(time.Duration(startSec * float64(time.Second))), ResponseMs: 1000, TTFT: 100,
 			Slot: slot, SlotHot: hot, SeriesNum: series, Turn: 1}
 	}
-	arm := buildTimelineArm("slots", []requestDataRecord{
-		mk(0, 1, 100, true), mk(1, 1, 100, true), mk(5, 1, 101, true), // slot 1: session 100 then 101
-		mk(0, 2, 200, false), mk(7, 2, 205, false), // slot 2: session 200 then 205
+	// Only the worker was recorded: each stretch of a worker's requests under
+	// one series_num is one session and gets its own row.
+	arm := buildTimelineArm("workers", []requestDataRecord{
+		mk(0, 1, 100, true), mk(1, 1, 100, true), mk(5, 1, 101, true), // worker 1: session 100 then 101
+		mk(0, 2, 200, false), mk(7, 2, 205, false), mk(9, 2, 200, false), // worker 2: 200, 205, then 200 again
 	})
-	if arm.Groups != 2 {
-		t.Fatalf("groups = %d, want 2 slots (not 4 sessions)", arm.Groups)
+	if arm.Groups != 5 {
+		t.Fatalf("groups = %d, want one per session (5)", arm.Groups)
 	}
-	type k struct {
-		slot   int
-		series int
-	}
-	flagged := map[k]bool{}
+	rows := map[int]map[int]bool{} // row -> series on it
 	for _, r := range arm.Reqs {
-		if r.Row != r.Slot-1 || r.Sub != 0 {
-			t.Errorf("request %+v not on its slot row", r)
+		if rows[r.Row] == nil {
+			rows[r.Row] = map[int]bool{}
 		}
-		if r.Flags&flagSession != 0 {
-			flagged[k{r.Slot, r.Series}] = true
-		}
+		rows[r.Row][r.Series] = true
 		if (r.Slot == 1) != (r.Flags&flagHot != 0) {
 			t.Errorf("hot flag wrong on %+v", r)
 		}
-	}
-	want := map[k]bool{{1, 100}: true, {1, 101}: true, {2, 200}: true, {2, 205}: true}
-	if len(flagged) != len(want) {
-		t.Errorf("session boundaries = %v, want %v", flagged, want)
-	}
-	// The second turn of session 100 is not a boundary.
-	for _, r := range arm.Reqs {
-		if r.Slot == 1 && r.Series == 100 && r.Start == 1000 && r.Flags&flagSession != 0 {
-			t.Error("a continuing session was flagged as a boundary")
+		if r.Flags&flagSession != 0 {
+			t.Errorf("session boundary flagged on a row that holds one session: %+v", r)
 		}
 	}
+	for row, ss := range rows {
+		if len(ss) != 1 {
+			t.Errorf("row %d mixes sessions %v", row, ss)
+		}
+	}
+	// The two turns of session 100 share a row.
+	var r0, r1 int
+	for _, r := range arm.Reqs {
+		if r.Slot == 1 && r.Series == 100 {
+			if r.Start == 0 {
+				r0 = r.Row
+			} else {
+				r1 = r.Row
+			}
+		}
+	}
+	if r0 != r1 {
+		t.Error("a continuing session was split across rows")
+	}
 
-	// Old files: no slot recorded -> one group per series_num, as before.
+	// No worker recorded: one group per series_num.
 	old := buildTimelineArm("old", []requestDataRecord{mk(0, 0, 7, false), mk(1, 0, 8, false), mk(2, 0, 7, false)})
 	if old.Groups != 2 {
 		t.Errorf("fallback groups = %d, want 2 series", old.Groups)

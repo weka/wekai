@@ -302,11 +302,13 @@ already ask for `stream_options.include_usage`, which is how vLLM delivers them.
   its first request to its last (labelled `#<run>`, the order sessions started
   in; a corpus session replayed on a later pass is a new run), and overlapping
   requests of that session (subagent fan-out) are packed into sub-rows under it.
-  The fixed-pool modes (`--series N`) draw one row per worker instead (`w<N>`,
-  hot-pool workers `h<N>`), with a thin marker where the worker moves on to its
-  next session. x = time (zoom shared with the report). Reqdata records
-  `session_run` (router replay) or `slot`/`slot_hot` (fixed pool) per request;
-  files with neither group by `series_num`.
+  Reqdata records `session_run` per request; files that recorded only the
+  worker (`slot`, the fixed-pool modes and router-replay files written before
+  `session_run`) get the same one-row-per-session layout, each stretch of a
+  worker's requests under one `series_num` being one session; files with
+  neither group by `series_num`. The live view of the fixed-pool modes draws
+  one row per worker (`w<N>`, hot-pool `h<N>`). x = time (zoom shared with the
+  report).
   Rows are ordered by first request. Each request bar, left to right = waits, separated by where they
   happened: client wait (the turn was due but no concurrency slot was free;
   `ready_ms` -> `sent_ms` in reqdata), engine queue (other limits, then no free

@@ -110,9 +110,11 @@ type timelineReq struct {
 	idx    int       // position in the records the arm was built from
 }
 
-// rowKey identifies a row group: one session (router replay), one worker
-// (fixed-pool modes), or, when neither was recorded, a series_num.
-type rowKey struct{ session, slot, series int }
+// rowKey identifies a row group: one session (its run number, or the n-th
+// session a worker played when only the worker was recorded), one worker (the
+// live view of the fixed-pool modes), or, when neither was recorded, a
+// series_num.
+type rowKey struct{ session, slot, seg, series int }
 
 func rowKeyOf(slot, series int) rowKey {
 	if slot > 0 {
@@ -377,11 +379,12 @@ func (p *subRowPacker) release(u int, end float64) {
 	}
 }
 
-// buildTimelineArm builds an arm with one row group per session (router
-// replay), per worker (fixed-pool modes), or per series_num when neither was
-// recorded, ordered by the group's first request. A worker plays sessions one
-// after another, so on its row the first request of each new session is
-// flagged for a boundary marker. Time zero is the earliest start in recs.
+// buildTimelineArm builds an arm with one row group per session, ordered by the
+// session's first request. A session is its run number when recorded; when only
+// the worker was recorded (the fixed-pool modes) it is one stretch of that
+// worker's requests under one series_num, since a worker plays its sessions one
+// after another; with neither, its series_num. Time zero is the earliest start
+// in recs.
 func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
 	arm := timelineArm{Name: name, Reqs: make([]timelineReq, 0, len(recs))}
 	if len(recs) == 0 {
@@ -412,19 +415,22 @@ func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
 	sort.SliceStable(arm.Reqs, func(i, j int) bool { return arm.Reqs[i].Start < arm.Reqs[j].Start })
 	groups := map[rowKey]int{}
 	packers := map[rowKey]*subRowPacker{}
-	lastSeries := map[rowKey]int{}
+	workerSeries, workerSeg := map[int]int{}, map[int]int{} // per worker: series_num of its current session, sessions so far
 	for i := range arm.Reqs {
 		q := &arm.Reqs[i]
 		k := lineOf(recs[q.idx])
+		if k.slot > 0 {
+			if s, seen := workerSeries[k.slot]; !seen || s != q.Series {
+				workerSeries[k.slot] = q.Series
+				workerSeg[k.slot]++
+			}
+			k.seg = workerSeg[k.slot]
+		}
 		g, ok := groups[k]
 		if !ok {
 			g = len(groups)
 			groups[k] = g
 			packers[k] = &subRowPacker{}
-		}
-		if prev, seen := lastSeries[k]; k.session == 0 && (!seen || prev != q.Series) {
-			q.Flags |= flagSession
-			lastSeries[k] = q.Series
 		}
 		q.Row = g
 		q.Sub = packers[k].place(q.Start, q.Start+q.E2E)
