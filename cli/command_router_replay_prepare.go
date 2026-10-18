@@ -4,8 +4,12 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -29,7 +33,11 @@ type RouterReplayPrepareCommand struct {
 	// while requests were running holds only those already finished, so
 	// rebuilding the same corpus from the finished file needs the same cut.
 	CompleteBy string `long:"complete-by" description:"Only records whose response had finished (ts + total_ms) by this RFC3339 instant"`
-	Args       struct {
+	// Shards bounds memory: records are split by session into this many
+	// temp files and built one shard at a time.
+	Shards  int `long:"shards" default:"256" description:"Split the capture by session into this many temp shards; peak memory is about one shard per worker"`
+	Workers int `long:"workers" description:"Shards parsed in parallel (default: number of CPUs)"`
+	Args    struct {
 		Src string `positional-arg-name:"src" description:"Directory of redacted *.jsonl files (or one .jsonl). Default: ~/.wekai/router/capture/redacted/"`
 	} `positional-args:"yes"`
 }
@@ -186,31 +194,309 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 	if err != nil {
 		return err
 	}
+	// A shard's records are held parsed in memory; keep GC headroom from
+	// pushing a large one past physical RAM.
+	setSoftMemoryLimit(0.75)
 
-	// Reuse the tree command's parser + tree builder so the linkage logic
-	// is single-sourced.
-	var records []treeRecord
-	for _, f := range files {
-		recs, err := parseTreeFile(f)
-		if err != nil {
-			return fmt.Errorf("parse %s: %w", f, err)
+	// The output directory is known up front (the default file name needs
+	// the corpus time range, known only at the end); shards and the session
+	// spool live there so they share the output's disk.
+	dstDir := filepath.Dir(c.Out)
+	if c.Out == "" {
+		base := filepath.Dir(strings.TrimRight(src, string(filepath.Separator)))
+		dstDir = filepath.Join(base, "replays")
+		if err := os.MkdirAll(dstDir, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", dstDir, err)
 		}
-		recs, err = filterRecordsByTime(recs, c.Since, c.Until, c.CompleteBy)
+	}
+	work, err := os.MkdirTemp(dstDir, ".replay-prepare-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(work)
+
+	// Pass 1: split the capture by session. Everything replay-prepare links
+	// (spawns, instances, implicit parents, think times) is scoped to one
+	// session, so a shard holding whole sessions can be built on its own, and
+	// only one shard is in memory at a time. A session resumed days later
+	// hashes to the same shard as its earlier records.
+	shards, orphans, err := shardBySession(files, work, c.Shards)
+	if err != nil {
+		return err
+	}
+
+	// Pass 2: persona labels depend on whether a persona spawns, or is
+	// spawned, anywhere in the corpus — the one cross-session fact. Collect
+	// it from every shard (a few entries per distinct system prompt).
+	workers := c.Workers
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	persona := newPersonaFlags()
+	err = eachShardOrdered(shards, workers,
+		func(path string) (*personaFlags, error) {
+			records, err := c.loadShard(path)
+			if err != nil || len(records) == 0 {
+				return nil, err
+			}
+			return buildTreeReport(records).persona, nil
+		},
+		func(f *personaFlags) error {
+			if f != nil {
+				persona.merge(f)
+			}
+			return nil
+		})
+	if err != nil {
+		return err
+	}
+
+	// Pass 3: build each shard's sessions against the corpus-wide flags and
+	// spool their lines; the header carries totals known only once every
+	// shard is done.
+	spool, err := os.CreateTemp(work, "sessions-")
+	if err != nil {
+		return err
+	}
+	defer spool.Close()
+	b := &replayBuilder{sw: bufio.NewWriterSize(spool, 1<<20), think: newThinkAccumulator(), orphans: orphans, persona: persona}
+	// Shards parse in parallel; sessions are built in shard order so the
+	// output does not depend on scheduling.
+	err = eachShardOrdered(shards, workers,
+		func(path string) ([]treeRecord, error) {
+			records, err := c.loadShard(path)
+			if err != nil {
+				return nil, err
+			}
+			return records, os.Remove(path)
+		},
+		b.addRecords)
+	if err != nil {
+		return err
+	}
+	if err := b.sw.Flush(); err != nil {
+		return err
+	}
+	if b.records == 0 {
+		return fmt.Errorf("no records found in %s", src)
+	}
+
+	dst := c.Out
+	if dst == "" {
+		dst = filepath.Join(dstDir, fmt.Sprintf("replay-%s-to-%s.jsonl",
+			ymd(b.startTs.Format(time.RFC3339)), ymd(b.endTs.Format(time.RFC3339))))
+	}
+	name := c.Name
+	if name == "" {
+		name = strings.TrimSuffix(filepath.Base(dst), filepath.Ext(dst))
+	}
+	b.summary.StartTs = b.startTs.Format(time.RFC3339)
+	b.summary.EndTs = b.endTs.Format(time.RFC3339)
+	b.summary.Timing = b.think.summary()
+	header := ReplayHeader{
+		Schema:      "replay-v5",
+		Name:        name,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		// Base name only: replay files get published as artifacts, and a full
+		// path would leak the producer's local filesystem layout.
+		Source:  filepath.Base(strings.TrimRight(src, "/")),
+		Summary: b.summary,
+	}
+	if err := b.write(dst, &header, spool); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %d sessions / %d instances / %d requests / %d repaired_parents / %d cycles_broken / %d orphan records dropped / %d unplaced records -> %s\n",
+		len(b.entries), b.instances, b.summary.Requests, b.summary.RepairedParents, b.summary.CyclesBroken, b.orphans, b.unplaced, dst)
+	return nil
+}
+
+// loadShard parses one shard and applies the time filters.
+func (c *RouterReplayPrepareCommand) loadShard(path string) ([]treeRecord, error) {
+	// Fresh interner per shard: sessions never span shards, so its tables
+	// would only grow across them.
+	records, err := parseTreeFile(path, newTreeInterner())
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return filterRecordsByTime(records, c.Since, c.Until, c.CompleteBy)
+}
+
+// eachShardOrdered runs work on every shard with up to workers in flight and
+// hands the results to consume in shard order. A slot frees only once its
+// result is consumed, so at most workers results are held at a time.
+func eachShardOrdered[T any](shards []string, workers int, work func(string) (T, error), consume func(T) error) error {
+	type result struct {
+		v   T
+		err error
+	}
+	results := make([]chan result, len(shards))
+	for i := range results {
+		results[i] = make(chan result, 1)
+	}
+	slots := make(chan struct{}, max(workers, 1))
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for i, path := range shards {
+			select {
+			case slots <- struct{}{}:
+			case <-done:
+				return
+			}
+			go func() {
+				v, err := work(path)
+				results[i] <- result{v, err}
+			}()
+		}
+	}()
+	for i := range shards {
+		r := <-results[i]
+		if r.err != nil {
+			return r.err
+		}
+		err := consume(r.v)
+		var zero T
+		r.v = zero
+		<-slots
 		if err != nil {
 			return err
 		}
-		records = append(records, recs...)
 	}
-	if len(records) == 0 {
-		return fmt.Errorf("no records found in %s", src)
-	}
-	rep := buildTreeReport(records)
+	return nil
+}
 
-	// Index records and build per-instance request streams.
-	recByID := make(map[uint64]*treeRecord, len(records))
-	for i := range records {
-		recByID[records[i].ID] = &records[i]
+// shardBySession copies every POST 2xx record line of files into one of n
+// shard files under dir, picked by a hash of the record's session id, and
+// returns the shard paths and how many records were dropped for having no
+// session id. Records with no session id are dropped: they would
+// form one synthetic session spanning the whole capture, which replays as an
+// unrealistic single stream and is the one session that does not shard.
+func shardBySession(files []string, dir string, n int) ([]string, int, error) {
+	if n <= 0 {
+		n = 1
 	}
+	paths := make([]string, n)
+	outs := make([]*os.File, n)
+	ws := make([]*bufio.Writer, n)
+	defer func() {
+		for _, f := range outs {
+			if f != nil {
+				f.Close()
+			}
+		}
+	}()
+	for i := range paths {
+		paths[i] = filepath.Join(dir, fmt.Sprintf("shard-%04d.jsonl", i))
+		f, err := os.Create(paths[i])
+		if err != nil {
+			return nil, 0, err
+		}
+		outs[i] = f
+		ws[i] = bufio.NewWriterSize(f, 256<<10)
+	}
+	// Only the fields that route a line; the line itself is copied verbatim
+	// and fully parsed in pass 2.
+	var probe struct {
+		Method  string `json:"method"`
+		Status  int    `json:"status"`
+		Request struct {
+			Headers http.Header `json:"headers"`
+		} `json:"request"`
+	}
+	orphans := 0
+	for _, path := range files {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, 0, err
+		}
+		br := bufio.NewReaderSize(f, 1<<20)
+		for {
+			line, readErr := br.ReadBytes('\n')
+			if len(line) > 1 {
+				probe.Method, probe.Status, probe.Request.Headers = "", 0, nil
+				// Same skips as parseLine, so dropped lines never reach disk.
+				if json.Unmarshal(line, &probe) == nil && probe.Method == "POST" &&
+					probe.Status >= 200 && probe.Status < 300 {
+					if sid := probe.Request.Headers.Get("X-Claude-Code-Session-Id"); sid == "" {
+						orphans++
+					} else {
+						h := fnv.New32a()
+						h.Write([]byte(sid))
+						w := ws[h.Sum32()%uint32(n)]
+						if _, err := w.Write(line); err != nil {
+							f.Close()
+							return nil, 0, err
+						}
+						if line[len(line)-1] != '\n' {
+							w.WriteByte('\n')
+						}
+					}
+				}
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				f.Close()
+				return nil, 0, fmt.Errorf("read %s: %w", path, readErr)
+			}
+		}
+		f.Close()
+	}
+	for i, w := range ws {
+		if err := w.Flush(); err != nil {
+			return nil, 0, err
+		}
+		if err := outs[i].Close(); err != nil {
+			return nil, 0, err
+		}
+		outs[i] = nil
+	}
+	return paths, orphans, nil
+}
+
+// replayBuilder accumulates replay sessions shard by shard: session lines go
+// to the spool, and only the index entries, totals and think-time samples stay
+// in memory.
+type replayBuilder struct {
+	sw       *bufio.Writer
+	spoolLen int64
+	entries  []benchmark.ReplayIndexSession // Offset is into the spool until write
+	starts   []time.Time                    // session first-seen, for output order
+	think    *thinkAccumulator
+	summary  ReplaySummary
+	persona  *personaFlags // corpus-wide, see personaFlags
+
+	records        int
+	instances      int
+	orphans        int
+	unplaced       int // records whose instance the tree no longer has
+	startTs, endTs time.Time
+}
+
+// addRecords builds and spools the sessions of records, which must hold every
+// record of each session they touch.
+func (b *replayBuilder) addRecords(records []treeRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	// Reuse the tree command's tree builder so the linkage logic is
+	// single-sourced.
+	rep := buildTreeReportWith(records, b.persona) // sorts records by ts
+	b.records += len(records)
+	if b.startTs.IsZero() || records[0].Ts.Before(b.startTs) {
+		b.startTs = records[0].Ts
+	}
+	if last := records[len(records)-1].Ts; last.After(b.endTs) {
+		b.endTs = last
+	}
+	b.summary.Sessions += rep.TotalSessions
+	b.summary.Instances += rep.TotalInstances
+	b.summary.Spawns += rep.TotalSpawns
+	b.summary.MatchedSpawns += rep.MatchedSpawns
+	b.summary.FanOutTurns += rep.FanOutTurns
+	b.summary.MaxFanOutInOneTurn = max(b.summary.MaxFanOutInOneTurn, rep.MaxFanoutSeen)
+
 	// Group records by their owning instance id (recompute the same key the
 	// tree builder uses).
 	instReqs := map[string][]*treeRecord{}
@@ -226,13 +512,15 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 		// never get routed into instReqs and the replay session emits empty.
 		sid := r.SessionID()
 		key := sid + ":" + sig + ":" + fp
-		// May have been collapsed onto a canonical main instance — find the
-		// canonical key by checking if rep.Instances has this exact key; if
-		// not, we look it up against the report's instance set by best-match
-		// (same session, same persona, earliest-seen-by-time main).
+		// May have been collapsed onto a canonical main instance, which can
+		// carry a different persona (a session's main agent changes system
+		// prompt mid-way): follow the tree's own collapse map. Persona
+		// best-match is only a fallback.
 		if _, ok := rep.Instances[key]; !ok {
-			key = canonicalInstanceKey(rep, sid, sig)
-			if key == "" {
+			if canon, ok := rep.collapsed[key]; ok {
+				key = canon
+			} else if key = canonicalInstanceKey(rep, sid, sig); key == "" {
+				b.unplaced++
 				continue
 			}
 		}
@@ -244,7 +532,6 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 		})
 	}
 
-	// Stable session order: by first-seen timestamp.
 	sessIDs := make([]string, 0, len(rep.Sessions))
 	for sid := range rep.Sessions {
 		sessIDs = append(sessIDs, sid)
@@ -252,54 +539,6 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 	sort.Slice(sessIDs, func(i, j int) bool {
 		return rep.Sessions[sessIDs[i]].FirstSeenTs.Before(rep.Sessions[sessIDs[j]].FirstSeenTs)
 	})
-
-	// Resolve output path.
-	dst := c.Out
-	if dst == "" {
-		base := filepath.Dir(strings.TrimRight(src, string(filepath.Separator)))
-		dst = filepath.Join(base, "replays")
-		if err := os.MkdirAll(dst, 0o755); err != nil {
-			return fmt.Errorf("mkdir %s: %w", dst, err)
-		}
-		fname := fmt.Sprintf("replay-%s-to-%s.jsonl",
-			ymd(rep.StartTs), ymd(rep.EndTs))
-		dst = filepath.Join(dst, fname)
-	}
-	name := c.Name
-	if name == "" {
-		name = strings.TrimSuffix(filepath.Base(dst), filepath.Ext(dst))
-	}
-
-	// Stream-write: header on line 1, then one session per line. Build each
-	// session in turn rather than accumulating the whole structure in
-	// memory — that way replay-prepare itself doesn't blow up on huge
-	// captures.
-	f, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	bw := bufio.NewWriterSize(f, 1<<20)
-	defer bw.Flush()
-
-	header := ReplayHeader{
-		Schema:      "replay-v5",
-		Name:        name,
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-		// Base name only: replay files get published as artifacts, and a full
-		// path would leak the producer's local filesystem layout.
-		Source: filepath.Base(strings.TrimRight(src, "/")),
-		Summary: ReplaySummary{
-			Sessions:           rep.TotalSessions,
-			Instances:          rep.TotalInstances,
-			Spawns:             rep.TotalSpawns,
-			MatchedSpawns:      rep.MatchedSpawns,
-			FanOutTurns:        rep.FanOutTurns,
-			MaxFanOutInOneTurn: rep.MaxFanoutSeen,
-			StartTs:            rep.StartTs,
-			EndTs:              rep.EndTs,
-		},
-	}
 
 	// Implicit-parent pass: for any instance not linked via Agent-tool
 	// spawn, find the latest request in the SAME SESSION (any instance,
@@ -358,20 +597,6 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 		}
 	}
 
-	totalReqs := 0
-	emittedSessions := 0
-	emittedInstances := 0
-	totalRepaired := 0
-	totalCyclesBroken := 0
-	think := newThinkAccumulator()
-	// Two-pass write: build all sessions first to fill in Summary.Requests,
-	// then write header + sessions. Sessions go through a slice but each
-	// session is small relative to the file (median 2.7 KB) — we only ever
-	// hold the marshaled bytes briefly. If we wanted true zero-buffering
-	// we'd have to write the header last; sticking it on line 1 wins on
-	// readability.
-	var sessionLines [][]byte
-	var indexEntries []benchmark.ReplayIndexSession
 	for _, sid := range sessIDs {
 		sess := rep.Sessions[sid]
 		rs := ReplaySession{
@@ -410,42 +635,75 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 				rr := buildReplayRequest(r)
 				if rr != nil {
 					ri.Requests = append(ri.Requests, *rr)
-					totalReqs++
+					b.summary.Requests++
 				}
+				// Each record feeds exactly one instance, and only its
+				// ID/Ts are read after this point; drop the bodies so
+				// memory shrinks as sessions are written.
+				r.Req = redactedRequest{}
+				r.Resp = redactedResponse{}
 			}
 			if len(ri.Requests) == 0 {
 				continue
 			}
 			rs.Instances = append(rs.Instances, ri)
-			emittedInstances++
+			b.instances++
 		}
 		if len(rs.Instances) == 0 {
 			continue
 		}
-		repaired := repairDanglingParents(&rs)
-		totalRepaired += repaired
+		b.summary.RepairedParents += repairDanglingParents(&rs)
 		cyclesBroken := breakParentCycles(&rs)
-		totalCyclesBroken += cyclesBroken
+		b.summary.CyclesBroken += cyclesBroken
 		if cyclesBroken > 0 {
 			fmt.Fprintf(os.Stderr, "replay-prepare: broke %d parent-dependency cycle(s) (instances promoted to roots)\n", cyclesBroken)
 		}
-		annotateThink(&rs, think)
-		emittedSessions++
+		annotateThink(&rs, b.think)
 		// Compact JSON encoding (no indent) so each session sits on one
 		// line. The header line uses the same encoding for consistency.
 		line, err := json.Marshal(&rs)
 		if err != nil {
 			return fmt.Errorf("marshal session %s: %w", sid, err)
 		}
-		sessionLines = append(sessionLines, line)
-		indexEntries = append(indexEntries, sessionIndexEntry(&rs, int64(len(line))))
+		e := sessionIndexEntry(&rs, int64(len(line)))
+		e.Offset = b.spoolLen
+		b.entries = append(b.entries, e)
+		b.starts = append(b.starts, sess.FirstSeenTs)
+		if _, err := b.sw.Write(line); err != nil {
+			return err
+		}
+		if err := b.sw.WriteByte('\n'); err != nil {
+			return err
+		}
+		b.spoolLen += int64(len(line)) + 1
 	}
-	header.Summary.Requests = totalReqs
-	header.Summary.RepairedParents = totalRepaired
-	header.Summary.CyclesBroken = totalCyclesBroken
-	header.Summary.Timing = think.summary()
-	// Write header on line 1.
-	hb, err := json.Marshal(&header)
+	return nil
+}
+
+// write emits the replay file: header on line 1, the spooled session lines in
+// first-seen order (shards emit them interleaved in time), and the session
+// index (replay-v5) last, once the offsets are known; readers find it by
+// reading the file's tail.
+func (b *replayBuilder) write(dst string, header *ReplayHeader, spool *os.File) error {
+	order := make([]int, len(b.entries))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		a, c := order[i], order[j]
+		if !b.starts[a].Equal(b.starts[c]) {
+			return b.starts[a].Before(b.starts[c])
+		}
+		return b.entries[a].SessionID < b.entries[c].SessionID
+	})
+
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	bw := bufio.NewWriterSize(f, 1<<20)
+	hb, err := json.Marshal(header)
 	if err != nil {
 		return err
 	}
@@ -456,19 +714,18 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 		return err
 	}
 	offset := int64(len(hb)) + 1
-	for i, ln := range sessionLines {
-		indexEntries[i].Offset = offset
-		offset += int64(len(ln)) + 1
-		if _, err := bw.Write(ln); err != nil {
-			return err
+	index := make([]benchmark.ReplayIndexSession, 0, len(order))
+	for _, i := range order {
+		e := b.entries[i]
+		n := e.Length + 1 // with its newline
+		if _, err := io.Copy(bw, io.NewSectionReader(spool, e.Offset, n)); err != nil {
+			return fmt.Errorf("copy session %s: %w", e.SessionID, err)
 		}
-		if err := bw.WriteByte('\n'); err != nil {
-			return err
-		}
+		e.Offset = offset
+		offset += n
+		index = append(index, e)
 	}
-	// Last line: the session index (replay-v5). Written after the sessions so
-	// the offsets are known; readers find it by reading the file's tail.
-	ib, err := json.Marshal(&benchmark.ReplayIndex{Schema: benchmark.ReplayIndexSchema, Sessions: indexEntries})
+	ib, err := json.Marshal(&benchmark.ReplayIndex{Schema: benchmark.ReplayIndexSchema, Sessions: index})
 	if err != nil {
 		return err
 	}
@@ -478,9 +735,10 @@ func (c *RouterReplayPrepareCommand) Execute(args []string) error {
 	if err := bw.WriteByte('\n'); err != nil {
 		return err
 	}
-	fmt.Printf("wrote %d sessions / %d instances / %d requests / %d repaired_parents / %d cycles_broken / index %d bytes -> %s\n",
-		emittedSessions, emittedInstances, totalReqs, totalRepaired, totalCyclesBroken, len(ib), dst)
-	return nil
+	if err := bw.Flush(); err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // sessionIndexEntry describes one session line for the index trailer; the
@@ -510,8 +768,8 @@ func sessionIndexEntry(rs *ReplaySession, length int64) benchmark.ReplayIndexSes
 
 // parseTreeFile is a thin wrapper around RouterTreeCommand.parseFile so we
 // don't duplicate the raw/redacted detection logic here.
-func parseTreeFile(path string) ([]treeRecord, error) {
-	c := &RouterTreeCommand{}
+func parseTreeFile(path string, intern *treeInterner) ([]treeRecord, error) {
+	c := &RouterTreeCommand{intern: intern}
 	recs, _, _, _, err := c.parseFile(path)
 	return recs, err
 }

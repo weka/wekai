@@ -1,7 +1,12 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestRepairDanglingParents(t *testing.T) {
@@ -350,4 +355,73 @@ func TestBreakParentCycles(t *testing.T) {
 			t.Fatal("dangling parent was altered — should stay as-is (already handled by repairDanglingParents)")
 		}
 	})
+}
+
+// A session's main agent can change system prompt mid-way (a new persona
+// signature). Both personas spawn, so both instances are labelled main and the
+// tree collapses them into the earlier one; the later persona's requests must
+// follow that collapse instead of being dropped for having no instance of
+// their own persona left.
+func TestReplayPrepareKeepsRequestsOfCollapsedMain(t *testing.T) {
+	t0 := time.Date(2026, 5, 12, 8, 0, 0, 0, time.UTC)
+	rec := func(id uint64, at time.Duration, persona, seed, prompt string) treeRecord {
+		return treeRecord{
+			ID: id, Ts: t0.Add(at), Sid: "s1",
+			Req: redactedRequest{
+				SystemBlocks: []redactedSystemBlock{{Type: "text", Hash: persona}},
+				Messages:     []redactedMessage{{Role: "user", Hash: seed}},
+			},
+			Resp: redactedResponse{OutputBlocks: []redactedOutputBlock{
+				{Type: "tool_use", ToolUseID: "tu" + prompt, PromptHash: prompt},
+			}},
+		}
+	}
+	records := []treeRecord{
+		rec(1, 0, "persona-A", "seed-1", "p1"),
+		rec(2, time.Second, "persona-A", "seed-1", "p2"),
+		rec(3, 2*time.Second, "persona-B", "seed-2", "p3"),
+		rec(4, 3*time.Second, "persona-B", "seed-2", "p4"),
+	}
+	var spool bytes.Buffer
+	b := &replayBuilder{sw: bufio.NewWriter(&spool), think: newThinkAccumulator(), persona: newPersonaFlags()}
+	if err := b.addRecords(records); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.sw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if b.unplaced != 0 {
+		t.Fatalf("unplaced = %d, want 0", b.unplaced)
+	}
+	var rs ReplaySession
+	if err := json.Unmarshal(bytes.TrimSpace(spool.Bytes()), &rs); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	for _, inst := range rs.Instances {
+		n += len(inst.Requests)
+	}
+	if len(rs.Instances) != 1 || n != 4 {
+		t.Fatalf("got %d instance(s) / %d request(s), want the 2 mains collapsed into 1 instance with all 4 requests", len(rs.Instances), n)
+	}
+}
+
+// eachShardOrdered must consume results in shard order whatever order the
+// workers finish in.
+func TestEachShardOrdered(t *testing.T) {
+	shards := []string{"a", "b", "c", "d", "e", "f"}
+	var got []string
+	err := eachShardOrdered(shards, 3,
+		func(s string) (string, error) {
+			// Earlier shards finish later.
+			time.Sleep(time.Duration(len(shards)-int(s[0]-'a')) * time.Millisecond)
+			return s, nil
+		},
+		func(s string) error { got = append(got, s); return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "") != "abcdef" {
+		t.Fatalf("consumed %v, want shard order", got)
+	}
 }
