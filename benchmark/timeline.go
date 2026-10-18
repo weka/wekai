@@ -432,6 +432,11 @@ func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
 			groups[k] = g
 			packers[k] = &subRowPacker{}
 		}
+		if k.seg > 0 {
+			// A session derived from its worker: number it by start order like
+			// a recorded session run, and drop the worker, which is not a line.
+			q.Sess, q.Slot = g+1, 0
+		}
 		q.Row = g
 		q.Sub = packers[k].place(q.Start, q.Start+q.E2E)
 		if end := q.Start + q.E2E; end > arm.Span {

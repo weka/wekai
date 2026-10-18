@@ -301,7 +301,7 @@ func TestBuildTimelineArmWorkerSessionsGetTheirOwnRows(t *testing.T) {
 			rows[r.Row] = map[int]bool{}
 		}
 		rows[r.Row][r.Series] = true
-		if (r.Slot == 1) != (r.Flags&flagHot != 0) {
+		if (r.Series < 200) != (r.Flags&flagHot != 0) { // worker 1 (hot) ran series 100 and 101
 			t.Errorf("hot flag wrong on %+v", r)
 		}
 		if r.Flags&flagSession != 0 {
@@ -313,10 +313,15 @@ func TestBuildTimelineArmWorkerSessionsGetTheirOwnRows(t *testing.T) {
 			t.Errorf("row %d mixes sessions %v", row, ss)
 		}
 	}
+	for _, r := range arm.Reqs {
+		if r.Slot != 0 || r.Sess != r.Row+1 {
+			t.Errorf("derived session carries worker %d / run %d on row %d, want no worker and run = row+1", r.Slot, r.Sess, r.Row)
+		}
+	}
 	// The two turns of session 100 share a row.
 	var r0, r1 int
 	for _, r := range arm.Reqs {
-		if r.Slot == 1 && r.Series == 100 {
+		if r.Series == 100 {
 			if r.Start == 0 {
 				r0 = r.Row
 			} else {
