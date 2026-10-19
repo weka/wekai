@@ -31,6 +31,7 @@ type RouterAnalyzeReplayCommand struct {
 
 	contextSize *contextSizeReport
 	weekly      *weeklyReport
+	volume      *volumeReport
 
 	Args struct {
 		Path string `positional-arg-name:"PATH" description:"replay-v3 file, or source redacted-capture file/dir"`
@@ -97,6 +98,7 @@ func (c *RouterAnalyzeReplayCommand) Execute(args []string) error {
 
 	c.contextSize = buildContextSizeReport(models, ctxByModel)
 	c.weekly = buildWeeklyReport(store, isReplay)
+	c.volume = buildVolumeReport(store)
 
 	// Compute per-model + overall reports. Retention is scored per model
 	// only: a cache never serves one model's KV to another, so its total is
@@ -581,6 +583,7 @@ func (c *RouterAnalyzeReplayCommand) outputText(reports []modelReport, overall b
 	if c.contextSize != nil {
 		printContextSizeText(c.contextSize)
 	}
+	printVolumeText(c.volume)
 	printWeeklyText(c.weekly)
 
 	if prefill != nil {
@@ -610,6 +613,7 @@ func (c *RouterAnalyzeReplayCommand) outputJSON(reports []modelReport, overall b
 		Overall      jsonReplayReport   `json:"overall"`
 		ContextSize  *jsonContextSize   `json:"context_size,omitempty"`
 		Weekly       []jsonWeek         `json:"weekly,omitempty"`
+		Volume       []jsonVolumeRow    `json:"volume_by_context,omitempty"`
 		PrefillSplit *jsonPrefillSplit  `json:"prefill_split,omitempty"`
 	}
 	out := result{
@@ -619,6 +623,7 @@ func (c *RouterAnalyzeReplayCommand) outputJSON(reports []modelReport, overall b
 	out.Overall.Retention = toJSONRetention(overallRetention)
 	out.ContextSize = toJSONContextSize(c.contextSize)
 	out.Weekly = toJSONWeekly(c.weekly)
+	out.Volume = toJSONVolume(c.volume)
 	for _, r := range reports {
 		jr := toJSONReport(r.Model, r.Report)
 		jr.Retention = toJSONRetention(r.Retention)

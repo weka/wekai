@@ -34,6 +34,7 @@ type PrefixRequest struct {
 	Session         int32
 	InputTokens     int
 	CacheReadTokens int
+	OutputTokens    int
 	// AnyTokens reports a non-zero per-unit token count, as opposed to a
 	// file without per-block tokens.
 	AnyTokens bool
@@ -67,6 +68,7 @@ func (b *PrefixBatch) AddChain(reqs []RouterReplayRequest) {
 			Model:           req.Model,
 			InputTokens:     req.InputTokens,
 			CacheReadTokens: req.CacheReadTokens,
+			OutputTokens:    req.OutputTokens,
 			parent:          -1,
 			length:          int32(len(units)),
 		}
