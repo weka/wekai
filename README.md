@@ -233,17 +233,28 @@ reading front to back. `--replay-selection-strategy`:
 stamp (see `--replay-reuse-sessions`). An unindexed v3/v4 file plays from the
 beginning under the default; the other strategies need v5.
 
-**Downloading it.** The capture embedded in the image and run by the Helm
-chart is published as a scratch image holding just `/replay.jsonl`, pulled
-anonymously with `curl` — no Docker engine, no registry client (~1.3 GB
-download, ~9 GB on disk). `Dockerfile`'s `REPLAY_IMAGE` ARG is the source
-of truth for the tag. The current capture is replay-v5: per-request
-`total_ms` and `think_ms`, so `--replay-realtime` keeps the original think
-time between turns, plus the session index; older v3 captures fall back to
-the absolute schedule:
+**Downloading it.** Captures are published as scratch images holding just
+`/replay.jsonl`, tagged `replay-<label>-<sha12>` (`task replay:push
+LABEL=...`), and pulled anonymously with `curl` — no Docker engine, no
+registry client. Two are current, both replay-v5 (per-request `total_ms` and
+`think_ms`, so `--replay-realtime` keeps the original think time between
+turns, plus the session index); older v3 captures fall back to the absolute
+schedule:
+
+| Tag | Window | Sessions / requests | Download / on disk |
+|---|---|---|---|
+| `replay-40d-oct14-337a03810637` | 2026-09-05 → 10-14 | 3,190 / 370,658 | 1.3 GB / 8.8 GB |
+| `replay-160d-oct15-dfe3662680de` | 2026-05-12 → 10-15 | 14,305 / 1,729,396 | 6.1 GB / 40.8 GB |
+
+The 40d capture is the one embedded in the image and run by the Helm chart
+(`Dockerfile`'s `REPLAY_IMAGE` ARG is the source of truth for the tag). It
+was cut from the 160d one with `wekai router replay-trim --last-days 40`,
+which keeps the sessions that started in the last 40 days and drops those
+still active in the final 24h. The 160d capture is the full corpus, for
+runs that need more sessions or the older traffic:
 
 ```
-REPO=weka.io/wekai; TAG=replay-a5a97a8ac620
+REPO=weka.io/wekai; TAG=replay-40d-oct14-337a03810637   # or the 160d tag
 TOKEN=$(curl -s "https://quay.io/v2/auth?service=quay.io&scope=repository:$REPO:pull" | jq -r .token)
 LAYER=$(curl -s -H "Authorization: Bearer $TOKEN" \
   -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
@@ -473,7 +484,8 @@ models — otherwise only dynamic/openrouter specs resolve.
 compiles the `wekai` binary (module github.com/weka/wekai), and a second `COPY --link --from=` stage
 embeds one router-replay JSONL artifact at `/wekai/replay.jsonl`, pulled
 from a separately-published scratch image (default
-`quay.io/weka.io/wekai:replay-<sha12>` — published by `task replay:push`,
+`quay.io/weka.io/wekai:replay-40d-oct14-337a03810637`, tags of the form
+`replay-<label>-<sha12>` — published by `task replay:push`,
 see "CI / Publishing" below; replay artifacts and the app image share the
 wekai quay repo, distinguished by the `replay-` tag prefix; to fetch that
 artifact standalone see "Downloading it" above). Both
@@ -731,7 +743,7 @@ Three functions:
   `helm-username`/`helm-password` as Dagger secrets.
 
 ```
-task replay:push REPLAY=/path/to/replay.jsonl   # dagger call push-replay
+task replay:push REPLAY=/path/to/replay.jsonl LABEL=40d-oct14   # dagger call push-replay
 task app:push                                    # dagger call publish (image only)
 task helm:push                                   # dagger call push-helm (image + chart, image first)
 ```

@@ -1,3 +1,4 @@
+import re
 from typing import Annotated
 
 import dagger
@@ -176,6 +177,7 @@ class WekaiCoreFlows:
         self,
         replay: dagger.File,
         registry: str = "quay.io/weka.io/wekai",
+        label: str = "",
     ) -> str:
         """Publishes a router replay file as a minimal scratch image.
 
@@ -189,7 +191,14 @@ class WekaiCoreFlows:
 
         Args:
             replay: The local replay JSONL file to publish (mandatory).
+            label: Optional human-readable part of the tag, e.g. "40d-oct14",
+                giving replay-<label>-<sha12>. The hash stays, so the tag
+                still names the exact content.
         """
+        if label and not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,60}", label):
+            raise ValueError(
+                f"label {label!r}: use lowercase letters, digits, '.', '_' or '-'"
+            )
         sha_line = await (
             dag.container(platform=LINUX_AMD64)
             .from_("alpine:latest")
@@ -198,7 +207,7 @@ class WekaiCoreFlows:
             .stdout()
         )
         sha = sha_line.split()[0]
-        tag = f"replay-{sha[:12]}"
+        tag = f"replay-{label}-{sha[:12]}" if label else f"replay-{sha[:12]}"
 
         replay_image = dag.container(platform=LINUX_AMD64).with_file(
             "/replay.jsonl", replay
@@ -217,7 +226,7 @@ class WekaiCoreFlows:
         self,
         source: Annotated[dagger.Directory, Ignore(SOURCE_IGNORE)],
         registry: str = "quay.io/weka.io/wekai",
-        replay_image: str = "quay.io/weka.io/wekai:replay-a5a97a8ac620",
+        replay_image: str = "quay.io/weka.io/wekai:replay-40d-oct14-337a03810637",
         version: str = "",
     ) -> str:
         """Builds and publishes the wekai image from this repo's own Dockerfile.
@@ -248,7 +257,7 @@ class WekaiCoreFlows:
         helm_password: dagger.Secret,
         registry: str = "quay.io/weka.io/wekai",
         helm_registry: str = "quay.io/weka.io/helm",
-        replay_image: str = "quay.io/weka.io/wekai:replay-a5a97a8ac620",
+        replay_image: str = "quay.io/weka.io/wekai:replay-40d-oct14-337a03810637",
         version: str = "",
     ) -> str:
         """Publishes the wekai image, then packages and pushes
