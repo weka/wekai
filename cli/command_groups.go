@@ -26,6 +26,7 @@ type RouterCommands struct {
 	Analyze       RouterAnalyzeCommand       `command:"analyze" description:"Analyze router capture files and emit per-model analytics"`
 	Tree          RouterTreeCommand          `command:"tree" description:"Reconstruct the agent tree (sessions, instances, parent->child edges, parallelism) from redacted captures"`
 	ReplayPrepare RouterReplayPrepareCommand `command:"replay-prepare" description:"Convert a directory of redacted captures into one replay-friendly JSON file"`
+	ReplayTrim    RouterReplayTrimCommand    `command:"replay-trim" description:"Cut the latest N days or N sessions out of a replay file into a smaller replay"`
 	AnalyzeReplay RouterAnalyzeReplayCommand `command:"analyze-replay" description:"Simulate a replay or source capture offline and report expected cache hit ratio"`
 }
 

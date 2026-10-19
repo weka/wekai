@@ -227,3 +227,7 @@ func replayFirstStart(idx *ReplayIndex, strategy, from string) (int, error) {
 	}
 	return first, nil
 }
+
+// ReadReplayIndex loads the index trailer of a replay-v5 file; nil, nil for a
+// file without one (replay-v3/v4).
+func ReadReplayIndex(f *os.File) (*ReplayIndex, error) { return readReplayIndex(f) }
