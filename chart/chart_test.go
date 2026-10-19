@@ -514,17 +514,36 @@ func TestRealtimeReplacesTheFixedSeriesPool(t *testing.T) {
 		t.Error("--series is still passed with realtime on; it pins max-series, so the run would " +
 			"stop at the pool size and report that as the fleet's ceiling")
 	}
+	if !strings.Contains(on, "--replay-realtime") {
+		t.Error("realtime render is missing --replay-realtime")
+	}
+	// --replay-realtime alone is the binary's recipe: the chart must not
+	// restate any of its knobs unless a value is set.
+	for _, unwanted := range []string{
+		"--start-series", "--max-series", "--admit-every", "--admit-count",
+		"--ttft-limit", "--ttft-window", "--decode-rate-min",
+	} {
+		if strings.Contains(on, unwanted) {
+			t.Errorf("realtime render restates %s; unset knobs must fall through to the binary default", unwanted)
+		}
+	}
+}
+
+// TestRealtimeKnobsRenderWhenSet: each realtime knob reaches the binary when
+// set, and decodeRateMin=0 (gate off) is a value, not "unset".
+func TestRealtimeKnobsRenderWhenSet(t *testing.T) {
+	on := render(t, "--set", "replay.realtime=true",
+		"--set", "replay.startSessions=8", "--set", "replay.maxSessions=500",
+		"--set", "replay.admitEvery=2m", "--set", "replay.admitCount=32",
+		"--set", "replay.ttftLimit=5s", "--set", "replay.ttftWindow=1m",
+		"--set", "replay.decodeRateMin=0")
 	for _, want := range []string{
-		"--replay-realtime", "--start-series=1", "--admit-every=1s", "--ttft-limit=5s", "--ttft-window=30s",
+		"--start-series=8", "--max-series=500", "--admit-every=2m", "--admit-count=32",
+		"--ttft-limit=5s", "--ttft-window=1m", "--decode-rate-min=0",
 	} {
 		if !strings.Contains(on, want) {
 			t.Errorf("realtime render is missing %s", want)
 		}
-	}
-	// The cap must sit far above any ceiling this workload reaches — simulation
-	// puts a well-cached fleet past 12,000 sessions.
-	if !strings.Contains(on, "--max-series=100000") {
-		t.Error("default maxSessions is not rendered high enough to stay out of the way")
 	}
 }
 

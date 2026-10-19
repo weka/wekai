@@ -97,13 +97,21 @@ replay:
   # count climbs on its own under the TTFT governor below. Passing a fixed pool
   # alongside would pin max-series and halt the run there, reporting the pool
   # size as the fleet's ceiling.
+  #
+  # `--replay-realtime` alone is the binary's complete recipe: start 32
+  # sessions, add 16 every minute while both gates stay open (windowed mean
+  # TTFT under 10s, per-request decode rate at least 20 tok/s), no session cap,
+  # sessions retired when a gate stays closed, corpus reused. Every knob below
+  # defaults to empty/off and is passed ONLY when set, so the binary's defaults
+  # stay the single source of truth and are not restated here.
   realtime: false
   # skipIdle jumps the clock when NOTHING is in flight and every active session
   # is waiting on its next turn — captured median gap ~8s against a ~4min mean,
   # so a faithful replay is mostly a replay of nobody typing. Safe because the
   # idle precondition means no in-flight request can have its latency distorted.
-  # Rarely fires once the run is loaded, which is the intent.
-  skipIdle: true
+  # Rarely fires once the run is loaded, which is the intent. Off by default,
+  # as in the binary.
+  skipIdle: false
   # Let the run CONTINUE after the corpus runs out and admitted session slots
   # can no longer be filled. Default false, so it aborts.
   #
@@ -131,32 +139,36 @@ replay:
   # the only thing that ends a run with no timeout, so a false here and no
   # timeout anywhere is how a job is meant to finish on its own.
   reuseSessions: true
-  # admitEvery is how fast the count climbs under realtime: one session, then
+  # admitEvery is how fast the count climbs under realtime: startSessions, then
   # admitCount more this often while the fleet keeps up. Concurrency is then whatever
   # the fleet's latency implies rather than a number set here. Ignored unless
-  # realtime is on.
+  # realtime is on. Empty = binary default (1m).
   #
   # NOT a neutral knob. On a fleet that answers fast this rate, not the fleet,
   # becomes the limit: simulated at a 0.90 cache hit rate, one-per-second finds
   # 52.8 req/s at 36% prefill utilisation while five-per-second finds 140.7 at
   # 97%. Run two rates and check the answer stopped moving before believing it.
-  admitEvery: "1s"
-  # Empty preserves the binary's default of one and supports older images.
-  # Set 32 with admitEvery: "2m" to add 32 sessions every two minutes.
+  admitEvery: ""
+  # Sessions added per admitEvery tick. Empty = binary default (16 under
+  # realtime). Set 32 with admitEvery: "2m" to add 32 sessions every two minutes.
   admitCount: ""
+  # Sessions admitted at the start (--start-series). Empty = binary default (32
+  # under realtime).
+  startSessions: ""
   # ttftLimit pauses admission while the windowed mean TTFT is at or above it,
   # and resumes below. This is the definition of "sustained" for the run — max
   # sessions at 5s and at 1s are different capacity numbers for one fleet — so
-  # it belongs in the record whether or not you change it.
-  ttftLimit: "5s"
+  # it belongs in the record whether or not you change it. Empty = binary
+  # default (10s), e.g. --set replay.ttftLimit=5s.
+  ttftLimit: ""
   # ttftWindow is how far back the gate averages, using the ARITHMETIC MEAN —
   # not the median, not a percentile. That choice decides the answer: TTFT on
   # this workload is heavily skewed, so a mean gate is tail-driven and closes at
   # roughly half the session count a median gate would. Intended: the tail is
   # real callers waiting. A duration and not a request count for a related
   # reason — a count is a different amount of history at every load level, so a
-  # count-based gate tightens as the fleet fills.
-  ttftWindow: "30s"
+  # count-based gate tightens as the fleet fills. Empty = binary default (30s).
+  ttftWindow: ""
   # Which statistic over that window the gate compares against ttftLimit:
   # mean (default), p50, p95 or p99. This decides the answer — TTFT here is
   # heavily skewed, so a mean gate closes at roughly half the session count a
@@ -166,12 +178,19 @@ replay:
   # before it existed — A/B against a previous build is the normal use. The
   # binary defaults to mean regardless.
   ttftLimitStat: ""
+  # decodeRateMin is the second admission gate next to TTFT, in output tokens
+  # per second per request (past the first token): while the windowed average
+  # is below it no session is admitted and, with retirement, an ending session
+  # is not replaced. Empty = binary default (20 under realtime); 0 turns the
+  # gate off, e.g. --set replay.decodeRateMin=30.
+  decodeRateMin: ""
   # maxSessions is the safety cap on the governor, nothing more. Simulation of
   # this workload reaches ~2,500 sessions on a cache-starved fleet and >12,000
   # on a well-cached one, so a cap near either is a cap you will hit. If the run
   # stops here it logs that it measured the cap rather than the fleet — but the
-  # cheaper habit is to set it far above any plausible ceiling.
-  maxSessions: 100000
+  # cheaper habit is to set it far above any plausible ceiling. Empty = binary
+  # default (uncapped under realtime).
+  maxSessions: ""
 
   # Where to scrape vllm:prompt_tokens_by_source_total for the cache-source
   # breakdown in the report. Usually NOT needed against a current router: since

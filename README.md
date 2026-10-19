@@ -181,7 +181,10 @@ Without real-time replay, admission depends only on the interval.
 Omitting `--admit-count` preserves one series per tick. Add `--replay-realtime`
 to preserve captured think times; without it, sessions run back-to-back.
 Helm equivalents: `replay.realtime=true`, `replay.admitCount=32`, and
-`replay.admitEvery=2m` (the chart starts with one series).
+`replay.admitEvery=2m`. With `replay.realtime=true` alone the chart passes just
+`--replay-realtime`, so the binary's recipe above applies; `replay.ttftLimit`,
+`replay.decodeRateMin`, `replay.startSessions`, `replay.maxSessions`,
+`replay.admitEvery`/`admitCount` and `replay.ttftWindow` are passed only when set.
 
 **Where the replay file comes from.** `wekai router serve` proxies live
 LLM traffic and captures it (redacted); `wekai router replay-prepare`

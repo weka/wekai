@@ -68,15 +68,35 @@ spec:
                      must NOT be passed: it pins max-series too, and the run
                      would stop at the pool size and report that as the fleet's
                      ceiling. Start at one and let it climb. */}}
+                {{- /* --replay-realtime is the binary's complete recipe (ramp,
+                     TTFT and decode-rate gates, retirement). Each knob is
+                     passed only when set, so the chart never restates — and
+                     can never drift from — a binary default. */}}
                 --replay-realtime \
-                --start-series=1 \
-                --max-series={{ .Values.replay.maxSessions | int64 }} \
-                --admit-every={{ .Values.replay.admitEvery }} \
-                {{- if .Values.replay.admitCount }}
-                --admit-count={{ .Values.replay.admitCount | int64 }} \
+                {{- with .Values.replay.startSessions }}
+                --start-series={{ . | int64 }} \
                 {{- end }}
-                --ttft-limit={{ .Values.replay.ttftLimit }} \
-                --ttft-window={{ .Values.replay.ttftWindow }} \
+                {{- with .Values.replay.maxSessions }}
+                --max-series={{ . | int64 }} \
+                {{- end }}
+                {{- with .Values.replay.admitEvery }}
+                --admit-every={{ . }} \
+                {{- end }}
+                {{- with .Values.replay.admitCount }}
+                --admit-count={{ . | int64 }} \
+                {{- end }}
+                {{- with .Values.replay.ttftLimit }}
+                --ttft-limit={{ . }} \
+                {{- end }}
+                {{- with .Values.replay.ttftWindow }}
+                --ttft-window={{ . }} \
+                {{- end }}
+                {{- /* toString, not `with`: 0 is a meaningful value (gate off)
+                       and must render, while empty means "binary default". */}}
+                {{- $decode := .Values.replay.decodeRateMin }}
+                {{- if not (or (kindIs "invalid" $decode) (eq (toString $decode) "")) }}
+                --decode-rate-min={{ $decode }} \
+                {{- end }}
                 {{- /* Guarded, and defaulted empty, so the chart can still deploy
                        an image from before this flag existed. A/B against a
                        previous build is the normal way this chart is used, and
