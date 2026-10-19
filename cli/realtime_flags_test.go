@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -208,4 +209,59 @@ func TestDecodeRateFlags(t *testing.T) {
 			t.Errorf("%v: err=%v want error %v", tc.args, err, tc.wantErr)
 		}
 	}
+}
+
+// A replay file turns real-time replay on unless the flag turns it off; with no
+// replay file it stays off.
+func TestRealtimeIsTheReplayDefault(t *testing.T) {
+	unsetEnv(t, "BENCHMARK_REPLAY_REALTIME")
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"replay file alone", []string{"--router-replay-file=r.jsonl"}, true},
+		{"explicit on", []string{"--router-replay-file=r.jsonl", "--replay-realtime"}, true},
+		{"opted out", []string{"--router-replay-file=r.jsonl", "--replay-realtime=false"}, false},
+		{"no replay file", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var opts BenchmarkAutoOptions
+			if _, err := flags.ParseArgs(&opts, tc.args); err != nil {
+				t.Fatal(err)
+			}
+			c := BenchmarkAutoCommand{BenchmarkAutoOptions: &opts}
+			c.applyRealtimeDefaults()
+			if opts.ReplayRealtime != tc.want {
+				t.Fatalf("ReplayRealtime = %v, want %v", opts.ReplayRealtime, tc.want)
+			}
+		})
+	}
+}
+
+// The fixed pool is still reachable, by opting out explicitly; --series alone
+// with a replay file is refused with that way out named.
+func TestFixedPoolNeedsTheOptOut(t *testing.T) {
+	unsetEnv(t, "BENCHMARK_REPLAY_REALTIME")
+	parse := func(args ...string) *BenchmarkAutoCommand {
+		var opts BenchmarkAutoOptions
+		if _, err := flags.ParseArgs(&opts, args); err != nil {
+			t.Fatal(err)
+		}
+		return &BenchmarkAutoCommand{BenchmarkAutoOptions: &opts}
+	}
+	err := parse("--router-replay-file=r.jsonl", "--series=256").validateRealtime(&bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "--replay-realtime=false") {
+		t.Fatalf("--series with a replay file: err = %v, want a refusal naming --replay-realtime=false", err)
+	}
+	if err := parse("--router-replay-file=r.jsonl", "--series=256", "--replay-realtime=false").validateRealtime(&bytes.Buffer{}); err != nil {
+		t.Fatalf("fixed pool with the opt-out: %v", err)
+	}
+}
+
+// unsetEnv removes an environment variable for the test, restoring it after.
+func unsetEnv(t *testing.T, key string) {
+	t.Helper()
+	t.Setenv(key, "") // registers the restore
+	os.Unsetenv(key)
 }

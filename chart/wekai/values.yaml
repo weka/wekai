@@ -70,13 +70,13 @@ replay:
   # A capped run is NOT comparable with an uncapped one. The run reports how many
   # sessions it shortened and how many requests it dropped.
   maxRequestsPerSession: 0
-  series: 256              # parallel series workers replaying sessions (--series; 0 = binary default ramp)
+  series: 256              # fixed-pool mode only (realtime: false): parallel series workers replaying sessions (--series)
 
   # ── Real-time replay and session admission ────────────────────────────────
-  # Together these change what the run measures. The default (both off) holds
-  # a FIXED series pool and asks "how does the fleet behave at concurrency N".
-  # Turning them on asks "what is the most load this fleet can carry", and the
-  # answer is no longer a number set here.
+  # These change what the run measures. Real-time (the default) asks "what is
+  # the most load this fleet can carry", and the answer is not a number set
+  # here. realtime: false holds a FIXED pool of `series` sessions back-to-back
+  # and asks "how does the fleet behave at concurrency N" instead.
   #
   # A note on the `fidelity` figure this mode reports: it is the ratio of
   # captured conversation replayed to wall time elapsed, and it measures THIS
@@ -87,7 +87,9 @@ replay:
   # happening. Useful for comparing two fleets on one corpus; useless as a
   # saturation signal.
   #
-  # realtime is the switch. It paces each session by the timestamps it was
+  # realtime is the switch, ON by default (as in the binary, which runs a
+  # replay in real time unless passed --replay-realtime=false). It paces each
+  # session by the timestamps it was
   # captured with, so a conversation keeps its own think time instead of firing
   # back-to-back — the recorded gap includes the ORIGINAL response time, which
   # this fleet will not reproduce, so it is a floor rather than a schedule and a
@@ -98,13 +100,13 @@ replay:
   # alongside would pin max-series and halt the run there, reporting the pool
   # size as the fleet's ceiling.
   #
-  # `--replay-realtime` alone is the binary's complete recipe: start 32
+  # Real-time replay is the binary's complete recipe: start 32
   # sessions, add 16 every minute while both gates stay open (windowed mean
   # TTFT under 10s, per-request decode rate at least 20 tok/s), no session cap,
   # sessions retired when a gate stays closed, corpus reused. Every knob below
   # defaults to empty/off and is passed ONLY when set, so the binary's defaults
   # stay the single source of truth and are not restated here.
-  realtime: false
+  realtime: true
   # skipIdle jumps the clock when NOTHING is in flight and every active session
   # is waiting on its next turn — captured median gap ~8s against a ~4min mean,
   # so a faithful replay is mostly a replay of nobody typing. Safe because the

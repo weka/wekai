@@ -53,6 +53,7 @@ until curl -sf http://127.0.0.1:8080/v1/models > /dev/null; do sleep 0.5; done
 /tmp/wekai-local benchmark auto \
   --router-replay-file <replay.jsonl> \
   --models "dynamic/http://127.0.0.1:8080/v1,type=openai_vllm,alias=<run-name>" \
+  --replay-realtime=false \
   --concurrency 128 --series 256 --hot-series-concurrency 0 \
   --limit-context 140000 --print-errors-threshold=1s --total 30000 \
   [--save-request-data <dir>]
@@ -200,6 +201,7 @@ reason to race it: always gate.
 /tmp/wekai-local benchmark auto \
   --router-replay-file <replay.jsonl> \
   --models "dynamic/http://127.0.0.1:8080/v1,type=openai_vllm,alias=<run-name>" \
+  --replay-realtime=false \
   --concurrency 90 --series 256 --hot-series-concurrency 6 \
   --limit-context 140000 \
   --print-errors-threshold=1s \

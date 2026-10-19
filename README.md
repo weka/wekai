@@ -133,28 +133,45 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:25202/alice
 
 `wekai benchmark auto --router-replay-file` replays previously captured
 agentic traffic against a target endpoint — the same run mode the Helm
-chart below wraps. Canonical run (the chart's exact defaults, expressed as
-flags):
+chart below wraps. It runs in **real time by default**, which is also the
+chart's default:
 
 ```
 wekai benchmark auto \
   --router-replay-file replay.jsonl \
   --models http://YOUR-LLM-HOST:8000 \
+  --timeout 8h \
+  --save-request-data ./results
+```
+
+Real-time replay is the full recipe on its own: think-time pacing, the
+decode-rate gate (20 tok/s per request), start 32 sessions and add 16 every
+minute while the windowed mean TTFT is under `--ttft-limit` (10s), no session
+cap, sessions reused from the top of the file (so the run lasts until
+`--timeout`), and the request timeline in the report. Admission pauses while
+the TTFT gate is closed and resumes with one batch per tick, without catching
+up on skipped ticks. It answers "what is the most load this fleet can carry".
+
+The fixed-pool run of earlier releases, which asks "how does the fleet behave
+at concurrency N", needs the explicit opt-out (`replay.realtime=false` in the
+chart):
+
+```
+wekai benchmark auto \
+  --router-replay-file replay.jsonl \
+  --models http://YOUR-LLM-HOST:8000 \
+  --replay-realtime=false \
   --series 256 --concurrency 28 --hot-series-concurrency 4 \
   --timeout 8h \
   --save-request-data ./results
 ```
 
-To start with 32 series and add 32 more every two minutes, replace
-`--series 256` with `--start-series=32 --max-series=256 --admit-count=32
---admit-every=2m`. The first increase happens after two minutes; each batch
-is capped only when `--max-series` is set. Omit it for an unlimited ramp.
-With `--replay-realtime`, admission pauses while the TTFT gate is closed
-and resumes with one batch per tick, without catching up on skipped ticks.
-`--replay-realtime` on its own is the full recipe: think-time pacing, the decode-rate gate (20 tok/s per request), start
-32 sessions and add 16 every minute while the windowed mean TTFT is under
-`--ttft-limit` (10s), no session cap, sessions reused from the top of the file
-(so the run lasts until `--timeout`), and the request timeline in the report.
+`--series` without the opt-out is refused: it pins the session count that
+real-time replay grows. To start a fixed-pool run with 32 series and add 32
+more every two minutes, replace `--series 256` with `--start-series=32
+--max-series=256 --admit-count=32 --admit-every=2m`. The first increase
+happens after two minutes; each batch is capped only when `--max-series` is
+set. Omit it for an unlimited ramp.
 `--ttft-retire` is on by default: when a session ends while TTFT is more than
 `--ttft-retire-margin` (0.15) above the limit, or the decode rate is below the
 floor, no new session replaces it (between the limit and that threshold sessions are
@@ -164,7 +181,7 @@ and not yet ended, and the status line reports
 `sessions=<active>(started=,ended=,unreplaced=,corpus=)`. Every default can be
 overridden with the explicit flag (`--ttft-retire=false`, `--max-series=N`, ...).
 
-`--decode-rate-min=N` (default 20 with `--replay-realtime`, `0` to turn off) is a
+`--decode-rate-min=N` (default 20 under real-time replay, `0` to turn off) is a
 second session-level gate next to TTFT: while the average per-request decode
 rate is below N, no session is admitted and a session that ends is not replaced
 (with `--ttft-retire`). The rate is output tokens/s of requests in their decode
@@ -178,11 +195,11 @@ A batch is admitted only when both gates stayed open for the whole
 either gate has blocked, admission resumes only after three such open intervals
 in a row: growth is fast until the first block and cautious after it.
 Without real-time replay, admission depends only on the interval.
-Omitting `--admit-count` preserves one series per tick. Add `--replay-realtime`
-to preserve captured think times; without it, sessions run back-to-back.
-Helm equivalents: `replay.realtime=true`, `replay.admitCount=32`, and
-`replay.admitEvery=2m`. With `replay.realtime=true` alone the chart passes just
-`--replay-realtime`, so the binary's recipe above applies; `replay.ttftLimit`,
+Omitting `--admit-count` preserves one series per tick. Real-time replay
+preserves captured think times; with `--replay-realtime=false`, sessions run
+back-to-back. Helm equivalents: `replay.realtime=false`, `replay.admitCount=32`,
+and `replay.admitEvery=2m`. With the chart's default `replay.realtime=true` it
+passes no realtime flag at all, so the binary's recipe above applies; `replay.ttftLimit`,
 `replay.decodeRateMin`, `replay.startSessions`, `replay.maxSessions`,
 `replay.admitEvery`/`admitCount` and `replay.ttftWindow` are passed only when set.
 
@@ -200,8 +217,8 @@ without shipping any real captured text.
 **Think time (replay-v4).** Each request carries `total_ms` and `think_ms`:
 the gap between the END of its reference (`think_ref`: `prev` = the same
 agent's previous request, `spawn` = the parent request that spawned a
-sub-agent, `session_start`) and its own start, clamped at 0. With
-`--replay-realtime`, `--replay-timing=think` (the default when the file
+sub-agent, `session_start`) and its own start, clamped at 0. Under
+real-time replay, `--replay-timing=think` (the default when the file
 has `think_ms`) schedules each turn at the end of its reference on THIS
 run's clock plus the captured think time, so a fleet that answers faster or
 slower than the capture keeps the user's pauses; `--replay-timing=absolute`
@@ -237,7 +254,7 @@ beginning under the default; the other strategies need v5.
 `/replay.jsonl`, tagged `replay-<label>-<sha12>` (`task replay:push
 LABEL=...`), and pulled anonymously with `curl` — no Docker engine, no
 registry client. Two are current, both replay-v5 (per-request `total_ms` and
-`think_ms`, so `--replay-realtime` keeps the original think time between
+`think_ms`, so real-time replay keeps the original think time between
 turns, plus the session index); older v3 captures fall back to the absolute
 schedule:
 

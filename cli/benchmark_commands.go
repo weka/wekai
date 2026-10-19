@@ -747,7 +747,10 @@ func (c *BenchmarkThroughputCommand) Execute(args []string) error {
 //
 // The other two are warnings: they describe a run that does less than the
 // operator asked for, not one that reports something false.
-// applyRealtimeDefaults makes --replay-realtime a complete recipe on its own:
+// applyRealtimeDefaults first resolves --replay-realtime: unset, it is on
+// whenever --router-replay-file is given, so a plain replay run measures the
+// most load the fleet can carry; --replay-realtime=false opts out to a fixed
+// --series pool. Real-time replay is then a complete recipe on its own:
 // the TTFT-gated ramp (start 32, +16 every minute, uncapped), session reuse
 // (the run keeps going until --timeout instead of running out of corpus),
 // --ttft-retire with its 15% margin, --decode-rate-min=20 (30s window), and the
@@ -755,6 +758,14 @@ func (c *BenchmarkThroughputCommand) Execute(args []string) error {
 // Every one of them stays overridable by passing the flag explicitly;
 // --replay-timing already resolves to think when the file carries think_ms.
 func (c *BenchmarkAutoCommand) applyRealtimeDefaults() {
+	switch c.ReplayRealtimeFlag {
+	case "true":
+		c.ReplayRealtime = true
+	case "false":
+		c.ReplayRealtime = false
+	default: // real-time is how a replay runs unless asked otherwise
+		c.ReplayRealtime = c.ReplayRealtime || c.RouterReplayFile != ""
+	}
 	if !c.ReplayRealtime {
 		if c.DecodeRateMin < 0 {
 			c.DecodeRateMin = 0 // the decode gate is a realtime-replay feature
@@ -804,8 +815,9 @@ func (c *BenchmarkAutoCommand) validateRealtime(w io.Writer) error {
 		return fmt.Errorf("--ttft-retire-margin must be non-negative (0.15 = retire at 15%% above --ttft-limit)")
 	}
 	if c.ReplayRealtime && c.Series > 0 {
-		return fmt.Errorf("--series pins the session count, which --replay-realtime grows on its own; "+
-			"drop --series (use --max-series for a safety cap, currently %d)", c.MaxSeries)
+		return fmt.Errorf("--series pins the session count, which real-time replay (the default with "+
+			"--router-replay-file) grows on its own; drop --series (use --max-series for a safety cap, "+
+			"currently %d), or pass --replay-realtime=false for a fixed pool of --series sessions", c.MaxSeries)
 	}
 	if c.ReplaySkipIdle && !c.ReplayRealtime {
 		fmt.Fprintln(w, "warning: --replay-skip-idle has nothing to skip without --replay-realtime; "+

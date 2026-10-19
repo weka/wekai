@@ -68,11 +68,11 @@ spec:
                      must NOT be passed: it pins max-series too, and the run
                      would stop at the pool size and report that as the fleet's
                      ceiling. Start at one and let it climb. */}}
-                {{- /* --replay-realtime is the binary's complete recipe (ramp,
-                     TTFT and decode-rate gates, retirement). Each knob is
-                     passed only when set, so the chart never restates — and
-                     can never drift from — a binary default. */}}
-                --replay-realtime \
+                {{- /* Real-time replay is the binary's default with a replay
+                     file and its complete recipe (ramp, TTFT and decode-rate
+                     gates, retirement), so nothing is passed to turn it on.
+                     Each knob is passed only when set, so the chart never
+                     restates — and can never drift from — a binary default. */}}
                 {{- with .Values.replay.startSessions }}
                 --start-series={{ . | int64 }} \
                 {{- end }}
@@ -113,8 +113,12 @@ spec:
                 {{- if .Values.replay.allowUnderfill }}
                 --replay-allow-underfill \
                 {{- end }}
-                {{- else if .Values.replay.series }}
+                {{- else }}
+                {{- /* The opt-out: a fixed pool of `series` sessions. */}}
+                --replay-realtime=false \
+                {{- if .Values.replay.series }}
                 --series={{ .Values.replay.series | int64 }} \
+                {{- end }}
                 {{- end }}
                 {{- /* Cycling the corpus is the BINARY's default, so true renders
                      nothing: the flag appears only to turn it off. That keeps
