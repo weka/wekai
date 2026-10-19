@@ -217,12 +217,14 @@ and `requests`. The replayer finds it by reading the file's last 2 MiB
 at its offset, which is what lets a run choose its sessions instead of
 reading front to back. `--replay-selection-strategy`:
 
-- `last-week` (default): the first lap plays the capture's final seven days,
+- `reverse-from-end` (default): whole corpus newest first every lap, so a
+  run opens on the most recent traffic and, needing more sessions than the
+  corpus holds, starts again from the end.
+- `last-week`: the first lap plays the capture's final seven days,
   then every lap is the whole corpus in file order. A run needing 10,000
   sessions from a 5,000-session corpus whose last week starts at 3,500 plays
   3,500→5,000, then 1→5,000, then 1→5,000 again…
 - `beginning`: whole corpus in file order every lap.
-- `reverse-from-end`: whole corpus newest first every lap.
 - `random`: a fresh (per-lap seeded) permutation of the whole corpus every
   lap, so no session repeats before every other one has played.
 

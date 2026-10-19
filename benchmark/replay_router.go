@@ -303,7 +303,7 @@ type routerReplayStreamOpts struct {
 	// the requests it drops become garbage before the session reaches a worker,
 	// and a worker holds its whole session for as long as the session runs.
 	MaxRequestsPerSession int
-	// Strategy is a ReplayStrategy* name; empty is last-week. Every strategy
+	// Strategy is a ReplayStrategy* name; empty is reverse-from-end. Every strategy
 	// but beginning needs the file's index trailer, and so does From; an
 	// unindexed file under the default plays from the beginning.
 	Strategy string
@@ -352,7 +352,7 @@ func openRouterReplayStream(path string, opts routerReplayStreamOpts) (*routerRe
 		return nil, err
 	}
 	if strategy == "" {
-		strategy = ReplayStrategyLastWeek
+		strategy = ReplayStrategyReverse
 		if index == nil && opts.From == "" {
 			strategy = ReplayStrategyBeginning
 			fmt.Fprintf(os.Stderr, "[router-replay] %s (%s) has no session index; replaying it from the beginning\n",
