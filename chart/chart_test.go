@@ -514,11 +514,12 @@ func TestRealtimeReplacesTheFixedSeriesPool(t *testing.T) {
 		t.Error("--series is still passed with realtime on; it pins max-series, so the run would " +
 			"stop at the pool size and report that as the fleet's ceiling")
 	}
-	if !strings.Contains(on, "--replay-realtime") {
-		t.Error("realtime render is missing --replay-realtime")
+	if strings.Contains(on, "--replay-realtime") {
+		t.Error("realtime render passes --replay-realtime; real-time is the binary's default with a " +
+			"replay file, so the chart must not restate it")
 	}
-	// --replay-realtime alone is the binary's recipe: the chart must not
-	// restate any of its knobs unless a value is set.
+	// Real-time replay is the binary's recipe: the chart must not restate any
+	// of its knobs unless a value is set.
 	for _, unwanted := range []string{
 		"--start-series", "--max-series", "--admit-every", "--admit-count",
 		"--ttft-limit", "--ttft-window", "--decode-rate-min",
@@ -547,20 +548,31 @@ func TestRealtimeKnobsRenderWhenSet(t *testing.T) {
 	}
 }
 
-// TestDefaultRenderIsUnchanged: a chart that does not ask for realtime must
-// render exactly the run it rendered before any of this existed.
-func TestDefaultRenderIsUnchanged(t *testing.T) {
-	off := render(t)
+// TestDefaultRenderIsRealtime: real-time replay is the chart's default, as it
+// is the binary's, so leaving realtime unset renders exactly the realtime run.
+func TestDefaultRenderIsRealtime(t *testing.T) {
+	if render(t) != render(t, "--set", "replay.realtime=true") {
+		t.Error("the default render differs from replay.realtime=true; real-time is the default")
+	}
+}
+
+// TestFixedPoolIsTheOptOut: realtime=false must say so to the binary, whose
+// default is real-time, and render the fixed pool of `series` sessions with
+// none of the realtime knobs.
+func TestFixedPoolIsTheOptOut(t *testing.T) {
+	off := render(t, "--set", "replay.realtime=false")
+	if !strings.Contains(off, "--replay-realtime=false") {
+		t.Error("realtime=false rendered no --replay-realtime=false; the binary would run real-time anyway")
+	}
 	if !strings.Contains(off, "--series=256") {
-		t.Error("the fixed series pool changed on the default path")
+		t.Error("the fixed series pool is missing from the opt-out render")
 	}
 	for _, unwanted := range []string{
-		"--admit-every", "--ttft-limit", "--ttft-window", "--replay-realtime",
+		"--admit-every", "--ttft-limit", "--ttft-window",
 		"--replay-skip-idle", "--start-series", "--max-series",
 	} {
 		if strings.Contains(off, unwanted) {
-			t.Errorf("%s is rendered by default; the default run must be byte-identical to the "+
-				"one that shipped before real-time replay existed", unwanted)
+			t.Errorf("%s is rendered with realtime=false; it only means something under real-time replay", unwanted)
 		}
 	}
 }
@@ -569,8 +581,8 @@ func TestDefaultRenderIsUnchanged(t *testing.T) {
 // something is pacing against that time; on a back-to-back pool there is no
 // dead time to skip, and rendering the flag would suggest otherwise.
 func TestSkipIdleRequiresRealtime(t *testing.T) {
-	if out := render(t, "--set", "replay.skipIdle=true"); strings.Contains(out, "--replay-skip-idle") {
-		t.Error("--replay-skip-idle rendered without --replay-realtime; there is no dead time to " +
+	if out := render(t, "--set", "replay.realtime=false", "--set", "replay.skipIdle=true"); strings.Contains(out, "--replay-skip-idle") {
+		t.Error("--replay-skip-idle rendered with realtime=false; there is no dead time to " +
 			"skip on a pool that fires back to back")
 	}
 	if out := render(t, "--set", "replay.realtime=true", "--set", "replay.skipIdle=true"); !strings.Contains(out, "--replay-skip-idle") {
@@ -739,8 +751,8 @@ func TestDefaultRealtimeRenderEmitsOnlyFlagsThatShippedWithIt(t *testing.T) {
 				"empty, or add it here if it shipped alongside realtime", f)
 		}
 	}
-	if !seen["--replay-realtime"] {
-		t.Error("premise check: the realtime render is missing --replay-realtime")
+	if !seen["--router-replay-file"] {
+		t.Error("premise check: the realtime render is missing --router-replay-file")
 	}
 }
 
