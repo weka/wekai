@@ -56,7 +56,9 @@ type harnessConfig struct {
 	CORSOrigins           []string
 
 	MaxNodeConcurrency int64
+	MaxNodeQueueDepth  int64
 	RebalanceRatio     float64
+	RetryTimeLimit     time.Duration
 
 	MaxAttempts        int
 	UpstreamCredential string
@@ -79,6 +81,8 @@ func (c harnessConfig) gateway() gateway.Config {
 		PathAllowlist:         c.PathAllowlist,
 		CORSOrigins:           c.CORSOrigins,
 		DefaultCapacity:       1,
+		RetryTimeLimit:        c.RetryTimeLimit,
+		NodeQueueDepth:        c.MaxNodeQueueDepth,
 	}
 }
 
@@ -1297,6 +1301,16 @@ func TestMaxNodeConcurrencyRejects429WhenAllBackendsAtCap(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.BackendCapExceeded.WithLabelValues(bOther.URL)); got != capBeforeOther+1 {
 		t.Errorf("router_backend_cap_exceeded_total{backend=%s} went %v -> %v, want +1", bOther.URL, capBeforeOther, got)
+	}
+	// RetryTimeLimit is unset (the harness default), so the capacity retry loop
+	// bails before ever reaching the per-backend wait queue — the "default off"
+	// contract from the node-queue plan. Neither backend's queue should ever
+	// have been touched.
+	if got := bFirst.Queued(); got != 0 {
+		t.Errorf("backend %s Queued() = %d, want 0 (RetryTimeLimit unset: queueing must not engage)", bFirst.URL, got)
+	}
+	if got := bOther.Queued(); got != 0 {
+		t.Errorf("backend %s Queued() = %d, want 0 (RetryTimeLimit unset: queueing must not engage)", bOther.URL, got)
 	}
 
 	// Release the first held request; its lease frees up.

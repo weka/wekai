@@ -168,6 +168,34 @@ var (
 		Buckets: prometheus.ExponentialBuckets(0.005, 2, 12), // 5ms .. ~10s, the shipped budget's range
 	}, []string{"reason", "outcome"})
 
+	// BackendQueueWaitSeconds is the per-backend wait queue's equivalent of
+	// RetryWaitSeconds: how long a request spent waiting for a slot on the one
+	// backend the affinity policy picked for it, for a request whose selector
+	// returned a *policy.SaturatedError naming that backend specifically
+	// (router/internal/gateway's awaitSlot). "woken" means a slot freed and
+	// this request got a re-decide out of it; "expired" means the retry budget
+	// ran out first; "abandoned" means the caller went away while waiting.
+	//
+	// Separate from RetryWaitSeconds rather than a new label on it: that one
+	// measures the whole-fleet poll loop, this one measures a wait bound to a
+	// single backend, and conflating the two would make neither comparable
+	// against the mechanism actually in play for a given request.
+	BackendQueueWaitSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "router_backend_queue_wait_seconds",
+		Help:    "Latency spent waiting in a single backend's wait queue, by outcome: woken (a slot freed and the request re-decided), expired (the retry budget ran out), abandoned (the caller disconnected).",
+		Buckets: prometheus.ExponentialBuckets(0.005, 2, 12), // same range as router_retry_wait_seconds
+	}, []string{"outcome"})
+
+	// BackendQueueFullTotal counts a request refused a place in line outright
+	// because a backend's wait queue was already at its depth bound — the
+	// immediate-503 path, distinct from a queued request that later timed out
+	// (429). Per-backend so an operator can see WHICH backend's queue is
+	// actually the bottleneck rather than only that the fleet is.
+	BackendQueueFullTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_backend_queue_full_total",
+		Help: "Requests refused a place in a backend's wait queue because it was already at its depth bound (max-node-concurrency). Answered 503, not 429 — the request never waited at all.",
+	}, []string{"backend"})
+
 	StreamAborted = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_stream_aborted_total",
 		Help: "Streams terminated before their dialect's terminal marker.",
@@ -475,7 +503,8 @@ func All() []prometheus.Collector {
 		CircuitState, CircuitTransitions,
 		RoutingDecisionDuration, PolicySelections, PolicyFallbacks, RouteDecisions,
 		WorkerLoadAvg, WorkerLoadMax, WorkerLoadMin,
-		UpstreamErrors, RetriesTotal, RetryWaitSeconds, StreamAborted, PanicsTotal, ClientDisconnects,
+		UpstreamErrors, RetriesTotal, RetryWaitSeconds, BackendQueueWaitSeconds, BackendQueueFullTotal,
+		StreamAborted, PanicsTotal, ClientDisconnects,
 		LoadAccountingErrors, DiscoveryConflicts,
 		CachePredictedFraction, CacheObservedFraction, CacheEntries, CacheTokens,
 		CacheSplits, CacheOverflows, CacheSoftBlocked, CacheStretches, CacheStretchInflight,
@@ -566,7 +595,16 @@ func warm() {
 			RetryWaitSeconds.WithLabelValues(r, o)
 		}
 	}
+	// BackendQueueOutcomes is the closed enum for router_backend_queue_wait_seconds.
+	for _, o := range BackendQueueOutcomes {
+		BackendQueueWaitSeconds.WithLabelValues(o)
+	}
 }
+
+// BackendQueueOutcomes is the closed enum router_backend_queue_wait_seconds'
+// outcome label can take, named here so the set that is warmed and the set
+// that is emitted cannot drift (the same reason CapacityRetryReasons exists).
+var BackendQueueOutcomes = []string{"woken", "expired", "abandoned"}
 
 // Handler serves the metrics endpoint. It is mounted on its own listener, never
 // on the inference mux (GW-13).

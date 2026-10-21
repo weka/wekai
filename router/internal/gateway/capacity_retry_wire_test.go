@@ -263,3 +263,86 @@ func TestRetryReasonNamesWhichRefusal(t *testing.T) {
 		t.Error("a nil error must not read as a capacity refusal")
 	}
 }
+
+// partialAttemptSelector answers depending only on how many times it has been
+// called, which is what lets a test pin down exactly what px.Serve's internal
+// loop sees on a given call — something no real policy exposes directly. The
+// first call returns a backend that cannot be connected to, forcing px.Serve
+// to call Select again within the SAME Serve invocation; every call after that
+// returns a *policy.SaturatedError. The point is to guarantee res.Attempts is
+// always > 0 by the time serveWithCapacityRetry inspects the result — the
+// exact precondition the per-backend wait queue requires res.Attempts == 0 to
+// exclude.
+type partialAttemptSelector struct {
+	dead  *registry.Backend
+	sat   *policy.SaturatedError
+	calls atomic.Int32
+}
+
+func (s *partialAttemptSelector) Name() string { return "partial-attempt" }
+
+func (s *partialAttemptSelector) Select(_ context.Context, _ []*registry.Backend, _ *policy.RoutingRequest) (*registry.Backend, error) {
+	if s.calls.Add(1)%2 == 1 {
+		return s.dead, nil
+	}
+	return nil, s.sat
+}
+
+// TestCapacityRetryStaysOnPollPathAfterPartialAttempt covers the guard in
+// serveWithCapacityRetry that keeps the per-backend wait queue scoped to a
+// request that never reached an upstream at all. A *policy.SaturatedError
+// surfacing after a partial attempt — here, a failed connection to a
+// different backend within the same px.Serve call — must stay on the
+// existing fleet-wide poll loop (TestCapacityRefusalGivesUpAtTheLimit's path)
+// and never join Preferred's wait queue, even though it is the very same
+// error type a from-cold refusal would produce.
+func TestCapacityRetryStaysOnPollPathAfterPartialAttempt(t *testing.T) {
+	reg := registry.New(registry.Options{})
+
+	// Registered and healthy, but refuses every connection: an instant,
+	// reliable failure with none of a real upstream's timing variance.
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	a, err := reg.Add(registry.Spec{URL: deadURL, Prov: registry.ProvStatic, Capacity: 1})
+	if err != nil {
+		t.Fatalf("add backend a: %v", err)
+	}
+	a.SetHealth(registry.Healthy)
+
+	// Never actually dialed; only its identity and wait queue matter.
+	b, err := reg.Add(registry.Spec{URL: "http://127.0.0.1:1", Prov: registry.ProvStatic, Capacity: 1})
+	if err != nil {
+		t.Fatalf("add backend b: %v", err)
+	}
+	b.SetHealth(registry.Healthy)
+
+	sel := &partialAttemptSelector{dead: a, sat: &policy.SaturatedError{Preferred: b, Limit: 10}}
+	target := Target{Name: "default", Registry: reg, Selector: sel}
+	gw := New(Config{
+		MaxBodyBytes: 64 << 20, DefaultCapacity: 1,
+		RetryTimeLimit: 150 * time.Millisecond,
+	}, stubRouter{target}, proxy.New(proxy.Config{MaxAttempts: 2, StreamBufferBytes: 64 << 10}), openai.New())
+
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429: a partial attempt must exhaust the poll budget rather than "+
+			"wait on a backend it never touched", resp.StatusCode)
+	}
+	if got := b.Queued(); got != 0 {
+		t.Errorf("Queued() on the SaturatedError's Preferred backend = %d, want 0: Attempts>0 must "+
+			"never join the wait queue", got)
+	}
+	if n := sel.calls.Load(); n < 4 {
+		t.Errorf("the selector was asked %d times, want at least 4: the test setup must exercise "+
+			"several poll iterations, each with a partial attempt, to be a meaningful check", n)
+	}
+}

@@ -142,7 +142,12 @@ func (r *refusedSignal) saturated(b *registry.Backend, _ loadView) (bool, int64)
 // still backstops it, which is why this one is opt-in and that one is not.
 type concurrencySignal struct{ limit int64 }
 
-func (concurrencySignal) name() string { return "concurrency" }
+// concurrencySignalName is pulled out as a constant because the node-queue
+// logic in policy.go needs to tell "saturated only by concurrency" apart from
+// every other combination of signals, by name, without constructing one.
+const concurrencySignalName = "concurrency"
+
+func (concurrencySignal) name() string { return concurrencySignalName }
 
 func (c concurrencySignal) saturated(b *registry.Backend, _ loadView) (bool, int64) {
 	if b.Inflight() >= c.limit {

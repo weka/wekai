@@ -24,6 +24,9 @@ type SeriesBackend interface {
 	Label() string
 	Inflight() int64
 	Requests() uint64
+	// Queued reports how many requests are waiting in this backend's wait
+	// queue (router/internal/waitq), bound to it for prefix-cache locality.
+	Queued() int64
 	// Down reports unhealthy or being removed.
 	Down() bool
 }
@@ -52,7 +55,7 @@ type BackendSeries struct {
 	clk       clock.Clock
 	retention time.Duration
 
-	inflightDesc, requestsDesc *prometheus.Desc
+	inflightDesc, requestsDesc, queuedDesc *prometheus.Desc
 
 	mu      sync.Mutex
 	sources []func() []SeriesBackend
@@ -92,6 +95,10 @@ func NewBackendSeries(clk clock.Clock, retention time.Duration) *BackendSeries {
 				"Kept while the backend is unhealthy or removed and dropped after 15 minutes of that; "+
 				"a backend that returns after being dropped may restart from 0, a normal counter reset.",
 			[]string{"backend"}, nil),
+		queuedDesc: prometheus.NewDesc("router_backend_queued",
+			"Requests currently waiting in this backend's wait queue for a concurrency slot to free. "+
+				"Reported as 0 while the backend is unhealthy or removed, same as router_backend_inflight.",
+			[]string{"backend"}, nil),
 		tracked: map[trackKey]*tracked{},
 	}
 }
@@ -112,6 +119,7 @@ func (c *BackendSeries) SetSources(srcs ...func() []SeriesBackend) {
 func (c *BackendSeries) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.inflightDesc
 	ch <- c.requestsDesc
+	ch <- c.queuedDesc
 }
 
 func (c *BackendSeries) Collect(ch chan<- prometheus.Metric) {
@@ -131,6 +139,7 @@ func (c *BackendSeries) Collect(ch chan<- prometheus.Metric) {
 	type sample struct {
 		inflight int64
 		requests uint64
+		queued   int64
 	}
 	out := map[string]*sample{}
 	report := func(t *tracked, down bool) {
@@ -145,6 +154,7 @@ func (c *BackendSeries) Collect(ch chan<- prometheus.Metric) {
 		s.requests += t.b.Requests()
 		if !down {
 			s.inflight += t.b.Inflight()
+			s.queued += t.b.Queued()
 		}
 	}
 
@@ -183,5 +193,6 @@ func (c *BackendSeries) Collect(ch chan<- prometheus.Metric) {
 	for label, s := range out {
 		ch <- prometheus.MustNewConstMetric(c.inflightDesc, prometheus.GaugeValue, float64(s.inflight), label)
 		ch <- prometheus.MustNewConstMetric(c.requestsDesc, prometheus.CounterValue, float64(s.requests), label)
+		ch <- prometheus.MustNewConstMetric(c.queuedDesc, prometheus.GaugeValue, float64(s.queued), label)
 	}
 }

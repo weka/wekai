@@ -76,6 +76,21 @@ func TestCapacityRetrySeriesExistBeforeAnyRetry(t *testing.T) {
 	}
 }
 
+// TestBackendQueueWaitSecondsSeriesExistBeforeAnyWait guards
+// router_backend_queue_wait_seconds the same way
+// TestCapacityRetrySeriesExistBeforeAnyRetry guards router_retry_wait_seconds:
+// its outcome label is a closed enum, so every value must read 0 from
+// startup rather than being absent until the first queued request resolves.
+func TestBackendQueueWaitSecondsSeriesExistBeforeAnyWait(t *testing.T) {
+	reg := Registry()
+	for _, o := range BackendQueueOutcomes {
+		want := map[string]string{"outcome": o}
+		if !hasLabels(seriesLabels(t, reg, "router_backend_queue_wait_seconds"), want) {
+			t.Errorf("router_backend_queue_wait_seconds{outcome=%q} is absent at startup", o)
+		}
+	}
+}
+
 // TestPerPoolEnumSeriesExistBeforeAnyTraffic covers the two per-pool vectors
 // that carry a second label. The rest of the pool's collectors are already
 // resolved by ForPool's own .With calls, which is what made the asymmetry

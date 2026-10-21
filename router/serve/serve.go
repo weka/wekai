@@ -155,6 +155,12 @@ type Options struct {
 	RetryTimeLimit time.Duration
 	TailTTL        time.Duration
 	RefusalTTL     time.Duration
+	// MaxNodeQueueDepth overrides the depth bound of a backend's
+	// --max-node-concurrency wait queue, independent of the concurrency limit
+	// itself. 0 (the default) preserves the original behaviour: depth equals
+	// the concurrency limit. See gateway.Config.NodeQueueDepth. Only meaningful
+	// when NodeConcurrency is also set.
+	MaxNodeQueueDepth int64
 
 	// --- Kubernetes discovery, applied to any route carrying a selector.
 
@@ -219,6 +225,7 @@ func (o Options) gatewayConfig() gateway.Config {
 		CORSOrigins:           o.CORSOrigins,
 		DefaultCapacity:       1,
 		RetryTimeLimit:        o.RetryTimeLimit,
+		NodeQueueDepth:        o.MaxNodeQueueDepth,
 	}
 }
 

@@ -168,3 +168,75 @@ func runLifecycle(rng *rand.Rand, bs []*registry.Backend) {
 		panic("simulated handler panic")
 	}
 }
+
+// TestReleaseWakesAQueuedTicket covers the lease<->waitq hookup: Release is
+// the single wake source for a backend's wait queue (waitq.go's Wake is never
+// called anywhere else on the request path), so a ticket joined on a backend
+// must be signalled the moment that backend's lease is released.
+func TestReleaseWakesAQueuedTicket(t *testing.T) {
+	_, bs := newBackends(t, 1)
+	b := bs[0]
+
+	l := lease.Acquire(b)
+	tk, ok := b.Waiters().Join(0, false)
+	if !ok {
+		t.Fatal("Join: want true")
+	}
+
+	select {
+	case <-tk.C():
+		t.Fatal("ticket woken before any release")
+	default:
+	}
+
+	l.Release()
+
+	select {
+	case <-tk.C():
+	default:
+		t.Fatal("ticket was not woken by Release")
+	}
+}
+
+// TestDoubleReleaseWakesOnlyOnce guards the idempotency half of the hookup:
+// Release's once.Do must mean the wake fires exactly once too, not once per
+// call site that happens to invoke Release on an already-released lease.
+func TestDoubleReleaseWakesOnlyOnce(t *testing.T) {
+	_, bs := newBackends(t, 1)
+	b := bs[0]
+
+	l := lease.Acquire(b)
+	l.Release()
+	l.Release() // idempotent: must not wake a second ticket
+
+	first, ok := b.Waiters().Join(0, false)
+	if !ok {
+		t.Fatal("Join first: want true")
+	}
+	second, ok := b.Waiters().Join(0, false)
+	if !ok {
+		t.Fatal("Join second: want true")
+	}
+
+	// Both tickets were joined AFTER the lease already released, so neither
+	// should ever be woken by it — this just establishes a clean baseline
+	// before the real assertion: one more release wakes exactly one of them.
+	l2 := lease.Acquire(b)
+	l2.Release()
+	l2.Release()
+
+	woken := 0
+	select {
+	case <-first.C():
+		woken++
+	default:
+	}
+	select {
+	case <-second.C():
+		woken++
+	default:
+	}
+	if woken != 1 {
+		t.Fatalf("tickets woken = %d, want exactly 1 (one release, one wake)", woken)
+	}
+}

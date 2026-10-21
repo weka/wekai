@@ -173,6 +173,33 @@ func (LeastOutstanding) Select(_ context.Context, cands []*registry.Backend, _ *
 // router-side concurrency filter before any policy ran.
 var ErrAllBackendsSaturated = errors.New("policy: every backend is saturated")
 
+// SaturatedError is ErrAllBackendsSaturated with a hint attached: Preferred,
+// when non-nil, is the one backend the gateway's capacity retry should wait
+// on rather than poll the whole fleet for.
+//
+// It exists because the affinity policy, not the gateway, is the only place
+// that knows which backend a woken retry would actually land on — the deepest
+// holder of the request's prefix among the backends saturated only by the
+// concurrency signal. Waiting on any other backend would either lose that
+// locality or wait on a backend that will refuse again for an unrelated
+// reason (a real 429, or an imbalance that a release elsewhere does not fix).
+//
+// Every existing caller compares with errors.Is(err, ErrAllBackendsSaturated),
+// never ==, which Unwrap satisfies — so returning this in place of the plain
+// sentinel is backward compatible by construction.
+type SaturatedError struct {
+	// Preferred is the backend worth waiting for, or nil when no single
+	// backend is a good enough bet to queue on (the caller then falls back to
+	// the existing poll loop).
+	Preferred *registry.Backend
+	// Limit is the NodeConcurrency that saturated Preferred — the bound the
+	// gateway uses to size the wait queue's depth.
+	Limit int64
+}
+
+func (e *SaturatedError) Error() string { return ErrAllBackendsSaturated.Error() }
+func (e *SaturatedError) Unwrap() error { return ErrAllBackendsSaturated }
+
 // Observer receives the outcome of each upstream attempt so a flow's signals
 // can learn from it. Implemented by the routing flow; wired by the gateway.
 //

@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 
 	"github.com/weka/wekai/router/internal/circuit"
+	"github.com/weka/wekai/router/internal/waitq"
 )
 
 // Kind distinguishes a leaf inference worker from a child router.
@@ -132,6 +133,17 @@ type Backend struct {
 	requests atomic.Uint64
 
 	Served, Failed atomic.Uint64
+
+	// waiters holds requests refused only by the concurrency signal on THIS
+	// backend, bound here rather than pool-wide so a wait preserves the
+	// prefix-cache locality the policy picked this backend for. Woken by
+	// internal/lease on every release, the same single call site that is
+	// already the one legitimate mutator of inflight (see AddInflight).
+	//
+	// A value field, not a pointer, so a zero-value Backend has a usable queue
+	// with no constructor — the same reason CB is the only pointer field here
+	// that needs one.
+	waiters waitq.Queue
 }
 
 func (b *Backend) Kind() Kind     { return Kind(b.kind.Load()) }
@@ -154,6 +166,14 @@ func (b *Backend) Locality() string {
 func (b *Backend) SetLocality(l string) { b.locality.Store(&l) }
 
 func (b *Backend) Inflight() int64 { return b.inflight.Load() }
+
+// Waiters returns this backend's wait queue, for joining (the gateway's
+// capacity retry path) and waking (internal/lease on release).
+func (b *Backend) Waiters() *waitq.Queue { return &b.waiters }
+
+// Queued reports how many requests are currently waiting for a slot on this
+// backend.
+func (b *Backend) Queued() int64 { return int64(b.waiters.Len()) }
 
 func (b *Backend) Capacity() int64 {
 	if c := b.capacity.Load(); c > 0 {

@@ -9,6 +9,7 @@ import (
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/policy"
 	"github.com/weka/wekai/router/internal/proxy"
+	"github.com/weka/wekai/router/internal/registry"
 )
 
 // Waiting out a capacity refusal instead of passing it to the client.
@@ -66,6 +67,91 @@ func backoffAt(n int, remaining time.Duration) time.Duration {
 	return d
 }
 
+// errNodeQueueFull means a request could not even get a place in a backend's
+// wait queue because it was already at its depth bound. Answered 503, not
+// 429: unlike a queued request that timed out waiting (the ordinary capacity
+// 429), this one never waited at all, so there is nothing the usual
+// Retry-After semantics for a capacity refusal describe.
+//
+// Deliberately NOT wrapping policy.ErrAllBackendsSaturated: isCapacityRefusal
+// and the gateway's 429 branch must never see this as the same condition, or
+// it would double-count a single rejection as both a queue-full 503 and a
+// saturation 429.
+var errNodeQueueFull = errors.New("gateway: backend wait queue is full")
+
+// queueOutcome is what awaitSlot resolved to.
+type queueOutcome int
+
+const (
+	// queueWoken: a slot freed (or was already free) and the caller should
+	// loop back and re-run Select fresh.
+	queueWoken queueOutcome = iota
+	// queueExpired: the retry budget ran out while waiting.
+	queueExpired
+	// queueAbandoned: the client disconnected while waiting.
+	queueAbandoned
+	// queueFull: the backend's wait queue was already at its depth bound; the
+	// caller never waited at all.
+	queueFull
+)
+
+// awaitSlot waits for a slot to free on sat.Preferred specifically, rather
+// than polling the whole fleet — which is the entire point: a wait bound to
+// one backend preserves the prefix-cache locality the policy picked it for,
+// where a pool-wide poll that re-runs Select from scratch would not.
+//
+// The queue depth bound defaults to one waiter per concurrency slot
+// (max(1, Limit)): a waiter deeper than that needs more than a full turnover
+// of the backend's batch to be admitted, which at realistic generation times
+// already exceeds any sane retry budget, so there is no point queueing it at
+// all. Config.NodeQueueDepth, when positive, overrides that default outright —
+// an operator who wants to test without the depth bound biting can set it to
+// a large number, without actually removing the bound, which is what keeps
+// this a memory-bounded queue rather than an unbounded one by accident.
+func (s *Server) awaitSlot(r *http.Request, sat *policy.SaturatedError, remaining time.Duration) queueOutcome {
+	b := sat.Preferred
+	depth := s.cfg.NodeQueueDepth
+	if depth <= 0 {
+		depth = sat.Limit
+		if depth < 1 {
+			depth = 1
+		}
+	}
+	limit := sat.Limit
+	if limit < 1 {
+		limit = 1
+	}
+
+	ticket, ok := b.Waiters().Join(int(depth), false)
+	if !ok {
+		metrics.BackendQueueFullTotal.WithLabelValues(b.Label()).Inc()
+		return queueFull
+	}
+
+	// Closes the race against a release that happened between Select's read
+	// of Inflight and this Join: if a slot is already free, there is nothing
+	// to wait for.
+	if b.Inflight() < limit {
+		ticket.Leave()
+		return queueWoken
+	}
+
+	start := s.cfg.Clock.Now()
+	select {
+	case <-ticket.C():
+		metrics.BackendQueueWaitSeconds.WithLabelValues("woken").Observe(s.cfg.Clock.Now().Sub(start).Seconds())
+		return queueWoken
+	case <-s.cfg.Clock.After(remaining):
+		ticket.Leave()
+		metrics.BackendQueueWaitSeconds.WithLabelValues("expired").Observe(s.cfg.Clock.Now().Sub(start).Seconds())
+		return queueExpired
+	case <-r.Context().Done():
+		ticket.Leave()
+		metrics.BackendQueueWaitSeconds.WithLabelValues("abandoned").Observe(s.cfg.Clock.Now().Sub(start).Seconds())
+		return queueAbandoned
+	}
+}
+
 // isCapacityRefusal reports whether an error means "the fleet cannot take this
 // right now" as opposed to "something went wrong".
 func isCapacityRefusal(err error) bool {
@@ -107,6 +193,12 @@ func (s *Server) serveWithCapacityRetry(
 ) proxy.Result {
 	deadline := s.cfg.Clock.Now().Add(s.cfg.RetryTimeLimit)
 	var res proxy.Result
+	// queuedOn is set when the previous iteration woke from a backend's wait
+	// queue, so this iteration's Serve is the re-decide that wake was for. If
+	// it lands anywhere other than queuedOn — lost the race, or the ladder
+	// routed elsewhere — the slot that woke us was never spent, and would
+	// strand the next waiter on queuedOn forever if nobody passes it on.
+	var queuedOn *registry.Backend
 
 	// Set on the first refusal that is actually waited on, so a request that
 	// never waits observes nothing and the histogram counts REQUESTS THAT
@@ -154,6 +246,12 @@ func (s *Server) serveWithCapacityRetry(
 		}
 
 		res = s.px.Serve(w, r, cands, target.Selector, s.dialect, rr, body, accepted, outcome, auth)
+		if queuedOn != nil {
+			if res.Backend != queuedOn {
+				queuedOn.Waiters().Wake()
+			}
+			queuedOn = nil
+		}
 		if s.cfg.RetryTimeLimit <= 0 || !isCapacityRefusal(res.Err) || res.Committed {
 			// satisfied means the waiting worked: a later attempt was served.
 			// Anything else — a backend broke, the fleet emptied — ended the
@@ -182,6 +280,33 @@ func (s *Server) serveWithCapacityRetry(
 			metrics.RetriesTotal.WithLabelValues(lastReason, "exhausted").Inc()
 			settle("expired")
 			return res
+		}
+
+		// The per-backend wait queue only applies to the specific case the
+		// policy singled out: NOTHING has reached an upstream yet for this
+		// request (res.Attempts == 0), and the selector named one backend
+		// worth waiting for rather than the whole fleet. res.Attempts > 0
+		// means the proxy already walked part of the candidate set — a
+		// different refusal with its own budget (REL-1) — and that path stays
+		// on the poll loop below unchanged, which is exactly what
+		// capacity_retry_wire_test.go pins down.
+		var sat *policy.SaturatedError
+		if res.Attempts == 0 && errors.As(res.Err, &sat) && sat.Preferred != nil {
+			switch s.awaitSlot(r, sat, remaining) {
+			case queueWoken:
+				queuedOn = sat.Preferred
+				continue
+			case queueExpired:
+				metrics.RetriesTotal.WithLabelValues(lastReason, "exhausted").Inc()
+				settle("expired")
+				return res
+			case queueAbandoned:
+				settle("abandoned")
+				return res
+			case queueFull:
+				res.Err = errNodeQueueFull
+				return res
+			}
 		}
 
 		metrics.RetriesTotal.WithLabelValues(lastReason, "retried").Inc()

@@ -274,6 +274,17 @@ func (s *Server) inferenceHandler(route dialect.Route, affine bool) http.Handler
 		}
 		switch {
 		case res.Committed || res.Err == nil:
+		case errors.Is(res.Err, errNodeQueueFull):
+			// The request never got a place in line at all — distinct from a
+			// queued request that timed out waiting, which IS the ordinary
+			// saturation 429 below. There is nothing to retry out here: the
+			// queue was already as deep as --max-node-concurrency allows, so
+			// 503 says so immediately rather than making the caller wait a
+			// Retry-After just to be told the same thing.
+			slog.Warn("rejected: backend wait queue is already at its depth bound",
+				"request_id", obs.RequestID(ctx), "pool", target.Name,
+				"reason", "node_queue_full")
+			writeQueueFull(w, s.dialect)
 		case errors.Is(res.Err, policy.ErrSplitGuardBlocked):
 			// Declined on purpose: every backend holding this prefix is
 			// saturated and none of the rest is far enough below to be worth a
@@ -781,6 +792,17 @@ func writeBusy(w http.ResponseWriter, d dialect.Dialect) {
 	w.Header().Set("Retry-After", "1")
 	d.WriteError(w, http.StatusTooManyRequests,
 		"rate_limit_error", "server is busy; retry shortly")
+}
+
+// writeQueueFull answers a request that could not get a place in a backend's
+// wait queue at all. 503, not writeBusy's 429: the request never waited —
+// there is no "try again after backing off" to suggest, since the depth bound
+// that refused it describes the fleet right now, not a transient instant a
+// brief wait would resolve.
+func writeQueueFull(w http.ResponseWriter, d dialect.Dialect) {
+	w.Header().Set("Retry-After", "1")
+	d.WriteError(w, http.StatusServiceUnavailable,
+		"server_busy", "server is busy; retry shortly")
 }
 
 // ProbeHandler serves the kubelet's probes, for mounting on the OPERATIONAL

@@ -99,6 +99,41 @@ signal and is always on. `--max-node-concurrency` is an opt-in early warning
 that saves a round trip: set it to the backends' vLLM `--max-num-seqs` and
 saturation is predicted rather than discovered one refusal at a time.
 
+When a request's one preferred backend is saturated *only* by
+`--max-node-concurrency` — not by a real `429` and not by `--rebalance-ratio`,
+neither of which a slot freeing up on that backend fixes — and
+`--retry-time-limit` is set, the request does not poll the whole fleet. It
+joins a small FIFO queue bound to that one backend (depth equal to the
+concurrency limit by default, one waiter per slot — see
+`--max-node-concurrency-queue-depth` below) and is woken the instant a lease
+there releases, then re-decides fresh. This is what keeps a queued request on
+the backend that already holds its prefix instead of either spilling it to a
+colder one or re-polling blind every few milliseconds. A release that frees a
+slot nobody queued for, or a woken request that ends up routed elsewhere, both
+correctly reach the next waiter in line — nothing is stranded.
+
+By default the two flags above fully configure it; there is no need for a
+separate queue depth or timeout. A queue already at depth answers `503`
+immediately, since there is no instant that waiting would resolve. A queued
+request that outlasts `--retry-time-limit` answers the same `429` it always
+would have. Watch `router_backend_queued` (current depth),
+`router_backend_queue_wait_seconds` (how long waiting actually took, by
+outcome) and `router_backend_queue_full_total` (how often the depth bound
+itself was hit).
+
+`--max-node-concurrency-queue-depth` overrides that depth bound independently
+of `--max-node-concurrency`'s own value. `0` (the default) is the behaviour
+above, unchanged: depth equals the concurrency limit. A positive value sets
+the depth explicitly — useful when a real test wants requests that arrive at
+full backend capacity to actually wait rather than risk an early `503` from a
+depth bound that is too tight; set it to a large number to make the queue
+effectively unbounded for that run. It is still a bound, not true unlimited
+queueing — the limit exists to protect router memory, not as an arbitrary
+default — so treat a very large value as a deliberate, temporary choice for a
+test rather than a production setting. It only does anything when
+`--max-node-concurrency` is also set: at `0` the signal that produces a
+queueable refusal is never raised, so this flag is inert on its own.
+
 `--soft-node-concurrency` makes that limit the **top of a band** rather than a
 single cliff. Below the soft value a holder is an ordinary cache hit; at or
 above it the router prefers to split the request elsewhere; and if nothing
@@ -715,6 +750,9 @@ So alert on all three:
 | `router_retries_total{reason="capacity_saturated"}` | waits caused by every backend being full. The transient fallback cannot apply here — there was no candidate — so waiting is the only move |
 | `router_retries_total{reason="capacity_guard_blocked"}` | waits caused by the split guard. The fallback is tried BEFORE this error is returned, so a count here with `overflows_total` at zero means the threshold is too tight or off — not that the router waited instead of falling back |
 | `router_retry_wait_seconds` | latency `--retry-time-limit` added, **per request** — `_count{outcome="satisfied"}` is how many requests the waiting rescued, `{outcome="expired"}` how many spent the budget and got a 429 anyway, and the quantiles what it cost. Spans the first refusal to the *start* of the attempt that ended the wait, so it excludes that attempt's service time and stays bounded by the budget in every outcome — quantiles are comparable across them. End-to-end cost is `router_request_duration_seconds`. `retries_total` counts *attempts*, so it answers neither |
+| `router_backend_queued` | requests currently waiting in ONE backend's `--max-node-concurrency` queue. Non-zero only while `--retry-time-limit` is set; the per-backend companion to the fleet-wide `router_backend_queue_wait_seconds` below |
+| `router_backend_queue_wait_seconds` | latency spent in a backend's wait queue, by outcome — `woken` (a slot freed, request re-decided), `expired` (budget ran out, same 429 as the poll path), `abandoned` (caller disconnected). Separate from `router_retry_wait_seconds`: that one measures the whole-fleet poll loop, this one a wait bound to a single backend, and the two describe different mechanisms for the same refusal |
+| `router_backend_queue_full_total{backend}` | requests refused a place in line outright because that backend's queue was already at its depth bound (`--max-node-concurrency`). Answered `503`, not `429` — the request never waited at all |
 | `router_vllm_metrics_endpoints` | upstream endpoints `asked` vs `contributing` on the last aggregation cycle. Catches a backend that is **in the pool and unscrapeable** — hung vLLM, partition, present-but-unready — which is otherwise invisible in flat `vllm:` totals. It does **not** catch a backend leaving: `asked` tracks the live set, so a deleted pod drops both labels together and the ratio still reads 1.0. Use `router_backends_total` for that, and alert on `asked == 0` separately |
 | `router_stream_aborted_total{reason="upstream_error"}` | streams the BACKEND stopped sending before the terminal marker. Feeds the circuit breaker, so a backend truncating responses is ejected rather than counted healthy |
 | `router_stream_aborted_total{reason="client_disconnect"}` | streams the CALLER abandoned. Does **not** count against the backend — on a saturated fleet callers give up constantly, and blaming them would eject healthy backends exactly when losing one costs most |

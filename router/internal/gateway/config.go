@@ -108,6 +108,20 @@ type Config struct {
 
 	// Clock is the time source for that backoff. Nil means clock.Real.
 	Clock clock.Clock
+
+	// NodeQueueDepth overrides the depth bound of a backend's --max-node-concurrency
+	// wait queue (see awaitSlot). Zero (the default) preserves the original
+	// behaviour: depth equals max(1, the concurrency limit) — one waiter per
+	// concurrency slot. A positive value sets the depth independently of the
+	// concurrency limit, so an operator can make the queue effectively
+	// unbounded for a test (a large number) without removing the bound
+	// outright, which still protects router memory per the rationale on
+	// awaitSlot.
+	//
+	// Only meaningful when NodeConcurrency (the --max-node-concurrency signal)
+	// is also set: with that at zero, SaturatedError is never produced and
+	// awaitSlot is never reached, so this field has no effect.
+	NodeQueueDepth int64
 }
 
 // Redacted returns the config with nothing secret in it, for

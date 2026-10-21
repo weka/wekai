@@ -93,6 +93,12 @@ func (l *Lease) Release() {
 				"backend", l.b.URL, "value", n)
 			l.b.StoreInflight(0)
 		}
+		// The single wake source for this backend's wait queue (waitq). Every
+		// path that ends a lease — normal completion, the retry loop's own
+		// release, a panic unwinding — funnels through this once.Do, so no other
+		// call site is needed to keep a queued request from waiting past the
+		// moment its slot actually freed.
+		l.b.Waiters().Wake()
 	})
 }
 

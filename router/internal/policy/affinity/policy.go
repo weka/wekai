@@ -336,12 +336,25 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	// 1.6 for every request in the pool, so no candidate could ever clear it
 	// and the flow rejected with the fleet nearly idle.
 	saturated := make(map[string]int64, len(cands))
+	// waitable collects backends saturated ONLY by the concurrency signal —
+	// never by refused or imbalance. Those two mean "the backend itself said
+	// no" or "it is relatively overloaded", neither of which a router-side
+	// release count on this backend fixes, so they are not worth queuing on.
+	// A backend concurrency saturates and nothing else touches is exactly the
+	// case a release on IT, and only it, resolves.
+	var waitable []*registry.Backend
 	for _, c := range cands {
 		ref := int64(-1)
+		firedAny := false
+		onlyConcurrency := true
 		for _, sg := range p.signals {
 			hit, r := sg.saturated(c, view)
 			if !hit {
 				continue
+			}
+			firedAny = true
+			if sg.name() != concurrencySignalName {
+				onlyConcurrency = false
 			}
 			p.m.Signal(sg.name())
 			// Smallest across the SIGNALS on one backend: refused says 48,
@@ -358,6 +371,9 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 			continue
 		}
 		saturated[c.URL] = ref
+		if firedAny && onlyConcurrency {
+			waitable = append(waitable, c)
+		}
 	}
 
 	// Slots are resolved once and reused, so the candidate mask and the
@@ -382,6 +398,9 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 		// rejection must be one increment, and Select can run twice for one
 		// request when the proxy retries.
 		metrics.PolicyFallbacks.WithLabelValues(p.Name(), "all_saturated").Inc()
+		if b := p.queueTarget(ctx, waitable, rr); b != nil {
+			return nil, &policy.SaturatedError{Preferred: b, Limit: p.cfg.NodeConcurrency}
+		}
 		return nil, policy.ErrAllBackendsSaturated
 	}
 
@@ -625,6 +644,67 @@ func (p *Policy) Select(ctx context.Context, cands []*registry.Backend, rr *poli
 	p.m.Decision("load")
 	metrics.PolicyFallbacks.WithLabelValues(p.Name(), "no_holders").Inc()
 	return p.fallback.Select(ctx, usable, rr)
+}
+
+// queueTarget picks the one backend among waitable worth waiting on, or nil
+// when none is: the caller then falls back to the plain ErrAllBackendsSaturated
+// and the gateway's existing poll loop.
+//
+// This is a FORECAST of what Select would do on a woken retry, not a
+// decision — it must not touch p.m or rr.PolicyState, which belong to the
+// real decision Select makes when the request actually re-runs. Called only
+// from the len(usable) == 0 branch of Select, so it never changes behaviour
+// while any backend is genuinely usable (spillover is untouched by
+// construction).
+func (p *Policy) queueTarget(ctx context.Context, waitable []*registry.Backend, rr *policy.RoutingRequest) *registry.Backend {
+	if len(waitable) == 0 {
+		return nil
+	}
+	if len(rr.Units) == 0 {
+		// No routable prefix: nothing to be affine to, so the fallback
+		// selector (least-outstanding) picks among the waitable set exactly
+		// as it would among the usable set in the no-units branch above.
+		b, err := p.fallback.Select(ctx, waitable, rr)
+		if err != nil {
+			return nil
+		}
+		return b
+	}
+
+	slots := make([]int, len(waitable))
+	var waitMask markSet
+	for i, c := range waitable {
+		s := p.tree.slotOrCreate(c.URL)
+		slots[i] = s
+		waitMask.Add(s)
+	}
+	pth := path{units: rr.Units, modelKey: modelKey(rr.Model)}
+	a := p.tree.walk(pth, waitMask)
+
+	// Empty pool: no waitable backend holds any marked run on this path at
+	// all. !availDeepest: a waitable backend holds some ancestor, but the
+	// DEEPEST marked run belongs to someone else — exactly the "shallow
+	// anchor" case Select itself refuses to treat as a cache hit. Queueing
+	// there would either gain nothing or hit ErrSplitGuardBlocked on wake;
+	// not worth it either way.
+	if a.pool.Empty() || !a.availDeepest {
+		return nil
+	}
+
+	holders := make([]*registry.Backend, 0, len(waitable))
+	for i, c := range waitable {
+		if a.pool.Has(slots[i]) {
+			holders = append(holders, c)
+		}
+	}
+	if len(holders) == 0 {
+		return nil
+	}
+	b, err := p.fallback.Select(ctx, holders, rr)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 // Commit records that b served the request, marking it on EVERY run along the

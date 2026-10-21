@@ -76,6 +76,32 @@ func (r *seriesRig) scrape(backend string) (inflight, requests float64, hasIn, h
 	return
 }
 
+// scrapeQueued returns router_backend_queued for backend, and whether it was
+// present. Kept separate from scrape/want rather than added as a new
+// parameter to both, which every existing call site would then have to grow a
+// 0 for — this collector's queued-specific behavior gets its own small set of
+// tests instead.
+func (r *seriesRig) scrapeQueued(backend string) (queued float64, present bool) {
+	r.t.Helper()
+	reg := prometheus.NewPedanticRegistry()
+	reg.MustRegister(r.col)
+	fams, err := reg.Gather()
+	if err != nil {
+		r.t.Fatalf("gather: %v", err)
+	}
+	for _, f := range fams {
+		if f.GetName() != "router_backend_queued" {
+			continue
+		}
+		for _, m := range f.Metric {
+			if m.Label[0].GetValue() == backend {
+				queued, present = m.GetGauge().GetValue(), true
+			}
+		}
+	}
+	return
+}
+
 func (r *seriesRig) want(backend string, inflight, requests float64, present bool) {
 	r.t.Helper()
 	in, req, hasIn, hasReq := r.scrape(backend)
@@ -186,6 +212,53 @@ func TestBackendSeriesRemovedThenDroppedThenReAdded(t *testing.T) {
 	l := lease.Acquire(nb)
 	r.want(bk, 1, 1, true)
 	l.Release()
+}
+
+func TestBackendSeriesReportsQueuedDepth(t *testing.T) {
+	r := newSeriesRig(t)
+	b := r.add(bk)
+
+	t1, ok := b.Waiters().Join(0, false)
+	if !ok {
+		t.Fatal("Join t1: want true")
+	}
+	if got, present := r.scrapeQueued(bk); !present || got != 1 {
+		t.Fatalf("queued = %v (present=%v), want 1", got, present)
+	}
+
+	if _, ok := b.Waiters().Join(0, false); !ok {
+		t.Fatal("Join t2: want true")
+	}
+	if got, present := r.scrapeQueued(bk); !present || got != 2 {
+		t.Fatalf("queued = %v (present=%v), want 2", got, present)
+	}
+
+	t1.Leave()
+	if got, present := r.scrapeQueued(bk); !present || got != 1 {
+		t.Fatalf("queued after Leave = %v (present=%v), want 1", got, present)
+	}
+}
+
+// TestBackendSeriesUnhealthyZeroesQueued mirrors
+// TestBackendSeriesUnhealthyZeroesInflightThenDrops: a backend that goes
+// unhealthy is reporting nothing useful about anyone still waiting on it, so
+// router_backend_queued is forced to 0 the same way router_backend_inflight
+// is, rather than reporting a stale depth for a backend no longer admitting
+// anyone.
+func TestBackendSeriesUnhealthyZeroesQueued(t *testing.T) {
+	r := newSeriesRig(t)
+	b := r.add(bk)
+	if _, ok := b.Waiters().Join(0, false); !ok {
+		t.Fatal("Join: want true")
+	}
+	if got, present := r.scrapeQueued(bk); !present || got != 1 {
+		t.Fatalf("queued = %v (present=%v), want 1", got, present)
+	}
+
+	b.SetHealth(registry.Unhealthy)
+	if got, present := r.scrapeQueued(bk); !present || got != 0 {
+		t.Fatalf("queued while unhealthy = %v (present=%v), want 0", got, present)
+	}
 }
 
 func TestBackendSeriesRemovedBackendReportsZeroInflight(t *testing.T) {
