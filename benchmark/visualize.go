@@ -865,6 +865,9 @@ var vizTemplate = template.Must(template.New("viz").Parse(`<!DOCTYPE html>
   .v3-rate { color: #8a9096; }
   .v3-views { display: inline-flex; align-items: center; gap: 3px; }
   .v3-hint { margin-left: auto; }
+  .v3-bar input[type=range] { width: 90px; vertical-align: middle; accent-color: #7C03EC; }
+  #v3Host.v3-expanded { position: fixed; inset: 0; z-index: 1000; padding: 8px 14px; background: #0D1013; box-sizing: border-box; }
+  .v3-bar .v3-expand { font-weight: 500; }
   .v3-canvas { display: block; cursor: grab; background: #0D1013; border: 1px solid #42464A; border-radius: 6px; }
   .v3-tip { position: fixed; z-index: 50; display: none; padding: 6px 9px; background: #1E2429; color: #F2F2EB; border: 1px solid #42464A; border-radius: 6px; font-size: 12px; line-height: 1.45; pointer-events: none; }
   .v3-tip b { color: #C79FF1; font-weight: 500; }
@@ -1065,14 +1068,14 @@ function timelineArmOf(s) {
   const ix = s.colIx, rows = s.rows || [];
   const at = k => ix[k] ? ix[k][0] : -1;
   const P = {};
-  ["t", "ttft", "resp", "sn", "turn", "in", "ca", "out", "gi", "r", "u", "sl", "tp", "rw", "r4", "cw", "x", "ef", "src", "rc", "tm", "g"].forEach(k => { P[k] = at(k); });
+  ["t", "ttft", "resp", "sn", "turn", "in", "ca", "out", "gi", "r", "u", "sl", "ss", "tp", "rw", "r4", "cw", "x", "ef", "src", "rc", "tm", "g"].forEach(k => { P[k] = at(k); });
   const v = (row, k, d) => P[k] >= 0 ? row[P[k]] : d;
   const grp = (row, k, w) => P[k] >= 0 ? row.slice(P[k], P[k] + w) : null;
   const FLAG_SOURCES = 16, FLAG_TIMINGS = 8;   // timeline.go flagSources, flagTimings
   const reqs = rows.map(row => {
     const cw = v(row, "cw", 0), ef = v(row, "ef", 0), x = v(row, "x", 0), gi = v(row, "gi", -1);
     const q = {
-      r: v(row, "r", 0), u: v(row, "u", 0), s: v(row, "sn", 0), sl: v(row, "sl", 0), n: v(row, "turn", 0),
+      r: v(row, "r", 0), u: v(row, "u", 0), s: v(row, "sn", 0), sl: v(row, "sl", 0), ss: v(row, "ss", 0), n: v(row, "turn", 0),
       t: v(row, "t", 0) - cw, e: (ef || v(row, "resp", 0)) + cw, f: v(row, "ttft", 0),
       i: v(row, "in", 0), c: v(row, "ca", 0), o: v(row, "out", 0),
       tp: v(row, "tp", 0), rw: v(row, "rw", 0), r4: v(row, "r4", 0), cw: cw, x: x,
@@ -1340,17 +1343,16 @@ function applyCtxFilter(minTok, maxTok) {
 // --- Color assignment (official WEKA brand, neutral-first) ---
 // Multi-series palettes are restrained tints DERIVED from the brand set so
 // a 2-8 series report reads as one family: weka arms a purple ramp
-// (#7C03EC/#C79FF1 family), hbm/gpu neutral slate (the brand has no blue,
-// so it stays desaturated), dram a dimmed #6BE0A0 green, the fallback
-// dimmed yellow/green/slate tints. Position and the legend carry identity;
+// (#7C03EC/#C79FF1 family), hbm/gpu a muted green ramp, dram a muted cyan
+// ramp, the fallback dimmed yellow/green/slate tints. Position and the legend carry identity;
 // full saturation belongs to the external-KV accent alone, and #FF6B6B is
 // reserved for errors.
 const OTHER_PALETTE = [
   "#ab9a64","#8a95a3","#a678e8","#5f987d","#b98f83","#c2b078",
   "#8d5fd6","#707c8a","#75b094","#d0b3f5","#9aa5b1","#c9b8e8",
 ];
-const GPU_VARIANTS = ["#8094b5","#68809f","#9cb0cb","#54687f","#aec3da"]; // muted slate-BLUE (perceptible cool lean, restraint kept)
-const DRAM_VARIANTS = ["#5f987d","#4d8069","#75b094","#3f6a57","#8cc4a9"];
+const GPU_VARIANTS = ["#5fae7a","#4c9466","#78c290","#3e7a54","#92d2a6"]; // hbm: muted green
+const DRAM_VARIANTS = ["#4fb3bf","#3e9aa6","#6cc6d0","#2f7f89","#8ad6de"]; // dram: muted cyan
 const WEKA_VARIANTS = [
   "#a678e8","#C79FF1","#8d5fd6","#b58ff0","#7745c0","#d0b3f5",
 ];
@@ -2179,15 +2181,15 @@ function tickStats(tickTime) {
 // (calm dominant mass), compute = dimmed #FF8569 warning orange (the cost
 // signal). Passes lightness/CVD/contrast checks on #000; the two muted
 // fills sit below the chroma floor by design.
-const MIX_COMPUTE_COLOR = "#a86853";
+const MIX_COMPUTE_COLOR = "#c0504d"; // compute: muted red (not the #FF6B6B error red)
 const MIX_LOCAL_COLOR = "#756a99";
 const MIX_EXTERNAL_COLOR = "#7C03EC"; // official primary purple — the single high-chroma accent
 // MIX_HOST_COLOR is sglang-only: its 4-way breakdown splits vLLM's implicit
 // "local" into device (GPU radix cache, reuses MIX_LOCAL_COLOR) and host
 // (CPU/DRAM HiCache L2), which needs a color of its own. Muted teal-green
 // sits clearly apart from the compute/local/external triad above and from
-// GPU_VARIANTS' cooler slate-blue and DRAM_VARIANTS' own green family below.
-const MIX_HOST_COLOR = "#4a9d8f";
+// GPU_VARIANTS' green family; it shares DRAM_VARIANTS' cyan, being DRAM.
+const MIX_HOST_COLOR = "#4fb3bf"; // DRAM tier: the dram arm cyan
 const ADT_LINE_COLOR = "#F2F2EB";
 const MIX_BAND_H = 64;
 // Band fills sit on a solid-black backdrop; slightly translucent so the
@@ -4580,18 +4582,37 @@ function tlSyncFromReport() {
 // --- 3D view: time (X) x throughput (Y, up) x active series (Z, depth) ---
 // One curve per enabled arm, from the same records the metrics view plots, on
 // each arm's own elapsed clock (so arms line up like the metrics view's) and
-// over the report's zoom window. Each arm keeps its palette colour, blended
-// toward green or red by its output tok/s relative to the other enabled arms
-// over that window, so the best and worst arms read at a glance.
+// over the report's zoom window. Each arm keeps its report colour (hbm green,
+// dram orange, weka purple). Dots along each curve carry the TTFT there, green
+// at 0 s to red at TTFT_MAX, keyed by a colour bar beside the cube.
 const V3 = (() => {
   // Built on first show: the report script also runs headless (tests, public
   // export), where nothing should touch this view's DOM.
   const host = document.getElementById("v3Host");
-  let cv, cx, tip, elY, elZ, elArms, elSm, built = false;
+  let cv, cx, tip, elY, elZ, elArms, elSm, elFill, elAlpha, built = false, expanded = false;
   const BINS = 240, CAM = 4;
+  const TTFT_MAX = 20000;   // ms: dots are fully red at and above this
+  const LINE_DOT_EVERY = 6;  // one TTFT dot per this many bins (~40 per arm)
+  // Cache-mix fill: input tokens by source, stacked bottom to top. Colours are
+  // the arm colours of the tier (hbm green, dram cyan, weka purple);
+  // compute is the report's compute red. An arm's external tier takes its own class's colour, the way
+  // series colours are assigned from the arm name.
+  const MIX_CATS = ["compute", "hbm", "dram", "weka"];
+  const MIX_CAT_COLOR = { compute: MIX_COMPUTE_COLOR, hbm: GPU_VARIANTS[0], dram: DRAM_VARIANTS[0], weka: WEKA_VARIANTS[0] };
+  const MIX_CAT_LABEL = { compute: "compute", hbm: "GPU cache (hbm)", dram: "DRAM", weka: "weka" };
+  function mixCat(band, armClass) {
+    switch (band) {
+      case "local_compute": case "compute": return "compute";
+      case "local_cache_hit": case "device": return "hbm";
+      case "host": return "dram";
+      case "external_kv_transfer": case "storage": return armClass === "dram" ? "dram" : "weka";
+    }
+    return "compute";
+  }
   const VIEWS = { iso: [-0.62, 0.38], front: [0, 0], top: [0, Math.PI / 2 - 0.001], side: [-Math.PI / 2, 0] };
   let yaw = VIEWS.iso[0], pitch = VIEWS.iso[1], zoom = 1;
-  let cw = 0, ch = 0, enabled = new Set([0]), shown = false, proj = [];
+  let cw = 0, ch = 0, enabled = new Set(DATA.map((_, i) => i)), shown = false, proj = [];   // every arm on by default
+  let fillLayer = null;   // offscreen layer for the cache-mix fill
 
   // ---- data ----
   // Per arm over [t0, t1] (elapsed ms): Y per bin and active series per bin.
@@ -4664,10 +4685,46 @@ const V3 = (() => {
       }
     };
     smooth(y);
+    // TTFT at each bin: mean over the requests that started in it, carried
+    // forward across empty bins, smoothed like Y.
+    const ts = new Float64Array(BINS), tn = new Float64Array(BINS);
+    for (const r of s.records) {
+      const b = bin(r.t);
+      if (b >= 0 && b < BINS && r.ttft > 0) { ts[b] += r.ttft; tn[b]++; }
+    }
+    const ttft = new Float64Array(BINS);
+    for (let b = 0, last = 0; b < BINS; b++) { if (tn[b]) last = ts[b] / tn[b]; ttft[b] = last; }
+    smooth(ttft);
     if (elZ.value === "infl") smooth(zs);   // a rate-like mean; the step counts stay exact
     // The arm's output rate over the part of the window it actually ran.
     const dur = Math.max(1, Math.min(t1, end) - t0) / 1000;
-    return { y, z: zs, hasZ, bw, end, outRate: outTot / dur };
+    // Cache mix per bin: band tokens of the overlapping sample intervals, pro
+    // rata by overlap, smoothed like Y, then normalised to fractions. A bin no
+    // sample covers carries the previous bin's mix.
+    const armClass = classifyAlias(getAlias(s.name));
+    const mixTok = {}; MIX_CATS.forEach(c => { mixTok[c] = new Float64Array(BINS); });
+    const segs = s.mix || [];
+    for (const m of segs) {
+      const span = m.t1 - m.t0; if (span <= 0) continue;
+      for (let b = Math.max(0, bin(m.t0)); b < BINS && t0 + b * bw < m.t1; b++) {
+        const a = Math.max(m.t0, t0 + b * bw), c2 = Math.min(m.t1, t0 + (b + 1) * bw);
+        if (c2 <= a) continue;
+        const f = (c2 - a) / span;
+        (m.bands || []).forEach(bd => { mixTok[mixCat(bd.n, armClass)][b] += (bd.v || 0) * f; });
+      }
+    }
+    MIX_CATS.forEach(c => smooth(mixTok[c]));
+    let mix = null;
+    if (segs.length) {
+      mix = MIX_CATS.map(() => new Float64Array(BINS));
+      let prev = null;
+      for (let b = 0; b < BINS; b++) {
+        const tot = MIX_CATS.reduce((n, c) => n + mixTok[c][b], 0);
+        if (tot > 0) prev = MIX_CATS.map(c => mixTok[c][b] / tot);
+        if (prev) MIX_CATS.forEach((c, k) => { mix[k][b] = prev[k]; });
+      }
+    }
+    return { y, z: zs, ttft, mix, hasZ, bw, end, outRate: outTot / dur };
   }
 
   // ---- colour ----
@@ -4678,17 +4735,9 @@ const V3 = (() => {
     if (h[0] === "#") return [1, 3, 5].map(i => parseInt(h.substr(i, 2), 16));
     const m = h.match(/[\d.]+/g); return m ? m.slice(0, 3).map(Number) : [200, 200, 200];
   }
-  function hsl2rgb(h, s, l) {
-    const k = n => (n + h / 30) % 12, a = s * Math.min(l, 1 - l);
-    const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1));
-    return [f(0) * 255, f(8) * 255, f(4) * 255];
-  }
-  function armColor(i, score) {
-    const base = rgb(seriesColors[i]);
-    if (score === null) return base;
-    const sc = hsl2rgb(score * 125, 0.75, 0.5);   // 0 red .. 1 green
-    return base.map((v, k) => Math.round(v * 0.45 + sc[k] * 0.55));
-  }
+  // Dot colour for a TTFT: hue 120 (green) at 0 s down to 0 (red) at TTFT_MAX.
+  const ttftHue = ms => 120 * (1 - Math.min(Math.max(ms, 0), TTFT_MAX) / TTFT_MAX);
+  const ttftColor = (ms, a) => "hsla(" + ttftHue(ms).toFixed(0) + ",75%,52%," + a + ")";
   const css = (c, a) => "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + (a === undefined ? 1 : a) + ")";
 
   // ---- format ----
@@ -4723,16 +4772,27 @@ const V3 = (() => {
   }
 
   // ---- arm picker ----
+  // Built once; a redraw only refreshes each row's swatch and rate. Rebuilding
+  // the rows on every draw replaced the checkbox under the user's click.
+  let armRows = null;
   function buildArms(stats) {
-    elArms.innerHTML = DATA.map((s, i) =>
-      '<label title="' + s.name.replace(/"/g, "&quot;") + '"><input type="checkbox" data-i="' + i + '"' + (enabled.has(i) ? " checked" : "") + '>' +
-      '<i style="background:' + css(stats[i] ? stats[i].color : rgb(seriesColors[i])) + '"></i>' + getAlias(s.name) +
-      (stats[i] ? ' <span class="v3-rate">' + fmtN(stats[i].outRate) + " out/s" + (stats[i].hasZ ? "" : ", no dataset samples") + "</span>" : "") + "</label>").join("");
-    elArms.querySelectorAll("input").forEach(el => el.addEventListener("change", () => {
-      const i = +el.getAttribute("data-i");
-      if (el.checked) enabled.add(i); else if (enabled.size > 1) enabled.delete(i); else el.checked = true;
-      draw();
-    }));
+    if (!armRows) {
+      elArms.innerHTML = DATA.map((s, i) =>
+        '<label title="' + s.name.replace(/"/g, "&quot;") + '"><input type="checkbox" data-i="' + i + '"' + (enabled.has(i) ? " checked" : "") + '>' +
+        '<i></i>' + getAlias(s.name) + ' <span class="v3-rate"></span></label>').join("");
+      armRows = [...elArms.querySelectorAll("label")].map(l => ({ cb: l.querySelector("input"), sw: l.querySelector("i"), rate: l.querySelector(".v3-rate") }));
+      armRows.forEach(row => row.cb.addEventListener("change", () => {
+        const i = +row.cb.getAttribute("data-i");
+        if (row.cb.checked) enabled.add(i); else if (enabled.size > 1) enabled.delete(i); else row.cb.checked = true;
+        draw();
+      }));
+    }
+    armRows.forEach((row, i) => {
+      row.cb.checked = enabled.has(i);
+      row.sw.style.background = css(rgb(seriesColors[i]));
+      const st = stats[i];
+      row.rate.textContent = st ? fmtN(st.outRate) + " out/s" + (st.hasZ ? "" : ", no dataset samples") : "";
+    });
   }
 
   // ---- draw ----
@@ -4744,12 +4804,11 @@ const V3 = (() => {
     if (zoomed) { t0 = viewTMin; t1 = viewTMax; }
     else arms.forEach(i => DATA[i].records.forEach(r => { const e = r.t + Math.max(r.resp || 0, 0); if (e > t1) t1 = e; }));
     if (t1 <= t0) t1 = t0 + 1000;
-    const key = arms.join(",") + "|" + elY.value + "|" + elZ.value + "|" + elSm.value + "|" + t0 + "|" + t1;
+    const key = arms.join(",") + "|" + elY.value + "|" + elZ.value + "|" + elSm.value + "|" + t0 + "|" + t1;   // fill is drawn from the cached mix
     if (cache.key === key) return cache.data;
     const per = {};
     arms.forEach(i => { per[i] = armBins(DATA[i], elY.value, t0, t1); });
-    const rates = arms.map(i => per[i].outRate), lo = Math.min(...rates), hi = Math.max(...rates);
-    arms.forEach(i => { per[i].score = arms.length > 1 ? (hi > lo ? (per[i].outRate - lo) / (hi - lo) : 0.5) : null; per[i].color = armColor(i, per[i].score); });
+    arms.forEach(i => { per[i].color = rgb(seriesColors[i]); });
     let ymax = 1, zmax = 1;
     arms.forEach(i => { per[i].y.forEach(v => { if (v > ymax) ymax = v; }); per[i].z.forEach(v => { if (v > zmax) zmax = v; }); });
     cache = { key, data: { arms, per, t0, t1, ymax: ymax * 1.05, zmax: zmax * 1.05 } };
@@ -4796,27 +4855,100 @@ const V3 = (() => {
     cx.font = "11px monospace";
     // curves: floor shadow (time x series), back-wall shadow (time x Y), drop lines, then the curve itself
     proj = [];
-    d.arms.forEach(i => {
+    // Painter's order: farthest arm first, so a nearer arm's fill, line and dots
+    // land on top whatever the rotation (arm order alone let a later arm's fill
+    // cover a nearer one). Depth is the projected depth of the arm's centroid.
+    const depthOf = i => {
+      const p = d.per[i];
+      let sx = 0, sy = 0, sz = 0, n = 0;
+      for (let b = 0; b < BINS; b++) {
+        const t = d.t0 + (b + 0.5) * p.bw;
+        if (!isZoomed() && t > p.end) break;
+        sx += X(t); sy += Y(p.y[b]); sz += Z(p.z[b]); n++;
+      }
+      return n ? P(sx / n, sy / n, sz / n)[2] : 0;
+    };
+    d.arms.map(i => [i, depthOf(i)]).sort((a, b) => b[1] - a[1]).map(e => e[0]).forEach(i => {
       const p = d.per[i], c = p.color, pts = [];
       if (!p.hasZ) return;   // no dataset samples for this arm
       for (let b = 0; b < BINS; b++) {
         const t = d.t0 + (b + 0.5) * p.bw;
         if (!isZoomed() && t > p.end) break;
-        pts.push([X(t), Y(p.y[b]), Z(p.z[b]), t, p.y[b], p.z[b]]);
+        pts.push([X(t), Y(p.y[b]), Z(p.z[b]), t, p.y[b], p.z[b], p.ttft[b]]);
       }
       if (!pts.length) return;
+      if (elFill.value === "mix" && p.mix) {
+        // vertical curtain from the floor to the curve, split by input-token
+        // source. Slices are painted opaque onto an offscreen layer (so adjacent
+        // ones meet without anti-aliasing seams, and an arm's sources, stacked,
+        // never overlap) and the layer is composited semi-transparent.
+        const dpr = window.devicePixelRatio || 1;
+        if (!fillLayer) fillLayer = document.createElement("canvas");
+        if (fillLayer.width !== cv.width || fillLayer.height !== cv.height) { fillLayer.width = cv.width; fillLayer.height = cv.height; }
+        const fx = fillLayer.getContext("2d");
+        fx.setTransform(1, 0, 0, 1, 0, 0); fx.clearRect(0, 0, fillLayer.width, fillLayer.height);
+        fx.setTransform(dpr, 0, 0, dpr, 0, 0); fx.lineJoin = "round"; fx.lineWidth = 0.8;
+        const b0 = Math.round((pts[0][3] - d.t0) / p.bw - 0.5);
+        for (let k = 0; k + 1 < pts.length; k++) {
+          const A = pts[k], B = pts[k + 1];
+          let la = -1, lb = -1;
+          for (let m = 0; m < MIX_CATS.length; m++) {
+            const fa = p.mix[m][b0 + k], fb = p.mix[m][b0 + k + 1];
+            const ha = la + (A[1] + 1) * fa, hb = lb + (B[1] + 1) * fb;
+            if (fa > 0 || fb > 0) {
+              const q1 = P(A[0], la, A[2]), q2 = P(B[0], lb, B[2]), q3 = P(B[0], hb, B[2]), q4 = P(A[0], ha, A[2]);
+              fx.fillStyle = fx.strokeStyle = MIX_CAT_COLOR[MIX_CATS[m]];
+              fx.beginPath(); fx.moveTo(q1[0], q1[1]); fx.lineTo(q2[0], q2[1]); fx.lineTo(q3[0], q3[1]); fx.lineTo(q4[0], q4[1]); fx.closePath();
+              fx.fill(); fx.stroke();   // the hairline stroke closes the gap to the next slice
+            }
+            la = ha; lb = hb;
+          }
+        }
+        cx.save(); cx.globalAlpha = +elAlpha.value / 100; cx.setTransform(1, 0, 0, 1, 0, 0); cx.drawImage(fillLayer, 0, 0); cx.restore();
+      }
       line(pts.map(v => [v[0], -1, v[2]]), css(c, 0.28), 1.2);
       line(pts.map(v => [v[0], v[1], zBack]), css(c, 0.22), 1.2);
-      cx.strokeStyle = css(c, 0.10); cx.lineWidth = 1; cx.beginPath();
-      for (let k = 0; k < pts.length; k += 6) { const a = P(pts[k][0], -1, pts[k][2]), b2 = P(pts[k][0], pts[k][1], pts[k][2]); cx.moveTo(a[0], a[1]); cx.lineTo(b2[0], b2[1]); }
-      cx.stroke();
       line(pts, css(c), 2.2);
-      pts.forEach(v => { const s = P(v[0], v[1], v[2]); proj.push({ x: s[0], y: s[1], i, t: v[3], yv: v[4], zv: v[5] }); });
+      // TTFT: dots on the curve every LINE_DOT_EVERY steps, coloured by TTFT there
+      for (let k = 0; k < pts.length; k += LINE_DOT_EVERY) {
+        const a = P(pts[k][0], pts[k][1], pts[k][2]);
+        cx.beginPath(); cx.arc(a[0], a[1], 3.6, 0, 2 * Math.PI);
+        cx.fillStyle = ttftColor(pts[k][6], 0.95); cx.fill();
+        cx.lineWidth = 1; cx.strokeStyle = "rgba(13,16,19,0.9)"; cx.stroke();
+      }
+      pts.forEach((v, k) => { const s = P(v[0], v[1], v[2]); proj.push({ x: s[0], y: s[1], i, t: v[3], yv: v[4], zv: v[5], tt: v[6], b: Math.round((v[3] - d.t0) / p.bw - 0.5) }); });
     });
-    // legend: score colours
-    if (d.arms.length > 1) {
-      cx.font = "11px sans-serif"; cx.textAlign = "left"; cx.fillStyle = "#8a9096";
-      cx.fillText("colour: arm palette blended toward green (highest output tok/s over the window) or red (lowest)", 12, ch - 10);
+    // TTFT legend: a vertical colour bar beside the cube
+    // Fixed beside the cube: just outside the furthest any corner can project at
+    // the default zoom under any rotation (a corner is sqrt(3) from the centre;
+    // nearest to the camera it is magnified by CAM / (CAM - sqrt(3))), so the bar
+    // never moves while the cube turns.
+    const reach = Math.sqrt(3) * Math.min(cw, ch) * 0.29 * CAM / (CAM - Math.sqrt(3));
+    const bh = Math.min(260, ch * 0.45), bw2 = 12;
+    const bx = Math.min(cw - 60, cw / 2 + reach + 24), by = ch / 2 + 10 - bh / 2;
+    cx.font = "11px sans-serif"; cx.textAlign = "center"; cx.fillStyle = "#C9C9C9";
+    cx.fillText("TTFT", bx + bw2 / 2, by - 12);
+    const tintAt = ms => ttftColor(ms, 0.95);
+    for (let k = 0; k < bh; k++) {   // top = TTFT_MAX, bottom = 0
+      cx.fillStyle = tintAt(TTFT_MAX * (1 - k / bh));
+      cx.fillRect(bx, by + k, bw2, 1);
+    }
+    cx.strokeStyle = "#42464A"; cx.lineWidth = 1; cx.strokeRect(bx - 0.5, by - 0.5, bw2 + 1, bh + 1);
+    if (elFill.value === "mix") {
+      cx.font = "11px sans-serif"; cx.textAlign = "left";
+      const lx = Math.min(bx - 6, cw - 120);   // keep the longest label inside the canvas
+      let ly = by + bh + 34;
+      cx.fillStyle = "#C9C9C9"; cx.fillText("input tokens", lx, ly); ly += 16;
+      MIX_CATS.slice().reverse().forEach(c => {
+        cx.fillStyle = css(rgb(MIX_CAT_COLOR[c]), 0.6); cx.fillRect(lx, ly - 9, 12, 10);
+        cx.fillStyle = "#b8bec4"; cx.fillText(MIX_CAT_LABEL[c], lx + 16, ly); ly += 15;
+      });
+    }
+    cx.font = "10px monospace"; cx.textAlign = "left"; cx.fillStyle = "#b8bec4";
+    for (let v = 0; v <= TTFT_MAX; v += 5000) {
+      const y = by + bh * (1 - v / TTFT_MAX);
+      cx.fillRect(bx + bw2, y - 0.5, 4, 1);
+      cx.fillText(v / 1000 + "s" + (v === TTFT_MAX ? "+" : ""), bx + bw2 + 7, y + 3);
     }
   }
 
@@ -4829,9 +4961,12 @@ const V3 = (() => {
     '<option value="in">input tok/s (incl. cached)</option>' +
     '<option value="req">requests/s</option></select></label>' +
     '<label>Z <select class="v3-z">' +
-    '<option value="series">active series</option>' +
+    '<option value="series">active sessions</option>' +
     '<option value="infl">requests in flight</option>' +
     '<option value="adt">active dataset (tokens)</option></select></label>' +
+    '<label title="Fill under each curve split by where its input tokens came from (the cache-mix samples)">Fill <select class="v3-fill">' +
+    '<option value="mix">cache mix</option><option value="off">off</option></select></label>' +
+    '<label title="Opacity of the cache-mix fill">Opacity <input type="range" class="v3-alpha" min="5" max="100" step="1" value="52"> <span class="v3-alpha-v">52%</span></label>' +
     '<label title="Moving average over Y (and over Z for requests in flight)">Smooth <select class="v3-smooth">' +
     '<option value="0">off</option><option value="60000">1 min</option><option value="120000" selected>2 min</option>' +
     '<option value="300000">5 min</option><option value="600000">10 min</option></select></label>' +
@@ -4839,10 +4974,11 @@ const V3 = (() => {
     '<button class="v3-all" title="Enable every arm">All arms</button>' +
     '<span class="v3-views">View <button data-v="iso">3D</button><button data-v="front">time &times; Y</button>' +
     '<button data-v="top">time &times; Z</button><button data-v="side">Z &times; Y</button></span>' +
+    '<button class="v3-expand" title="Fill the window with the 3D view (Esc or Back to return)">&#x2922; Expand</button>' +
     '<span class="v3-hint">Drag to rotate &middot; wheel zooms &middot; double-click resets</span>' +
     '</div><canvas class="v3-canvas"></canvas><div class="v3-tip"></div>';
   const q = c => host.querySelector(c);
-  cv = q(".v3-canvas"); cx = cv.getContext("2d"); tip = q(".v3-tip"); elY = q(".v3-y"); elArms = q(".v3-arms"); elSm = q(".v3-smooth"); elZ = q(".v3-z");
+  cv = q(".v3-canvas"); cx = cv.getContext("2d"); tip = q(".v3-tip"); elY = q(".v3-y"); elArms = q(".v3-arms"); elSm = q(".v3-smooth"); elZ = q(".v3-z"); elFill = q(".v3-fill"); elAlpha = q(".v3-alpha");
   // ---- interaction ----
   let drag = null;
   cv.addEventListener("mousedown", e => { drag = { x: e.clientX, y: e.clientY, yaw, pitch }; tip.style.display = "none"; });
@@ -4860,6 +4996,8 @@ const V3 = (() => {
     const st = cache.data.per[best.i];
     tip.innerHTML = "<b>" + getAlias(DATA[best.i].name) + "</b><br>at " + fmtT(best.t) +
       "<br>" + yLabel() + " <b>" + fmtN(best.yv) + "</b><br>" + zLabel() + " <b>" + fmtZ(best.zv) + "</b>" +
+      "<br>TTFT <b>" + (best.tt / 1000).toFixed(1) + "s</b>" +
+      (st.mix ? "<br>input: " + MIX_CATS.map((c, m) => st.mix[m][best.b] > 0.005 ? MIX_CAT_LABEL[c] + " <b>" + Math.round(st.mix[m][best.b] * 100) + "%</b>" : "").filter(Boolean).join(" &middot; ") : "") +
       "<br><span class='v3-dim'>window output " + fmtN(st.outRate) + " tok/s</span>";
     tip.style.display = "block";
     tip.style.left = Math.min(e.clientX + 14, window.innerWidth - 240) + "px";
@@ -4875,12 +5013,31 @@ const V3 = (() => {
   elY.addEventListener("change", draw);
   elSm.addEventListener("change", draw);
   elZ.addEventListener("change", draw);
+  elFill.addEventListener("change", draw);
+  elAlpha.addEventListener("input", () => { q(".v3-alpha-v").textContent = elAlpha.value + "%"; draw(); });
+  const elExpand = q(".v3-expand");
+  function setExpanded(on) {
+    expanded = on;
+    host.classList.toggle("v3-expanded", on);
+    document.documentElement.classList.toggle("wtl-expanded-page", on);
+    elExpand.innerHTML = on ? "&#x2715; Back" : "&#x2922; Expand";
+    resize();
+  }
+  elExpand.addEventListener("click", () => setExpanded(!expanded));
+  window.addEventListener("keydown", e => { if (e.key === "Escape" && expanded) setExpanded(false); });
+  window.addEventListener("resize", () => { if (expanded) resize(); });
 
   }
   function resize() {
     const dpr = window.devicePixelRatio || 1;
-    host.style.width = W + "px";
-    cw = W; ch = Math.max(H, 480) - 40;
+    if (expanded) {
+      host.style.width = "";
+      cw = window.innerWidth - 28;
+      ch = window.innerHeight - host.querySelector(".v3-bar").offsetHeight - 24;
+    } else {
+      host.style.width = W + "px";
+      cw = W; ch = Math.max(H, 480) - 40;
+    }
     cv.style.width = cw + "px"; cv.style.height = ch + "px";
     cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr);
     draw();
@@ -4919,7 +5076,7 @@ const V3 = (() => {
     V3.show(m === "3d");
     if (m === "timeline") {
       if (!tlView) {
-        tlView = WekaiTimeline.create(host, {
+        tlView = WekaiTimeline.createSplit(host, {
           kinds: TIMELINE_KINDS,
           onZoom: (a, b) => {
             if (a === null) { resetZoomView(); return; }

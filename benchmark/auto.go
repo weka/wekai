@@ -139,10 +139,10 @@ type AutoBenchmarkConfig struct {
 	// slots at MaxSeries and keeps ticking, so a recovered fleet regrows.
 	TTFTRetire       bool
 	TTFTRetireMargin float64
-	// DecodeRateMin (opt-in, tokens/s per streaming request) holds new requests
-	// while the fleet's per-request decode rate over DecodeRateWindow is below
-	// it; see decodeRate. The hold is reported apart from TTFT but is added to
-	// the TTFT the admission gate and retire decisions see.
+	// DecodeRateMin (tokens/s per in-flight decode; 0 = off) gates sessions:
+	// while the per-request decode rate over DecodeRateWindow is below it no
+	// session is admitted and, with TTFTRetire, an ending session is not
+	// replaced. Requests are never held; see decodeRate.
 	DecodeRateMin    float64
 	DecodeRateWindow time.Duration
 	// TTFTLimitStat is which statistic over that window the gate compares
@@ -332,11 +332,14 @@ type requestDataRecord struct {
 	SeriesGUID string `json:"series_guid"`
 	SeriesNum  int    `json:"series_num"`
 	RequestNum int    `json:"request_num"`
-	// Slot is the concurrency slot (worker lane) that issued the request; for
-	// replay, series_num is the SESSION the slot was running. 0 / absent in
-	// files written before slots were recorded. SlotHot marks hot-pool slots.
-	Slot    int  `json:"slot,omitempty"`
-	SlotHot bool `json:"slot_hot,omitempty"`
+	// SessionRun is the 1-based run number of the session that issued the
+	// request (router replay: sessions in the order they started; a corpus
+	// session replayed on a later pass is a new run). Slot is instead the
+	// worker that issued it in the fixed-pool modes; series_num is the
+	// session index there. SlotHot marks hot-pool workers.
+	SessionRun int  `json:"session_run,omitempty"`
+	Slot       int  `json:"slot,omitempty"`
+	SlotHot    bool `json:"slot_hot,omitempty"`
 	// ReadyMs / SentMs are unix-ms: when the request became eligible to send
 	// and when it was issued after the concurrency gate opened. Their
 	// difference is client-side wait (no free worker); both absent in files
@@ -347,9 +350,6 @@ type requestDataRecord struct {
 	// turn became eligible (real-time replay: previous turn's end to its due
 	// time). Idle by design, as opposed to idle for want of a session.
 	ThinkPauseMs int64 `json:"think_pause_ms,omitempty"`
-	// DecodeHoldMs is the part of the ready -> sent wait spent held back by
-	// --decode-rate-min (not part of ttft_ms; the admission gate adds it).
-	DecodeHoldMs int64 `json:"decode_hold_ms,omitempty"`
 	// Retries429 / RetryWaitMs: 429 sheds this request backed off and retried,
 	// and the time slept doing so. Included in response_time_ms and ttft_ms.
 	Retries429  int   `json:"retries_429,omitempty"`
@@ -1238,6 +1238,9 @@ type autoState struct {
 	// Replay-mode: number of conversations fully walked (one increment per
 	// completed Conversation, regardless of turn count). Zero in synthetic mode.
 	seriesReplayCompleted atomic.Int64
+	// sessionsStarted numbers router-replay sessions as they start (their
+	// SessionRun); its value is how many have started.
+	sessionsStarted atomic.Int64
 
 	// Running count of consecutive request failures across ALL workers. Reset
 	// to 0 on any success, incremented on any error. Used by the simple abort
@@ -1268,10 +1271,8 @@ type autoState struct {
 	// retire threshold, so the slot did not take another session).
 	seriesRetired atomic.Int64
 
-	// decode is the --decode-rate-min tracker (nil when the gate is off);
-	// decodeHolding counts requests currently held back by it.
-	decode        *decodeRate
-	decodeHolding atomic.Int64
+	// decode is the --decode-rate-min tracker (nil when the gate is off).
+	decode *decodeRate
 
 	// Content-level cache estimator (*cacheEstimator) that estimates repeated
 	// (warm) prompt tokens client-side across all modes (synthetic/step/replay).
@@ -1523,9 +1524,9 @@ type displaySnapshot struct {
 	replayCompleted int64   // conversations fully walked
 	replayRemaining int     // still-queued conversations
 	replayActive    int64   // worker goroutines still alive (effective concurrency cap)
-	seriesRetired   int64   // slots retired by --ttft-retire
+	seriesRetired   int64   // ended sessions not replaced (--ttft-retire)
+	sessionsStarted int64   // router replay: sessions started so far (0 in the fixed-pool modes)
 	decodeRate      float64 // --decode-rate-min: per-request decode tok/s now (0 = gate off / no data)
-	decodeHolding   int64   // --decode-rate-min: requests held right now
 	decodeOn        bool
 }
 
@@ -1828,6 +1829,15 @@ func shortModelName(model string) string {
 	return base
 }
 
+// seriesTok is the worker count of the fixed-pool modes; router replay reports
+// sessions in its prefix instead and has no workers to show.
+func seriesTok(snap *displaySnapshot) string {
+	if snap.sessionsStarted > 0 {
+		return ""
+	}
+	return fmt.Sprintf("series=%d ", snap.series)
+}
+
 // renderModelOneLiner returns a compact one-line status for non-TTY multi-model display.
 func renderModelOneLiner(snap *displaySnapshot) string {
 	ttftStr := formatDur(snap.ttftP50)
@@ -1841,8 +1851,16 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 			replayPrefix = fmt.Sprintf("replay=%d/%d(queue=%d,active=%d,retired=%d) ",
 				snap.replayCompleted, snap.replayTotal, snap.replayRemaining, snap.replayActive, snap.seriesRetired)
 		}
+		if snap.sessionsStarted > 0 {
+			// Router replay counts sessions, never workers: active now,
+			// started and ended so far, and how many of the ended were not
+			// replaced (--ttft-retire).
+			replayPrefix = fmt.Sprintf("sessions=%d(started=%d,ended=%d,unreplaced=%d,corpus=%d) ",
+				snap.sessionsStarted-snap.replayCompleted, snap.sessionsStarted, snap.replayCompleted,
+				snap.seriesRetired, snap.replayTotal)
+		}
 		if snap.decodeOn {
-			replayPrefix += fmt.Sprintf("dec=%.1ft/s held=%d ", snap.decodeRate, snap.decodeHolding)
+			replayPrefix += fmt.Sprintf("dec=%.1ft/s ", snap.decodeRate)
 		}
 	}
 	// Two counts, because they answer different questions and were being read
@@ -1908,8 +1926,8 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 		if snap.gateHotActive > 0 {
 			hotInfo = fmt.Sprintf(" hot=%d", snap.gateHotActive)
 		}
-		return fmt.Sprintf("DONE(%s) %sseries=%d conc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d%s in=%s warm=%s scached=%s out=%s%s",
-			snap.termReason, replayPrefix, snap.series, snap.concurrency, snap.gateDispatched, snap.gateActive, hotInfo,
+		return fmt.Sprintf("DONE(%s) %s%sconc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d%s in=%s warm=%s scached=%s out=%s%s",
+			snap.termReason, replayPrefix, seriesTok(snap), snap.concurrency, snap.gateDispatched, snap.gateActive, hotInfo,
 			formatFloat(snap.reqPerSec), snap.cacheHitRate*100, snap.globalLocalCacheRate*100, ttftStr, snap.totalCompleted, snap.totalErrors, verifyInfo,
 			formatKiloInt(snap.totalInput), formatKiloInt(snap.totalInputWarm), formatKiloInt(snap.totalCached), formatKiloInt(snap.totalOutput), outConf)
 	}
@@ -1917,8 +1935,8 @@ func renderModelOneLiner(snap *displaySnapshot) string {
 	if snap.gateHotActive > 0 {
 		hotInfo = fmt.Sprintf(" hot=%d", snap.gateHotActive)
 	}
-	return fmt.Sprintf("%sseries=%d conc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d%s elapsed=%s in=%s warm=%s scached=%s out=%s%s",
-		replayPrefix, snap.series, snap.concurrency, snap.gateDispatched, snap.gateActive, hotInfo,
+	return fmt.Sprintf("%s%sconc=%d in_flight=%d held=%d%s rps=%s cache=%.1f%% gcache=%.1f%% ttft50=%s total=%d errors=%d%s elapsed=%s in=%s warm=%s scached=%s out=%s%s",
+		replayPrefix, seriesTok(snap), snap.concurrency, snap.gateDispatched, snap.gateActive, hotInfo,
 		formatFloat(snap.reqPerSec), snap.cacheHitRate*100, snap.globalLocalCacheRate*100, ttftStr, snap.totalCompleted, snap.totalErrors, verifyInfo,
 		formatDuration(snap.elapsed),
 		formatKiloInt(snap.totalInput), formatKiloInt(snap.totalInputWarm), formatKiloInt(snap.totalCached), formatKiloInt(snap.totalOutput), outConf)
@@ -2181,11 +2199,11 @@ func runSingleModelBenchmark(
 			if st.decode != nil {
 				snap.decodeOn = true
 				snap.decodeRate, _ = st.decode.rate(time.Now())
-				snap.decodeHolding = st.decodeHolding.Load()
 			}
 		}
 		if st.routerReplay != nil {
 			snap.replayTotal = st.routerReplay.Total()
+			snap.sessionsStarted = st.sessionsStarted.Load()
 			snap.replayCompleted = st.seriesReplayCompleted.Load()
 			snap.replayRemaining = st.routerReplay.Remaining()
 			snap.replayActive = st.activeReplayWorkers.Load()
@@ -2193,7 +2211,6 @@ func runSingleModelBenchmark(
 			if st.decode != nil {
 				snap.decodeOn = true
 				snap.decodeRate, _ = st.decode.rate(time.Now())
-				snap.decodeHolding = st.decodeHolding.Load()
 			}
 		}
 		snap.globalLocalCacheRate = st.stream.GlobalLocalCacheRate()
@@ -2788,15 +2805,16 @@ func runSingleModelBenchmark(
 					return
 				case <-t.C:
 				}
-				st.mu.Lock()
-				series := st.series
-				st.mu.Unlock()
 				tstats := st.ttft.Stats(time.Now())
-				// `slots` and not `sessions`: this is the admitted worker count,
-				// and a worker runs one session at a time then pulls the next.
-				// It is the concurrency of conversations, not a total of them —
-				// adding it to the retired count double-counts every worker that
-				// has finished one and started another.
+				// Active sessions: started and not yet ended. A fixed-pool
+				// run has no session count of its own and reports its
+				// admitted workers.
+				active := st.sessionsStarted.Load() - st.seriesReplayCompleted.Load()
+				if st.routerReplay == nil {
+					st.mu.Lock()
+					active = int64(st.series)
+					st.mu.Unlock()
+				}
 				// The pass count is reported, not inferred. A hit rate spanning
 				// several passes is a different quantity from a single-pass one,
 				// and leaving it to be deduced from the session count exceeding
@@ -2805,8 +2823,8 @@ func runSingleModelBenchmark(
 				if st.routerReplay != nil && st.routerReplay.Pass() > 0 {
 					passInfo = fmt.Sprintf(" corpus_pass=%d", st.routerReplay.Pass()+1)
 				}
-				fmt.Fprintf(os.Stderr, "[realtime] slots=%d%s %s %s skipped=%s\n",
-					series, passInfo, tstats.String(cfg.TTFTLimitStat),
+				fmt.Fprintf(os.Stderr, "[realtime] sessions=%d%s %s %s skipped=%s\n",
+					active, passInfo, tstats.String(cfg.TTFTLimitStat),
 					st.lag.summary(st.skipClk.Now()), st.skipClk.Skew().Round(time.Second))
 			}
 		}()
@@ -2815,13 +2833,16 @@ func runSingleModelBenchmark(
 	if st.live != nil {
 		admitStart := time.Now()
 		st.live.setSources(func() (int, int) {
+			if st.routerReplay != nil {
+				return int(st.sessionsStarted.Load() - st.seriesReplayCompleted.Load()), cfg.MaxSeries
+			}
 			st.mu.Lock()
 			defer st.mu.Unlock()
 			return st.series, cfg.MaxSeries
 		}, func() *liveGate { return admissionGate(cfg, st, admitStart) })
 	}
 	if cfg.AdmitEvery > 0 {
-		go admitSeries(benchCtx, cfg, st.ttft, func(next int) {
+		go admitSeries(benchCtx, cfg, st.ttft, st.decode, func(next int) {
 			st.mu.Lock()
 			st.series = next
 			if next > st.allTimePeakSeries {
@@ -3390,6 +3411,7 @@ func runSingleModelBenchmark(
 		}
 		if st.routerReplay != nil {
 			finalSnap.replayTotal = st.routerReplay.Total()
+			finalSnap.sessionsStarted = st.sessionsStarted.Load()
 			finalSnap.replayCompleted = st.seriesReplayCompleted.Load()
 			finalSnap.replayRemaining = st.routerReplay.Remaining()
 			finalSnap.replayActive = st.activeReplayWorkers.Load()

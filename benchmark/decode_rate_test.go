@@ -1,7 +1,6 @@
 package benchmark
 
 import (
-	"context"
 	"math"
 	"testing"
 	"time"
@@ -50,24 +49,29 @@ func TestDecodeRateOnlyCountsTheWindow(t *testing.T) {
 	}
 }
 
-func TestDecodeGateOpenRules(t *testing.T) {
+func TestDecodeGateRules(t *testing.T) {
 	now := time.Now()
 	d := newDecodeRate(30 * time.Second)
-	if !d.open(now, 20) {
-		t.Fatal("empty window must not hold requests")
+	if d.slow(now, 20) {
+		t.Fatal("empty window must not gate sessions")
 	}
-	slow := prog(20*time.Second, now, 100) // 5 tok/s for 20 request-seconds
-	d.begin(slow)
-	if d.open(now, 20) {
-		t.Fatal("5 tok/s < 20 must hold")
+	d.begin(prog(20*time.Second, now, 100)) // 5 tok/s for 20 request-seconds
+	if !d.slow(now, 20) {
+		t.Fatal("5 tok/s < 20 must gate")
 	}
-	if !d.open(now, 0) || !(*decodeRate)(nil).open(now, 20) {
+	if d.slow(now, 0) || (*decodeRate)(nil).slow(now, 20) {
 		t.Fatal("gate off must be open")
 	}
 	tiny := newDecodeRate(30 * time.Second)
 	tiny.begin(prog(2*time.Second, now, 1)) // only 2 request-seconds: too little to judge
-	if !tiny.open(now, 20) {
-		t.Fatal("under decodeGateMinSeconds of decoding must stay open")
+	if tiny.slow(now, 20) {
+		t.Fatal("under decodeGateMinSeconds of decoding must not gate")
+	}
+	// a request still waiting for its first token is not decoding
+	waiting := newDecodeRate(30 * time.Second)
+	waiting.begin(&liveProgress{})
+	if _, s := waiting.rate(now); s != 0 {
+		t.Fatal("pre-first-token request counted as decoding")
 	}
 	// never-streamed requests are not decode samples
 	nf := &liveProgress{}
@@ -77,22 +81,13 @@ func TestDecodeGateOpenRules(t *testing.T) {
 	if _, s := d2.rate(now); s != 0 {
 		t.Fatal("request without a first token counted as decoding")
 	}
-}
-
-func TestDecodeHoldReleasesWhenRateRecovers(t *testing.T) {
-	d := newDecodeRate(30 * time.Second)
-	now := time.Now()
-	slow := prog(20*time.Second, now, 100)
-	d.begin(slow)
-	go func() {
-		time.Sleep(600 * time.Millisecond)
-		d.end(slow, time.Now(), 100)                   // leaves 20s @5 tok/s in the window...
-		fast := prog(20*time.Second, time.Now(), 2000) // ...plus 20s @100 tok/s -> 52.5
-		d.begin(fast)
-	}()
-	held := d.hold(context.Background(), 20)
-	if held < 500*time.Millisecond || held > 3*time.Second {
-		t.Fatalf("held %v, want released shortly after the rate recovered", held)
+	// a request that streamed and then failed counts its streamed tokens
+	failed := prog(10*time.Second, now, 50)
+	d3 := newDecodeRate(30 * time.Second)
+	d3.begin(failed)
+	d3.end(failed, now, 0)
+	if r, s := d3.rate(now); s < 9.9 || r < 4.9 || r > 5.1 {
+		t.Fatalf("failed-after-first-token request: rate=%.2f secs=%.2f, want 5 tok/s over 10s", r, s)
 	}
 }
 
@@ -102,19 +97,5 @@ func TestLiveProgressSetOutNeverMovesBack(t *testing.T) {
 	p.setOut(7)
 	if p.out.Load() != 10 {
 		t.Fatalf("out=%d", p.out.Load())
-	}
-}
-
-func TestSplitDecodeHoldLeadsTheClientWait(t *testing.T) {
-	segs := []tlSeg{{segWaitClient, 3000}, {segDecode, 500}}
-	got := splitDecodeHold(segs, 2000)
-	if len(got) != 3 || got[0] != (tlSeg{segDecodeHold, 2000}) || got[1] != (tlSeg{segWaitClient, 1000}) || got[2].kind != segDecode {
-		t.Fatalf("got %+v", got)
-	}
-	if got := splitDecodeHold(segs, 9000); len(got) != 2 || got[0] != (tlSeg{segDecodeHold, 3000}) {
-		t.Fatalf("hold longer than the wait must be clamped: %+v", got)
-	}
-	if got := splitDecodeHold(segs, 0); len(got) != 2 {
-		t.Fatalf("no hold must be a no-op: %+v", got)
 	}
 }

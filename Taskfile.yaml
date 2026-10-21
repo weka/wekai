@@ -3,7 +3,7 @@ version: "3"
 vars:
   IMAGE: wekai
   TAG: '{{.TAG | default "dev"}}'
-  REPLAY_IMAGE: '{{.REPLAY_IMAGE | default "quay.io/weka.io/wekai:replay-a5a97a8ac620"}}'
+  REPLAY_IMAGE: '{{.REPLAY_IMAGE | default "quay.io/weka.io/wekai:replay-40d-oct14-337a03810637"}}'
   REGISTRY: '{{.REGISTRY | default "quay.io/weka.io/wekai"}}'
   REPLAY_REGISTRY: '{{.REPLAY_REGISTRY | default "quay.io/weka.io/wekai"}}'
   HELM_REGISTRY: '{{.HELM_REGISTRY | default "quay.io/weka.io/helm"}}'
@@ -164,7 +164,7 @@ tasks:
         .
 
   replay:push:
-    desc: "Push a replay JSONL as a layer image (tag replay-<hash>) into the wekai quay repo (dagger call push-replay). Override REPLAY_REGISTRY=... as needed."
+    desc: "Push a replay JSONL as a layer image (tag replay-<hash>, or replay-<LABEL>-<hash> with LABEL=40d-oct14) into the wekai quay repo (dagger call push-replay). Override REPLAY_REGISTRY=... as needed."
     requires:
       vars: [REPLAY]
     cmds:
@@ -172,6 +172,7 @@ tasks:
         dagger call push-replay
         --replay="{{.REPLAY}}"
         --registry="{{.REPLAY_REGISTRY}}"
+        {{if .LABEL}}--label="{{.LABEL}}"{{end}}
 
   app:push:
     desc: "Build (from this repo's Dockerfile) and publish the wekai image (dagger call publish). Override REGISTRY=... and REPLAY_IMAGE=... as needed."

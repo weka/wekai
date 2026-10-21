@@ -90,13 +90,16 @@ func readReplayIndex(f *os.File) (*ReplayIndex, error) {
 // Replay selection strategies: which sessions each lap over the corpus
 // dispatches, and in what order. Sessions sit in the file by start time.
 //
+//   - reverse-from-end (the default): every lap is the whole corpus, newest
+//     first. Sessions are complete by construction (replay-trim drops those
+//     still active at the capture's end), so the newest end of the file is as
+//     good a place to start as any, and better: it is the current traffic.
 //   - last-week: the first lap plays the final seven days of the capture (from
 //     the first session that started within seven days of the last one, to the
 //     end of the file); every later lap is the whole corpus in file order. A
 //     run that needs more sessions than the corpus holds therefore opens on
 //     the most recent traffic and then cycles everything.
 //   - beginning: every lap is the whole corpus in file order.
-//   - reverse-from-end: every lap is the whole corpus, newest first.
 //   - random: every lap is a fresh permutation of the whole corpus, so no
 //     session repeats before every other one has played.
 //
@@ -227,3 +230,7 @@ func replayFirstStart(idx *ReplayIndex, strategy, from string) (int, error) {
 	}
 	return first, nil
 }
+
+// ReadReplayIndex loads the index trailer of a replay-v5 file; nil, nil for a
+// file without one (replay-v3/v4).
+func ReadReplayIndex(f *os.File) (*ReplayIndex, error) { return readReplayIndex(f) }

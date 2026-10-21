@@ -36,7 +36,6 @@ const (
 	segUnattributed   = 12 // sent, but not yet in the engine's clock: network / frontend
 	segWaited         = 13 // renderer only: all wait kinds merged
 	segRetry429       = 14 // client backoff after the fleet shed the request with a 429
-	segDecodeHold     = 15 // client held the due request back: --decode-rate-min not met
 )
 
 // Per-request flag bits.
@@ -66,7 +65,6 @@ type timelineKind struct {
 var timelineKinds = []timelineKind{
 	{segWaitClient, "wait_client", "client wait (concurrency limit)", "#b8c0c8"},
 	{segRetry429, "wait_429", "429 shed / backoff", "#d65db1"},
-	{segDecodeHold, "wait_decode_hold", "held: decode rate below minimum", "#c9a227"},
 	{segWaitOther, "wait_other", "engine queue: other limits", "#5b646d"},
 	{segWaitKV, "wait_kv", "engine queue: no free KV blocks", "#f08a3c"},
 	{segUnattributed, "wait_unattributed", "unattributed wait (network / frontend)", "#a08f7a"},
@@ -89,7 +87,8 @@ type timelineReq struct {
 	Row    int       `json:"r"`            // series group, in order of the series' first request
 	Sub    int       `json:"u,omitempty"`  // sub-row within the group (overlapping requests of one series)
 	Series int       `json:"s"`            // series_num: the replay session this request belongs to
-	Slot   int       `json:"sl,omitempty"` // concurrency slot (worker lane); the row group when present
+	Slot   int       `json:"sl,omitempty"` // fixed-pool modes: the worker; the row group when present
+	Sess   int       `json:"ss,omitempty"` // router replay: the session run; the row group when present
 	Turn   int       `json:"n"`
 	Start  float64   `json:"t"`
 	E2E    float64   `json:"e"`
@@ -111,9 +110,11 @@ type timelineReq struct {
 	idx    int       // position in the records the arm was built from
 }
 
-// rowKey identifies a row group: the concurrency slot when the request carries
-// one, else (files written before slots were recorded) its series_num.
-type rowKey struct{ slot, series int }
+// rowKey identifies a row group: one session (its run number, or the n-th
+// session a worker played when only the worker was recorded), one worker (the
+// live view of the fixed-pool modes), or, when neither was recorded, a
+// series_num.
+type rowKey struct{ session, slot, seg, series int }
 
 func rowKeyOf(slot, series int) rowKey {
 	if slot > 0 {
@@ -288,7 +289,6 @@ func timelineFromRecord(r requestDataRecord, t0 int64) timelineReq {
 	tp := float64(r.ThinkPauseMs)
 	rw := float64(r.RetryWaitMs)
 	segs, trunc := timelineSegments(cw, rw, e2e, r.TTFT, r.IsError, r.KV)
-	segs = splitDecodeHold(segs, float64(r.DecodeHoldMs))
 	tr := timelineReq{
 		Series: r.SeriesNum,
 		Turn:   r.Turn,
@@ -332,7 +332,7 @@ func timelineFromRecord(r requestDataRecord, t0 int64) timelineReq {
 			}
 		}
 	}
-	tr.Slot = r.Slot
+	tr.Slot, tr.Sess = r.Slot, r.SessionRun
 	if r.SlotHot {
 		tr.Flags |= flagHot
 	}
@@ -379,10 +379,12 @@ func (p *subRowPacker) release(u int, end float64) {
 	}
 }
 
-// buildTimelineArm builds an arm with one row group per concurrency slot (per
-// series_num for data recorded without slots), ordered by the group's first
-// request. A slot replays sessions one after another, so the first request of
-// each new session is flagged for a boundary marker. Time zero is the earliest start in recs.
+// buildTimelineArm builds an arm with one row group per session, ordered by the
+// session's first request. A session is its run number when recorded; when only
+// the worker was recorded (the fixed-pool modes) it is one stretch of that
+// worker's requests under one series_num, since a worker plays its sessions one
+// after another; with neither, its series_num. Time zero is the earliest start
+// in recs.
 func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
 	arm := timelineArm{Name: name, Reqs: make([]timelineReq, 0, len(recs))}
 	if len(recs) == 0 {
@@ -413,19 +415,27 @@ func buildTimelineArm(name string, recs []requestDataRecord) timelineArm {
 	sort.SliceStable(arm.Reqs, func(i, j int) bool { return arm.Reqs[i].Start < arm.Reqs[j].Start })
 	groups := map[rowKey]int{}
 	packers := map[rowKey]*subRowPacker{}
-	lastSeries := map[rowKey]int{}
+	workerSeries, workerSeg := map[int]int{}, map[int]int{} // per worker: series_num of its current session, sessions so far
 	for i := range arm.Reqs {
 		q := &arm.Reqs[i]
-		k := rowKeyOf(q.Slot, q.Series)
+		k := lineOf(recs[q.idx])
+		if k.slot > 0 {
+			if s, seen := workerSeries[k.slot]; !seen || s != q.Series {
+				workerSeries[k.slot] = q.Series
+				workerSeg[k.slot]++
+			}
+			k.seg = workerSeg[k.slot]
+		}
 		g, ok := groups[k]
 		if !ok {
 			g = len(groups)
 			groups[k] = g
 			packers[k] = &subRowPacker{}
 		}
-		if prev, seen := lastSeries[k]; !seen || prev != q.Series {
-			q.Flags |= flagSession
-			lastSeries[k] = q.Series
+		if k.seg > 0 {
+			// A session derived from its worker: number it by start order like
+			// a recorded session run, and drop the worker, which is not a line.
+			q.Sess, q.Slot = g+1, 0
 		}
 		q.Row = g
 		q.Sub = packers[k].place(q.Start, q.Start+q.E2E)
@@ -470,22 +480,4 @@ func eligibleAt(loopTop, now time.Time, late time.Duration) time.Time {
 		return r
 	}
 	return loopTop
-}
-
-// splitDecodeHold carves the --decode-rate-min hold out of the leading client
-// wait: the hold comes first (the request was due and deliberately not sent),
-// then whatever slot wait followed it.
-func splitDecodeHold(segs []tlSeg, holdMs float64) []tlSeg {
-	if holdMs <= 0 || len(segs) == 0 || segs[0].kind != segWaitClient {
-		return segs
-	}
-	cw := segs[0].ms
-	if holdMs > cw {
-		holdMs = cw
-	}
-	out := []tlSeg{{segDecodeHold, holdMs}}
-	if rest := cw - holdMs; rest > 0 {
-		out = append(out, tlSeg{segWaitClient, rest})
-	}
-	return append(out, segs[1:]...)
 }

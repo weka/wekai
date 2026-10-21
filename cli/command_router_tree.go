@@ -31,6 +31,10 @@ type RouterTreeCommand struct {
 	Args       struct {
 		Path string `positional-arg-name:"path" description:"Directory of *.jsonl or a single .jsonl file" required:"yes"`
 	} `positional-args:"yes"`
+
+	// intern, when set, deduplicates the strings of parsed records (see
+	// treeInterner); nil keeps every record's own copies.
+	intern *treeInterner
 }
 
 // treeRecord is the minimal projection of a capture record needed for
@@ -216,14 +220,12 @@ func (c *RouterTreeCommand) parseLine(line []byte, out *[]treeRecord, rawCount, 
 	var req redactedRequest
 	var resp redactedResponse
 
-	// Detect format by probing the request body.
-	var probe map[string]interface{}
-	isRedacted := false
-	if err := json.Unmarshal(rec.Request.Body, &probe); err == nil {
-		if schema, ok := probe["_schema"].(string); ok && schema == "req-v1" {
-			isRedacted = true
-		}
+	// Detect format by probing the request body. A raw body is a JSON
+	// string, so decoding it into a struct fails and leaves it unredacted.
+	var probe struct {
+		Schema string `json:"_schema"`
 	}
+	isRedacted := json.Unmarshal(rec.Request.Body, &probe) == nil && probe.Schema == "req-v1"
 	if isRedacted {
 		*redactedCount++
 		_ = json.Unmarshal(rec.Request.Body, &req)
@@ -236,6 +238,10 @@ func (c *RouterTreeCommand) parseLine(line []byte, out *[]treeRecord, rawCount, 
 		reqRaw, respRaw := BuildRedactedPair([]byte(reqBody), []byte(respBody))
 		_ = json.Unmarshal(reqRaw, &req)
 		_ = json.Unmarshal(respRaw, &resp)
+	}
+	if c.intern != nil {
+		c.intern.request(&req)
+		c.intern.response(&resp)
 	}
 	sid := ""
 	if rec.Request.Headers != nil {
@@ -359,6 +365,13 @@ type treeReport struct {
 	StartTs             string                   `json:"start_ts"`
 	EndTs               string                   `json:"end_ts"`
 
+	// persona holds the flags these records alone yield, for callers that
+	// build the tree in parts (see personaFlags).
+	persona *personaFlags
+	// collapsed maps each instance id merged away in pass 5 to the
+	// canonical main instance that absorbed it.
+	collapsed map[string]string
+
 	// User metadata. UsersDetected is false when no record carried a
 	// non-empty "user" field (router lacked --user-prefix or upstream
 	// captures pre-date that flag). The remaining fields are zero in
@@ -442,6 +455,35 @@ func instanceFingerprint(req redactedRequest) string {
 }
 
 func buildTreeReport(records []treeRecord) *treeReport {
+	return buildTreeReportWith(records, nil)
+}
+
+// personaFlags are the corpus-wide facts about persona signatures that label
+// instances: whether a persona ever spawns sub-agents, and whether it is ever
+// the linked target of a spawn. Unlike the rest of the tree they span
+// sessions, so a caller that builds the tree in parts collects them from every
+// part first (see treeReport.persona) and passes the union back in.
+type personaFlags struct {
+	spawnsOthers  map[string]bool
+	isSpawnTarget map[string]bool
+}
+
+func newPersonaFlags() *personaFlags {
+	return &personaFlags{spawnsOthers: map[string]bool{}, isSpawnTarget: map[string]bool{}}
+}
+
+func (f *personaFlags) merge(o *personaFlags) {
+	for k := range o.spawnsOthers {
+		f.spawnsOthers[k] = true
+	}
+	for k := range o.isSpawnTarget {
+		f.isSpawnTarget[k] = true
+	}
+}
+
+// buildTreeReportWith is buildTreeReport with persona flags from outside
+// records added to the ones records themselves yield; nil adds none.
+func buildTreeReportWith(records []treeRecord, global *personaFlags) *treeReport {
 	rep := &treeReport{
 		Sessions:           map[string]*sessionInfo{},
 		Instances:          map[string]*instanceInfo{},
@@ -712,6 +754,14 @@ func buildTreeReport(records []treeRecord) *treeReport {
 			personaIsSpawnTarget[inst.PersonaSig] = true
 		}
 	}
+	rep.persona = &personaFlags{spawnsOthers: personaSpawnsOthers, isSpawnTarget: personaIsSpawnTarget}
+	if global != nil {
+		// Copy so the flags this report records stay its own.
+		merged := newPersonaFlags()
+		merged.merge(rep.persona)
+		merged.merge(global)
+		personaSpawnsOthers, personaIsSpawnTarget = merged.spawnsOthers, merged.isSpawnTarget
+	}
 	for _, inst := range rep.Instances {
 		var label string
 		switch {
@@ -771,6 +821,7 @@ func buildTreeReport(records []treeRecord) *treeReport {
 			delete(rep.Instances, iid)
 		}
 	}
+	rep.collapsed = collapse
 	if len(collapse) > 0 {
 		// rewire children's ParentInstID and prune session.InstanceIDs
 		for _, inst := range rep.Instances {

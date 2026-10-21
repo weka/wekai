@@ -81,7 +81,8 @@ type liveArm struct {
 	done     []liveDone
 	dropped  int
 	lanes    map[rowKey]int
-	lastSess map[rowKey]int // series_num last seen on each row, to flag session boundaries
+	ended    map[rowKey]bool // session lines whose session has ended: drawn, no longer counted
+	lastSess map[rowKey]int  // series_num last seen on each row, to flag session boundaries
 	packers  map[rowKey]*subRowPacker
 	inflight map[uint64]liveInflight
 	nextID   uint64
@@ -91,7 +92,7 @@ type liveArm struct {
 	ttftSamples []ttftSample
 	lastSample  time.Time
 	thinking    map[rowKey]int // slots currently pausing before a scheduled turn (count: fan-out)
-	slotsFn     func() (admitted, max int)
+	slotsFn     func() (active, max int)
 	gateFn      func() *liveGate
 }
 
@@ -119,11 +120,9 @@ type liveGate struct {
 	// (0 = off) and how many have.
 	RetireMs float64 `json:"retire_ms,omitempty"`
 	Retired  int64   `json:"retired,omitempty"`
-	// --decode-rate-min: the per-request decode rate now, the minimum, and
-	// how many due requests are currently held back.
-	DecodeRate    float64 `json:"decode_rate,omitempty"`
-	DecodeMin     float64 `json:"decode_min,omitempty"`
-	DecodeHolding int64   `json:"decode_holding,omitempty"`
+	// --decode-rate-min: the per-request decode rate now and the minimum.
+	DecodeRate float64 `json:"decode_rate,omitempty"`
+	DecodeMin  float64 `json:"decode_min,omitempty"`
 }
 
 // liveRates are token throughputs (tokens/s) over trailing windows.
@@ -134,15 +133,16 @@ type liveRates struct {
 	Out60 float64 `json:"out60"`
 }
 
-// liveState counts the admitted session slots by what each is doing now.
+// liveState counts the active sessions by what each is doing now (in the
+// fixed-pool modes: the workers).
 type liveState struct {
-	Slots    int        `json:"slots"`     // admitted session slots
+	Sessions int        `json:"sessions"`  // active sessions (fixed-pool modes: admitted workers)
 	Max      int        `json:"max"`       // admission ceiling (--max-series); 0 = none
-	InFlight int        `json:"in_flight"` // slots with a request outstanding at the engine
-	Waiting  int        `json:"waiting"`   // slots whose next turn is due but waits for a free concurrency slot
-	Think    int        `json:"think"`     // slots pausing until their next turn is due
-	Idle     int        `json:"idle"`      // slots with no turn pending (between sessions)
-	Requests int        `json:"requests"`  // outstanding HTTP requests (a fan-out slot can hold several)
+	InFlight int        `json:"in_flight"` // sessions with a request outstanding at the engine
+	Waiting  int        `json:"waiting"`   // sessions whose next turn is due but waits under the client concurrency limit
+	Think    int        `json:"think"`     // sessions pausing until their next turn is due
+	Idle     int        `json:"idle"`      // sessions with no turn pending (fixed-pool workers between sessions)
+	Requests int        `json:"requests"`  // outstanding HTTP requests (a session with subagents can hold several)
 	Rates    *liveRates `json:"rates,omitempty"`
 	Gate     *liveGate  `json:"gate,omitempty"`
 }
@@ -151,7 +151,7 @@ func newLiveArm(name string, max int) *liveArm {
 	if max <= 0 {
 		max = DefaultLiveMaxRequests
 	}
-	return &liveArm{name: name, t0: time.Now(), max: max, lanes: map[rowKey]int{}, lastSess: map[rowKey]int{}, rates: newRateAccum(1000, liveRateBuckets), thinking: map[rowKey]int{}, packers: map[rowKey]*subRowPacker{}, inflight: map[uint64]liveInflight{}}
+	return &liveArm{name: name, t0: time.Now(), max: max, lanes: map[rowKey]int{}, ended: map[rowKey]bool{}, lastSess: map[rowKey]int{}, rates: newRateAccum(1000, liveRateBuckets), thinking: map[rowKey]int{}, packers: map[rowKey]*subRowPacker{}, inflight: map[uint64]liveInflight{}}
 }
 
 // lane returns the stable row group of a slot (or, without one, a series),
@@ -168,6 +168,9 @@ func (a *liveArm) lane(k rowKey) int {
 // newSession reports whether series is a different session from the one the
 // row last ran, and records it. Callers hold a.mu.
 func (a *liveArm) newSession(k rowKey, series int) bool {
+	if k.session > 0 {
+		return false // the row is the session: it has no boundaries
+	}
 	prev, seen := a.lastSess[k]
 	a.lastSess[k] = series
 	return !seen || prev != series
@@ -194,7 +197,7 @@ func (a *liveArm) begin(series, turn int, guid string, sl slotInfo, ready time.T
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.nextID++
-	k := rowKeyOf(sl.N, series)
+	k := lineOfSlot(sl, series)
 	sub := a.packer(k).place(float64(ready.Sub(a.t0).Milliseconds()), math.Inf(1))
 	prog := &liveProgress{}
 	a.inflight[a.nextID] = liveInflight{series: series, turn: turn, lane: a.lane(k), sub: sub, start: ready, guid: guid,
@@ -202,13 +205,26 @@ func (a *liveArm) begin(series, turn int, guid string, sl slotInfo, ready time.T
 	return liveToken{arm: a, id: a.nextID, prog: prog}
 }
 
-// setSources wires the run's admission state into the live view.
+// setSources wires the run's admission state into the live view: slots
+// reports the active sessions (fixed-pool modes: admitted workers) and the cap.
 func (a *liveArm) setSources(slots func() (int, int), gate func() *liveGate) {
 	if a == nil {
 		return
 	}
 	a.mu.Lock()
 	a.slotsFn, a.gateFn = slots, gate
+	a.mu.Unlock()
+}
+
+// endLine records that the session drawn on sl's line has ended: its row stays
+// in the timeline but no longer counts as an active session. A no-op for
+// worker lines, which carry on with the next session.
+func (a *liveArm) endLine(sl slotInfo) {
+	if a == nil || !sl.Session || sl.N <= 0 {
+		return
+	}
+	a.mu.Lock()
+	a.ended[lineOfSlot(sl, 0)] = true
 	a.mu.Unlock()
 }
 
@@ -219,7 +235,7 @@ func (a *liveArm) thinkUntil(sl slotInfo, now, due time.Time) bool {
 		return false
 	}
 	a.mu.Lock()
-	a.thinking[rowKeyOf(sl.N, 0)]++
+	a.thinking[lineOfSlot(sl, 0)]++
 	a.mu.Unlock()
 	return true
 }
@@ -230,7 +246,7 @@ func (a *liveArm) thinkDone(sl slotInfo, registered bool) {
 		return
 	}
 	a.mu.Lock()
-	k := rowKeyOf(sl.N, 0)
+	k := lineOfSlot(sl, 0)
 	if a.thinking[k] <= 1 {
 		delete(a.thinking, k)
 	} else {
@@ -245,7 +261,7 @@ func (a *liveArm) state() liveState {
 	var st liveState
 	sent, unsent := map[rowKey]bool{}, map[rowKey]bool{}
 	for _, f := range a.inflight {
-		k := rowKeyOf(f.slot.N, f.series)
+		k := lineOfSlot(f.slot, f.series)
 		if f.sentAt.IsZero() {
 			unsent[k] = true
 		} else {
@@ -253,7 +269,12 @@ func (a *liveArm) state() liveState {
 			st.Requests++
 		}
 	}
+	seen := 0
 	for k := range a.lanes {
+		if a.ended[k] {
+			continue
+		}
+		seen++
 		switch {
 		case sent[k]:
 			st.InFlight++
@@ -265,16 +286,15 @@ func (a *liveArm) state() liveState {
 			st.Idle++
 		}
 	}
-	seen := len(a.lanes)
 	slotsFn, gateFn := a.slotsFn, a.gateFn
 	nowMs := float64(time.Since(a.t0).Milliseconds())
 	st.Rates = a.windowRatesLocked(nowMs)
 	a.mu.Unlock()
-	st.Slots = seen
+	st.Sessions = seen
 	if slotsFn != nil {
-		st.Slots, st.Max = slotsFn()
-		if st.Slots > seen { // admitted but not yet running a request
-			st.Idle += st.Slots - seen
+		st.Sessions, st.Max = slotsFn()
+		if st.Sessions > seen { // started but not yet running a request
+			st.Idle += st.Sessions - seen
 		}
 	}
 	if gateFn != nil {
@@ -407,7 +427,7 @@ func (a *liveArm) complete(tok liveToken, rec requestDataRecord) {
 	defer a.mu.Unlock()
 	req := timelineFromRecord(rec, a.t0.UnixMilli())
 	req.GUID = rec.SeriesGUID
-	k := rowKeyOf(rec.Slot, rec.SeriesNum)
+	k := lineOf(rec)
 	req.Row = a.lane(k)
 	end := req.Start + req.E2E
 	if f, ok := a.inflight[tok.id]; ok && tok.arm == a {
@@ -447,7 +467,7 @@ func (a *liveArm) abandon(tok liveToken) {
 	}
 	a.mu.Lock()
 	if f, ok := a.inflight[tok.id]; ok {
-		a.packer(rowKeyOf(f.slot.N, f.series)).release(f.sub, float64(time.Since(a.t0).Milliseconds()))
+		a.packer(lineOfSlot(f.slot, f.series)).release(f.sub, float64(time.Since(a.t0).Milliseconds()))
 		delete(a.inflight, tok.id)
 	}
 	a.mu.Unlock()
@@ -492,7 +512,7 @@ func (a *liveArm) snapshot(since uint64) liveData {
 			break
 		}
 		q := timelineReq{
-			Row: f.lane, Sub: f.sub, Series: f.series, Slot: f.slot.N, Turn: f.turn, GUID: f.guid,
+			Row: f.lane, Sub: f.sub, Series: f.series, Slot: slotNum(f.slot), Sess: sessionRun(f.slot), Turn: f.turn, GUID: f.guid,
 			Start: float64(f.start.Sub(a.t0).Milliseconds()), Flags: flagInflight | f.flags(),
 		}
 		if f.sentAt.IsZero() {

@@ -133,45 +133,75 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:25202/alice
 
 `wekai benchmark auto --router-replay-file` replays previously captured
 agentic traffic against a target endpoint — the same run mode the Helm
-chart below wraps. Canonical run (the chart's exact defaults, expressed as
-flags):
+chart below wraps. It runs in **real time by default**, which is also the
+chart's default:
 
 ```
 wekai benchmark auto \
   --router-replay-file replay.jsonl \
   --models http://YOUR-LLM-HOST:8000 \
+  --timeout 8h \
+  --save-request-data ./results
+```
+
+Real-time replay is the full recipe on its own: think-time pacing, the
+decode-rate gate (20 tok/s per request), start 32 sessions and add 16 every
+minute while the windowed mean TTFT is under `--ttft-limit` (10s), no session
+cap, sessions reused from the top of the file (so the run lasts until
+`--timeout`), and the request timeline in the report. Admission pauses while
+the TTFT gate is closed and resumes with one batch per tick, without catching
+up on skipped ticks. It answers "what is the most load this fleet can carry".
+
+The fixed-pool run of earlier releases, which asks "how does the fleet behave
+at concurrency N", needs the explicit opt-out (`replay.realtime=false` in the
+chart):
+
+```
+wekai benchmark auto \
+  --router-replay-file replay.jsonl \
+  --models http://YOUR-LLM-HOST:8000 \
+  --replay-realtime=false \
   --series 256 --concurrency 28 --hot-series-concurrency 4 \
   --timeout 8h \
   --save-request-data ./results
 ```
 
-To start with 32 series and add 32 more every two minutes, replace
-`--series 256` with `--start-series=32 --max-series=256 --admit-count=32
---admit-every=2m`. The first increase happens after two minutes; each batch
-is capped only when `--max-series` is set. Omit it for an unlimited ramp.
-With `--replay-realtime`, admission pauses while the TTFT gate is closed
-and resumes with one batch per tick, without catching up on skipped ticks.
-`--replay-realtime` on its own is the full recipe: think-time pacing, the decode-rate gate (20 tok/s per request), start
-32 sessions and add 16 every minute while the windowed mean TTFT is under
-`--ttft-limit` (10s), no session cap, sessions reused from the top of the file
-(so the run lasts until `--timeout`), and the request timeline in the report.
+`--series` without the opt-out is refused: it pins the session count that
+real-time replay grows. To start a fixed-pool run with 32 series and add 32
+more every two minutes, replace `--series 256` with `--start-series=32
+--max-series=256 --admit-count=32 --admit-every=2m`. The first increase
+happens after two minutes; each batch is capped only when `--max-series` is
+set. Omit it for an unlimited ramp.
 `--ttft-retire` is on by default: when a session ends while TTFT is more than
-`--ttft-retire-margin` (0.15) above the limit, its slot retires instead of
-starting the next session (between the limit and that threshold sessions are
-replaced but none added; below it admission adds batches). Every default can be
+`--ttft-retire-margin` (0.15) above the limit, or the decode rate is below the
+floor, no new session replaces it (between the limit and that threshold sessions are
+replaced but none added; below it admission adds batches). The unit is the
+session throughout: admission starts sessions, active sessions are those started
+and not yet ended, and the status line reports
+`sessions=<active>(started=,ended=,unreplaced=,corpus=)`. Every default can be
 overridden with the explicit flag (`--ttft-retire=false`, `--max-series=N`, ...).
 
-`--decode-rate-min=N` (default 20 with `--replay-realtime`, `0` to turn off) holds back due requests while the average
-per-request decode rate (output tokens/s of streaming requests over
-`--decode-rate-window`, default 30s; exact per-chunk counts via vLLM's
-`continuous_usage_stats`) is below N, and sends them when it recovers. The hold
-is reported as `decode_hold_ms` and its own timeline segment, outside `ttft_ms`,
-but it is added to the TTFT the admission gate and `--ttft-retire` see.
+`--decode-rate-min=N` (default 20 under real-time replay, `0` to turn off) is a
+second session-level gate next to TTFT: while the average per-request decode
+rate is below N, no session is admitted and a session that ends is not replaced
+(with `--ttft-retire`). The rate is output tokens/s of requests in their decode
+phase -- from the first token on, whatever their outcome -- over
+`--decode-rate-window` (default 30s; exact per-chunk counts via vLLM's
+`continuous_usage_stats`). Requests are always sent when due; nothing is held.
+An empty TTFT window does not open admission while a due request has waited
+past `--ttft-limit` for its first token.
+A batch is admitted only when both gates stayed open for the whole
+`--admit-every` interval before it (sampled every 5s), not just at the tick. Once
+either gate has blocked, admission resumes only after three such open intervals
+in a row: growth is fast until the first block and cautious after it.
 Without real-time replay, admission depends only on the interval.
-Omitting `--admit-count` preserves one series per tick. Add `--replay-realtime`
-to preserve captured think times; without it, sessions run back-to-back.
-Helm equivalents: `replay.realtime=true`, `replay.admitCount=32`, and
-`replay.admitEvery=2m` (the chart starts with one series).
+Omitting `--admit-count` preserves one series per tick. Real-time replay
+preserves captured think times; with `--replay-realtime=false`, sessions run
+back-to-back. Helm equivalents: `replay.realtime=false`, `replay.admitCount=32`,
+and `replay.admitEvery=2m`. With the chart's default `replay.realtime=true` it
+passes no realtime flag at all, so the binary's recipe above applies; `replay.ttftLimit`,
+`replay.decodeRateMin`, `replay.startSessions`, `replay.maxSessions`,
+`replay.admitEvery`/`admitCount` and `replay.ttftWindow` are passed only when set.
 
 **Where the replay file comes from.** `wekai router serve` proxies live
 LLM traffic and captures it (redacted); `wekai router replay-prepare`
@@ -187,8 +217,8 @@ without shipping any real captured text.
 **Think time (replay-v4).** Each request carries `total_ms` and `think_ms`:
 the gap between the END of its reference (`think_ref`: `prev` = the same
 agent's previous request, `spawn` = the parent request that spawned a
-sub-agent, `session_start`) and its own start, clamped at 0. With
-`--replay-realtime`, `--replay-timing=think` (the default when the file
+sub-agent, `session_start`) and its own start, clamped at 0. Under
+real-time replay, `--replay-timing=think` (the default when the file
 has `think_ms`) schedules each turn at the end of its reference on THIS
 run's clock plus the captured think time, so a fleet that answers faster or
 slower than the capture keeps the user's pauses; `--replay-timing=absolute`
@@ -204,12 +234,14 @@ and `requests`. The replayer finds it by reading the file's last 2 MiB
 at its offset, which is what lets a run choose its sessions instead of
 reading front to back. `--replay-selection-strategy`:
 
-- `last-week` (default): the first lap plays the capture's final seven days,
+- `reverse-from-end` (default): whole corpus newest first every lap, so a
+  run opens on the most recent traffic and, needing more sessions than the
+  corpus holds, starts again from the end.
+- `last-week`: the first lap plays the capture's final seven days,
   then every lap is the whole corpus in file order. A run needing 10,000
   sessions from a 5,000-session corpus whose last week starts at 3,500 plays
   3,500→5,000, then 1→5,000, then 1→5,000 again…
 - `beginning`: whole corpus in file order every lap.
-- `reverse-from-end`: whole corpus newest first every lap.
 - `random`: a fresh (per-lap seeded) permutation of the whole corpus every
   lap, so no session repeats before every other one has played.
 
@@ -218,17 +250,28 @@ reading front to back. `--replay-selection-strategy`:
 stamp (see `--replay-reuse-sessions`). An unindexed v3/v4 file plays from the
 beginning under the default; the other strategies need v5.
 
-**Downloading it.** The capture embedded in the image and run by the Helm
-chart is published as a scratch image holding just `/replay.jsonl`, pulled
-anonymously with `curl` — no Docker engine, no registry client (~1.3 GB
-download, ~9 GB on disk). `Dockerfile`'s `REPLAY_IMAGE` ARG is the source
-of truth for the tag. The current capture is replay-v5: per-request
-`total_ms` and `think_ms`, so `--replay-realtime` keeps the original think
-time between turns, plus the session index; older v3 captures fall back to
-the absolute schedule:
+**Downloading it.** Captures are published as scratch images holding just
+`/replay.jsonl`, tagged `replay-<label>-<sha12>` (`task replay:push
+LABEL=...`), and pulled anonymously with `curl` — no Docker engine, no
+registry client. Two are current, both replay-v5 (per-request `total_ms` and
+`think_ms`, so real-time replay keeps the original think time between
+turns, plus the session index); older v3 captures fall back to the absolute
+schedule:
+
+| Tag | Window | Sessions / requests | Download / on disk |
+|---|---|---|---|
+| `replay-40d-oct14-337a03810637` | 2026-09-05 → 10-14 | 3,190 / 370,658 | 1.3 GB / 8.8 GB |
+| `replay-160d-oct15-dfe3662680de` | 2026-05-12 → 10-15 | 14,305 / 1,729,396 | 6.1 GB / 40.8 GB |
+
+The 40d capture is the one embedded in the image and run by the Helm chart
+(`Dockerfile`'s `REPLAY_IMAGE` ARG is the source of truth for the tag). It
+was cut from the 160d one with `wekai router replay-trim --last-days 40`,
+which keeps the sessions that started in the last 40 days and drops those
+still active in the final 24h. The 160d capture is the full corpus, for
+runs that need more sessions or the older traffic:
 
 ```
-REPO=weka.io/wekai; TAG=replay-a5a97a8ac620
+REPO=weka.io/wekai; TAG=replay-40d-oct14-337a03810637   # or the 160d tag
 TOKEN=$(curl -s "https://quay.io/v2/auth?service=quay.io&scope=repository:$REPO:pull" | jq -r .token)
 LAYER=$(curl -s -H "Authorization: Bearer $TOKEN" \
   -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
@@ -288,12 +331,17 @@ already ask for `stream_options.include_usage`, which is how vLLM delivers them.
 
 - `wekai benchmark visualize <dir> --timeline` (also `visualize-merge`, and
   `benchmark auto --timeline` for the end-of-run report) adds a Metrics/Timeline
-  switch to the report. Timeline: one row per concurrency SLOT (`--series N` gives N
-  rows; hot-pool slots are labelled `h<N>`), x = time (zoom shared with the
-  report). The sessions a slot replays follow one another along its row with a
-  thin marker where a new session starts, and overlapping requests (sub-agent
-  fan-out) are packed into sub-rows under it. Reqdata records `slot`/`slot_hot`
-  per request; files without them group by `series_num` (the session) instead.
+  switch to the report. Timeline: router replay draws one row per SESSION, from
+  its first request to its last (labelled `#<run>`, the order sessions started
+  in; a corpus session replayed on a later pass is a new run), and overlapping
+  requests of that session (subagent fan-out) are packed into sub-rows under it.
+  Reqdata records `session_run` per request; files that recorded only the
+  worker (`slot`, the fixed-pool modes and router-replay files written before
+  `session_run`) get the same one-row-per-session layout, each stretch of a
+  worker's requests under one `series_num` being one session; files with
+  neither group by `series_num`. The live view of the fixed-pool modes draws
+  one row per worker (`w<N>`, hot-pool `h<N>`). x = time (zoom shared with the
+  report).
   Rows are ordered by first request. Each request bar, left to right = waits, separated by where they
   happened: client wait (the turn was due but no concurrency slot was free;
   `ready_ms` -> `sent_ms` in reqdata), engine queue (other limits, then no free
@@ -301,10 +349,10 @@ already ask for `stream_options.include_usage`, which is how vLLM delivers them.
   prefill split by token share into computed / external / host / GPU cache
   (kv_fetch counted in the external share), preempted, decode. Requests with no
   engine details use client timestamps with one "prefill (unknown source)" colour.
-  Under the toolbar a state line counts the admitted slots (live: from the run;
+  Under the toolbar a state line counts the active sessions (live: from the run;
   offline: reconstructed from reqdata at the view's right edge) as in flight /
   waiting at gate / think pause / idle, and, live, the admission gate (stat over
-  window vs limit, open or closed, next admit). A slot's think pause is shaded
+  window vs limit, open or closed, next admit). A session's think pause is shaded
   faintly (`think_pause_ms` in reqdata). Live `/api/state` serves the same counts.
   Above the rows, strips show token throughput (input stacked by source,
   output as a line) and the gate's TTFT (mean / p95 against the limit) on the
@@ -315,7 +363,7 @@ already ask for `stream_options.include_usage`, which is how vLLM delivers them.
   Time spent backing off after a 429 is its own wait (`retries_429`,
   `retry_wait_ms`). Live: `/api/series` serves the strips' history.
   "Merge waits" collapses all wait kinds into one colour. Hovering anywhere on a
-  row outlines that whole slot row.
+  row outlines that whole row.
 - `wekai benchmark timeline <dir> -o timeline.html` renders just that view.
 - `wekai benchmark auto --live-port 8088` serves the same view live while the
   run executes: same per-series rows, in-flight requests growing, polled every 2s.
@@ -453,7 +501,8 @@ models — otherwise only dynamic/openrouter specs resolve.
 compiles the `wekai` binary (module github.com/weka/wekai), and a second `COPY --link --from=` stage
 embeds one router-replay JSONL artifact at `/wekai/replay.jsonl`, pulled
 from a separately-published scratch image (default
-`quay.io/weka.io/wekai:replay-<sha12>` — published by `task replay:push`,
+`quay.io/weka.io/wekai:replay-40d-oct14-337a03810637`, tags of the form
+`replay-<label>-<sha12>` — published by `task replay:push`,
 see "CI / Publishing" below; replay artifacts and the app image share the
 wekai quay repo, distinguished by the `replay-` tag prefix; to fetch that
 artifact standalone see "Downloading it" above). Both
@@ -711,7 +760,7 @@ Three functions:
   `helm-username`/`helm-password` as Dagger secrets.
 
 ```
-task replay:push REPLAY=/path/to/replay.jsonl   # dagger call push-replay
+task replay:push REPLAY=/path/to/replay.jsonl LABEL=40d-oct14   # dagger call push-replay
 task app:push                                    # dagger call publish (image only)
 task helm:push                                   # dagger call push-helm (image + chart, image first)
 ```

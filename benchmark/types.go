@@ -60,10 +60,6 @@ type RequestMetrics struct {
 	ReadyAt, SentAt time.Time
 	// ThinkPause is the deliberate pause before the request became eligible.
 	ThinkPause time.Duration
-	// DecodeHold is the part of the client-side wait (ReadyAt..SentAt) spent
-	// held back by --decode-rate-min. Not part of TimeToFirstToken; added to
-	// what the admission gate observes.
-	DecodeHold time.Duration
 	Error      error
 	Response   string // The actual response content
 	// ContentOnly is the assistant's content stream WITHOUT the reasoning

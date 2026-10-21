@@ -136,8 +136,11 @@ func TestSelectionStrategies(t *testing.T) {
 		want           []string
 		passes         []int
 	}{
-		// The default: the last week, then whole laps from the top.
-		{"", "", 20, append(ids(2, 3, 4, 5, 6, 7, 8, 9), ids(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1)...),
+		// The default: whole laps newest first, wrapping to the end again.
+		{"", "", 12, ids(9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 9, 8),
+			[]int{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1}},
+		// last-week: the last week, then whole laps from the top.
+		{ReplayStrategyLastWeek, "", 20, append(ids(2, 3, 4, 5, 6, 7, 8, 9), ids(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1)...),
 			[]int{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2}},
 		{ReplayStrategyBeginning, "", 12, ids(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1), nil},
 		{ReplayStrategyReverse, "", 12, ids(9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 9, 8), nil},
@@ -146,7 +149,8 @@ func TestSelectionStrategies(t *testing.T) {
 		// s5 started 05-17 08:00; noon that day is after it and before s6.
 		{ReplayStrategyBeginning, "2026-05-17T12:00:00Z", 2, ids(6, 7), nil},
 		{ReplayStrategyReverse, "2026-05-17T12:00:00Z", 2, ids(5, 4), nil},
-		{"", "8", 4, ids(8, 9, 0, 1), nil},
+		{ReplayStrategyLastWeek, "8", 4, ids(8, 9, 0, 1), nil},
+		{"", "8", 4, ids(8, 7, 6, 5), nil},
 	} {
 		t.Run(tc.strategy+"/"+tc.from, func(t *testing.T) {
 			st, err := openRouterReplayStream(path, routerReplayStreamOpts{
@@ -209,7 +213,7 @@ func seq(n int) []int {
 // progress display divides by.
 func TestLastWeekWithoutReuseIsTheWeek(t *testing.T) {
 	path := writeWeeklyReplayFile(t, 10)
-	st, err := openRouterReplayStream(path, routerReplayStreamOpts{ChanCap: 1})
+	st, err := openRouterReplayStream(path, routerReplayStreamOpts{ChanCap: 1, Strategy: ReplayStrategyLastWeek})
 	if err != nil {
 		t.Fatal(err)
 	}

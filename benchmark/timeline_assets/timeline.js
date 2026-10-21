@@ -23,7 +23,7 @@ var WekaiTimeline = (function () {
   var WAIT_KINDS = { 0: 1, 1: 1, 11: 1, 12: 1, 14: 1, 15: 1 };
   // One word for the UI: a series is a simulated user lane (rows on the timeline); it runs one replayed session after
   // another (purple ticks mark session boundaries). Admission adds series, --ttft-retire retires them.
-  var SERIES_TIP = "A series is one simulated user lane (a timeline row): it runs one replayed session after another (purple ticks mark session boundaries). Admission adds series; --ttft-retire retires them.";   // kinds the "merge waits" toggle collapses into WAITED
+  var SERIES_TIP = "Active sessions: replayed user sessions in progress. Each timeline row is one session, from its first request to its last; a session with subagents spreads over several sub-rows while they overlap. Admission starts new sessions; while the fleet is over its TTFT or decode limit, a session that ends is not replaced.";   // kinds the "merge waits" toggle collapses into WAITED
   var AXIS_H = 34, RIGHT = 14, GAP = 2;
   var ROW_HEIGHTS = [1, 2, 3, 4, 6, 10, 14, 20];
 
@@ -70,15 +70,22 @@ var WekaiTimeline = (function () {
     host.innerHTML =
       '<div class="wtl-bar">' +
       '<button class="wtl-expand" title="Fill the window with the timeline (Esc or Back to return)">&#x2922; Expand</button>' +
+      '<label class="wtl-paneswrap" hidden title="Stack several timelines, one arm each; they share zoom and replay">Panes <select class="wtl-panes"></select></label>' +
+      '<span class="wtl-play" title="Replay the run: requests appear as they started and fill in stage by stage">' +
+      '<button class="wtl-restart" title="Replay from the start">&#x23EE;</button>' +
+      '<button class="wtl-playbtn" title="Play / pause">&#x25B6;</button>' +
+      '<button class="wtl-stop" title="Stop the replay and show the whole run" hidden>&#x25A0;</button>' +
+      '<input type="range" class="wtl-speed" min="0" max="10" step="1" value="5" title="Replay speed">' +
+      '<span class="wtl-speedv"></span><span class="wtl-playt"></span></span>' +
       '<label class="wtl-armwrap" hidden>Arm <select class="wtl-arm"></select></label>' +
       '<label>Row height <select class="wtl-rowh"></select></label>' +
       '<label title="Collapse client wait, engine queue and unattributed wait into one colour"><input type="checkbox" class="wtl-merge"> Merge waits</label>' +
       '<button class="wtl-reset" hidden>Reset zoom</button>' +
       '<label class="wtl-followwrap" hidden><input type="checkbox" class="wtl-follow"> Follow latest</label>' +
       '<span class="wtl-panels">Show' +
-      '<button data-p="state" title="Run state: series, in flight, gate">State</button>' +
+      '<button data-p="state" title="Run state: sessions, in flight, gate">State</button>' +
       '<button data-p="legend" title="Colour legend">Legend</button>' +
-      '<button data-p="act" title="Active series / in flight over time">Activity</button>' +
+      '<button data-p="act" title="Active sessions / in flight over time">Activity</button>' +
       '<button data-p="rate" title="Input and output tokens/s over time">Tokens/s</button>' +
       '<button data-p="ttft" title="TTFT over time">TTFT</button></span>' +
       '<span class="wtl-at"></span>' +
@@ -89,6 +96,12 @@ var WekaiTimeline = (function () {
       '<div class="wtl-scroll"><div class="wtl-content"><canvas class="wtl-canvas"></canvas><canvas class="wtl-overlay"></canvas></div><div class="wtl-empty" hidden>No requests yet</div></div>' +
       '<div class="wtl-tip"></div>';
     var $ = function (c) { return host.querySelector(c); };
+    if (opts.paneTitle) {
+      // A split pane: the split's own bar holds expand, replay and the arm choice.
+      host.classList.add("wtl-in-split");
+      var pt = document.createElement("span"); pt.className = "wtl-panetitle"; pt.textContent = opts.paneTitle; pt.title = opts.paneTitle;
+      $(".wtl-bar").insertBefore(pt, $(".wtl-bar").firstChild);
+    }
     var elArm = $(".wtl-arm"), elRowH = $(".wtl-rowh"), elReset = $(".wtl-reset"), elFollow = $(".wtl-follow");
     var elInfo = $(".wtl-info"), elLegend = $(".wtl-legend"), elScroll = $(".wtl-scroll");
     var elContent = $(".wtl-content"), canvas = $(".wtl-canvas"), tip = $(".wtl-tip"), elEmpty = $(".wtl-empty");
@@ -96,11 +109,17 @@ var WekaiTimeline = (function () {
     var elState = $(".wtl-state");
     var stripRate = $(".wtl-strip-rate"), stripTTFT = $(".wtl-strip-ttft"), stripAct = $(".wtl-strip-act");
     var elExpand = $(".wtl-expand"), expanded = false, elAt = $(".wtl-at");
+    // Panes of one split view share zoom, expand and replay through opts.sync
+    // (createSplit); a lone timeline has no sync and expands itself.
+    var syncKey = {}, expandHost = opts.expandHost || host;
+    function emit(kind, v) { if (opts.sync) opts.sync.emit(syncKey, kind, v); }
     // Expand: the timeline (with its own bar: arm, row height, zoom) takes the whole window; Back / Esc returns.
-    function setExpanded(on) {
+    function setExpanded(on, fromSync) {
       expanded = on;
-      host.classList.toggle("wtl-expanded", on);
+      expandHost.classList.toggle("wtl-expanded-host", on);
+      host.classList.toggle("wtl-x", on);
       document.documentElement.classList.toggle("wtl-expanded-page", on);
+      if (!fromSync) emit("expand", on);
       elExpand.innerHTML = on ? "&#x2715; Back" : "&#x2922; Expand";
       elExpand.title = on ? "Back to the full report (Esc)" : "Fill the window with the timeline (Esc or Back to return)";
       applyPanels();
@@ -430,7 +449,7 @@ var WekaiTimeline = (function () {
       var act = activity(a, now), ymax = 1;
       [act.series, act.inflight].forEach(function (st) { for (var i = 0; i < st.t.length; i++) if (st.t[i] <= r[1] && st.v[i] > ymax) ymax = st.v[i]; });
       ymax *= 1.1;
-      var x = stripFrame(c, [{ t: "active series", c: "#C79FF1", line: true }, { t: "requests in flight", c: "#5f987d", line: true, w: 1 }], ymax, function (v) { return Math.round(v) + ""; });
+      var x = stripFrame(c, [{ t: "active sessions", c: "#C79FF1", line: true }, { t: "requests in flight", c: "#5f987d", line: true, w: 1 }], ymax, function (v) { return Math.round(v) + ""; });
       var base = STRIP_H - 15, hgt = STRIP_H - 26;
       function step(st, color, width) {
         x.strokeStyle = color; x.lineWidth = width; x.beginPath();
@@ -443,7 +462,18 @@ var WekaiTimeline = (function () {
       }
       step(act.inflight, "#5f987d", 1); step(act.series, "#C79FF1", 1.6);
     }
-    function drawStrips(a, r) { drawActStrip(a, r, opts.live ? curNow() : 0); drawRateStrip(a, r); drawTTFTStrip(a, r); }
+    function drawStrips(a, r) {
+      drawActStrip(a, r, opts.live ? curNow() : 0); drawRateStrip(a, r); drawTTFTStrip(a, r);
+      if (playT === null) return;
+      // replay: the strips show the whole run, dimmed past the clock
+      var px = Math.max(plotL, mapX(playT, r));
+      [stripAct, stripRate, stripTTFT].forEach(function (c) {
+        if (c.hidden || px >= plotL + plotW) return;
+        var x = c.getContext("2d");
+        x.fillStyle = "rgba(13,16,19,0.72)"; x.fillRect(px, 0, plotL + plotW - px, STRIP_H);
+        x.strokeStyle = "#C79FF1"; x.beginPath(); x.moveTo(px + 0.5, 0); x.lineTo(px + 0.5, STRIP_H); x.stroke();
+      });
+    }
 
     // ---- slot state header ----
     function setStateText(html) {
@@ -459,10 +489,10 @@ var WekaiTimeline = (function () {
       if (!a || !host.classList.contains("wtl-hide-state")) { if (elAt.innerHTML) elAt.innerHTML = ""; return; }
       var rr = range(), now = opts.live ? curNow() : 0;
       var cursor = hoverT !== null && hoverT >= rr[0] && hoverT <= rr[1];
-      var T = cursor ? hoverT : opts.live ? Math.min(rr[1], now) : rr[1];
+      var T = cursor ? hoverT : playT !== null ? playT : opts.live ? Math.min(rr[1], now) : rr[1];
       var act = activity(a, now);
-      var h = "<span class='wtl-dim'>" + (cursor ? "at" : opts.live ? "now" : "view end") + "</span> <b>" + fmtElapsed(T, 1000) + "</b>" +
-        " &middot; series <b>" + stepAt(act.series, T) + "</b> &middot; in flight <b>" + stepAt(act.inflight, T) + "</b>";
+      var h = "<span class='wtl-dim'>" + (cursor ? "at" : playT !== null ? "replay" : opts.live ? "now" : "view end") + "</span> <b>" + fmtElapsed(T, 1000) + "</b>" +
+        " &middot; sessions <b>" + stepAt(act.series, T) + "</b> &middot; in flight <b>" + stepAt(act.inflight, T) + "</b>";
       if (a.rates && a.rates.in && a.rates.in.length) {
         // A short window around the point: a few pixels of the view, never under two buckets or 10 s.
         var w = Math.max(2 * a.rates.bw, 6 * (rr[1] - rr[0]) / plotW, 10000);
@@ -481,11 +511,11 @@ var WekaiTimeline = (function () {
     // Live: the server's counts and admission gate.
     function renderState(st) {
       if (!st) return;
-      var h = "<span title='" + SERIES_TIP + "'>active series</span> <b>" + st.slots + "</b>" + (st.max ? " / <b>" + st.max + "</b> max" : "") +
+      var h = "<span title='" + SERIES_TIP + "'>active sessions</span> <b>" + st.sessions + "</b>" + (st.max ? " / <b>" + st.max + "</b> max" : "") +
         " &middot; <span title='request outstanding at the engine'>in flight <b>" + st.in_flight + "</b></span>" +
         " &middot; <span title='next turn due, waiting under the client concurrency limit'>waiting at gate <b>" + st.waiting + "</b></span>" +
         " &middot; <span title='pausing until the next turn is due'>think pause <b>" + st.think + "</b></span>" +
-        " &middot; <span title='no turn pending: between sessions'>idle <b>" + st.idle + "</b></span>" +
+        (st.idle ? " &middot; <span title='no turn pending'>idle <b>" + st.idle + "</b></span>" : "") +
         " <span class='wtl-dim'>(" + st.requests + " requests outstanding)</span>";
       if (st.rates) {
         var rt = st.rates;
@@ -504,14 +534,14 @@ var WekaiTimeline = (function () {
         if (!g.enabled) h += "<br>admission: ungated" + (g.admit_count ? ", +" + g.admit_count + " every " + fmtSec(g.every_s) : "");
         else {
           h += " &mdash; gate: " + g.stat + " &lt; " + fmtSec(g.limit_ms / 1000) + " &rarr; <b class='" + (g.open ? "wtl-gating" : "wtl-bad") + "'>" + (g.open ? "OPEN" : "CLOSED") + "</b>";
-          h += g.capped ? " (at the series cap, no more admissions)" : g.every_s ? (g.open ? " (next +" + g.admit_count + " in " + fmtSec(g.next_in_s) + ")" : " (admissions held; next check in " + fmtSec(g.next_in_s) + ")") : "";
+          h += g.capped ? " (at the session cap, no more admissions)" : g.every_s ? (g.open ? " (next +" + g.admit_count + " in " + fmtSec(g.next_in_s) + ")" : " (admissions held; next check in " + fmtSec(g.next_in_s) + ")") : "";
           if (g.decode_min) {
             var slow = (g.decode_rate || 0) < g.decode_min;
-            h += " &middot; <span title='--decode-rate-min: due requests are held while the per-request decode rate over the window is below the minimum'>decode <b class='" + (slow ? "wtl-bad" : "wtl-gating") + "'>" + (g.decode_rate || 0).toFixed(1) + "</b> / " + g.decode_min + " tok/s per request, held <b>" + (g.decode_holding || 0) + "</b></span>";
+            h += " &middot; <span title='--decode-rate-min: below it no session is admitted and an ending session is not replaced'>decode <b class='" + (slow ? "wtl-bad" : "wtl-gating") + "'>" + (g.decode_rate || 0).toFixed(1) + "</b> / " + g.decode_min + " tok/s per request</span>";
           }
           if (g.retire_ms) {
             var shedding = g.value_ms > g.retire_ms;
-            h += " &middot; <span title='--ttft-retire: a series whose session ends while the gate statistic is above this does not take another session'>retire above " + fmtSec(g.retire_ms / 1000) + " &rarr; <b class='" + (shedding ? "wtl-bad" : "wtl-gating") + "'>" + (shedding ? "SHRINKING" : "holding") + "</b>, retired <b>" + (g.retired || 0) + "</b></span>";
+            h += " &middot; <span title='--ttft-retire: a row whose session ends while the gate statistic is above this does not take another session'>retire above " + fmtSec(g.retire_ms / 1000) + " &rarr; <b class='" + (shedding ? "wtl-bad" : "wtl-gating") + "'>" + (shedding ? "SHRINKING" : "holding") + "</b>, retired <b>" + (g.retired || 0) + "</b></span>";
           }
         }
       }
@@ -522,7 +552,7 @@ var WekaiTimeline = (function () {
     function renderOfflineState() {
       var a = arm(); if (!a || opts.live) return;
       var rr0 = range(), atCursor = hoverT !== null && hoverT >= rr0[0] && hoverT <= rr0[1];
-      var T = atCursor ? hoverT : rr0[1], c = { f: 0, w: 0, t: 0, i: 0 };
+      var T = atCursor ? hoverT : playT !== null ? playT : rr0[1], c = { f: 0, w: 0, t: 0, i: 0 };
       var act = activity(a, 0), activeAtT = stepAt(act.series, T);
       for (var g = 0; g < a.groups.length; g++) {
         var grp = a.groups[g]; ensureSorted(grp);
@@ -544,8 +574,107 @@ var WekaiTimeline = (function () {
         rate = "<br>view average tokens/s: input <b>" + fmtRate(rateAt(a.rates, "in", rr[0], rr[1])) + "</b> &middot; output <b>" + fmtRate(rateAt(a.rates, "out", rr[0], rr[1])) + "</b>";
       }
       renderAt();
-      setStateText("at <b>" + fmtElapsed(T, 1000) + "</b> (" + (atCursor ? "cursor" : "view end") + "): <b><span title='" + SERIES_TIP + "'>" + activeAtT + "</span></b> active series <span class='wtl-dim'>(" + a.groups.length + " over the run)</span> &middot; in flight <b>" + c.f +
+      setStateText("at <b>" + fmtElapsed(T, 1000) + "</b> (" + (atCursor ? "cursor" : playT !== null ? "replay" : "view end") + "): <b><span title='" + SERIES_TIP + "'>" + activeAtT + "</span></b> active sessions <span class='wtl-dim'>(" + a.groups.length + " rows over the run)</span> &middot; in flight <b>" + c.f +
         "</b> &middot; waiting at gate <b>" + c.w + "</b> &middot; think pause <b>" + c.t + "</b> &middot; idle <b>" + c.i + "</b>" + rate);
+    }
+
+    // ---- replay ----
+    // playT (ms of arm time) is the replay clock, null when not replaying: only
+    // requests started by then are drawn, each cut at playT, so stages fill in as
+    // the clock passes them. One pane drives the clock (requestAnimationFrame)
+    // and the others follow its ticks, so split panes stay in lockstep.
+    var SPEEDS = [1, 2, 5, 10, 30, 60, 120, 300, 600, 1200, 3000];
+    var playT = null, playing = false, playRaf = 0, playLast = 0, extSpeed = 0;   // extSpeed: the split's speed when it drives
+    var elPlay = $(".wtl-playbtn"), elRestart = $(".wtl-restart"), elStop = $(".wtl-stop"), elSpeed = $(".wtl-speed");
+    var elSpeedV = $(".wtl-speedv"), elPlayT = $(".wtl-playt");
+    if (opts.live) $(".wtl-play").hidden = true;
+    function speed() { return SPEEDS[+elSpeed.value]; }
+    function playEnd() { return opts.sync ? opts.sync.maxSpan() : (arm() ? arm().span : 0); }
+    function updPlayUI() {
+      elPlay.innerHTML = playing ? "&#x23F8;" : "&#x25B6;";
+      elStop.hidden = playT === null;
+      elSpeedV.textContent = speed() + "\u00d7";
+      elPlayT.innerHTML = playT === null ? "" : "<b>" + fmtElapsed(playT, 1000) + "</b> / " + fmtElapsed(playEnd(), 1000);
+    }
+    function playFrame(now) {
+      if (!playing) return;
+      playT = Math.min(playEnd(), playT + (now - playLast) * speed());
+      playLast = now;
+      if (playT >= playEnd()) playing = false;
+      emit("tick", { t: playT, playing: playing });
+      updPlayUI(); draw();
+      if (playing) playRaf = requestAnimationFrame(playFrame);
+    }
+    function play(fromStart) {
+      if (playT === null || fromStart || playT >= playEnd()) playT = 0;
+      playing = true; playLast = performance.now();
+      cancelAnimationFrame(playRaf); playRaf = requestAnimationFrame(playFrame);
+      emit("play", { t: playT, playing: true });
+      updPlayUI(); draw();
+    }
+    function pause() {
+      playing = false; cancelAnimationFrame(playRaf);
+      emit("play", { t: playT, playing: false });
+      updPlayUI();
+    }
+    function stopPlay() {
+      playing = false; cancelAnimationFrame(playRaf); playT = null;
+      emit("stop");
+      updPlayUI(); draw();
+    }
+    elPlay.addEventListener("click", function () { if (playing) pause(); else play(false); });
+    elRestart.addEventListener("click", function () { play(true); });
+    elStop.addEventListener("click", stopPlay);
+    elSpeed.addEventListener("input", function () { updPlayUI(); emit("speed", +elSpeed.value); });
+    updPlayUI();
+    // apply is what the other panes' events do here (no re-emit).
+    function applySync(kind, v) {
+      if (kind === "view") setView(v[0], v[1], true);
+      else if (kind === "expand") setExpanded(v, true);
+      else if (kind === "speed") { elSpeed.value = v; updPlayUI(); }
+      else if (kind === "stop") { playing = false; cancelAnimationFrame(playRaf); playT = null; updPlayUI(); draw(); }
+      else if (kind === "play" || kind === "tick") {
+        // A follower never runs its own clock: it shows the driver's.
+        cancelAnimationFrame(playRaf);
+        playT = v.t; playing = v.playing; updPlayUI(); draw();
+      }
+    }
+
+    // Replay highlights (the overlay, repainted every frame): requests still
+    // running at the clock washed in the live view's in-flight colour up to the
+    // clock with a solid tip at the running edge,
+    // and requests that just finished flashing and fading over FLASH_WALL_MS of
+    // real time at the current speed. Rows are at least 2px tall here so the
+    // highlights read at 1px row height.
+    var FLASH_WALL_MS = 1500;
+    function drawReplayHighlights(a, scrollTop, rh) {
+      var r = range(), fade = FLASH_WALL_MS * (extSpeed || speed()), hh = Math.max(rh, 2);
+      var cIn = colors[INFLIGHT_KIND] || "#d0b3f5";
+      layout(a);
+      for (var g = Math.max(0, groupAt(a, scrollTop)); g < a.groups.length; g++) {
+        var gy = AXIS_H + groupTop(a, g) - scrollTop;
+        if (gy > H) break;
+        var grp = a.groups[g];
+        ensureSorted(grp);
+        for (var k = firstAtOrAfter(grp.reqs, playT - fade - grp.maxE); k < grp.reqs.length && grp.reqs[k].t <= playT; k++) {
+          var q = grp.reqs[k], end = q.t + q.e, y = gy + (q.u || 0) * rowH - (hh - rh) / 2;
+          var x0 = Math.max(mapX(q.t, r), plotL);
+          if (end > playT) {
+            var x1 = Math.min(mapX(playT, r), plotL + plotW);
+            if (x1 < plotL) continue;
+            // a light wash keeps the stages readable; a solid tip marks the running edge
+            octx.fillStyle = cIn;
+            octx.globalAlpha = 0.35; octx.fillRect(x0, y, Math.max(1.5, x1 - x0), hh);
+            octx.globalAlpha = 1; octx.fillRect(Math.max(x0, x1 - 3), y, Math.min(3, Math.max(1.5, x1 - x0)), hh);
+          } else if (playT - end < fade) {
+            var x2 = Math.min(mapX(end, r), plotL + plotW);
+            if (x2 < plotL) continue;
+            octx.globalAlpha = 0.85 * (1 - (playT - end) / fade); octx.fillStyle = "#F2F2EB";
+            octx.fillRect(x0, y, Math.max(1.5, x2 - x0), hh);
+          }
+        }
+      }
+      octx.globalAlpha = 1;
     }
 
     // ---- tile cache ----
@@ -582,15 +711,17 @@ var WekaiTimeline = (function () {
         var grp = a.groups[g];
         ensureSorted(grp);
         if (g > 0 && rowH >= 6) { c.fillStyle = "#13181b"; c.fillRect(0, gy - 1, W, 1); }
-        // Session boundaries inside the window: the slot moved on to a new session.
+        // Session boundaries inside the window: a fixed-pool worker moved on to a new session.
         c.fillStyle = "rgba(199,159,241,0.45)";
         var gh = grp.subs * rowH;
-        for (var n = firstAtOrAfter(grp.bounds, r[0]); n < grp.bounds.length && grp.bounds[n] <= r[1]; n++) {
+        var bEnd = playT === null ? r[1] : Math.min(r[1], playT);
+        for (var n = firstAtOrAfter(grp.bounds, r[0]); n < grp.bounds.length && grp.bounds[n] <= bEnd; n++) {
           c.fillRect(Math.round(mapX(grp.bounds[n], r)) - 1, gy - 1, 1, gh + 1);
         }
         // Only requests that can intersect the window: starts in [r0 - longest, r1].
         var i0 = firstAtOrAfter(grp.reqs, r[0] - grp.maxE);
-        for (var k = i0; k < grp.reqs.length && grp.reqs[k].t <= r[1]; k++) drawReq(grp.reqs[k], gy + (grp.reqs[k].u || 0) * rowH, rh, r, 0);
+        var kEnd = playT === null ? r[1] : Math.min(r[1], playT);
+        for (var k = i0; k < grp.reqs.length && grp.reqs[k].t <= kEnd; k++) drawReq(grp.reqs[k], gy + (grp.reqs[k].u || 0) * rowH, rh, r, 0);
         for (var u = 0; u < grp.subs; u++) flushLod(u, gy + u * rowH, rh);
       }
     }
@@ -623,7 +754,8 @@ var WekaiTimeline = (function () {
       // Completed requests come from cached tiles (a tile is a band of rows
       // painted once per view, so scrolling is a few blits); anything that
       // changes with the clock -- in-flight bars, labels -- is painted per frame.
-      var tilesKey = r[0] + "|" + r[1] + "|" + rowH + "|" + merge + "|" + W + "|" + a.ver + "|" + (window.devicePixelRatio || 1);
+      var tilesKey = r[0] + "|" + r[1] + "|" + rowH + "|" + merge + "|" + W + "|" + a.ver + "|" + (window.devicePixelRatio || 1) +
+        "|" + (playT === null ? "" : Math.floor(mapX(playT, r)));   // a replay repaints once per pixel of clock
       if (preview && tiles.r) {
         // Mid wheel-zoom: show the tiles painted for the previous window, scaled
         // to the new one, and repaint properly once the zoom settles.
@@ -652,10 +784,14 @@ var WekaiTimeline = (function () {
         for (var u = 0; u < grp.subs; u++) flushLod(u, gy + u * rowH, rh);
         if (rowH >= 8) {
           var any = grp.reqs[0] || grp.infl[0];
-          if (any) { ctx.fillStyle = "#6f767d"; ctx.textAlign = "right"; ctx.font = "10px monospace"; ctx.fillText(any.sl ? ((any.x & FLAG_HOT) ? "h" : "s") + any.sl : "s" + any.s, plotL - 5, gy + rh - 3); }
+          if (any) { ctx.fillStyle = "#6f767d"; ctx.textAlign = "right"; ctx.font = "10px monospace"; ctx.fillText(any.ss ? "#" + any.ss : any.sl ? ((any.x & FLAG_HOT) ? "h" : "w") + any.sl : "s" + any.s, plotL - 5, gy + rh - 3); }
         }
       }
       ctx.restore();
+      if (playT !== null) {
+        var px = mapX(playT, r);
+        if (px >= plotL && px <= plotL + plotW) { ctx.strokeStyle = "#C79FF1"; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(px, AXIS_H - 4); ctx.lineTo(px, H); ctx.stroke(); ctx.lineWidth = 1; }
+      }
       if (opts.live) {
         var nx = mapX(now, r);
         if (nx >= plotL && nx <= plotL + plotW) { ctx.strokeStyle = "#7C03EC"; ctx.beginPath(); ctx.moveTo(nx + 0.5, AXIS_H); ctx.lineTo(nx + 0.5, H); ctx.stroke(); }
@@ -690,6 +826,7 @@ var WekaiTimeline = (function () {
         octx.strokeStyle = "#F2F2EB"; octx.lineWidth = 1;
         octx.strokeRect(Math.round(hx0) - 0.5, hy - 0.5, Math.max(2, hx1 - hx0) + 1, rh + 1);
       }
+      if (playT !== null) drawReplayHighlights(a, scrollTop, rh);
       octx.restore();
       if (drag) {
         var dx0 = Math.min(drag.x0, drag.x1), dx1 = Math.max(drag.x0, drag.x1);
@@ -729,6 +866,7 @@ var WekaiTimeline = (function () {
     function drawReq(q, y, rh, r, now) {
       var infl = (q.x & FLAG_INFL) !== 0;
       var end = infl ? Math.max(0, now - q.t) : q.e;
+      if (playT !== null) { if (q.t > playT) return; end = Math.min(end, playT - q.t); }   // replay: cut at the clock
       var xs = mapX(q.t, r), xe = mapX(q.t + end, r);
       if (q.tp) {
         // The deliberate pause before this turn: idle by design, not for want of a session.
@@ -748,9 +886,10 @@ var WekaiTimeline = (function () {
         lodK[u] = best; lodX0[u] = x0; lodX1[u] = x1;
         return;
       }
-      var t = q.t;
-      for (var i = 0; i < segs.length; i += 2) {
-        var d = segs[i + 1];
+      var t = q.t, rem = end;
+      for (var i = 0; i < segs.length && rem > 0; i += 2) {
+        var d = Math.min(segs[i + 1], rem);
+        rem -= d;
         var sx0 = mapX(t, r), sx1 = mapX(t + d, r);
         t += d;
         if (sx1 < plotL || sx0 > plotL + plotW) continue;
@@ -780,6 +919,7 @@ var WekaiTimeline = (function () {
         var q = lists[l][i];
         if (l === 0 && q.t > t + tol) break;
         if ((q.u || 0) !== sub) continue;
+        if (playT !== null && q.t > playT) continue;
         var e = (q.x & FLAG_INFL) ? Math.max(0, now - q.t) : q.e;
         var d = t < q.t ? q.t - t : (t > q.t + e ? t - q.t - e : 0);
         if (d <= tol && d < bd) { bd = d; best = q; }
@@ -800,7 +940,7 @@ var WekaiTimeline = (function () {
       var infl = (q.x & FLAG_INFL) !== 0, e2e = infl ? Math.max(0, now - q.t) : q.e;
       var inst = q.gu || (a.guids && q.gi ? a.guids[q.gi - 1] : "");
       var ic = inst.indexOf(":"); if (ic >= 0) inst = inst.slice(ic + 1);
-      var head = q.sl ? "<b>" + ((q.x & FLAG_HOT) ? "hot series " : "series ") + q.sl + "</b> &middot; session " + q.s : "<b>series " + q.s + "</b>";
+      var head = q.ss ? "<b>session " + q.s + "</b> &middot; run #" + q.ss : q.sl ? "<b>" + ((q.x & FLAG_HOT) ? "hot worker " : "worker ") + q.sl + "</b> &middot; session " + q.s : "<b>session " + q.s + "</b>";
       var html = head + " turn " + q.n + ((q.x & FLAG_SESSION) ? " (first of session)" : "") + (inst ? " &middot; instance " + esc(inst.length > 24 ? inst.slice(0, 24) + "\u2026" : inst) : "") + (infl ? " <b>(in flight)</b>" : "") +
         ((q.x & FLAG_ERR) ? " <b style='color:#FF6B6B'>error</b>" : "") + ((q.x & FLAG_COLD) ? " cold start" : "") + ((q.x & FLAG_EMPTY) ? " empty" : "") + "<br>" +
         "start " + fmtClock(a.t0 + q.t, true) + " (+" + fmtDur(q.t) + ")<br>";
@@ -855,6 +995,7 @@ var WekaiTimeline = (function () {
       else { vMin = a; vMax = Math.max(b, a + 1); }
       elReset.hidden = !isZoomed();
       scheduleDraw();
+      if (!silent) emit("view", [vMin, vMax]);
     }
     function userZoom(a, b) {
       setView(a, b);
@@ -922,6 +1063,15 @@ var WekaiTimeline = (function () {
       applyArm();
     }
 
+    if (opts.onPanes) {
+      var elPanes = $(".wtl-panes");
+      $(".wtl-paneswrap").hidden = !(opts.maxPanes > 1);
+      for (var pn = 1; pn <= (opts.maxPanes || 1); pn++) { var po = document.createElement("option"); po.value = pn; po.textContent = pn; elPanes.appendChild(po); }
+      elPanes.value = opts.paneCount || 1;
+      elPanes.addEventListener("change", function () { opts.onPanes(+elPanes.value); });
+    }
+    if (opts.sync) opts.sync.add({ key: syncKey, apply: applySync, span: function () { return arm() ? arm().span : 0; } });
+
     var api = {
       // setArms replaces all data. Each arm: {name, t0, span, layout, rows, reqs}.
       setArms: function (list, select) {
@@ -942,6 +1092,21 @@ var WekaiTimeline = (function () {
         }, 50);
       },
       selectArm: selectArm,
+      setExpanded: function (on, silent) { setExpanded(on, silent); },
+      // setReplay drives this pane's replay clock from outside (the split's bar):
+      // t in arm ms, or null to show the whole run.
+      setReplay: function (t, isPlaying, spd) { cancelAnimationFrame(playRaf); playT = t; playing = !!isPlaying; if (spd) extSpeed = spd; updPlayUI(); draw(); },
+      span: function () { return arm() ? arm().span : 0; },
+      // Shared controls of a split view (the split's bar sets every pane).
+      setRowH: function (h) {   // 0 = this arm's own default
+        if (h > 0) { rowH = h; userRowH = true; } else { userRowH = false; if (arm()) rowH = defaultRowH(arm()); }
+        elRowH.value = rowH; resize();
+      },
+      setMerge: function (on) { merge = !!on; elMerge.checked = merge; buildLegend(); draw(); },
+      setPanel: function (p, on) {   // in the current mode (normal / expanded)
+        panelsOn[expanded ? "expanded" : "normal"][p] = on ? 1 : 0; applyPanels(); sizeKey = ""; resize();
+      },
+      panels: function () { return panelsOn[expanded ? "expanded" : "normal"]; },
       currentArm: function () { return cur; },
       setView: function (a, b) { setView(a, b); },
       getView: function () { return range(); },
@@ -1006,5 +1171,193 @@ var WekaiTimeline = (function () {
     return api;
   }
 
-  return { create: create, fmtDur: fmtDur };
+  // syncGroup relays events between the panes of one split view.
+  function syncGroup() {
+    var members = [];
+    return {
+      add: function (m) { members.push(m); },
+      emit: function (from, kind, v) { members.forEach(function (m) { if (m.key !== from) m.apply(kind, v); }); },
+      maxSpan: function () { return members.reduce(function (mx, m) { return Math.max(mx, m.span()); }, 0); },
+    };
+  }
+
+  // createSplit lays out one timeline per chosen arm side by side under one
+  // bar that owns expand, the replay controls and the arm choice (all arms by
+  // default). Panes share zoom through a sync group; the replay clock runs
+  // here and drives every pane, so the arms replay in lockstep, each on its
+  // own elapsed clock. It exposes the subset of a timeline's API pages use.
+  function createSplit(host, opts) {
+    var SPEEDS = [1, 2, 5, 10, 30, 60, 120, 300, 600, 1200, 3000];
+    host.classList.add("wtl-split");
+    host.innerHTML =
+      '<div class="wtl-bar wtl-splitbar">' +
+      '<button class="wtl-expand" title="Fill the window with the timelines (Esc or Back to return)">&#x2922; Expand</button>' +
+      '<span class="wtl-armsel"></span>' +
+      '<label>Row height <select class="wtl-rowh"><option value="0">auto</option></select></label>' +
+      '<label title="Collapse client wait, engine queue and unattributed wait into one colour"><input type="checkbox" class="wtl-merge"> Merge waits</label>' +
+      '<span class="wtl-panels">Show' +
+      '<button data-p="state" title="Run state: sessions, in flight, gate">State</button>' +
+      '<button data-p="legend" title="Colour legend">Legend</button>' +
+      '<button data-p="act" title="Active sessions / in flight over time">Activity</button>' +
+      '<button data-p="rate" title="Input and output tokens/s over time">Tokens/s</button>' +
+      '<button data-p="ttft" title="TTFT over time">TTFT</button></span>' +
+      '<span class="wtl-play" title="Replay the run: requests appear as they started and fill in stage by stage">' +
+      '<button class="wtl-restart" title="Replay from the start">&#x23EE;</button>' +
+      '<button class="wtl-playbtn" title="Play / pause">&#x25B6;</button>' +
+      '<button class="wtl-stop" title="Stop the replay and show the whole run" hidden>&#x25A0;</button>' +
+      '<input type="range" class="wtl-speed" min="0" max="10" step="1" value="5" title="Replay speed">' +
+      '<span class="wtl-speedv"></span><span class="wtl-playt"></span></span>' +
+      '</div><div class="wtl-legend wtl-splitlegend"></div><div class="wtl-panesrow"></div>';
+    var $ = function (c) { return host.querySelector(c); };
+    var row = $(".wtl-panesrow"), elLegend = $(".wtl-splitlegend"), elArmSel = $(".wtl-armsel"), elExpand = $(".wtl-expand");
+    var elPlay = $(".wtl-playbtn"), elRestart = $(".wtl-restart"), elStop = $(".wtl-stop"), elSpeed = $(".wtl-speed");
+    var elSpeedV = $(".wtl-speedv"), elPlayT = $(".wtl-playt");
+    var arms = [], chosen = null, panes = [], view = [null, null], expanded = false;
+    var playT = null, playing = false, raf = 0, last = 0;
+    var me = { key: {}, apply: function (kind, v) { if (kind === "expand") markExpanded(v); else if (kind === "view") view = v; }, span: function () { return 0; } };
+    // Shared pane controls: row height (auto = each arm's default), merge waits,
+    // panel toggles (per mode, read back from the first pane).
+    var elRowH = $(".wtl-rowh"), elMerge = $(".wtl-merge"), panelBtns = host.querySelectorAll(".wtl-splitbar .wtl-panels button");
+    ROW_HEIGHTS.forEach(function (h) { var o = document.createElement("option"); o.value = h; o.textContent = h + "px"; elRowH.appendChild(o); });
+    elRowH.value = 1;   // dense by default: the panes show whole runs side by side
+    elRowH.addEventListener("change", function () { panes.forEach(function (t) { t.setRowH(+elRowH.value); }); });
+    elMerge.addEventListener("change", function () { panes.forEach(function (t) { t.setMerge(elMerge.checked); }); });
+    // One legend for every pane, under the bar; the Legend toggle is the split's
+    // own (per mode, like the panes' panels).
+    var legendOn = { normal: true, expanded: false };
+    function buildLegend() {
+      var kinds = opts.kinds || [], merge = elMerge.checked;
+      elLegend.innerHTML = kinds.filter(function (k) {
+        if (k.id === INFLIGHT_KIND) return !!opts.live;
+        if (k.id === WAITED) return merge;
+        if (WAIT_KINDS[k.id]) return !merge;
+        return true;
+      }).map(function (k) {
+        return '<span><i style="background:' + k.color + '"></i>' + esc(k.label) + "</span>";
+      }).join("") + '<span><i style="background:rgba(124,150,190,0.35)"></i>think pause (idle by design)</span>';
+      elLegend.hidden = !legendOn[expanded ? "expanded" : "normal"];
+    }
+    function syncPanelBtns() {
+      var on = panes[0] ? panes[0].panels() : {};
+      [].forEach.call(panelBtns, function (b) {
+        var p = b.getAttribute("data-p");
+        b.classList.toggle("on", p === "legend" ? !!legendOn[expanded ? "expanded" : "normal"] : !!on[p]);
+      });
+      elLegend.hidden = !legendOn[expanded ? "expanded" : "normal"];
+    }
+    [].forEach.call(panelBtns, function (b) {
+      b.addEventListener("click", function () {
+        var p = b.getAttribute("data-p");
+        if (p === "legend") {
+          var m = expanded ? "expanded" : "normal";
+          legendOn[m] = !legendOn[m];
+        } else {
+          var on = !(panes[0] && panes[0].panels()[p]);
+          panes.forEach(function (t) { t.setPanel(p, on); });
+        }
+        syncPanelBtns();
+        panes.forEach(function (t) { t.resize(); });
+      });
+    });
+    elMerge.addEventListener("change", buildLegend);
+    buildLegend();
+
+    function markExpanded(on) {
+      expanded = on;
+      host.classList.toggle("wtl-expanded-host", on);
+      document.documentElement.classList.toggle("wtl-expanded-page", on);
+      elExpand.innerHTML = on ? "&#x2715; Back" : "&#x2922; Expand";
+    }
+    function setExpanded(on) {
+      markExpanded(on);
+      panes.forEach(function (t) { t.setExpanded(on, true); });
+      syncPanelBtns();
+    }
+    elExpand.addEventListener("click", function () { setExpanded(!expanded); });
+    window.addEventListener("keydown", function (e) { if (e.key === "Escape" && expanded) setExpanded(false); });
+
+    function end() { return panes.reduce(function (m, t) { return Math.max(m, t.span()); }, 0); }
+    function ui() {
+      elPlay.innerHTML = playing ? "&#x23F8;" : "&#x25B6;";
+      elStop.hidden = playT === null;
+      elSpeedV.textContent = SPEEDS[+elSpeed.value] + "×";
+      elPlayT.innerHTML = playT === null ? "" : "<b>" + fmtElapsed(playT, 1000) + "</b> / " + fmtElapsed(end(), 1000);
+    }
+    function push() { var sp = SPEEDS[+elSpeed.value]; panes.forEach(function (t) { t.setReplay(playT, playing, sp); }); ui(); }
+    function frame(now) {
+      if (!playing) return;
+      playT = Math.min(end(), playT + (now - last) * SPEEDS[+elSpeed.value]);
+      last = now;
+      if (playT >= end()) playing = false;
+      push();
+      if (playing) raf = requestAnimationFrame(frame);
+    }
+    function play(fromStart) {
+      if (playT === null || fromStart || playT >= end()) playT = 0;
+      playing = true; last = performance.now();
+      cancelAnimationFrame(raf); raf = requestAnimationFrame(frame);
+      push();
+    }
+    elPlay.addEventListener("click", function () { if (playing) { playing = false; cancelAnimationFrame(raf); push(); } else play(false); });
+    elRestart.addEventListener("click", function () { play(true); });
+    elStop.addEventListener("click", function () { playing = false; cancelAnimationFrame(raf); playT = null; push(); });
+    elSpeed.addEventListener("input", ui);
+    ui();
+
+    function buildArmSel() {
+      elArmSel.hidden = arms.length < 2;
+      elArmSel.innerHTML = "Arms " + arms.map(function (a, i) {
+        return '<label title="' + esc(a.name) + '"><input type="checkbox" data-i="' + i + '"' + (chosen[i] ? " checked" : "") + '> ' + esc(a.name) + "</label>";
+      }).join("");
+      [].forEach.call(elArmSel.querySelectorAll("input"), function (cb) {
+        cb.addEventListener("change", function () {
+          var i = +cb.getAttribute("data-i");
+          chosen[i] = cb.checked;
+          if (!chosen.some(Boolean)) { chosen[i] = true; cb.checked = true; return; }   // keep one
+          build();
+        });
+      });
+    }
+    function build() {
+      row.innerHTML = "";
+      var hub = syncGroup();
+      hub.add(me);
+      panes = [];
+      arms.forEach(function (a, i) {
+        if (!chosen[i]) return;
+        var d = document.createElement("div");
+        d.className = "wtl-pane";
+        row.appendChild(d);
+        var o = {};
+        for (var k in opts) o[k] = opts[k];
+        o.sync = hub; o.expandHost = host; o.paneTitle = arms.length > 1 ? a.name : "";
+        if (panes.length > 0) o.onZoom = null;   // the page hears zoom once
+        var t = create(d, o);
+        t.setArms(arms, i);
+        if (view[0] !== null) t.setView(view[0], view[1]);
+        panes.push(t);
+      });
+      panes.forEach(function (t) {
+        t.resize(); if (expanded) t.setExpanded(true, true); t.setReplay(playT, playing);
+        if (+elRowH.value) t.setRowH(+elRowH.value);
+        if (elMerge.checked) t.setMerge(true);
+      });
+      syncPanelBtns();
+    }
+    return {
+      setArms: function (list) {
+        arms = list;
+        chosen = arms.map(function () { return true; });   // every arm by default
+        buildArmSel(); build();
+      },
+      setView: function (a, b) { view = [a === undefined ? null : a, b]; if (panes[0]) panes[0].setView(a, b); },
+      getView: function () { return panes[0] ? panes[0].getView() : [0, 1]; },
+      resize: function () { panes.forEach(function (t) { t.resize(); }); },
+      redraw: function () { panes.forEach(function (t) { t.redraw(); }); },
+      panes: function () { return panes; },
+      perf: function () { return panes[0] ? panes[0].perf() : {}; },
+    };
+  }
+
+  return { create: create, createSplit: createSplit, fmtDur: fmtDur };
 })();
