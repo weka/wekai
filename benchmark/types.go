@@ -16,6 +16,10 @@ type RequestMetrics struct {
 	SeriesNum  int    // Series number (1-based) within a cycle
 	CycleNum   int    // Cycle number (1-based)
 	SeriesGUID string // GUID for the series this request belongs to
+	// XRequestID is the X-Request-Id header this request was sent with. vLLM
+	// adopts it as its request id, so server log lines can be matched to a
+	// record (e.g. a cross-contamination hit) without guessing by timestamp.
+	XRequestID string
 	// TimeToFirstToken is what the CALLER waited: every 429 backed off plus the
 	// attempt that finally answered. There is no per-attempt variant, on
 	// purpose.

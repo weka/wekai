@@ -575,6 +575,7 @@ func recordReplayRequest(
 			ResponseMs:           float64(metrics.TotalResponseTime.Milliseconds()),
 			Model:                cfg.Model,
 			SeriesGUID:           metrics.SeriesGUID,
+			XRequestID:           metrics.XRequestID,
 			SeriesNum:            metrics.SeriesNum,
 			RequestNum:           metrics.RequestNum,
 			Slot:                 slotNum(metrics.Slot),

@@ -541,12 +541,15 @@ func backoff429(base, spent, budget time.Duration) (time.Duration, bool) {
 }
 
 // sendOnce POSTs bodyBytes to url with the poster's auth/accept headers.
-func (p *replayPoster) sendOnce(ctx context.Context, url string, bodyBytes []byte, stream bool) (*http.Response, error) {
+func (p *replayPoster) sendOnce(ctx context.Context, url string, bodyBytes []byte, stream bool, xRequestID string) (*http.Response, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if xRequestID != "" {
+		httpReq.Header.Set("X-Request-Id", xRequestID)
+	}
 	if p.apiType == "anthropic" {
 		httpReq.Header.Set("Accept", "application/json")
 		httpReq.Header.Set("X-Api-Key", p.apiKey)
@@ -592,6 +595,10 @@ func (p *replayPoster) do(
 	gotResponse := false
 
 	sessionIdx := seriesNum - 1
+	// One id per request (shared by its 429 retries and the /v1 fallback):
+	// series, turn and a random suffix, since a session can be replayed again
+	// under the same series number on a later pass.
+	xRequestID := fmt.Sprintf("wk-s%d-t%d-%08x", seriesNum, turnIdx, rand.Uint32())
 	inj := p.buildInjection(req, su)
 	outputTarget := pickMaxTokens(req, p.outputRatio, p.minOutputTokens)
 
@@ -619,6 +626,7 @@ func (p *replayPoster) do(
 			SeriesNum:         seriesNum,
 			CycleNum:          turnIdx,
 			SeriesGUID:        sessionID + ":" + instanceID,
+			XRequestID:        xRequestID,
 			Error:             fmt.Errorf("build body: %w", err),
 			TotalResponseTime: time.Since(startTime),
 		}
@@ -648,7 +656,7 @@ func (p *replayPoster) do(
 		attemptStart = time.Now()
 		attempts := p.endpointAttempts()
 		for i, u := range attempts {
-			resp, err = p.sendOnce(ctx, u, bodyBytes, req.Stream)
+			resp, err = p.sendOnce(ctx, u, bodyBytes, req.Stream, xRequestID)
 			if err != nil {
 				err = classifyDeadline(err, reqLimit, time.Since(startTime), gotResponse, &RequestMetrics{})
 				return RequestMetrics{
@@ -656,6 +664,7 @@ func (p *replayPoster) do(
 					SeriesNum:         seriesNum,
 					CycleNum:          turnIdx,
 					SeriesGUID:        sessionID + ":" + instanceID,
+					XRequestID:        xRequestID,
 					Error:             err,
 					Retries429:        retries,
 					RetryWait:         retryWait,
@@ -704,6 +713,7 @@ func (p *replayPoster) do(
 				SeriesNum:         seriesNum,
 				CycleNum:          turnIdx,
 				SeriesGUID:        sessionID + ":" + instanceID,
+				XRequestID:        xRequestID,
 				Error:             ctx.Err(),
 				Retries429:        retries,
 				RetryWait:         retryWait,
@@ -722,6 +732,7 @@ func (p *replayPoster) do(
 		SeriesNum:    seriesNum,
 		CycleNum:     turnIdx,
 		SeriesGUID:   sessionID + ":" + instanceID,
+		XRequestID:   xRequestID,
 		OutputTarget: outputTarget,
 		progress:     progressFrom(ctx),
 	}
