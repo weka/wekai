@@ -330,6 +330,7 @@ type requestDataRecord struct {
 	// Identity
 	Model      string `json:"model"`
 	SeriesGUID string `json:"series_guid"`
+	XRequestID string `json:"x_request_id,omitempty"`
 	SeriesNum  int    `json:"series_num"`
 	RequestNum int    `json:"request_num"`
 	// SessionRun is the 1-based run number of the session that issued the
