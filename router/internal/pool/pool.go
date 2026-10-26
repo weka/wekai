@@ -29,6 +29,7 @@ import (
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/policy"
 	"github.com/weka/wekai/router/internal/policy/affinity"
+	"github.com/weka/wekai/router/internal/prefill"
 	"github.com/weka/wekai/router/internal/registry"
 )
 
@@ -71,6 +72,10 @@ type Config struct {
 
 	DrainDeadline time.Duration
 
+	// PrefillSplit, when set, enables moving heavy prefills a backend refuses
+	// onto prefill-only nodes. Its PoolName and Clock are filled in here.
+	PrefillSplit *prefill.Config
+
 	// OnCircuitTransition, when set, is attached to every backend as it joins,
 	// so an operator can tell an overload from an outage.
 	OnCircuitTransition func(url string) func(from, to any, ok, fail int)
@@ -81,6 +86,8 @@ type Pool struct {
 	Name     string
 	Registry *registry.Registry
 	Flow     *affinity.Policy
+	// Split is nil unless Config.PrefillSplit is set.
+	Split *prefill.Manager
 
 	checker *health.Checker
 	log     *slog.Logger
@@ -114,6 +121,12 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Pool, error) {
 		Registry: reg,
 		Flow:     flow,
 		log:      log.With("pool", cfg.Name),
+	}
+
+	if cfg.PrefillSplit != nil {
+		sc := *cfg.PrefillSplit
+		sc.PoolName, sc.Clock = cfg.Name, clk
+		p.Split = prefill.New(sc)
 	}
 
 	for _, b := range cfg.Backends {
@@ -167,6 +180,9 @@ func (p *Pool) Run(ctx context.Context) {
 
 	go p.tick(ctx, sweepInterval(p.Flow.TailTTL()), func() { p.Flow.Sweep() })
 	go p.tick(ctx, gaugeInterval, p.Flow.PublishGauges)
+	if p.Split != nil {
+		go p.Split.Run(ctx, func() []*registry.Backend { return p.Registry.Snapshot().Backends })
+	}
 }
 
 func (p *Pool) tick(ctx context.Context, every time.Duration, fn func()) {

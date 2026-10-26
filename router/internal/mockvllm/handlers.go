@@ -28,7 +28,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // touched in the cache model for a rejected request, matching a real 429
 // where the backend did no prefill and cached nothing. Callers must invoke
 // the returned release exactly once when ok.
-func (s *Server) admitOrReject(w http.ResponseWriter, units []kvcache.Unit) (release func(), res Residency, ok bool) {
+func (s *Server) admitOrReject(w http.ResponseWriter, units []kvcache.Unit, bypass bool) (release func(), res Residency, ok bool) {
+	if n, heavy := s.engine.RejectsPrefill(units, bypass); heavy {
+		writeLargePrefillRejected(w, n, s.engine.Config().PrefillRejectTokens)
+		s.coll.observe("rejected", Residency{}, 0)
+		return nil, Residency{}, false
+	}
 	release, res, ok = s.engine.Admit(units)
 	if !ok {
 		writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
@@ -46,7 +51,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	units := s.engine.Tokenize(string(req.promptBytes()))
-	release, res, ok := s.admitOrReject(w, units)
+	release, res, ok := s.admitOrReject(w, units, req.bypassesPrefillReject())
 	if !ok {
 		return
 	}
@@ -99,7 +104,7 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	units := s.engine.Tokenize(req.promptText())
-	release, res, ok := s.admitOrReject(w, units)
+	release, res, ok := s.admitOrReject(w, units, req.bypassesPrefillReject())
 	if !ok {
 		return
 	}
@@ -160,6 +165,19 @@ func writeError(w http.ResponseWriter, status int, typ, msg string) {
 	})
 }
 
+// writeLargePrefillRejected answers the way the engine's rejection does: a 400
+// whose param carries the recompute token count.
+func writeLargePrefillRejected(w http.ResponseWriter, tokens, limit int) {
+	writeJSON(w, http.StatusBadRequest, map[string]any{
+		"error": map[string]any{
+			"message": "prefill of " + strconv.Itoa(tokens) + " tokens exceeds WEKA_PREFILL_REJECT_TOKENS=" + strconv.Itoa(limit),
+			"type":    LargePrefillRejectedType,
+			"param":   strconv.Itoa(tokens),
+			"code":    http.StatusBadRequest,
+		},
+	})
+}
+
 // handleMessages serves Anthropic's /v1/messages against the same engine.
 //
 // Only the wire shape differs. The engine, its cache model and its vllm:
@@ -171,6 +189,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Model     string `json:"model"`
 		MaxTokens int    `json:"max_tokens"`
+		VLLMXArgs xargs  `json:"vllm_xargs"`
 		System    any    `json:"system"`
 		Messages  []struct {
 			Role    string `json:"role"`
@@ -196,7 +215,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	units := s.engine.Tokenize(sb.String())
-	release, res, ok := s.admitOrReject(w, units)
+	release, res, ok := s.admitOrReject(w, units, req.VLLMXArgs.bypassesPrefillReject())
 	if !ok {
 		return
 	}

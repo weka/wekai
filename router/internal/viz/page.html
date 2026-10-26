@@ -150,6 +150,15 @@ function renderTiles(snap){
     ['rows shown / total', (snap.nodes_shown||0) + ' / ' + (snap.nodes_total||0),
       snap.truncated ? 'warn' : ''],
   ];
+  const pf = snap.prefill;
+  if (pf){
+    const modes = backends.reduce((m, b) => { m[b.mode||'decode'] = (m[b.mode||'decode']||0) + 1; return m; }, {});
+    tiles.push(
+      ['decode / draining / prefill', (modes.decode||0) + ' / ' + (modes.draining||0) + ' / ' + (modes.prefill||0), ''],
+      ['rejections / jobs', pf.rejections + ' / ' + pf.jobs, pf.jobs_failed ? 'warn' : ''],
+      ['conversions / releases', pf.conversions + ' / ' + pf.releases, ''],
+      ['bypass fallbacks', String(pf.bypass_fallbacks), pf.bypass_fallbacks ? 'warn' : '']);
+  }
   $('tiles').innerHTML = tiles.map(([k,v,c]) =>
     '<div class="tile"><div class="v ' + c + '">' + v + '</div><div class="k">' + k + '</div></div>'
   ).join('');
@@ -176,7 +185,9 @@ function renderBackendsHeader(backends){
   $('backends').innerHTML = backends.map(b =>
     '<span class="b"><span class="hdot ' + healthClass(b) + '"></span>' +
     (b.url||'(unknown)') + ' <span style="color:var(--muted)">inflight ' + (b.inflight||0) +
-    ' · ' + (b.nodes||0) + ' blk</span></span>'
+    ' · ' + (b.nodes||0) + ' blk' +
+    (b.mode ? ' · ' + b.mode + (b.pending_prefill_tokens ? ' ' + b.pending_prefill_tokens + ' tok queued' : '') : '') +
+    '</span></span>'
   ).join('');
 }
 

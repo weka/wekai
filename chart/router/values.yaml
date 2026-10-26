@@ -102,6 +102,22 @@ router:
   #     - /v1/            # every inference and provider path, admin still closed
   pathAllowlist: []
 
+  # Dynamic prefill split. When a backend refuses a request as a heavy prefill
+  # (HTTP 400 large_prefill_rejected, its WEKA_PREFILL_REJECT_TOKENS), the
+  # router runs that prefill on a node it sets aside — draining it of decode
+  # work first — then sends the request for decode as usual. The client never
+  # sees the refusal. The nodes must share a KV tier, or the decode node
+  # recomputes what the prefill node computed. Off: the 400 reaches the client.
+  prefillSplit:
+    enabled: false
+    # Most prefill tokens queued plus in flight on one prefill node.
+    nodeBudgetTokens: 4000000
+    # Largest share of the pool that may be draining or prefill; at least one
+    # node always stays in decode.
+    maxFleetFraction: 0.5
+    # A prefill node with no prefill work for this long returns to decode.
+    releaseIdle: 60s
+
   # Split signals. The backend's own 429 is always on and needs no
   # configuration; these are opt-in early warnings that save a round trip.
   signals:

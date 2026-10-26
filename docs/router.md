@@ -124,6 +124,30 @@ binds. `router_cache_stretch_inflight` is the check — piled against the hard
 limit means soft is set too low, and the router is paying the queueing cost
 continuously rather than as relief.
 
+**Heavy prefills move to their own nodes.** With `--prefill-split`, a backend
+that refuses a request because recomputing its prompt would stall the node's
+running decodes (HTTP `400`, error type `large_prefill_rejected`, the recompute
+in `param`; the engine's `WEKA_PREFILL_REJECT_TOKENS`) does not fail the
+request. The router sets a node aside, runs the prefill there as a copy of the
+request limited to one token (`max_tokens=1`, `stream=false`), then sends the
+original through ordinary routing over the remaining nodes. The client never
+sees the refusal. Both carry `vllm_xargs.weka_prefill=1`, which the engine
+never refuses, so a rejection cannot loop; if the shared KV tier lagged the
+prefill, the decode node recomputes the rest. With the flag off the `400`
+reaches the client unchanged.
+
+A node is `decode` (normal), `draining` (no new decode routing; its running
+requests finish, and prefill jobs queue behind them), `prefill` (jobs only), and
+back to `decode` once it has had no prefill work for `--prefill-release-idle`.
+The prefill node is chosen like any other routing decision — the same flow, over
+the prefill nodes with room — where room is `--prefill-node-budget-tokens` of
+queued plus in-flight prefill. When none has room a decode node is drained, up
+to `floor(nodes * --prefill-max-fleet-fraction)` and always leaving one decode
+node; past that, jobs queue on the least-loaded prefill node, and with no
+prefill node at all the request is resent to the backend that refused it, with
+the bypass. It needs a KV tier the nodes share; without one the prefill is
+wasted work.
+
 `--rebalance-ratio` is **off by default**. Set to `0.5` it makes a backend
 carrying more than twice the fleet minimum stop taking new work, so the idle
 capacity beside it gets used — but that trades locality for evenness, and a
@@ -715,6 +739,12 @@ So alert on all three:
 | `router_retries_total{reason="capacity_saturated"}` | waits caused by every backend being full. The transient fallback cannot apply here — there was no candidate — so waiting is the only move |
 | `router_retries_total{reason="capacity_guard_blocked"}` | waits caused by the split guard. The fallback is tried BEFORE this error is returned, so a count here with `overflows_total` at zero means the threshold is too tight or off — not that the router waited instead of falling back |
 | `router_retry_wait_seconds` | latency `--retry-time-limit` added, **per request** — `_count{outcome="satisfied"}` is how many requests the waiting rescued, `{outcome="expired"}` how many spent the budget and got a 429 anyway, and the quantiles what it cost. Spans the first refusal to the *start* of the attempt that ended the wait, so it excludes that attempt's service time and stays bounded by the budget in every outcome — quantiles are comparable across them. End-to-end cost is `router_request_duration_seconds`. `retries_total` counts *attempts*, so it answers neither |
+| `router_prefill_rejections_total` | `large_prefill_rejected` answers the router absorbed (`--prefill-split` only, like the rest of this family) |
+| `router_prefill_jobs_total{outcome}` | prefill jobs, `ok` or `failed`; a failed job still sends the request on with the bypass |
+| `router_prefill_conversions_total` / `router_prefill_releases_total` | decode nodes taken out for prefill, and returned after `--prefill-release-idle` |
+| `router_prefill_bypass_fallbacks_total{reason}` | requests served with the bypass and no prefill: `no_node` (none could be added) or `job_failed` |
+| `router_prefill_nodes{mode}` / `router_prefill_node_mode{backend}` | backends per mode, and each backend's mode (0 decode, 1 draining, 2 prefill) |
+| `router_prefill_pending_tokens{backend}` | queued plus in-flight prefill tokens on a backend, the quantity `--prefill-node-budget-tokens` bounds |
 | `router_vllm_metrics_endpoints` | upstream endpoints `asked` vs `contributing` on the last aggregation cycle. Catches a backend that is **in the pool and unscrapeable** — hung vLLM, partition, present-but-unready — which is otherwise invisible in flat `vllm:` totals. It does **not** catch a backend leaving: `asked` tracks the live set, so a deleted pod drops both labels together and the ratio still reads 1.0. Use `router_backends_total` for that, and alert on `asked == 0` separately |
 | `router_stream_aborted_total{reason="upstream_error"}` | streams the BACKEND stopped sending before the terminal marker. Feeds the circuit breaker, so a backend truncating responses is ejected rather than counted healthy |
 | `router_stream_aborted_total{reason="client_disconnect"}` | streams the CALLER abandoned. Does **not** count against the backend — on a saturated fleet callers give up constantly, and blaming them would eject healthy backends exactly when losing one costs most |

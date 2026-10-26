@@ -135,6 +135,13 @@ type Config struct {
 	// segregation can work at all.
 	Tier *Tier
 
+	// PrefillRejectTokens, when > 0, makes the server refuse a request whose
+	// recompute (prompt tokens neither in the local cache nor in the shared
+	// tier) exceeds it, with HTTP 400 type large_prefill_rejected and the
+	// recompute count in param — the engine's WEKA_PREFILL_REJECT_TOKENS. A
+	// request carrying vllm_xargs.weka_prefill is never refused. 0 is off.
+	PrefillRejectTokens int
+
 	// DefaultMaxTokens is the completion length used when a request omits
 	// max_tokens (or sends <= 0).
 	DefaultMaxTokens int
@@ -211,6 +218,9 @@ func (c Config) blockSizeBytes() int {
 	}
 	return n
 }
+
+// LargePrefillRejectedType is the error type of a refused heavy prefill.
+const LargePrefillRejectedType = "large_prefill_rejected"
 
 // Engine holds one server's live cache model, admission state, and counters.
 // Safe for concurrent use.
@@ -325,6 +335,23 @@ func (e *Engine) Admit(units []kvcache.Unit) (release func(), res Residency, ok 
 		e.trie.Unpin(pin)
 		e.inflight.Add(-1)
 	}, res, true
+}
+
+// RejectsPrefill reports whether a request must be refused for recomputing too
+// much, and how many tokens it would recompute. It reads the cache without
+// recording the request, so a refusal leaves no trace in it.
+func (e *Engine) RejectsPrefill(units []kvcache.Unit, bypass bool) (tokens int, reject bool) {
+	if e.cfg.PrefillRejectTokens <= 0 || bypass {
+		return 0, false
+	}
+	cached, total := e.trie.Query(units)
+	if e.cfg.Tier != nil {
+		if shared := e.cfg.Tier.Query(units); shared > cached {
+			cached = shared
+		}
+	}
+	tokens = max(total-cached, 0)
+	return tokens, tokens > e.cfg.PrefillRejectTokens
 }
 
 // PublishToTier writes this request's blocks out to the fleet-shared tier, so

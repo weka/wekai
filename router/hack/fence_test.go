@@ -243,11 +243,11 @@ func TestNoDeadMetrics(t *testing.T) {
 	// emitted — but only while ForPool is itself reachable from outside, which
 	// is checked first. A collector named nowhere at all, ForPool included,
 	// still fails.
-	resolver := string(src)[strings.Index(string(src), "func ForPool("):]
-	if end := strings.Index(resolver, "\n}"); end > 0 {
-		resolver = resolver[:end]
-	}
-	resolverUsed := false
+	//
+	// ForPrefill is the same indirection for the prefill split's collectors,
+	// and is held to the same condition.
+	resolver := funcBody(string(src), "func ForPool(") + funcBody(string(src), "func ForPrefill(")
+	resolverUsed, prefillResolverUsed := false, false
 	for _, rel := range goFiles(t, root, false) {
 		if strings.HasPrefix(filepath.ToSlash(rel), "internal/metrics/") {
 			continue
@@ -256,13 +256,14 @@ func TestNoDeadMetrics(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(string(b), "metrics.ForPool") {
-			resolverUsed = true
-			break
-		}
+		resolverUsed = resolverUsed || strings.Contains(string(b), "metrics.ForPool")
+		prefillResolverUsed = prefillResolverUsed || strings.Contains(string(b), "metrics.ForPrefill")
 	}
 	if !resolverUsed {
 		t.Error("metrics.ForPool is never called, so every per-pool collector is dead")
+	}
+	if !prefillResolverUsed {
+		t.Error("metrics.ForPrefill is never called, so every prefill-split collector is dead")
 	}
 
 	for _, name := range declared {
@@ -288,6 +289,19 @@ func TestNoDeadMetrics(t *testing.T) {
 				"read as a flat zero forever, which is worse than absent", name)
 		}
 	}
+}
+
+// funcBody returns the source from a function's signature to its closing brace.
+func funcBody(src, sig string) string {
+	i := strings.Index(src, sig)
+	if i < 0 {
+		return ""
+	}
+	body := src[i:]
+	if end := strings.Index(body, "\n}"); end > 0 {
+		body = body[:end]
+	}
+	return body
 }
 
 // TestCoreDoesNotImportDialects enforces API-1.
