@@ -172,7 +172,7 @@ func parseSpan(name, v string) (time.Duration, error) {
 
 // datasetDurationBuckets split slot time by the length of the session holding
 // the slot: the share above a day is what a one-day run cannot have settled.
-var datasetDurationBuckets = []time.Duration{time.Hour, 6 * time.Hour, 24 * time.Hour, 3 * 24 * time.Hour, 7 * 24 * time.Hour}
+var datasetDurationBuckets = benchmark.DatasetLifeBounds
 
 type datasetBucket struct {
 	Label       string  `json:"label"`
@@ -449,10 +449,33 @@ func (c *RouterAnalyzeDatasetCommand) printText(rep datasetReport, reportEvery, 
 		}
 		fmt.Fprintf(&b, "%8s %4d %6d %9.1f %10s %9s %8.0f%% %9s\n", fmtSpan(s.At), s.Lap, s.Slots, s.Inflight, fmtTok(float64(s.Dataset)), fmtTok(per), 100*float64(s.Dataset)/rep.PlateauData, fmtSpan(s.MeanAge))
 	}
+	b.WriteString("\nLive slots by the life of the session they hold: % of slots (% of dataset); busy = slots with a request in flight\n")
+	fmt.Fprintf(&b, "%8s", "t")
+	for _, bk := range rep.Buckets {
+		fmt.Fprintf(&b, " %13s", bk.Label)
+	}
+	fmt.Fprintf(&b, " %7s\n", "busy")
+	for i := step - 1; i < len(rep.Samples); i += step {
+		s := rep.Samples[i]
+		fmt.Fprintf(&b, "%8s", fmtSpan(s.At))
+		busy := 0
+		for _, l := range s.ByLife {
+			fmt.Fprintf(&b, " %5.1f%% (%3.0f%%)", pctOf(l.Slots, s.Slots), 100*float64(l.Dataset)/math.Max(1, float64(s.Dataset)))
+			busy += l.Busy
+		}
+		fmt.Fprintf(&b, " %6.1f%%\n", pctOf(busy, s.Slots))
+	}
 	fmt.Fprintf(&b, "\nPlateau (mean of the last quarter of %s): %.0f slots, dataset %s\n", fmtSpan(rep.Samples[len(rep.Samples)-1].At), rep.PlateauSlots, fmtTok(rep.PlateauData))
 	fmt.Fprintf(&b, "Dataset reaches (6h mean) 50%% at %s, 75%% at %s, 90%% at %s of the plateau.\n",
 		fmtSpan(rep.Reach["50%"]), fmtSpan(rep.Reach["75%"]), fmtSpan(rep.Reach["90%"]))
 	fmt.Fprintf(&b, "Settled within ±%.0f%% (6h mean, to the end of the horizon): dataset %s, slots %s, per-slot %s.\n",
 		c.Tolerance*100, fmtSpan(rep.Settle["dataset"]), fmtSpan(rep.Settle["slots"]), fmtSpan(rep.Settle["per_slot"]))
 	fmt.Print(b.String())
+}
+
+func pctOf(a, b int) float64 {
+	if b == 0 {
+		return 0
+	}
+	return 100 * float64(a) / float64(b)
 }

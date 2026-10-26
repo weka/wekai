@@ -178,6 +178,30 @@ type DatasetSample struct {
 	Lap      int     // 0-based lap of the session last dispatched
 	// MeanAge is the mean age of the live slots' sessions.
 	MeanAge time.Duration
+	// ByLife splits the live slots by the total life of the session they
+	// hold, at DatasetLifeBounds.
+	ByLife []DatasetLifeShare
+}
+
+// DatasetLifeBounds are the session-life bucket edges for ByLife: a slot
+// holding a session that lives past a day is load a one-day run never sheds.
+var DatasetLifeBounds = []time.Duration{time.Hour, 6 * time.Hour, 24 * time.Hour, 3 * 24 * time.Hour, 7 * 24 * time.Hour}
+
+// DatasetLifeShare is one session-life bucket of a sample.
+type DatasetLifeShare struct {
+	Slots   int   // live slots holding a session of this life
+	Busy    int   // of those, with a request in flight
+	Dataset int64 // their tracked prompts
+}
+
+func lifeBucket(ms int64) int {
+	d := time.Duration(ms) * time.Millisecond
+	for i, b := range DatasetLifeBounds {
+		if d < b {
+			return i
+		}
+	}
+	return len(DatasetLifeBounds)
 }
 
 type datasetEvent struct {
@@ -207,13 +231,14 @@ func (h *datasetEventHeap) Pop() any {
 // datasetSlot walks one session's requests: starts at their StartMs, ends at
 // their EndMs, both offset by the slot's base time.
 type datasetSlot struct {
-	sess    *DatasetSession
-	base    int64
-	starts  int // next request to start (Requests order)
-	ends    []DatasetRequest
-	endPos  int
-	tracked int64
-	live    bool
+	sess     *DatasetSession
+	base     int64
+	starts   int // next request to start (Requests order)
+	ends     []DatasetRequest
+	endPos   int
+	tracked  int64
+	inflight int
+	live     bool
 }
 
 func (sl *datasetSlot) nextAt() int64 {
@@ -349,12 +374,14 @@ func SimulateDataset(sessions []DatasetSession, cfg DatasetSimConfig) ([]Dataset
 				r := sl.ends[sl.endPos]
 				sl.endPos++
 				inflight--
+				sl.inflight--
 				dataset += r.Prompt - sl.tracked
 				sl.tracked = r.Prompt
 			}
 			for sl.starts < len(sl.sess.Requests) && sl.sess.Requests[sl.starts].StartMs <= rel {
 				sl.starts++
 				inflight++
+				sl.inflight++
 			}
 			if sl.starts >= len(sl.sess.Requests) && sl.endPos >= len(sl.ends) && rel >= sl.sess.DurationMs {
 				dataset -= sl.tracked
@@ -414,8 +441,15 @@ func SimulateDataset(sessions []DatasetSession, cfg DatasetSimConfig) ([]Dataset
 		if t == nextSample {
 			s := DatasetSample{At: time.Duration(t) * time.Millisecond, Inflight: sArea / float64(sampleMs), Dataset: dataset, Started: started, Lap: lap}
 			var age int64
+			s.ByLife = make([]DatasetLifeShare, len(DatasetLifeBounds)+1)
 			for _, sl := range slots {
 				if sl.live {
+					b := &s.ByLife[lifeBucket(sl.sess.DurationMs)]
+					b.Slots++
+					b.Dataset += sl.tracked
+					if sl.inflight > 0 {
+						b.Busy++
+					}
 					s.Slots++
 					age += now - sl.base
 					if sl.tracked > 0 {
