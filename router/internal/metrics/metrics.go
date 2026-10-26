@@ -471,6 +471,49 @@ var (
 		Help: "Times a backend was excluded from candidate selection for being at or above --max-node-concurrency.",
 	}, []string{"backend"})
 
+	// Prefill split (--prefill-split). Per pool, and registered whether or not
+	// the feature is on; series appear only for a pool that has it enabled, so
+	// absence means "off" rather than "never happened".
+	PrefillRejections = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_prefill_rejections_total",
+		Help: "Backend 400 large_prefill_rejected responses the router absorbed instead of passing to the client.",
+	}, []string{"pool"})
+
+	PrefillJobs = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_prefill_jobs_total",
+		Help: "Prefill jobs run on a prefill node, by outcome: ok or failed.",
+	}, []string{"pool", "outcome"})
+
+	PrefillConversions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_prefill_conversions_total",
+		Help: "Decode nodes taken out of decode routing to become prefill nodes.",
+	}, []string{"pool"})
+
+	PrefillReleases = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_prefill_releases_total",
+		Help: "Prefill nodes returned to decode after going idle.",
+	}, []string{"pool"})
+
+	PrefillBypassFallbacks = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_prefill_bypass_fallbacks_total",
+		Help: "Rejected requests served with the bypass flag and no usable prefill: no_node (none could be added) or job_failed (the prefill job did not succeed).",
+	}, []string{"pool", "reason"})
+
+	PrefillNodes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "router_prefill_nodes",
+		Help: "Backends by prefill-split mode: decode, draining or prefill.",
+	}, []string{"pool", "mode"})
+
+	PrefillNodeMode = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "router_prefill_node_mode",
+		Help: "Prefill-split mode per backend: 0 decode, 1 draining, 2 prefill.",
+	}, []string{"pool", "backend"})
+
+	PrefillPendingTokens = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "router_prefill_pending_tokens",
+		Help: "Prefill tokens queued or in flight on a backend, the quantity --prefill-node-budget-tokens bounds.",
+	}, []string{"pool", "backend"})
+
 	// Discovery.
 	DiscoveryConflicts = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_discovery_conflicts_total",
@@ -512,6 +555,8 @@ func All() []prometheus.Collector {
 		CacheShallowAnchors, CacheShallowAnchorBlocks, CacheGuardRejects, SignalFired,
 		CachePoolSize, CacheTreeRuns, CacheTailSet, CacheBlocksExpired, VLLMMetricsEndpoints,
 		RequestsShed, SaturationRejects, BackendCapExceeded, observedShadow,
+		PrefillRejections, PrefillJobs, PrefillConversions, PrefillReleases,
+		PrefillBypassFallbacks, PrefillNodes, PrefillNodeMode, PrefillPendingTokens,
 	}
 }
 
@@ -726,3 +771,65 @@ func (m *PoolMetrics) Decision(tier string) { m.decisions.WithLabelValues(tier).
 
 // Signal counts one signal judging a backend unable to take more work.
 func (m *PoolMetrics) Signal(name string) { m.signals.WithLabelValues(name).Inc() }
+
+// PrefillModes is the closed enum of prefill-split node modes, in the order of
+// router_prefill_node_mode's values.
+var PrefillModes = []string{"decode", "draining", "prefill"}
+
+// PrefillMetrics is one pool's prefill-split collectors, resolved once.
+type PrefillMetrics struct {
+	pool string
+
+	// Per-backend gauges, with the pool label already applied.
+	nodeMode *prometheus.GaugeVec
+	pending  *prometheus.GaugeVec
+
+	Rejections      prometheus.Counter
+	JobsOK          prometheus.Counter
+	JobsFailed      prometheus.Counter
+	Conversions     prometheus.Counter
+	Releases        prometheus.Counter
+	FallbackNoNode  prometheus.Counter
+	FallbackJobFail prometheus.Counter
+}
+
+// ForPrefill resolves the prefill-split collectors for a pool, creating every
+// closed-enum series at 0.
+func ForPrefill(pool string) *PrefillMetrics {
+	for _, m := range PrefillModes {
+		PrefillNodes.WithLabelValues(pool, m)
+	}
+	lbl := prometheus.Labels{"pool": pool}
+	return &PrefillMetrics{
+		pool:            pool,
+		nodeMode:        PrefillNodeMode.MustCurryWith(lbl),
+		pending:         PrefillPendingTokens.MustCurryWith(lbl),
+		Rejections:      PrefillRejections.WithLabelValues(pool),
+		JobsOK:          PrefillJobs.WithLabelValues(pool, "ok"),
+		JobsFailed:      PrefillJobs.WithLabelValues(pool, "failed"),
+		Conversions:     PrefillConversions.WithLabelValues(pool),
+		Releases:        PrefillReleases.WithLabelValues(pool),
+		FallbackNoNode:  PrefillBypassFallbacks.WithLabelValues(pool, "no_node"),
+		FallbackJobFail: PrefillBypassFallbacks.WithLabelValues(pool, "job_failed"),
+	}
+}
+
+// SetNode publishes one backend's mode (an index into PrefillModes) and its
+// pending prefill tokens.
+func (m *PrefillMetrics) SetNode(backend string, mode int, pending int64) {
+	m.nodeMode.WithLabelValues(backend).Set(float64(mode))
+	m.pending.WithLabelValues(backend).Set(float64(pending))
+}
+
+// DropNode removes a departed backend's series.
+func (m *PrefillMetrics) DropNode(backend string) {
+	m.nodeMode.DeleteLabelValues(backend)
+	m.pending.DeleteLabelValues(backend)
+}
+
+// SetModeCounts publishes how many backends are in each mode.
+func (m *PrefillMetrics) SetModeCounts(counts [3]int) {
+	for i, n := range counts {
+		PrefillNodes.WithLabelValues(m.pool, PrefillModes[i]).Set(float64(n))
+	}
+}

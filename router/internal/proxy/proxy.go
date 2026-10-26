@@ -58,6 +58,7 @@ import (
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/obs"
 	"github.com/weka/wekai/router/internal/policy"
+	"github.com/weka/wekai/router/internal/prefill"
 	"github.com/weka/wekai/router/internal/registry"
 )
 
@@ -147,7 +148,38 @@ type Result struct {
 	// Committed is true once any byte reached the client, after which retry is
 	// forbidden regardless of what went wrong (REL-3, STR-9).
 	Committed bool
+	// PrefillRejected is true when the backend refused the request as a large
+	// prefill and the caller armed capture with WithRejectCapture. Nothing was
+	// written to the client; PrefillTokens is the recompute the engine named,
+	// 0 when it named none.
+	PrefillRejected bool
+	PrefillTokens   int64
 }
+
+type rejectCaptureKey struct{}
+
+// WithRejectCapture arms the request's attempts to absorb a large-prefill
+// rejection: instead of relaying the 400 to the client, Serve returns with
+// Result.PrefillRejected set so the caller can place the prefill elsewhere.
+func WithRejectCapture(ctx context.Context) context.Context {
+	return context.WithValue(ctx, rejectCaptureKey{}, true)
+}
+
+// WithoutRejectCapture disarms it again, for the requests the router itself
+// sends after absorbing a rejection: a refusal there is the engine
+// misbehaving, and must reach the caller rather than start another round.
+func WithoutRejectCapture(ctx context.Context) context.Context {
+	return context.WithValue(ctx, rejectCaptureKey{}, false)
+}
+
+func capturesRejection(ctx context.Context) bool {
+	v, _ := ctx.Value(rejectCaptureKey{}).(bool)
+	return v
+}
+
+// maxRejectionBody bounds how much of a 400 is read to recognise a rejection;
+// the engine's is a few hundred bytes.
+const maxRejectionBody = 64 << 10
 
 var errNoBackend = errors.New("proxy: no backend accepted the request")
 
@@ -155,6 +187,9 @@ var errNoBackend = errors.New("proxy: no backend accepted the request")
 // response instead of copying it to the client, so another backend can be tried.
 // It never reaches the client.
 var errRetryable = errors.New("proxy: retryable upstream response")
+
+// errPrefillRejected does the same for an absorbed large-prefill rejection.
+var errPrefillRejected = errors.New("proxy: large prefill rejected")
 
 // Selector picks a backend from a candidate set.
 type Selector interface {
@@ -270,6 +305,10 @@ func (p *Proxy) Serve(
 		}
 
 		res.Status, res.Err, res.Committed = out.status, out.err, committed
+		if out.rejected {
+			res.PrefillRejected, res.PrefillTokens = true, out.rejectedTokens
+			return res
+		}
 
 		// A refusal does not spend the failure budget: the backend is healthy,
 		// it is full, and walking this prefix's remaining holders is the
@@ -341,6 +380,9 @@ type attemptOut struct {
 	status    int
 	err       error
 	retryable bool
+	// rejected and rejectedTokens report an absorbed large-prefill rejection.
+	rejected       bool
+	rejectedTokens int64
 }
 
 // runAttempt pairs do's outcome with Record exactly once, whether do returns
@@ -422,6 +464,9 @@ func (p *Proxy) attempt(
 	var upstreamStatus int
 	var upstreamErr error
 	var rejectedForRetry bool
+	var prefillRejected bool
+	var prefillTokens int64
+	captureRejection := capturesRejection(r.Context())
 	// Hoisted out of the response hook so the caller can ask, after the copy,
 	// whether the stream ended cleanly.
 	var sb *scanBody
@@ -498,6 +543,17 @@ func (p *Proxy) attempt(
 		if outcome != nil {
 			outcome(b, resp.StatusCode)
 		}
+		if captureRejection && resp.StatusCode == http.StatusBadRequest {
+			data, _ := io.ReadAll(io.LimitReader(resp.Body, maxRejectionBody))
+			if n, ok := prefill.ParseRejection(data); ok {
+				_ = resp.Body.Close()
+				prefillRejected, prefillTokens = true, n
+				return errPrefillRejected
+			}
+			// Not a rejection: put back what was read, followed by whatever
+			// the limit left unread.
+			resp.Body = &replayBody{Reader: io.MultiReader(bytes.NewReader(data), resp.Body), Closer: resp.Body}
+		}
 		if canRetry && !*committed && isRetryable(resp.StatusCode, nil) {
 			// Returning an error makes ReverseProxy close the upstream body and
 			// call ErrorHandler INSTEAD of copying the response. That is what
@@ -535,7 +591,7 @@ func (p *Proxy) attempt(
 		// Deliberately writes nothing: the caller renders the dialect's error
 		// envelope, and writing here would both bypass that and commit the
 		// response, foreclosing a retry (API-9, REL-3).
-		if !errors.Is(e, errRetryable) {
+		if !errors.Is(e, errRetryable) && !errors.Is(e, errPrefillRejected) {
 			upstreamErr = e
 		}
 	}
@@ -550,9 +606,16 @@ func (p *Proxy) attempt(
 		upstreamErr = sb.aborted
 	}
 
-	out := attemptOut{status: upstreamStatus, err: upstreamErr}
+	out := attemptOut{status: upstreamStatus, err: upstreamErr,
+		rejected: prefillRejected, rejectedTokens: prefillTokens}
 	out.retryable = (rejectedForRetry || isRetryable(upstreamStatus, upstreamErr)) && !*committed
 	return out
+}
+
+// replayBody is a response body with an already-read prefix put back.
+type replayBody struct {
+	io.Reader
+	io.Closer
 }
 
 // isRetryable is deliberately narrower than v1's set.

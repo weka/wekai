@@ -38,6 +38,7 @@ import (
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/policy/affinity"
 	"github.com/weka/wekai/router/internal/pool"
+	"github.com/weka/wekai/router/internal/prefill"
 	"github.com/weka/wekai/router/internal/proxy"
 	"github.com/weka/wekai/router/internal/registry"
 	"github.com/weka/wekai/router/internal/routing"
@@ -142,6 +143,19 @@ type Options struct {
 	// off.
 	SoftNodeConcurrency int64
 	RebalanceRatio      float64
+	// PrefillSplit moves heavy prefills a backend refuses (HTTP 400
+	// large_prefill_rejected) onto prefill-only nodes the router sets aside
+	// from the fleet. Off by default.
+	PrefillSplit bool
+	// PrefillNodeBudgetTokens bounds the prefill tokens queued plus in flight
+	// on one prefill node.
+	PrefillNodeBudgetTokens int64
+	// PrefillMaxFleetFraction caps the share of a pool that may be prefill
+	// nodes; at least one node always stays in decode.
+	PrefillMaxFleetFraction float64
+	// PrefillReleaseIdle is how long a prefill node goes without work before
+	// it returns to decode.
+	PrefillReleaseIdle time.Duration
 	// AutoModel controls asking a pool what it serves when a route carries no
 	// explicit `as <model>`: "auto" (rewrite only when the pool serves exactly
 	// one model), "force", or "off". Empty means "auto".
@@ -238,6 +252,19 @@ func (o Options) flowConfig() affinity.Config {
 		TransientFallback:   o.TransientFallback,
 		TailTTL:             o.TailTTL,
 		RefusalTTL:          o.RefusalTTL,
+	}
+}
+
+// prefillConfig is nil with the split off, which is what leaves a backend's
+// large-prefill refusal reaching the caller unchanged.
+func (o Options) prefillConfig() *prefill.Config {
+	if !o.PrefillSplit {
+		return nil
+	}
+	return &prefill.Config{
+		NodeBudgetTokens: o.PrefillNodeBudgetTokens,
+		MaxFleetFraction: o.PrefillMaxFleetFraction,
+		ReleaseIdle:      o.PrefillReleaseIdle,
 	}
 }
 
@@ -405,6 +432,7 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			DefaultCapacity: 1,
 			DefaultDialect:  d.ID(),
 			DrainDeadline:   opts.DrainDeadline,
+			PrefillSplit:    opts.prefillConfig(),
 		}, clk, log)
 		if err != nil {
 			return nil, err
@@ -718,8 +746,41 @@ func vizData(pools []*pool.Pool) http.HandlerFunc {
 			}
 			p = got
 		}
-		viz.DataHandler(p.Flow)(w, r)
+		var src viz.DataSource = p.Flow
+		if p.Split != nil {
+			src = splitSource{inner: p.Flow, m: p.Split}
+		}
+		viz.DataHandler(src)(w, r)
 	}
+}
+
+// splitSource adds the prefill split's node modes and counters to the KV map.
+type splitSource struct {
+	inner viz.DataSource
+	m     *prefill.Manager
+}
+
+func (s splitSource) Snapshot(opts viz.SnapshotOptions) viz.Snapshot {
+	snap := s.inner.Snapshot(opts)
+	st := s.m.State()
+	byURL := make(map[string]prefill.NodeState, len(st.Nodes))
+	for _, n := range st.Nodes {
+		byURL[n.URL] = n
+	}
+	for i := range snap.Backends {
+		n, ok := byURL[snap.Backends[i].URL]
+		snap.Backends[i].Mode = prefill.Decode.String()
+		if ok {
+			snap.Backends[i].Mode = n.Mode
+			snap.Backends[i].PendingPrefillTokens = n.PendingTokens
+		}
+	}
+	snap.Prefill = &viz.PrefillSplit{
+		NodeBudgetTokens: st.NodeBudgetTokens, MaxFleetFraction: st.MaxFleetFraction,
+		Rejections: st.Rejections, Jobs: st.Jobs, JobsFailed: st.JobsFailed,
+		Conversions: st.Conversions, Releases: st.Releases, BypassFallbacks: st.BypassFallbacks,
+	}
+	return snap
 }
 
 // isRedundantV1 reports whether a backend URL's path is exactly "/v1" — the

@@ -64,6 +64,11 @@ type chatCompletionRequest struct {
 	StreamOptions *streamOptions  `json:"stream_options"`
 	MaxTokens     int             `json:"max_tokens"`
 	Tools         json.RawMessage `json:"tools"`
+	VLLMXArgs     xargs           `json:"vllm_xargs"`
+}
+
+func (r *chatCompletionRequest) bypassesPrefillReject() bool {
+	return r.VLLMXArgs.bypassesPrefillReject()
 }
 
 // promptBytes builds the canonical byte stream this request's prompt hashes
@@ -103,6 +108,27 @@ type completionRequest struct {
 	Stream        bool            `json:"stream"`
 	StreamOptions *streamOptions  `json:"stream_options"`
 	MaxTokens     int             `json:"max_tokens"`
+	VLLMXArgs     xargs           `json:"vllm_xargs"`
+}
+
+func (r *completionRequest) bypassesPrefillReject() bool {
+	return r.VLLMXArgs.bypassesPrefillReject()
+}
+
+// xargs is the request's vllm_xargs object. weka_prefill is the bypass the
+// router sets on a prefill job and on the decode resubmission after it.
+type xargs map[string]any
+
+func (x xargs) bypassesPrefillReject() bool {
+	switch v := x["weka_prefill"].(type) {
+	case bool:
+		return v
+	case float64:
+		return v != 0
+	case string:
+		return v != "" && v != "0" && v != "false"
+	}
+	return false
 }
 
 func (r *completionRequest) promptText() string {

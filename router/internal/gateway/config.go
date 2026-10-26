@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/weka/wekai/router/internal/clock"
+	"github.com/weka/wekai/router/internal/prefill"
 	"github.com/weka/wekai/router/internal/proxy"
 	"github.com/weka/wekai/router/internal/registry"
 )
@@ -173,6 +174,9 @@ type Target struct {
 	// position to make. See proxy.Relay for what each of them would otherwise
 	// do, and serve.Handler for how a route comes to be one.
 	Transparent bool
+	// Split moves heavy prefills a backend refuses onto prefill-only nodes. Nil
+	// leaves the backend's refusal to reach the caller unchanged.
+	Split *prefill.Manager
 }
 
 // Router maps a request's model to the pool that serves it.

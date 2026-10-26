@@ -83,6 +83,7 @@ func run(args []string) error {
 	cachedInputTPS := fs.Float64("cached-input-tps", 1_000_000, "tokens/sec for CACHED prompt tokens (cache read) — NOT free: only recompute is skipped, a cache hit still costs a KV read")
 	outputTPS := fs.Float64("output-tps", 500, "tokens/sec decode, per request — also paces SSE chunk spacing")
 	outputKVMultiplier := fs.Float64("output-kv-multiplier", 1.0, "models real vLLM writing decode KV into the same pool as prompt KV: on completion, ceil(output_tokens*multiplier/block-size-tokens) blocks are appended to the request's own chain, occupying capacity and evictable like prompt blocks. 0 disables this (outputs stay invisible to the cache, the historical behavior)")
+	prefillRejectTokens := fs.Int("prefill-reject-tokens", 0, "refuse a request whose recompute (prompt tokens in neither the local cache nor the shared tier) exceeds this with HTTP 400 large_prefill_rejected, as the engine's WEKA_PREFILL_REJECT_TOKENS does; a request carrying vllm_xargs.weka_prefill is never refused. 0 = off. Drives the router's --prefill-split offline")
 	externalKVTPS := fs.Float64("external-kv-tps", 0, "tokens/sec for prompt tokens read from a FLEET-SHARED KV tier (LMCache over WEKA), and the switch that creates one: 0 (the default) gives independent per-instance caches, where prefilling on one instance does nothing for another. Set it and every instance in this process reads and writes one shared trie, so a block computed anywhere is loadable everywhere at this rate — between --cached-input-tps (local HBM) and --cold-input-tps (recompute). This is what the router's --prefill-split depends on, and turning it off is how you measure that dependency")
 	logLevel := fs.String("log-level", "info", "debug, info, warn, or error")
 	surface := fs.String("surface", "vllm", "which HTTP surface to expose: 'vllm' (OpenAI routes + /health + /metrics), "+
@@ -114,19 +115,20 @@ func run(args []string) error {
 	}
 
 	cfg := mockvllm.Config{
-		ModelID:            *modelID,
-		Tier:               tier,
-		ExternalInputTPS:   *externalKVTPS,
-		BlockSizeTokens:    *blockSizeTokens,
-		CharsPerToken:      *charsPerToken,
-		BlockCapacity:      *blockCapacity,
-		MaxConcurrency:     *maxConcurrency,
-		BaseLatency:        *baseLatency,
-		ColdInputTPS:       *coldInputTPS,
-		CachedInputTPS:     *cachedInputTPS,
-		OutputTPS:          *outputTPS,
-		OutputKVMultiplier: *outputKVMultiplier,
-		DefaultMaxTokens:   *defaultMaxTokens,
+		ModelID:             *modelID,
+		Tier:                tier,
+		ExternalInputTPS:    *externalKVTPS,
+		BlockSizeTokens:     *blockSizeTokens,
+		CharsPerToken:       *charsPerToken,
+		BlockCapacity:       *blockCapacity,
+		MaxConcurrency:      *maxConcurrency,
+		PrefillRejectTokens: *prefillRejectTokens,
+		BaseLatency:         *baseLatency,
+		ColdInputTPS:        *coldInputTPS,
+		CachedInputTPS:      *cachedInputTPS,
+		OutputTPS:           *outputTPS,
+		OutputKVMultiplier:  *outputKVMultiplier,
+		DefaultMaxTokens:    *defaultMaxTokens,
 	}
 
 	// -instances <= 1 (the default) uses -port exactly as before; only

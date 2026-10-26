@@ -75,6 +75,9 @@ type Snapshot struct {
 	// same content across many backends.
 	AvgCopies float64 `json:"avg_copies"`
 
+	// Prefill reports the prefill split, when it is on.
+	Prefill *PrefillSplit `json:"prefill,omitempty"`
+
 	// NodesShown/NodesTotal/Truncated report how much of the fleet's true
 	// tree this snapshot actually renders — capping never happens silently
 	// (Truncated=true means NodesShown < NodesTotal).
@@ -124,6 +127,24 @@ type BackendMeta struct {
 	// may exceed what the (possibly capped) Tree shows for it.
 	Nodes  int64 `json:"nodes"`
 	Tokens int64 `json:"tokens"`
+	// Mode is the backend's prefill-split role (decode, draining or prefill)
+	// and PendingPrefillTokens its queued plus in-flight prefill work. Both
+	// are absent when the split is off.
+	Mode                 string `json:"mode,omitempty"`
+	PendingPrefillTokens int64  `json:"pending_prefill_tokens,omitempty"`
+}
+
+// PrefillSplit is the prefill split's fleet-level state: its limits and
+// lifetime counters. Nil in a Snapshot when the split is off.
+type PrefillSplit struct {
+	NodeBudgetTokens int64   `json:"node_budget_tokens"`
+	MaxFleetFraction float64 `json:"max_fleet_fraction"`
+	Rejections       uint64  `json:"rejections"`
+	Jobs             uint64  `json:"jobs"`
+	JobsFailed       uint64  `json:"jobs_failed"`
+	Conversions      uint64  `json:"conversions"`
+	Releases         uint64  `json:"releases"`
+	BypassFallbacks  uint64  `json:"bypass_fallbacks"`
 }
 
 // MaxParamValue is the hard ceiling an EXPLICITLY given ?limit=/

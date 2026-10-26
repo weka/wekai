@@ -64,6 +64,10 @@ type RouterServeCommand struct {
 	SplitGuard        float64       `long:"cache-split-guard" default:"0.20" description:"A prefix is split onto a backend only while its in-flight is below limit*(1-this). Higher keeps the holder set tighter at the cost of splitting less readily; too low and every backend ends up holding every prefix."`
 	TailTTL           time.Duration `long:"cache-tail-ttl" default:"5m" description:"How long a leaf of the shared prefix tree may go untouched before eviction. Memory pressure only: eviction never removes a run that still has children."`
 	TransientFallback float64       `long:"transient-fallback-threshold" description:"Serve a request the split guard refused on a backend WITHOUT recording it as a holder, while that backend is below ref*(1-this) — the same reference the guard measures against. Must be BELOW --cache-split-guard to do anything, since it is the looser bar: at 0.05 against a guard of 0.20, a backend under 80% of the holders' load takes the prefix and keeps it, one between 80% and 95% serves the request and is forgotten. 0 = off, and the guard's rejection is final."`
+	PrefillSplit      bool          `long:"prefill-split" description:"Move heavy prefills off decode nodes. When a backend refuses a request with HTTP 400 large_prefill_rejected (its WEKA_PREFILL_REJECT_TOKENS), the router runs that prefill on a node it has set aside — draining it of decode work first — then sends the request for decode as usual; the client never sees the refusal. Needs a KV tier the nodes share, or the decode node recomputes what the prefill node computed. With this off, the 400 reaches the client unchanged. Off by default."`
+	PrefillBudget     int64         `long:"prefill-node-budget-tokens" default:"4000000" description:"Most prefill tokens queued plus in flight on one prefill node. A job larger than this still runs on an otherwise empty node."`
+	PrefillFraction   float64       `long:"prefill-max-fleet-fraction" default:"0.5" description:"Largest share of a pool that may be draining or prefill nodes: floor(nodes * this), and at least one node always stays in decode."`
+	PrefillIdle       time.Duration `long:"prefill-release-idle" default:"60s" description:"A prefill node with no prefill work for this long returns to decode."`
 	RetryTimeLimit    time.Duration `long:"retry-time-limit" description:"Keep re-deciding a request that no backend can currently take for up to this long before answering 429, backing off 10ms/20ms/50ms/... to 3s with jitter. Applies to CAPACITY refusals only — every backend saturated, or the split guard declining a duplicate — both of which stop being true the moment any in-flight request completes. A client would retry anyway; this does the waiting where the fleet's state is already known. 0 = off, answer immediately. NOTE this is a per-attempt hold, not a per-request budget: a client that retries a shed request pays it again on every attempt, so the added latency is this value TIMES the attempt count. Measured against a client retrying ~18 times, a 10s setting produced ~190s of added latency before the request finally failed. Also the wait budget for --max-node-concurrency's per-backend queue (see there): this is reused rather than adding a second timeout flag, since both describe the same thing — how long to wait out a capacity refusal before answering 429."`
 	MaxNodeQueueDepth int64         `long:"max-node-concurrency-queue-depth" description:"Overrides the depth of --max-node-concurrency's per-backend wait queue, independent of the concurrency limit itself. 0 (the default) preserves the original behaviour exactly: depth equals --max-node-concurrency's value, one queue slot per concurrency slot. Set a positive number to size the queue independently — e.g. a large value to make it effectively unbounded for a test that wants requests arriving at full capacity to actually wait rather than risk an early 503 from too tight a bound. It is still a bound, not true unlimited queueing: router memory is the reason one exists at all (see --max-node-concurrency). Only meaningful when --max-node-concurrency is also set; with that at 0 the whole signal is inert and this flag is a no-op."`
 	RefusalTTL        time.Duration `long:"cache-refusal-ttl" default:"2s" description:"How long a backend's own 429 keeps it out of its prefixes. Cleared early by any success from it, and by its in-flight dropping below the level it refused at."`
@@ -223,41 +227,45 @@ func (c *RouterServeCommand) Execute(args []string) error {
 	defer stop()
 
 	return serve.Run(ctx, serve.Options{
-		Listen:                c.Listen,
-		MetricsListen:         c.MetricsListen,
-		Routes:                routes,
-		APIKey:                c.APIKey,
-		APIKeyFile:            c.APIKeyFile,
-		CORSOrigins:           c.CORSOrigins,
-		PathAllowlist:         c.PathAllowlist,
-		UserPrefix:            c.UserPrefix,
-		MaxBodyBytes:          c.MaxBodyBytes,
-		MaxConcurrentRequests: c.MaxConcurrent,
-		NodeConcurrency:       c.MaxNodeConc,
-		SoftNodeConcurrency:   c.SoftNodeConc,
-		RebalanceRatio:        c.RebalanceRatio,
-		AutoModel:             c.AutoModel,
-		SplitGuard:            c.SplitGuard,
-		TransientFallback:     c.TransientFallback,
-		RetryTimeLimit:        c.RetryTimeLimit,
-		TailTTL:               c.TailTTL,
-		RefusalTTL:            c.RefusalTTL,
-		MaxNodeQueueDepth:     c.MaxNodeQueueDepth,
-		HealthInterval:        c.HealthInterval,
-		HealthUnhealthy:       c.HealthUnhealthy,
-		HealthTimeout:         c.HealthTimeout,
-		HealthPath:            c.HealthPath,
-		DisableVLLMMetrics:    c.NoVLLMMetrics || c.NoBackendMetrics,
-		VLLMMetricsInterval:   c.metricsInterval(),
-		VLLMMetricsNames:      append(append([]string(nil), c.VLLMMetricsNames...), c.BackendMetricsNames...),
-		MaxAttempts:           c.MaxAttempts,
-		RequestTimeout:        c.RequestTimeout,
-		IdleTimeout:           c.IdleTimeout,
-		UpstreamCredential:    c.UpstreamCred,
-		DrainDeadline:         c.DrainTimeout,
-		Capture:               hook,
-		LogLevel:              c.LogLevel,
-		LogFormat:             c.LogFormat,
+		Listen:                  c.Listen,
+		MetricsListen:           c.MetricsListen,
+		Routes:                  routes,
+		APIKey:                  c.APIKey,
+		APIKeyFile:              c.APIKeyFile,
+		CORSOrigins:             c.CORSOrigins,
+		PathAllowlist:           c.PathAllowlist,
+		UserPrefix:              c.UserPrefix,
+		MaxBodyBytes:            c.MaxBodyBytes,
+		MaxConcurrentRequests:   c.MaxConcurrent,
+		NodeConcurrency:         c.MaxNodeConc,
+		SoftNodeConcurrency:     c.SoftNodeConc,
+		RebalanceRatio:          c.RebalanceRatio,
+		PrefillSplit:            c.PrefillSplit,
+		PrefillNodeBudgetTokens: c.PrefillBudget,
+		PrefillMaxFleetFraction: c.PrefillFraction,
+		PrefillReleaseIdle:      c.PrefillIdle,
+		AutoModel:               c.AutoModel,
+		SplitGuard:              c.SplitGuard,
+		TransientFallback:       c.TransientFallback,
+		RetryTimeLimit:          c.RetryTimeLimit,
+		TailTTL:                 c.TailTTL,
+		RefusalTTL:              c.RefusalTTL,
+		MaxNodeQueueDepth:       c.MaxNodeQueueDepth,
+		HealthInterval:          c.HealthInterval,
+		HealthUnhealthy:         c.HealthUnhealthy,
+		HealthTimeout:           c.HealthTimeout,
+		HealthPath:              c.HealthPath,
+		DisableVLLMMetrics:      c.NoVLLMMetrics || c.NoBackendMetrics,
+		VLLMMetricsInterval:     c.metricsInterval(),
+		VLLMMetricsNames:        append(append([]string(nil), c.VLLMMetricsNames...), c.BackendMetricsNames...),
+		MaxAttempts:             c.MaxAttempts,
+		RequestTimeout:          c.RequestTimeout,
+		IdleTimeout:             c.IdleTimeout,
+		UpstreamCredential:      c.UpstreamCred,
+		DrainDeadline:           c.DrainTimeout,
+		Capture:                 hook,
+		LogLevel:                c.LogLevel,
+		LogFormat:               c.LogFormat,
 	})
 }
 

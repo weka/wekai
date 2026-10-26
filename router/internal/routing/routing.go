@@ -137,6 +137,7 @@ func (r Rule) target() gateway.Target {
 		Credential:              r.Credential,
 		ForwardClientCredential: r.ForwardClientCredential,
 		Transparent:             r.Transparent,
+		Split:                   r.Pool.Split,
 	}
 }
 

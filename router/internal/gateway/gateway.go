@@ -21,6 +21,7 @@ import (
 	"github.com/weka/wekai/router/internal/metrics"
 	"github.com/weka/wekai/router/internal/obs"
 	"github.com/weka/wekai/router/internal/policy"
+	"github.com/weka/wekai/router/internal/prefill"
 	"github.com/weka/wekai/router/internal/proxy"
 	"github.com/weka/wekai/router/internal/registry"
 )
@@ -268,7 +269,13 @@ func (s *Server) inferenceHandler(route dialect.Route, affine bool) http.Handler
 				}
 			}
 		}
+		if target.Split != nil && !prefill.HasBypass(body) {
+			r = r.WithContext(proxy.WithRejectCapture(r.Context()))
+		}
 		res := s.serveWithCapacityRetry(w, r, target, rr, body, accepted, outcome, auth)
+		if res.PrefillRejected {
+			res = s.splitAndServe(w, r, target, rr, body, res, accepted, outcome, auth)
+		}
 		if res.Backend != nil {
 			obs.SetBackend(ctx, res.Backend.URL)
 		}
@@ -364,6 +371,18 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, t Target,
 // Filtering reads circuit State() only and never Allow(), so it cannot consume a
 // half-open probe token for a backend it does not select (R2, LB-9).
 func (s *Server) candidates(t Target) []*registry.Backend {
+	cands := s.healthy(t)
+	if t.Split != nil {
+		// Ordinary routing never lands on a node that is draining for, or
+		// running, prefill jobs.
+		cands = t.Split.DecodeNodes(cands)
+	}
+	return cands
+}
+
+// healthy is the pool's backends eligible for any traffic, prefill jobs
+// included.
+func (s *Server) healthy(t Target) []*registry.Backend {
 	snap := t.Registry.Snapshot()
 	cands := make([]*registry.Backend, 0, len(snap.Backends))
 	for _, b := range snap.Backends {
@@ -398,7 +417,7 @@ func (s *Server) handleMergedModels() http.Handler {
 		seen := map[string]bool{}
 
 		for _, t := range s.router.Targets() {
-			cands := s.candidates(t)
+			cands := s.healthy(t)
 			if len(cands) == 0 {
 				continue
 			}
@@ -612,7 +631,7 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	// receive traffic — it sheds with 429, not by going NotReady.
 	n, registered := 0, 0
 	for _, t := range s.router.Targets() {
-		n += len(s.candidates(t))
+		n += len(s.healthy(t))
 		registered += len(t.Registry.Snapshot().Backends)
 	}
 	// Counts and cause, unconditionally: this handler is mounted on the

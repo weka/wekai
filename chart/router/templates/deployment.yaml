@@ -111,6 +111,20 @@ spec:
             - "--retry-time-limit={{ .retryTimeLimit }}"
             {{- end }}
             {{- end }}
+            {{- with .Values.router.prefillSplit }}
+            {{- if .enabled }}
+            - "--prefill-split"
+            {{- if .nodeBudgetTokens }}
+            - "--prefill-node-budget-tokens={{ .nodeBudgetTokens }}"
+            {{- end }}
+            {{- if .maxFleetFraction }}
+            - "--prefill-max-fleet-fraction={{ .maxFleetFraction }}"
+            {{- end }}
+            {{- if .releaseIdle }}
+            - "--prefill-release-idle={{ .releaseIdle }}"
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.router.vllmMetrics.disabled }}
             - "--no-vllm-metrics"
             {{- else }}

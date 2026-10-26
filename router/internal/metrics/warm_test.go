@@ -151,3 +151,22 @@ func labelsOf(m *dto.Metric) map[string]string {
 	}
 	return lbl
 }
+
+// A pool with the prefill split on reports every counter at 0 from the start,
+// so "no heavy request yet" is readable rather than absent.
+func TestPrefillSeriesExistFromConstruction(t *testing.T) {
+	reg := Registry()
+	ForPrefill("p")
+	for name, lbl := range map[string]map[string]string{
+		"router_prefill_rejections_total":       {"pool": "p"},
+		"router_prefill_jobs_total":             {"pool": "p", "outcome": "failed"},
+		"router_prefill_conversions_total":      {"pool": "p"},
+		"router_prefill_releases_total":         {"pool": "p"},
+		"router_prefill_bypass_fallbacks_total": {"pool": "p", "reason": "no_node"},
+		"router_prefill_nodes":                  {"pool": "p", "mode": "draining"},
+	} {
+		if !hasLabels(seriesLabels(t, reg, name), lbl) {
+			t.Errorf("%s%v is absent before any event", name, lbl)
+		}
+	}
+}
