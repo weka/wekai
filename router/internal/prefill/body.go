@@ -3,9 +3,43 @@ package prefill
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"net/http"
 	"regexp"
 	"strconv"
 )
+
+// RejectHeader carries the recompute token count on the engine's refusal, an
+// HTTP 503. The status is not the signal — a 503 is also what an overloaded or
+// restarting backend says — so a refusal is recognised by this header, with the
+// body's error type as the fallback.
+const RejectHeader = "X-Weka-Prefill-Reject"
+
+// maxRejectionBody bounds how much of a 503 is read to recognise a refusal by
+// its body; the engine's is a few hundred bytes.
+const maxRejectionBody = 64 << 10
+
+// RejectionFromResponse recognises the engine's large-prefill refusal in a 503
+// and returns the recompute it names. When it is not a refusal the body is left
+// readable from the start.
+func RejectionFromResponse(resp *http.Response) (tokens int64, ok bool) {
+	if h := resp.Header.Get(RejectHeader); h != "" {
+		n, _ := strconv.ParseInt(h, 10, 64)
+		return max(n, 0), true
+	}
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxRejectionBody))
+	if n, ok := ParseRejection(data); ok {
+		return n, true
+	}
+	resp.Body = &replayBody{Reader: io.MultiReader(bytes.NewReader(data), resp.Body), Closer: resp.Body}
+	return 0, false
+}
+
+// replayBody is a response body with an already-read prefix put back.
+type replayBody struct {
+	io.Reader
+	io.Closer
+}
 
 // BypassKey is the vllm_xargs entry that exempts a request from the engine's
 // large-prefill rejection. The router sets it on a prefill job and on the

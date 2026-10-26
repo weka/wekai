@@ -2,7 +2,10 @@ package prefill
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -143,5 +146,28 @@ func TestParseRejection(t *testing.T) {
 		if tokens != c.tokens || ok != c.ok {
 			t.Errorf("%s: ParseRejection = (%d, %v), want (%d, %v)", c.name, tokens, ok, c.tokens, c.ok)
 		}
+	}
+}
+
+func TestRejectionFromResponse(t *testing.T) {
+	mk := func(h, body string) *http.Response {
+		r := &http.Response{StatusCode: 503, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}
+		if h != "" {
+			r.Header.Set(RejectHeader, h)
+		}
+		return r
+	}
+	if n, ok := RejectionFromResponse(mk("70000", "")); !ok || n != 70000 {
+		t.Errorf("header form = (%d, %v)", n, ok)
+	}
+	if n, ok := RejectionFromResponse(mk("", `{"error":{"type":"large_prefill_rejected","param":"5"}}`)); !ok || n != 5 {
+		t.Errorf("body fallback = (%d, %v)", n, ok)
+	}
+	other := mk("", `{"error":{"type":"overloaded"}}`)
+	if _, ok := RejectionFromResponse(other); ok {
+		t.Error("an ordinary 503 was taken for a rejection")
+	}
+	if b, _ := io.ReadAll(other.Body); string(b) != `{"error":{"type":"overloaded"}}` {
+		t.Errorf("body not restored: %q", b)
 	}
 }

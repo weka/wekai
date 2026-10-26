@@ -103,11 +103,11 @@ router:
   pathAllowlist: []
 
   # Dynamic prefill split. When a backend refuses a request as a heavy prefill
-  # (HTTP 400 large_prefill_rejected, its WEKA_PREFILL_REJECT_TOKENS), the
+  # (HTTP 503 with X-Weka-Prefill-Reject, its WEKA_PREFILL_REJECT_TOKENS), the
   # router runs that prefill on a node it sets aside — draining it of decode
   # work first — then sends the request for decode as usual. The client never
   # sees the refusal. The nodes must share a KV tier, or the decode node
-  # recomputes what the prefill node computed. Off: the 400 reaches the client.
+  # recomputes what the prefill node computed. Off: the 503 reaches the client.
   prefillSplit:
     enabled: false
     # Most prefill tokens queued plus in flight on one prefill node.

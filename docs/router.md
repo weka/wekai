@@ -126,14 +126,15 @@ continuously rather than as relief.
 
 **Heavy prefills move to their own nodes.** With `--prefill-split`, a backend
 that refuses a request because recomputing its prompt would stall the node's
-running decodes (HTTP `400`, error type `large_prefill_rejected`, the recompute
-in `param`; the engine's `WEKA_PREFILL_REJECT_TOKENS`) does not fail the
+running decodes (HTTP `503` carrying `X-Weka-Prefill-Reject: <tokens>`, error type
+`large_prefill_rejected`; it is a routing signal and never counts toward the
+circuit breaker, backend health or 5xx accounting; the engine's `WEKA_PREFILL_REJECT_TOKENS`) does not fail the
 request. The router sets a node aside, runs the prefill there as a copy of the
 request limited to one token (`max_tokens=1`, `stream=false`), then sends the
 original through ordinary routing over the remaining nodes. The client never
 sees the refusal. Both carry `vllm_xargs.weka_prefill=1`, which the engine
 never refuses, so a rejection cannot loop; if the shared KV tier lagged the
-prefill, the decode node recomputes the rest. With the flag off the `400`
+prefill, the decode node recomputes the rest. With the flag off the `503`
 reaches the client unchanged.
 
 A node is `decode` (normal), `draining` (no new decode routing; its running
@@ -739,7 +740,7 @@ So alert on all three:
 | `router_retries_total{reason="capacity_saturated"}` | waits caused by every backend being full. The transient fallback cannot apply here — there was no candidate — so waiting is the only move |
 | `router_retries_total{reason="capacity_guard_blocked"}` | waits caused by the split guard. The fallback is tried BEFORE this error is returned, so a count here with `overflows_total` at zero means the threshold is too tight or off — not that the router waited instead of falling back |
 | `router_retry_wait_seconds` | latency `--retry-time-limit` added, **per request** — `_count{outcome="satisfied"}` is how many requests the waiting rescued, `{outcome="expired"}` how many spent the budget and got a 429 anyway, and the quantiles what it cost. Spans the first refusal to the *start* of the attempt that ended the wait, so it excludes that attempt's service time and stays bounded by the budget in every outcome — quantiles are comparable across them. End-to-end cost is `router_request_duration_seconds`. `retries_total` counts *attempts*, so it answers neither |
-| `router_prefill_rejections_total` | `large_prefill_rejected` answers the router absorbed (`--prefill-split` only, like the rest of this family) |
+| `router_prefill_rejections_total` | `large_prefill_rejected` 503s the router absorbed (`--prefill-split` only, like the rest of this family) |
 | `router_prefill_jobs_total{outcome}` | prefill jobs, `ok` or `failed`; a failed job still sends the request on with the bypass |
 | `router_prefill_conversions_total` / `router_prefill_releases_total` | decode nodes taken out for prefill, and returned after `--prefill-release-idle` |
 | `router_prefill_bypass_fallbacks_total{reason}` | requests served with the bypass and no prefill: `no_node` (none could be added) or `job_failed` |

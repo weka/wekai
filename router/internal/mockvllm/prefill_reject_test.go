@@ -9,7 +9,7 @@ import (
 )
 
 // The engine's WEKA_PREFILL_REJECT_TOKENS contract: a request whose recompute
-// exceeds the limit is refused with a 400 naming the recompute, unless it
+// exceeds the limit is refused with a 503 naming the recompute (header and body), unless it
 // carries vllm_xargs.weka_prefill — and what the shared tier already holds does
 // not count as recompute.
 
@@ -41,8 +41,8 @@ func TestHeavyRequestIsRejectedWithItsRecomputeUnlessBypassed(t *testing.T) {
 	prompt := strings.Repeat("lorem ipsum ", 2000)
 
 	status, body := postChat(t, ts.URL, prompt, "")
-	if status != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", status)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", status)
 	}
 	e, _ := body["error"].(map[string]any)
 	if e["type"] != LargePrefillRejectedType {
@@ -73,8 +73,8 @@ func TestSharedTierContentIsNotRecompute(t *testing.T) {
 	other := rejectServer(t, 1000, tier)
 	prompt := strings.Repeat("lorem ipsum ", 2000)
 
-	if status, _ := postChat(t, other.URL, prompt, ""); status != http.StatusBadRequest {
-		t.Fatalf("cold fleet status = %d, want 400", status)
+	if status, _ := postChat(t, other.URL, prompt, ""); status != http.StatusServiceUnavailable {
+		t.Fatalf("cold fleet status = %d, want 503", status)
 	}
 	if status, _ := postChat(t, prefiller.URL, prompt, `,"vllm_xargs":{"weka_prefill":1}`); status != http.StatusOK {
 		t.Fatalf("prefill job status = %d", status)
