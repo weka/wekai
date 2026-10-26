@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -377,4 +378,170 @@ func TestDoneIsIdempotent(t *testing.T) {
 			t.Errorf("pending went negative: %d", n.PendingTokens)
 		}
 	}
+}
+
+func TestJobsQueueBehindTheNodeConcurrencyLimitInOrder(t *testing.T) {
+	const limit, total = 3, 9
+	f := newFleet(t, 2, Config{NodeConcurrency: limit})
+	var jobs []*Job
+	for range total {
+		j, err := f.m.Reserve(f.bs, 10, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if j.Backend != jobs0(jobs, j) {
+			t.Fatalf("jobs spread over two nodes; the fleet should have one prefill node")
+		}
+		jobs = append(jobs, j)
+	}
+
+	var mu sync.Mutex
+	running, peak := 0, 0
+	started := make([]chan struct{}, total)
+	release := make([]chan struct{}, total)
+	var wg sync.WaitGroup
+	for i, j := range jobs {
+		started[i], release[i] = make(chan struct{}), make(chan struct{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := f.m.WaitReady(context.Background(), j); err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			running++
+			peak = max(peak, running)
+			mu.Unlock()
+			close(started[i])
+			<-release[i]
+			mu.Lock()
+			running--
+			mu.Unlock()
+			j.Done()
+		}()
+	}
+	isStarted := func(i int) bool {
+		select {
+		case <-started[i]:
+			return true
+		default:
+			return false
+		}
+	}
+	for i := range limit {
+		<-started[i]
+	}
+	if n := prefillNode(f); n.RunningJobs != limit || n.QueuedJobs != total-limit {
+		t.Errorf("state = %+v, want %d running and %d queued", n, limit, total-limit)
+	}
+	// Each slot freed starts the longest-waiting job, and nothing else.
+	for i := range total - limit {
+		time.Sleep(20 * time.Millisecond)
+		if isStarted(i + limit) {
+			t.Fatalf("job %d started before a slot freed", i+limit)
+		}
+		close(release[i])
+		<-started[i+limit]
+		for k := i + limit + 1; k < total; k++ {
+			if isStarted(k) {
+				t.Fatalf("job %d jumped the queue", k)
+			}
+		}
+	}
+	for i := total - limit; i < total; i++ {
+		close(release[i])
+	}
+	wg.Wait()
+	if peak > limit {
+		t.Errorf("%d jobs ran at once, limit %d", peak, limit)
+	}
+}
+
+func jobs0(jobs []*Job, j *Job) *registry.Backend {
+	if len(jobs) == 0 {
+		return j.Backend
+	}
+	return jobs[0].Backend
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for end := time.Now().Add(3 * time.Second); time.Now().Before(end); time.Sleep(2 * time.Millisecond) {
+		if cond() {
+			return
+		}
+	}
+	t.Fatal("condition not reached")
+}
+
+func TestQueuedJobLeavesTheQueueWhenItsCallerGoes(t *testing.T) {
+	f := newFleet(t, 2, Config{NodeConcurrency: 1})
+	a, _ := f.m.Reserve(f.bs, 10, nil)
+	b, _ := f.m.Reserve(f.bs, 10, nil)
+	if err := f.m.WaitReady(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- f.m.WaitReady(ctx, b) }()
+	waitFor(t, func() bool { return prefillNode(f).QueuedJobs == 1 })
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitReady = %v", err)
+	}
+	b.Done()
+	a.Done()
+	if n := prefillNode(f); n.QueuedJobs != 0 || n.RunningJobs != 0 {
+		t.Errorf("node still holds work: %+v", n)
+	}
+}
+
+func TestOtherInflightCountsAgainstTheSameLimit(t *testing.T) {
+	f := newFleet(t, 2, Config{NodeConcurrency: 2})
+	j, _ := f.m.Reserve(f.bs, 10, nil)
+	if err := f.m.WaitReady(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	// Two other requests already fill the node's in-flight.
+	l1, l2 := lease.Acquire(j.Backend), lease.Acquire(j.Backend)
+	defer l2.Release()
+	j2, _ := f.m.Reserve(f.bs, 10, nil)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(2 * time.Millisecond):
+				f.clk.Advance(drainPoll)
+			}
+		}
+	}()
+	done := make(chan error, 1)
+	go func() { done <- f.m.WaitReady(context.Background(), j2) }()
+	select {
+	case err := <-done:
+		t.Fatalf("job ran with the node's in-flight at its limit: %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+	l1.Release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("job never ran after the node's in-flight dropped")
+	}
+}
+
+func prefillNode(f *fleet) NodeState {
+	for _, n := range f.m.State().Nodes {
+		if n.Mode != Decode.String() {
+			return n
+		}
+	}
+	return NodeState{}
 }

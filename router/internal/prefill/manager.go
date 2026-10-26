@@ -67,6 +67,11 @@ type Config struct {
 	// MaxFleetFraction caps the share of the fleet that is draining or
 	// prefill. At least one node always stays in decode.
 	MaxFleetFraction float64
+	// NodeConcurrency is the router's hard per-node in-flight limit
+	// (--max-node-concurrency). A prefill node never runs more jobs than this
+	// at once, and counts the node's other in-flight requests against it; jobs
+	// beyond it wait their turn. 0 is no limit.
+	NodeConcurrency int64
 	// ReleaseIdle is how long a node goes without prefill work before it
 	// returns to decode.
 	ReleaseIdle time.Duration
@@ -97,7 +102,11 @@ func (c Config) withDefaults() Config {
 type Picker func(eligible []*registry.Backend) (*registry.Backend, error)
 
 type node struct {
-	b        *registry.Backend
+	b *registry.Backend
+	// running is the jobs holding a slot; queue the jobs waiting for one, in
+	// arrival order.
+	running  int
+	queue    []*Job
 	mode     Mode
 	pending  int64
 	lastWork time.Time
@@ -113,7 +122,7 @@ type Manager struct {
 
 	// Mirrors of the Prometheus counters, which cannot be read back, for the
 	// /router-viz state.
-	rejections, jobsOK, jobsFailed, conversions, releases, fallbackNoNode, fallbackJobFailed atomic.Uint64
+	rejections, jobRetries, jobsOK, jobsFailed, conversions, releases, fallbackNoNode, fallbackJobFailed atomic.Uint64
 }
 
 // New builds a manager for one pool.
@@ -128,6 +137,10 @@ type Job struct {
 	n      *node
 	tokens int64
 	once   sync.Once
+	// granted closes when the job holds a slot; held is set with it.
+	granted chan struct{}
+	held    bool
+	queued  bool
 	// Backend is the node the job runs on.
 	Backend *registry.Backend
 }
@@ -137,6 +150,12 @@ func (j *Job) Done() {
 	j.once.Do(func() {
 		j.mgr.mu.Lock()
 		defer j.mgr.mu.Unlock()
+		j.mgr.dequeueLocked(j)
+		if j.held {
+			j.held = false
+			j.n.running--
+			j.mgr.grantLocked(j.n)
+		}
 		j.n.pending -= j.tokens
 		j.n.lastWork = j.mgr.cfg.Clock.Now()
 		j.mgr.publishLocked(j.n)
@@ -230,7 +249,10 @@ func (m *Manager) Reserve(cands []*registry.Backend, tokens int64, pick Picker) 
 	n.pending += tokens
 	n.lastWork = m.cfg.Clock.Now()
 	m.publishLocked(n)
-	return &Job{mgr: m, n: n, tokens: tokens, Backend: chosen}, nil
+	j := &Job{mgr: m, n: n, tokens: tokens, Backend: chosen, granted: make(chan struct{}), queued: true}
+	n.queue = append(n.queue, j)
+	m.publishQueuedLocked()
+	return j, nil
 }
 
 func (m *Manager) pickLocked(eligible []*registry.Backend, pick Picker) *registry.Backend {
@@ -284,22 +306,21 @@ func (m *Manager) canConvertLocked(fleet, nonDecode, decode int) bool {
 	return decode > 1 && nonDecode < limit
 }
 
-// WaitReady blocks until the job's node can run it: immediately for a prefill
-// node, and for a draining one once its in-flight requests — all decode, since
-// no prefill job has been dispatched to it yet — have finished. The node then
-// becomes a prefill node.
+// WaitReady blocks until the job may run on its node; a job is queued from
+// Reserve, so call it straight away. A draining node must
+// first finish its in-flight requests — all decode, since no prefill job has
+// been dispatched to it yet — and then becomes a prefill node. The job then
+// takes a slot under the node's concurrency limit, queueing in arrival order
+// behind the jobs ahead of it. The caller releases the slot with Done.
 func (m *Manager) WaitReady(ctx context.Context, j *Job) error {
 	for {
 		m.mu.Lock()
-		if j.n.mode != Draining {
-			m.mu.Unlock()
-			return nil
-		}
-		if j.Backend.Inflight() == 0 {
+		if j.n.mode == Draining && j.Backend.Inflight() == 0 {
 			j.n.mode = Prefill
 			m.publishLocked(j.n)
-			m.mu.Unlock()
-			return nil
+		}
+		if j.n.mode != Draining {
+			break
 		}
 		m.mu.Unlock()
 		select {
@@ -308,6 +329,80 @@ func (m *Manager) WaitReady(ctx context.Context, j *Job) error {
 			return ctx.Err()
 		}
 	}
+	// m.mu is held. The job joined its node's queue when it was reserved, so
+	// the queue is in arrival order whatever the drain wait did to timing.
+	for {
+		m.grantLocked(j.n)
+		if j.held {
+			m.mu.Unlock()
+			return nil
+		}
+		m.mu.Unlock()
+		select {
+		case <-j.granted:
+		case <-m.cfg.Clock.After(drainPoll):
+		case <-ctx.Done():
+			m.mu.Lock()
+			m.dequeueLocked(j)
+			if j.held {
+				// Granted in the same instant: hand the slot on.
+				j.held = false
+				j.n.running--
+				m.grantLocked(j.n)
+			}
+			m.mu.Unlock()
+			return ctx.Err()
+		}
+		m.mu.Lock()
+	}
+}
+
+// grantLocked hands free slots to the head of the node's queue. Slots are the
+// node's limit less its running jobs, and the node's own in-flight count — the
+// one routing reads — must be under the limit too, so decode work still on a
+// node counts against the same ceiling. The poll in WaitReady re-checks the
+// latter, which changes without anyone telling the manager.
+func (m *Manager) grantLocked(n *node) {
+	limit := m.cfg.NodeConcurrency
+	for len(n.queue) > 0 && n.mode != Draining {
+		if limit > 0 && (int64(n.running) >= limit || n.b.Inflight() >= limit) {
+			return
+		}
+		j := n.queue[0]
+		n.queue = n.queue[1:]
+		j.queued, j.held = false, true
+		n.running++
+		close(j.granted)
+		m.publishQueuedLocked()
+	}
+}
+
+func (m *Manager) dequeueLocked(j *Job) {
+	if !j.queued {
+		return
+	}
+	for i, q := range j.n.queue {
+		if q == j {
+			j.n.queue = append(j.n.queue[:i:i], j.n.queue[i+1:]...)
+			break
+		}
+	}
+	j.queued = false
+	m.publishQueuedLocked()
+}
+
+func (m *Manager) publishQueuedLocked() {
+	q := 0
+	for _, n := range m.nodes {
+		q += len(n.queue)
+	}
+	m.m.Queued.Set(float64(q))
+}
+
+// CountJobRetry records a prefill job retried after its node answered 429.
+func (m *Manager) CountJobRetry() {
+	m.jobRetries.Add(1)
+	m.m.JobRetries.Inc()
 }
 
 // Sweep returns idle nodes to decode and forgets nodes that have left the
@@ -402,6 +497,8 @@ type NodeState struct {
 	URL           string `json:"url"`
 	Mode          string `json:"mode"`
 	PendingTokens int64  `json:"pending_tokens"`
+	RunningJobs   int    `json:"running_jobs"`
+	QueuedJobs    int    `json:"queued_jobs"`
 }
 
 // State is the split's view for /router-viz.
@@ -413,6 +510,7 @@ type State struct {
 	Rejections       uint64      `json:"rejections"`
 	Jobs             uint64      `json:"jobs"`
 	JobsFailed       uint64      `json:"jobs_failed"`
+	JobRetries       uint64      `json:"job_retries"`
 	Conversions      uint64      `json:"conversions"`
 	Releases         uint64      `json:"releases"`
 	BypassFallbacks  uint64      `json:"bypass_fallbacks"`
@@ -423,13 +521,14 @@ func (m *Manager) State() State {
 	m.mu.Lock()
 	st := State{Enabled: true, NodeBudgetTokens: m.cfg.NodeBudgetTokens, MaxFleetFraction: m.cfg.MaxFleetFraction}
 	for url, n := range m.nodes {
-		st.Nodes = append(st.Nodes, NodeState{URL: url, Mode: n.mode.String(), PendingTokens: n.pending})
+		st.Nodes = append(st.Nodes, NodeState{URL: url, Mode: n.mode.String(), PendingTokens: n.pending, RunningJobs: n.running, QueuedJobs: len(n.queue)})
 	}
 	m.mu.Unlock()
 	sort.Slice(st.Nodes, func(i, j int) bool { return st.Nodes[i].URL < st.Nodes[j].URL })
 	st.Rejections = m.rejections.Load()
 	st.Jobs = m.jobsOK.Load() + m.jobsFailed.Load()
 	st.JobsFailed = m.jobsFailed.Load()
+	st.JobRetries = m.jobRetries.Load()
 	st.Conversions = m.conversions.Load()
 	st.Releases = m.releases.Load()
 	st.BypassFallbacks = m.fallbackNoNode.Load() + m.fallbackJobFailed.Load()

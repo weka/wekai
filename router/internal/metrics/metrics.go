@@ -471,6 +471,16 @@ var (
 		Help: "Rejected requests served with the bypass flag and no usable prefill: no_node (none could be added) or job_failed (the prefill job did not succeed).",
 	}, []string{"pool", "reason"})
 
+	PrefillJobRetries = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_prefill_job_retries_total",
+		Help: "Prefill jobs retried on the same node after it answered 429.",
+	}, []string{"pool"})
+
+	PrefillQueuedJobs = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "router_prefill_queued_jobs",
+		Help: "Prefill jobs waiting for a slot under the node concurrency limit.",
+	}, []string{"pool"})
+
 	PrefillNodes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "router_prefill_nodes",
 		Help: "Backends by prefill-split mode: decode, draining or prefill.",
@@ -527,7 +537,7 @@ func All() []prometheus.Collector {
 		CachePoolSize, CacheTreeRuns, CacheTailSet, CacheBlocksExpired, VLLMMetricsEndpoints,
 		RequestsShed, SaturationRejects, BackendCapExceeded, observedShadow,
 		PrefillRejections, PrefillJobs, PrefillConversions, PrefillReleases,
-		PrefillBypassFallbacks, PrefillNodes, PrefillNodeMode, PrefillPendingTokens,
+		PrefillBypassFallbacks, PrefillJobRetries, PrefillQueuedJobs, PrefillNodes, PrefillNodeMode, PrefillPendingTokens,
 	}
 }
 
@@ -751,6 +761,8 @@ type PrefillMetrics struct {
 	JobsFailed      prometheus.Counter
 	Conversions     prometheus.Counter
 	Releases        prometheus.Counter
+	JobRetries      prometheus.Counter
+	Queued          prometheus.Gauge
 	FallbackNoNode  prometheus.Counter
 	FallbackJobFail prometheus.Counter
 }
@@ -771,6 +783,8 @@ func ForPrefill(pool string) *PrefillMetrics {
 		JobsFailed:      PrefillJobs.WithLabelValues(pool, "failed"),
 		Conversions:     PrefillConversions.WithLabelValues(pool),
 		Releases:        PrefillReleases.WithLabelValues(pool),
+		JobRetries:      PrefillJobRetries.WithLabelValues(pool),
+		Queued:          PrefillQueuedJobs.WithLabelValues(pool),
 		FallbackNoNode:  PrefillBypassFallbacks.WithLabelValues(pool, "no_node"),
 		FallbackJobFail: PrefillBypassFallbacks.WithLabelValues(pool, "job_failed"),
 	}

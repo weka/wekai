@@ -255,6 +255,7 @@ func (o Options) prefillConfig() *prefill.Config {
 		return nil
 	}
 	return &prefill.Config{
+		NodeConcurrency:  o.NodeConcurrency,
 		NodeBudgetTokens: o.PrefillNodeBudgetTokens,
 		MaxFleetFraction: o.PrefillMaxFleetFraction,
 		ReleaseIdle:      o.PrefillReleaseIdle,

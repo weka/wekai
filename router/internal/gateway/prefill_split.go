@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/weka/wekai/router/internal/policy"
 	"github.com/weka/wekai/router/internal/prefill"
@@ -45,7 +47,7 @@ func (s *Server) splitAndServe(
 	if err := m.WaitReady(r.Context(), job); err != nil {
 		return proxy.Result{Err: err}
 	}
-	ok := s.runPrefillJob(r, job.Backend, rr, prefill.JobBody(body), auth)
+	ok := s.runPrefillJob(r, m, job.Backend, rr, prefill.JobBody(body), auth)
 	m.CountJob(ok)
 	if !ok {
 		m.FallbackJobFailed()
@@ -73,14 +75,41 @@ func (s *Server) prefillPicker(t Target, rr *policy.RoutingRequest, r *http.Requ
 // the response. It does not commit the prefix to the flow: the node is outside
 // decode routing, and a mark there would make the request's real holders look
 // unavailable to the decode decision that follows.
-func (s *Server) runPrefillJob(r *http.Request, b *registry.Backend,
+//
+// A 429 means the node's own admission cap is below the router's view, or a
+// race lost: the job holds its slot and tries again after a short backoff, the
+// node's Retry-After when it sent one, until it is served or the caller leaves.
+// Only another failure ends the job unsuccessfully.
+func (s *Server) runPrefillJob(r *http.Request, m *prefill.Manager, b *registry.Backend,
 	rr *policy.RoutingRequest, body []byte, auth proxy.Auth) bool {
 	job := *rr
 	job.PolicyState = nil
-	res := s.px.Serve(&discardWriter{h: http.Header{}}, r, []*registry.Backend{b},
-		policy.LeastOutstanding{}, s.dialect, &job, body, nil, nil, auth)
-	return res.Err == nil && !res.PrefillRejected && res.Status >= 200 && res.Status < 300
+	for attempt := 0; ; attempt++ {
+		dw := &discardWriter{h: http.Header{}}
+		res := s.px.Serve(dw, r, []*registry.Backend{b}, policy.LeastOutstanding{},
+			s.dialect, &job, body, nil, nil, auth)
+		if res.Err == nil && !res.PrefillRejected && res.Status >= 200 && res.Status < 300 {
+			return true
+		}
+		if res.Status != http.StatusTooManyRequests || res.Err != nil {
+			return false
+		}
+		m.CountJobRetry()
+		wait := backoffAt(attempt, time.Hour)
+		if ra, err := strconv.Atoi(dw.h.Get("Retry-After")); err == nil && ra >= 0 {
+			wait = min(time.Duration(ra)*time.Second, maxJobRetryWait)
+		}
+		select {
+		case <-s.cfg.Clock.After(wait):
+		case <-r.Context().Done():
+			return false
+		}
+	}
 }
+
+// maxJobRetryWait bounds a node's Retry-After, so one odd header cannot park a
+// request that is holding a slot.
+const maxJobRetryWait = 5 * time.Second
 
 // serveOnOriginal resends a refused request to the backend that refused it. A
 // backend that has since left decode mode or health is not sent decode work;
