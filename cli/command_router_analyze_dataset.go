@@ -184,12 +184,25 @@ type datasetBucket struct {
 	MeanPromptK float64 `json:"mean_tracked_prompt_k"`
 }
 
+// datasetWaitBucket groups sessions by their longest think gap.
+type datasetWaitBucket struct {
+	Label       string  `json:"label"`
+	Sessions    int     `json:"sessions"`
+	SessionsPct float64 `json:"sessions_pct"`
+	SlotTimePct float64 `json:"slot_time_pct"`
+	RequestsPct float64 `json:"requests_pct"`
+	// GapsAtLeast is the number of gaps, over all sessions, at or above the
+	// bucket's lower edge.
+	GapsAtLeast int `json:"gaps_at_least"`
+}
+
 type datasetReport struct {
 	Sessions        int                         `json:"sessions"`
 	ResponseScale   float64                     `json:"response_scale"`
 	TokenScale      float64                     `json:"token_scale"`
 	DurationP       map[string]time.Duration    `json:"session_duration"`
 	Buckets         []datasetBucket             `json:"buckets"`
+	Waits           []datasetWaitBucket         `json:"max_wait"`
 	Stationary      benchmark.DatasetStationary `json:"stationary"`
 	StationarySlots float64                     `json:"stationary_slots,omitempty"`
 	StationaryData  float64                     `json:"stationary_dataset_tokens"`
@@ -316,6 +329,38 @@ func (c *RouterAnalyzeDatasetCommand) buildReport(sessions []benchmark.DatasetSe
 		rep.Buckets = append(rep.Buckets, bk)
 	}
 
+	wb := append([]time.Duration{0}, benchmark.DatasetWaitBounds...)
+	for b := range wb {
+		lo, hi := wb[b], time.Duration(math.MaxInt64)
+		label := "≥ " + fmtSpan(lo)
+		if b+1 < len(wb) {
+			hi = wb[b+1]
+			label = fmtSpan(lo) + "–" + fmtSpan(hi)
+			if lo == 0 {
+				label = "< " + fmtSpan(hi)
+			}
+		}
+		wk := datasetWaitBucket{Label: label}
+		var dur float64
+		var reqs int
+		for _, s := range sessions {
+			if b > 0 {
+				wk.GapsAtLeast += s.Waits[b-1]
+			}
+			w := time.Duration(s.MaxWaitMs) * time.Millisecond
+			if w < lo || w >= hi {
+				continue
+			}
+			wk.Sessions++
+			dur += float64(s.DurationMs)
+			reqs += len(s.Requests)
+		}
+		wk.SessionsPct = 100 * float64(wk.Sessions) / float64(len(sessions))
+		wk.SlotTimePct = 100 * dur / totDur
+		wk.RequestsPct = 100 * float64(reqs) / float64(totReq)
+		rep.Waits = append(rep.Waits, wk)
+	}
+
 	st := benchmark.StationaryDataset(sessions)
 	rep.Stationary = st
 	if c.TargetInflight > 0 && st.PerSlotInflight > 0 {
@@ -429,6 +474,17 @@ func (c *RouterAnalyzeDatasetCommand) printText(rep datasetReport, reportEvery, 
 	}
 	b.WriteString("  slot-time / dataset: share of a slot's life / of its dataset-time spent in sessions of that life;\n")
 	b.WriteString("  busy: share of in-flight request time (the load the governor sees).\n\n")
+
+	b.WriteString("Sessions by their longest wait (think gap after a request end):\n")
+	fmt.Fprintf(&b, "%-10s %9s %9s %10s %10s %14s\n", "max wait", "sessions", "share", "slot-time", "requests", "gaps >= lower")
+	for _, w := range rep.Waits {
+		gaps := "-"
+		if w.GapsAtLeast > 0 {
+			gaps = fmt.Sprintf("%d", w.GapsAtLeast)
+		}
+		fmt.Fprintf(&b, "%-10s %9d %8.1f%% %9.1f%% %9.1f%% %14s\n", w.Label, w.Sessions, w.SessionsPct, w.SlotTimePct, w.RequestsPct, gaps)
+	}
+	b.WriteString("  gaps >= lower: think gaps across all sessions at least the bucket's lower edge.\n\n")
 
 	st := rep.Stationary
 	fmt.Fprintf(&b, "Long-run (whole laps): %s tokens and %.3f requests in flight per slot", fmtTok(st.PerSlotDataset), st.PerSlotInflight)

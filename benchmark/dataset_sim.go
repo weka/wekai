@@ -37,6 +37,12 @@ type DatasetSession struct {
 	PromptMsArea float64
 	// BusyMs is the total time requests of this session are in flight.
 	BusyMs int64
+	// MaxWaitMs is the session's longest think gap: a turn's captured wait
+	// after the end of the request it follows (its instance's previous one,
+	// or the spawning one). Offsets from the session start are not waits.
+	MaxWaitMs int64
+	// Waits counts the session's gaps at or above each DatasetWaitBounds edge.
+	Waits []int
 }
 
 // BuildDatasetSession schedules a session's requests the way the real-time
@@ -112,7 +118,7 @@ func BuildDatasetSession(s *RouterReplaySession, respScale float64) DatasetSessi
 		return end[i][j]
 	}
 
-	var out DatasetSession
+	out := DatasetSession{Waits: make([]int, len(DatasetWaitBounds))}
 	capFirst, capLast := int64(math.MaxInt64), int64(0)
 	for i := range s.Instances {
 		for j := range s.Instances[i].Requests {
@@ -121,6 +127,14 @@ func BuildDatasetSession(s *RouterReplaySession, respScale float64) DatasetSessi
 			out.Requests = append(out.Requests, DatasetRequest{StartMs: start[i][j], EndMs: end[i][j], Prompt: int64(r.InputTokens)})
 			out.DurationMs = max(out.DurationMs, end[i][j])
 			out.BusyMs += end[i][j] - start[i][j]
+			if r.ThinkMs != nil && (r.ThinkRef == ThinkRefPrev || r.ThinkRef == ThinkRefSpawn) {
+				out.MaxWaitMs = max(out.MaxWaitMs, *r.ThinkMs)
+				for k, b := range DatasetWaitBounds {
+					if time.Duration(*r.ThinkMs)*time.Millisecond >= b {
+						out.Waits[k]++
+					}
+				}
+			}
 			o := offset(r)
 			capFirst = min(capFirst, o)
 			capLast = max(capLast, o+r.TotalMs)
@@ -182,6 +196,9 @@ type DatasetSample struct {
 	// hold, at DatasetLifeBounds.
 	ByLife []DatasetLifeShare
 }
+
+// DatasetWaitBounds are the think-gap bucket edges of the wait breakdown.
+var DatasetWaitBounds = []time.Duration{time.Minute, 10 * time.Minute, time.Hour, 6 * time.Hour, 24 * time.Hour, 3 * 24 * time.Hour, 7 * 24 * time.Hour}
 
 // DatasetLifeBounds are the session-life bucket edges for ByLife: a slot
 // holding a session that lives past a day is load a one-day run never sheds.
