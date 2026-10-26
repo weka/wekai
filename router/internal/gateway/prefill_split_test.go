@@ -6,9 +6,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/weka/wekai/router/internal/dialect/openai"
 	"github.com/weka/wekai/router/internal/gateway"
@@ -402,5 +405,120 @@ func TestRejectionsNeverCountAgainstBackendHealth(t *testing.T) {
 	}
 	if n := b.Failed.Load(); n != 0 {
 		t.Errorf("%d failures recorded against a backend that only sent rejections", n)
+	}
+}
+
+// capBackend rejects a request without the bypass as a heavy prefill, and
+// refuses prefill jobs (max_tokens=1) with 429 above cap concurrent.
+type capBackend struct {
+	cap                     int64
+	inflight, peak, refused atomic.Int64
+}
+
+func (c *capBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	var doc struct {
+		MaxTokens float64        `json:"max_tokens"`
+		XArgs     map[string]any `json:"vllm_xargs"`
+	}
+	_ = json.Unmarshal(body, &doc)
+	w.Header().Set("Content-Type", "application/json")
+	if doc.XArgs["weka_prefill"] == nil {
+		w.Header().Set(prefill.RejectHeader, "9000")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if doc.MaxTokens == 1 {
+		n := c.inflight.Add(1)
+		defer c.inflight.Add(-1)
+		if n > c.cap {
+			c.refused.Add(1)
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		for {
+			p := c.peak.Load()
+			if n <= p || c.peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+}
+
+func burstThroughPrefillNode(t *testing.T, routerLimit, nodeCap int64, clients int) (*capBackend, prefill.State) {
+	t.Helper()
+	cb := &capBackend{cap: nodeCap}
+	reg := registry.New(registry.Options{})
+	for range 2 {
+		ts := httptest.NewServer(cb)
+		t.Cleanup(ts.Close)
+		b, err := reg.Add(registry.Spec{URL: ts.URL, Prov: registry.ProvStatic, Capacity: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.SetHealth(registry.Healthy)
+	}
+	mgr := prefill.New(prefill.Config{PoolName: t.Name(), NodeConcurrency: routerLimit})
+	p := &pool.Pool{Name: "default", Registry: reg, Flow: mustFlow(t, affinityCfg()), Split: mgr}
+	tbl, _ := routing.NewTable([]routing.Rule{{Pool: p}})
+	srv := httptest.NewServer(gateway.New(gateway.Config{MaxBodyBytes: 1 << 20, DefaultCapacity: 1}, tbl,
+		proxy.New(proxy.Config{MaxAttempts: 2}), openai.New()))
+	t.Cleanup(srv.Close)
+
+	var wg sync.WaitGroup
+	for i := range clients {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+				strings.NewReader(chatBody("request "+strconv.Itoa(i), false)))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("client %d saw %d", i, resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+	return cb, mgr.State()
+}
+
+// The router's own limit keeps the burst under the node's cap: no job is
+// refused, so none retries, and none falls back to decode.
+func TestPrefillJobsNeverExceedTheNodeConcurrencyLimit(t *testing.T) {
+	const n = 4
+	cb, st := burstThroughPrefillNode(t, n, n, 5*n)
+	if st.Jobs != 5*n || st.JobsFailed != 0 || st.BypassFallbacks != 0 {
+		t.Errorf("state = %+v, want %d jobs, none failed, no fallbacks", st, 5*n)
+	}
+	if cb.refused.Load() != 0 || st.JobRetries != 0 {
+		t.Errorf("%d jobs were refused and %d retried; the router should not have sent them", cb.refused.Load(), st.JobRetries)
+	}
+	if cb.peak.Load() > n {
+		t.Errorf("peak in-flight jobs on a node = %d, limit %d", cb.peak.Load(), n)
+	}
+}
+
+// With no router-side limit the node's 429s are retried on the same node and
+// every job still completes as a prefill job.
+func TestPrefillJobRefusedWith429IsRetriedNotFailed(t *testing.T) {
+	const n = 4
+	cb, st := burstThroughPrefillNode(t, 0, n, 5*n)
+	if st.Jobs != 5*n || st.JobsFailed != 0 || st.BypassFallbacks != 0 {
+		t.Errorf("state = %+v, want %d jobs, none failed, no fallbacks", st, 5*n)
+	}
+	if cb.refused.Load() == 0 || st.JobRetries == 0 {
+		t.Errorf("expected the burst to be refused and retried (refused %d, retries %d)", cb.refused.Load(), st.JobRetries)
+	}
+	if cb.peak.Load() > n {
+		t.Errorf("peak admitted jobs = %d, node cap %d", cb.peak.Load(), n)
 	}
 }

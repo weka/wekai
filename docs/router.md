@@ -780,6 +780,7 @@ So alert on all three:
 | `router_prefill_conversions_total` / `router_prefill_releases_total` | decode nodes taken out for prefill, and returned after `--prefill-release-idle` |
 | `router_prefill_bypass_fallbacks_total{reason}` | requests served with the bypass and no prefill: `no_node` (none could be added) or `job_failed` |
 | `router_prefill_nodes{mode}` / `router_prefill_node_mode{backend}` | backends per mode, and each backend's mode (0 decode, 1 draining, 2 prefill) |
+| `router_prefill_queued_jobs` / `router_prefill_job_retries_total` | prefill jobs waiting for a slot under `--max-node-concurrency` (a prefill node never runs more jobs than that, counting its other in-flight requests), and jobs retried on the same node after it answered 429 |
 | `router_prefill_pending_tokens{backend}` | queued plus in-flight prefill tokens on a backend, the quantity `--prefill-node-budget-tokens` bounds |
 | `router_backend_queued` | requests currently waiting in ONE backend's `--max-node-concurrency` queue. Non-zero only while `--retry-time-limit` is set; the per-backend companion to the fleet-wide `router_backend_queue_wait_seconds` below |
 | `router_backend_queue_wait_seconds` | latency spent in a backend's wait queue, by outcome — `woken` (a slot freed, request re-decided), `expired` (budget ran out, same 429 as the poll path), `abandoned` (caller disconnected). Separate from `router_retry_wait_seconds`: that one measures the whole-fleet poll loop, this one a wait bound to a single backend, and the two describe different mechanisms for the same refusal |
