@@ -177,10 +177,6 @@ func capturesRejection(ctx context.Context) bool {
 	return v
 }
 
-// maxRejectionBody bounds how much of a 400 is read to recognise a rejection;
-// the engine's is a few hundred bytes.
-const maxRejectionBody = 64 << 10
-
 var errNoBackend = errors.New("proxy: no backend accepted the request")
 
 // errRetryable is returned from ModifyResponse to make ReverseProxy discard a
@@ -383,6 +379,9 @@ type attemptOut struct {
 	// rejected and rejectedTokens report an absorbed large-prefill rejection.
 	rejected       bool
 	rejectedTokens int64
+	// ignored marks a rejection relayed to the client rather than absorbed:
+	// not a verdict on the backend either way.
+	ignored bool
 }
 
 // runAttempt pairs do's outcome with Record exactly once, whether do returns
@@ -413,6 +412,10 @@ func runAttempt(cb *circuit.Breaker, token bool, do func() attemptOut) (out atte
 		}
 	}()
 	out = do()
+	if out.rejected || out.ignored {
+		cb.Record(circuit.Ignored, token)
+		return out
+	}
 	cb.Record(circuit.Classify(out.status, out.err), token)
 	return out
 }
@@ -464,7 +467,7 @@ func (p *Proxy) attempt(
 	var upstreamStatus int
 	var upstreamErr error
 	var rejectedForRetry bool
-	var prefillRejected bool
+	var prefillRejected, relayedRejection bool
 	var prefillTokens int64
 	captureRejection := capturesRejection(r.Context())
 	// Hoisted out of the response hook so the caller can ask, after the copy,
@@ -536,25 +539,31 @@ func (p *Proxy) attempt(
 	}
 	rp.ModifyResponse = func(resp *http.Response) error {
 		upstreamStatus = resp.StatusCode
+		// A large-prefill rejection is a routing signal, not an outcome: it is
+		// recognised before the flow's outcome callback, and runAttempt records
+		// it as ignored, so it never feeds the breaker, backend health or the
+		// 5xx accounting.
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			if n, ok := prefill.RejectionFromResponse(resp); ok {
+				if captureRejection {
+					_ = resp.Body.Close()
+					prefillRejected, prefillTokens = true, n
+					return errPrefillRejected
+				}
+				// Not absorbed — the split is off, or this request already
+				// carries the bypass — so the caller gets the 503 as sent, but
+				// it is still no verdict on the backend and is never retried.
+				relayedRejection = true
+			}
+		}
 		// Report the outcome BEFORE the retry branch below returns: a 429 is
 		// exactly the case that gets retried, and it is also exactly the signal
 		// the flow needs. Reporting after the early return would drop every
 		// refusal the router acts on.
-		if outcome != nil {
+		if outcome != nil && !relayedRejection {
 			outcome(b, resp.StatusCode)
 		}
-		if captureRejection && resp.StatusCode == http.StatusBadRequest {
-			data, _ := io.ReadAll(io.LimitReader(resp.Body, maxRejectionBody))
-			if n, ok := prefill.ParseRejection(data); ok {
-				_ = resp.Body.Close()
-				prefillRejected, prefillTokens = true, n
-				return errPrefillRejected
-			}
-			// Not a rejection: put back what was read, followed by whatever
-			// the limit left unread.
-			resp.Body = &replayBody{Reader: io.MultiReader(bytes.NewReader(data), resp.Body), Closer: resp.Body}
-		}
-		if canRetry && !*committed && isRetryable(resp.StatusCode, nil) {
+		if canRetry && !*committed && !relayedRejection && isRetryable(resp.StatusCode, nil) {
 			// Returning an error makes ReverseProxy close the upstream body and
 			// call ErrorHandler INSTEAD of copying the response. That is what
 			// keeps the response uncommitted so another backend can be tried;
@@ -607,15 +616,9 @@ func (p *Proxy) attempt(
 	}
 
 	out := attemptOut{status: upstreamStatus, err: upstreamErr,
-		rejected: prefillRejected, rejectedTokens: prefillTokens}
-	out.retryable = (rejectedForRetry || isRetryable(upstreamStatus, upstreamErr)) && !*committed
+		rejected: prefillRejected, rejectedTokens: prefillTokens, ignored: relayedRejection}
+	out.retryable = !prefillRejected && !relayedRejection && (rejectedForRetry || isRetryable(upstreamStatus, upstreamErr)) && !*committed
 	return out
-}
-
-// replayBody is a response body with an already-read prefix put back.
-type replayBody struct {
-	io.Reader
-	io.Closer
 }
 
 // isRetryable is deliberately narrower than v1's set.

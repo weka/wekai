@@ -165,15 +165,16 @@ func writeError(w http.ResponseWriter, status int, typ, msg string) {
 	})
 }
 
-// writeLargePrefillRejected answers the way the engine's rejection does: a 400
+// writeLargePrefillRejected answers the way the engine's rejection does: a 503
 // whose param carries the recompute token count.
 func writeLargePrefillRejected(w http.ResponseWriter, tokens, limit int) {
-	writeJSON(w, http.StatusBadRequest, map[string]any{
+	w.Header().Set("X-Weka-Prefill-Reject", strconv.Itoa(tokens))
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 		"error": map[string]any{
 			"message": "prefill of " + strconv.Itoa(tokens) + " tokens exceeds WEKA_PREFILL_REJECT_TOKENS=" + strconv.Itoa(limit),
 			"type":    LargePrefillRejectedType,
 			"param":   strconv.Itoa(tokens),
-			"code":    http.StatusBadRequest,
+			"code":    http.StatusServiceUnavailable,
 		},
 	})
 }

@@ -236,8 +236,8 @@ func TestDecodeRoutingAvoidsThePrefillNodeAfterwards(t *testing.T) {
 func TestSplitOffPassesTheRejectionThrough(t *testing.T) {
 	f := newSplitFleet(t, 2, false, mockvllm.SurfaceVLLM)
 	status, body := f.post(t, "/v1/chat/completions", chatBody(heavyPrompt("y"), false))
-	if status != http.StatusBadRequest || !strings.Contains(body, prefill.RejectionType) {
-		t.Errorf("with the split off the client got %d %s, want the engine's 400", status, body)
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, prefill.RejectionType) {
+		t.Errorf("with the split off the client got %d %s, want the engine's 503", status, body)
 	}
 	if n := len(f.callsOf(isPrefillJob)); n != 0 {
 		t.Errorf("%d prefill jobs with the split off", n)
@@ -286,8 +286,9 @@ func TestRejectionOfABypassedRequestDoesNotLoop(t *testing.T) {
 		n++
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":{"type":"large_prefill_rejected","param":"9000","code":400}}`))
+		w.Header().Set(prefill.RejectHeader, "9000")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"type":"large_prefill_rejected","param":"9000","code":503}}`))
 	})
 	reg := registry.New(registry.Options{})
 	for range 3 {
@@ -320,19 +321,19 @@ func TestRejectionOfABypassedRequestDoesNotLoop(t *testing.T) {
 	if n != 3 {
 		t.Errorf("backends saw %d requests, want 3 (original, prefill job, resubmission)", n)
 	}
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want the backend's 400 once the bypass was refused too", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want the backend's 503 once the bypass was refused too", resp.StatusCode)
 	}
 }
 
-func TestOtherBadRequestsPassThroughIntact(t *testing.T) {
-	const msg = `{"error":{"type":"invalid_request_error","message":"bad field","code":400}}`
+func TestOtherServiceUnavailablePassesThroughIntact(t *testing.T) {
+	const msg = `{"error":{"type":"overloaded","message":"busy","code":503}}`
 	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
+		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(msg))
 	}))
 	t.Cleanup(srvB.Close)
@@ -355,12 +356,51 @@ func TestOtherBadRequestsPassThroughIntact(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	got, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 400 || string(got) != msg {
-		t.Errorf("got %d %q, want the backend's own 400 byte for byte", resp.StatusCode, got)
+	if resp.StatusCode != 503 || string(got) != msg {
+		t.Errorf("got %d %q, want the backend's own 503 byte for byte", resp.StatusCode, got)
 	}
 	if st := p.Split.State(); st.Rejections != 0 {
-		t.Errorf("an unrelated 400 was counted as a rejection: %+v", st)
+		t.Errorf("an unrelated 503 was counted as a rejection: %+v", st)
 	}
 }
 
 func affinityCfg() affinity.Config { return affinity.Config{} }
+
+// A rejection is a routing signal. However many a backend sends, it stays
+// healthy: no breaker opens and no failure is recorded against it.
+func TestRejectionsNeverCountAgainstBackendHealth(t *testing.T) {
+	reject := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			return
+		}
+		w.Header().Set(prefill.RejectHeader, "9000")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(reject.Close)
+	reg := registry.New(registry.Options{})
+	b, err := reg.Add(registry.Spec{URL: reject.URL, Prov: registry.ProvStatic, Capacity: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.SetHealth(registry.Healthy)
+	p := &pool.Pool{Name: "default", Registry: reg, Flow: mustFlow(t, affinityCfg()),
+		Split: prefill.New(prefill.Config{PoolName: t.Name()})}
+	tbl, _ := routing.NewTable([]routing.Rule{{Pool: p}})
+	srv := httptest.NewServer(gateway.New(gateway.Config{MaxBodyBytes: 1 << 20, DefaultCapacity: 1}, tbl,
+		proxy.New(proxy.Config{MaxAttempts: 2}), openai.New()))
+	t.Cleanup(srv.Close)
+
+	for range 60 {
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody("hi", false)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+	if !b.Available() {
+		t.Error("the backend was ejected by rejections")
+	}
+	if n := b.Failed.Load(); n != 0 {
+		t.Errorf("%d failures recorded against a backend that only sent rejections", n)
+	}
+}

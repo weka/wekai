@@ -137,8 +137,8 @@ type Config struct {
 
 	// PrefillRejectTokens, when > 0, makes the server refuse a request whose
 	// recompute (prompt tokens neither in the local cache nor in the shared
-	// tier) exceeds it, with HTTP 400 type large_prefill_rejected and the
-	// recompute count in param — the engine's WEKA_PREFILL_REJECT_TOKENS. A
+	// tier) exceeds it, with HTTP 503, header X-Weka-Prefill-Reject and
+	// error type large_prefill_rejected, the recompute count in both — the engine's WEKA_PREFILL_REJECT_TOKENS. A
 	// request carrying vllm_xargs.weka_prefill is never refused. 0 is off.
 	PrefillRejectTokens int
 

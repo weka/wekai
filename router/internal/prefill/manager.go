@@ -2,7 +2,7 @@
 //
 // In the common case every node serves prefill and decode. When the engine
 // refuses a request because recomputing its prompt would stall the node's
-// running decodes (HTTP 400 large_prefill_rejected), the router runs that
+// running decodes (HTTP 503, header X-Weka-Prefill-Reject), the router runs that
 // prefill on a node it has taken out of decode routing, then sends the request
 // for decode as usual. The prefill leaves its KV in the fleet's shared tier, so
 // the decode node loads it rather than recomputing.
