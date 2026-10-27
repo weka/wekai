@@ -120,9 +120,6 @@ spec:
             {{- if .maxFleetFraction }}
             - "--prefill-max-fleet-fraction={{ .maxFleetFraction }}"
             {{- end }}
-            {{- if .releaseIdle }}
-            - "--prefill-release-idle={{ .releaseIdle }}"
-            {{- end }}
             {{- end }}
             {{- end }}
             {{- if .Values.router.vllmMetrics.disabled }}

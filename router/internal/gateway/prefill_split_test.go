@@ -2,6 +2,7 @@ package gateway_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -192,19 +193,16 @@ func TestHeavyPrefillRunsOnADrainedNodeThenDecodesElsewhere(t *testing.T) {
 			if len(decodes) != 1 {
 				t.Fatalf("decode resubmissions = %d, want 1 (calls %+v)", len(decodes), f.calls)
 			}
-			if decodes[0].node == jobs[0].node {
-				t.Errorf("decode ran on the prefill node %d", jobs[0].node)
-			}
 			if decodes[0].stream != c.stream {
 				t.Errorf("decode stream = %v, want the client's %v", decodes[0].stream, c.stream)
 			}
-			if got := f.mgr.ModeOf(f.backend[jobs[0].node]); got == prefill.Decode {
-				t.Errorf("prefill node is still in decode mode")
+			if got := f.mgr.ModeOf(f.backend[jobs[0].node]); got != prefill.Decode {
+				t.Errorf("prefill node is still in %v mode after its last job", got)
 			}
 
 			st := f.mgr.State()
-			if st.Rejections != 1 || st.Jobs != 1 || st.Conversions != 1 || st.BypassFallbacks != 0 {
-				t.Errorf("state = %+v, want 1 rejection, 1 job, 1 conversion, 0 fallbacks", st)
+			if st.Rejections != 1 || st.Jobs != 1 || st.Conversions != 1 || st.Releases != 1 || st.BypassFallbacks != 0 {
+				t.Errorf("state = %+v, want 1 rejection, 1 job, 1 conversion, 1 release, 0 fallbacks", st)
 			}
 		})
 	}
@@ -215,15 +213,21 @@ func mustJSON(v any) string {
 	return string(b)
 }
 
-func TestDecodeRoutingAvoidsThePrefillNodeAfterwards(t *testing.T) {
+func TestDecodeRoutingAvoidsAPrefillNodeWhileItHasJobs(t *testing.T) {
 	f := newSplitFleet(t, 3, true, mockvllm.SurfaceVLLM)
-	if status, body := f.post(t, "/v1/chat/completions", chatBody(heavyPrompt("x"), false)); status != 200 {
-		t.Fatalf("heavy: %d %s", status, body)
+	job, err := f.mgr.Reserve(f.backend, 10, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	pnode := f.callsOf(isPrefillJob)[0].node
-	f.mu.Lock()
-	f.calls = nil
-	f.mu.Unlock()
+	if err := f.mgr.WaitReady(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	var pnode int
+	for i, b := range f.backend {
+		if b == job.Backend {
+			pnode = i
+		}
+	}
 
 	for i := range 12 {
 		status, body := f.post(t, "/v1/chat/completions", chatBody("short question "+strings.Repeat("q", i), false))
@@ -233,6 +237,11 @@ func TestDecodeRoutingAvoidsThePrefillNodeAfterwards(t *testing.T) {
 	}
 	if n := len(f.callsOf(func(c call) bool { return c.node == pnode })); n != 0 {
 		t.Errorf("%d decode requests were routed to the prefill node", n)
+	}
+
+	job.Done()
+	if got := f.mgr.ModeOf(job.Backend); got != prefill.Decode {
+		t.Errorf("mode = %v after the last job, want decode", got)
 	}
 }
 

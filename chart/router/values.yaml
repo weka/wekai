@@ -115,8 +115,6 @@ router:
     # Largest share of the pool that may be draining or prefill; at least one
     # node always stays in decode.
     maxFleetFraction: 0.5
-    # A prefill node with no prefill work for this long returns to decode.
-    releaseIdle: 60s
 
   # Split signals. The backend's own 429 is always on and needs no
   # configuration; these are opt-in early warnings that save a round trip.
