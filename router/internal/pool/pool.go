@@ -81,6 +81,10 @@ type Config struct {
 	// prefill/decode disaggregation; every other backend is a decode node.
 	// Empty leaves the pool undisaggregated.
 	PDPrefill []string
+	// PDPrefillFlow, when set, configures the prefill leg's flow in place of
+	// Flow, so the P nodes can run a concurrency band of their own. Nil copies
+	// Flow.
+	PDPrefillFlow *affinity.Config
 
 	// OnCircuitTransition, when set, is attached to every backend as it joins,
 	// so an operator can tell an overload from an outage.
@@ -121,6 +125,9 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Pool, error) {
 	var pflow *affinity.Policy
 	if len(cfg.PDPrefill) > 0 {
 		pc := cfg.Flow
+		if cfg.PDPrefillFlow != nil {
+			pc = *cfg.PDPrefillFlow
+		}
 		if pc.PoolName == "" {
 			pc.PoolName = affinity.DefaultPoolName
 		}
