@@ -149,6 +149,29 @@ prefill node at all the request is resent to the backend that refused it, with
 the bypass. It needs a KV tier the nodes share; without one the prefill is
 wasted work.
 
+**Prefill/decode disaggregation (vanilla vLLM NIXL).** `--pd-prefill-backends=<urls>`
+names a static set of prefill (P) nodes, a subset of `--backends`; the rest are
+decode (D) nodes. It replaces vLLM's round-robin toy proxy and is exclusive with
+`--prefill-split`. Every `/v1/chat/completions` and `/v1/completions` request goes
+to a P node first, as a copy with `max_tokens=1`, `stream=false`, no
+`stream_options` and `kv_transfer_params={"do_remote_decode": true, ...}`. The
+`kv_transfer_params` object in the P node's answer goes, verbatim, into the
+original request (streaming preserved), which then goes to a D node. Both legs
+carry the same `X-Request-Id` and the route's model rewrite.
+
+Each leg is chosen by the ordinary routing flow (prefix affinity plus load, with
+`--soft/--max-node-concurrency`), restricted to its own node set, and each set has
+a prefix tree of its own: a conversation's turns return to the P node whose prefix
+cache has them, and to the D node that already holds the blocks, so NIXL moves
+only the missing ones. The prefix is recorded for the node that served each leg.
+P legs count as in-flight on their node; a saturated P set or a `429` is waited
+out and retried (bounded by `--retry-time-limit` when set). A prefill leg that
+fails, or answers without `kv_transfer_params`, sends the request to a D node
+alone, which recomputes (`router_pd_fallbacks_total`). `/v1/messages` carries no
+`kv_transfer_params` and is served on D nodes only. `/router-viz` shows each
+backend's role as its `mode` (`prefill` or `decode`). The `router_cache_*` series
+for the P flow carry `pool="<pool>:prefill"`.
+
 `--rebalance-ratio` is **off by default**. Set to `0.5` it makes a backend
 carrying more than twice the fleet minimum stop taking new work, so the idle
 capacity beside it gets used — but that trades locality for evenness, and a
@@ -747,6 +770,10 @@ So alert on all three:
 | `router_prefill_nodes{mode}` / `router_prefill_node_mode{backend}` | backends per mode, and each backend's mode (0 decode, 1 draining, 2 prefill) |
 | `router_prefill_queued_jobs` / `router_prefill_job_retries_total` | prefill jobs waiting for a slot under `--max-node-concurrency` (a prefill node never runs more jobs than that, counting its other in-flight requests), and jobs retried on the same node after it answered 429 |
 | `router_prefill_pending_tokens{backend}` | queued plus in-flight prefill tokens on a backend, the quantity `--prefill-node-budget-tokens` bounds |
+| `router_pd_prefill_legs_total{outcome}` | prefill legs sent to a P node (`--pd-prefill-backends` only): `ok`, `failed` (non-2xx or transport error) or `no_params` (answered without `kv_transfer_params`) |
+| `router_pd_fallbacks_total{reason}` | requests sent to a D node without `kv_transfer_params`, so it recomputes: `no_prefill_node`, `prefill_failed` or `no_params` |
+| `router_pd_prefill_retries_total` | prefill legs retried after every P node was saturated or the chosen one answered 429 |
+| `router_pd_leg_duration_seconds{leg}` | wall time of the `prefill` leg (retries included) and the `decode` leg (to the end of its response) |
 | `router_vllm_metrics_endpoints` | upstream endpoints `asked` vs `contributing` on the last aggregation cycle. Catches a backend that is **in the pool and unscrapeable** — hung vLLM, partition, present-but-unready — which is otherwise invisible in flat `vllm:` totals. It does **not** catch a backend leaving: `asked` tracks the live set, so a deleted pod drops both labels together and the ratio still reads 1.0. Use `router_backends_total` for that, and alert on `asked == 0` separately |
 | `router_stream_aborted_total{reason="upstream_error"}` | streams the BACKEND stopped sending before the terminal marker. Feeds the circuit breaker, so a backend truncating responses is ejected rather than counted healthy |
 | `router_stream_aborted_total{reason="client_disconnect"}` | streams the CALLER abandoned. Does **not** count against the backend — on a saturated fleet callers give up constantly, and blaming them would eject healthy backends exactly when losing one costs most |

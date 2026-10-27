@@ -17,6 +17,7 @@ import (
 
 	"github.com/weka/wekai/router/internal/gateway"
 	"github.com/weka/wekai/router/internal/pool"
+	"github.com/weka/wekai/router/internal/proxy"
 )
 
 // Rule is one routing rule: which model names it claims, and where they go.
@@ -138,6 +139,8 @@ func (r Rule) target() gateway.Target {
 		ForwardClientCredential: r.ForwardClientCredential,
 		Transparent:             r.Transparent,
 		Split:                   r.Pool.Split,
+		PD:                      r.Pool.PD,
+		PrefillSelector:         pdSelector(r.Pool),
 	}
 }
 
@@ -171,4 +174,13 @@ func NormalizePatterns(raw string) []string {
 		}
 	}
 	return out
+}
+
+// pdSelector is the flow for the prefill leg, nil without disaggregation. A nil
+// *affinity.Policy must not become a non-nil Selector.
+func pdSelector(p *pool.Pool) proxy.Selector {
+	if p.PDFlow == nil {
+		return nil
+	}
+	return p.PDFlow
 }
