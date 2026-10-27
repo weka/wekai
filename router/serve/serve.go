@@ -152,6 +152,13 @@ type Options struct {
 	// NIXL prefill/decode disaggregation; every other backend is a decode node.
 	// Each must be an endpoint of some route. Exclusive with PrefillSplit.
 	PDPrefillBackends []string
+	// Per-role concurrency bands, used only with PDPrefillBackends. Zero
+	// inherits NodeConcurrency / SoftNodeConcurrency. The decode band governs
+	// the decode leg and requests that bypass P/D.
+	PDPrefillSoftNodeConcurrency int64
+	PDPrefillMaxNodeConcurrency  int64
+	PDDecodeSoftNodeConcurrency  int64
+	PDDecodeMaxNodeConcurrency   int64
 	// PrefillNodeBudgetTokens bounds the prefill tokens queued plus in flight
 	// on one prefill node.
 	PrefillNodeBudgetTokens int64
@@ -257,6 +264,26 @@ func (o Options) flowConfig() affinity.Config {
 	}
 }
 
+// roleFlowConfigs are the decode and prefill flows under P/D: the global flow
+// with each role's band overrides applied. Without P/D both are the global flow.
+func (o Options) roleFlowConfigs() (decode, prefillFlow affinity.Config) {
+	decode, prefillFlow = o.flowConfig(), o.flowConfig()
+	if len(o.PDPrefillBackends) == 0 {
+		return decode, prefillFlow
+	}
+	override := func(c *affinity.Config, soft, max int64) {
+		if soft > 0 {
+			c.SoftNodeConcurrency = soft
+		}
+		if max > 0 {
+			c.NodeConcurrency = max
+		}
+	}
+	override(&decode, o.PDDecodeSoftNodeConcurrency, o.PDDecodeMaxNodeConcurrency)
+	override(&prefillFlow, o.PDPrefillSoftNodeConcurrency, o.PDPrefillMaxNodeConcurrency)
+	return decode, prefillFlow
+}
+
 // prefillConfig is nil with the split off, which is what leaves a backend's
 // large-prefill refusal reaching the caller unchanged.
 func (o Options) prefillConfig() *prefill.Config {
@@ -288,8 +315,45 @@ func (o Options) pdPrefillFor(rt Route) []string {
 // split, naming a backend no route has, or leaving a pool without a decode
 // node.
 func (o Options) validatePD() error {
+	bands := [...]struct {
+		flag string
+		v    int64
+	}{
+		{"--pd-prefill-soft-node-concurrency", o.PDPrefillSoftNodeConcurrency},
+		{"--pd-prefill-max-node-concurrency", o.PDPrefillMaxNodeConcurrency},
+		{"--pd-decode-soft-node-concurrency", o.PDDecodeSoftNodeConcurrency},
+		{"--pd-decode-max-node-concurrency", o.PDDecodeMaxNodeConcurrency},
+	}
+	for _, b := range bands {
+		switch {
+		case b.v < 0:
+			return fmt.Errorf("router: %s must not be negative", b.flag)
+		case b.v > 0 && len(o.PDPrefillBackends) == 0:
+			return fmt.Errorf("router: %s needs --pd-prefill-backends", b.flag)
+		}
+	}
 	if len(o.PDPrefillBackends) == 0 {
 		return nil
+	}
+	decode, prefillFlow := o.roleFlowConfigs()
+	for _, r := range []struct {
+		role      string
+		soft, max int64
+		c         affinity.Config
+	}{
+		{"prefill", o.PDPrefillSoftNodeConcurrency, o.PDPrefillMaxNodeConcurrency, prefillFlow},
+		{"decode", o.PDDecodeSoftNodeConcurrency, o.PDDecodeMaxNodeConcurrency, decode},
+	} {
+		if r.soft == 0 && r.max == 0 {
+			continue
+		}
+		if r.c.SoftNodeConcurrency > 0 && r.c.NodeConcurrency <= 0 {
+			return fmt.Errorf("router: the %s soft node concurrency needs a max node concurrency", r.role)
+		}
+		if r.c.SoftNodeConcurrency >= r.c.NodeConcurrency && r.c.SoftNodeConcurrency > 0 {
+			return fmt.Errorf("router: the %s soft node concurrency (%d) must be below its max (%d)",
+				r.role, r.c.SoftNodeConcurrency, r.c.NodeConcurrency)
+		}
 	}
 	if o.PrefillSplit {
 		return errors.New("router: --pd-prefill-backends and --prefill-split are mutually exclusive")
@@ -469,14 +533,17 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		// endpoint in rotation permanently, because passive health never changes
 		// on its own.
 		transparent := len(rt.Endpoints) == 1 && unmanaged == 1 && rt.DiscoverySelector == ""
-		flow := opts.flowConfig()
+		flow, pflow := opts.roleFlowConfigs()
 		flow.PoolName = name
 		flow.Clock = clk
+		pflow.PoolName = name
+		pflow.Clock = clk
 
 		p, err := pool.New(pool.Config{
 			Name:            name,
 			Backends:        backends,
 			Flow:            flow,
+			PDPrefillFlow:   &pflow,
 			Health:          opts.healthConfig(),
 			DefaultCapacity: 1,
 			DefaultDialect:  d.ID(),
@@ -760,7 +827,7 @@ func runServers(ctx context.Context, opts Options, handler http.Handler) error {
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info("router listening", "listen", opts.Listen,
-			"metrics", opts.MetricsListen, "signals", signalSummary(opts.flowConfig()))
+			"metrics", opts.MetricsListen, "signals", opts.signalsLog())
 		errCh <- srv.ListenAndServe()
 	}()
 
@@ -1073,6 +1140,16 @@ func poolName(patterns string, i int) string {
 		return fmt.Sprintf("pool-%d", i)
 	}
 	return p
+}
+
+// signalsLog is the startup signal summary: one per role under P/D, since the
+// roles may run different concurrency bands.
+func (o Options) signalsLog() string {
+	decode, prefillFlow := o.roleFlowConfigs()
+	if len(o.PDPrefillBackends) == 0 {
+		return signalSummary(decode)
+	}
+	return fmt.Sprintf("prefill=[%s] decode=[%s]", signalSummary(prefillFlow), signalSummary(decode))
 }
 
 // signalSummary renders the enabled capacity signals for the startup log. An

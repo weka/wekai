@@ -204,7 +204,17 @@ out and retried (bounded by `--retry-time-limit` when set). A prefill leg that
 fails, or answers without `kv_transfer_params`, sends the request to a D node
 alone, which recomputes (`router_pd_fallbacks_total`). `/v1/messages` carries no
 `kv_transfer_params` and is served on D nodes only. `/router-viz` shows each
-backend's role as its `mode` (`prefill` or `decode`). The `router_cache_*` series
+backend's role as its `mode` (`prefill` or `decode`).
+
+The two roles can run different concurrency bands:
+`--pd-prefill-soft-node-concurrency` / `--pd-prefill-max-node-concurrency` for the
+P flow and `--pd-decode-soft-node-concurrency` / `--pd-decode-max-node-concurrency`
+for the D flow, which also governs requests that bypass P/D (`/v1/messages`). Each
+defaults to 0, inheriting the global `--soft-node-concurrency` /
+`--max-node-concurrency`, and is an error without `--pd-prefill-backends`. A
+decode-only node carries far more concurrent requests than a mixed one, so a shared
+band tends to cap the decode nodes first. The startup log prints
+`signals="prefill=[...] decode=[...]"` with each role's band. The `router_cache_*` series
 for the P flow carry `pool="<pool>:prefill"`.
 
 `--rebalance-ratio` is **off by default**. Set to `0.5` it makes a backend
