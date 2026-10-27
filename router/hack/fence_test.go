@@ -245,9 +245,10 @@ func TestNoDeadMetrics(t *testing.T) {
 	// still fails.
 	//
 	// ForPrefill is the same indirection for the prefill split's collectors,
-	// and is held to the same condition.
-	resolver := funcBody(string(src), "func ForPool(") + funcBody(string(src), "func ForPrefill(")
-	resolverUsed, prefillResolverUsed := false, false
+	// and is held to the same condition, as is ForPD for disaggregation's.
+	resolver := funcBody(string(src), "func ForPool(") + funcBody(string(src), "func ForPrefill(") +
+		funcBody(string(src), "func ForPD(")
+	resolverUsed, prefillResolverUsed, pdResolverUsed := false, false, false
 	for _, rel := range goFiles(t, root, false) {
 		if strings.HasPrefix(filepath.ToSlash(rel), "internal/metrics/") {
 			continue
@@ -258,12 +259,17 @@ func TestNoDeadMetrics(t *testing.T) {
 		}
 		resolverUsed = resolverUsed || strings.Contains(string(b), "metrics.ForPool")
 		prefillResolverUsed = prefillResolverUsed || strings.Contains(string(b), "metrics.ForPrefill")
+		pdResolverUsed = pdResolverUsed || strings.Contains(string(b), "metrics.ForPD")
 	}
 	if !resolverUsed {
 		t.Error("metrics.ForPool is never called, so every per-pool collector is dead")
 	}
 	if !prefillResolverUsed {
 		t.Error("metrics.ForPrefill is never called, so every prefill-split collector is dead")
+	}
+
+	if !pdResolverUsed {
+		t.Error("metrics.ForPD is never called, so every disaggregation collector is dead")
 	}
 
 	for _, name := range declared {

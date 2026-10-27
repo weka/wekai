@@ -546,6 +546,51 @@ var blockBuckets = []float64{0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 204
 // lives.
 var poolBuckets = []float64{1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64}
 
+// Prefill/decode disaggregation (--pd-prefill-backends). Per pool, and
+// registered whether or not the feature is on.
+var (
+	PDPrefillLegs = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_pd_prefill_legs_total",
+		Help: "Prefill legs sent to a P node, by outcome: ok, failed (non-2xx or transport error) or no_params (answered without kv_transfer_params).",
+	}, []string{"pool", "outcome"})
+	PDFallbacks = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_pd_fallbacks_total",
+		Help: "Requests sent to a D node without kv_transfer_params, so it recomputes the prompt: no_prefill_node, prefill_failed or no_params.",
+	}, []string{"pool", "reason"})
+	PDPrefillRetries = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_pd_prefill_retries_total",
+		Help: "Prefill legs retried after every P node was saturated or the chosen one answered 429.",
+	}, []string{"pool"})
+	PDLegSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "router_pd_leg_duration_seconds",
+		Help:    "Wall time of each prefill/decode leg, including retries; the decode leg runs to the end of its response.",
+		Buckets: prometheus.ExponentialBuckets(0.01, 2, 14),
+	}, []string{"pool", "leg"})
+)
+
+// PDMetrics is one pool's disaggregation collectors, resolved once.
+type PDMetrics struct {
+	LegOK, LegFailed, LegNoParams                    prometheus.Counter
+	FallbackNoNode, FallbackFailed, FallbackNoParams prometheus.Counter
+	Retries                                          prometheus.Counter
+	PrefillSeconds, DecodeSeconds                    prometheus.Observer
+}
+
+// ForPD resolves a pool's disaggregation collectors, every series at 0.
+func ForPD(pool string) *PDMetrics {
+	return &PDMetrics{
+		LegOK:            PDPrefillLegs.WithLabelValues(pool, "ok"),
+		LegFailed:        PDPrefillLegs.WithLabelValues(pool, "failed"),
+		LegNoParams:      PDPrefillLegs.WithLabelValues(pool, "no_params"),
+		FallbackNoNode:   PDFallbacks.WithLabelValues(pool, "no_prefill_node"),
+		FallbackFailed:   PDFallbacks.WithLabelValues(pool, "prefill_failed"),
+		FallbackNoParams: PDFallbacks.WithLabelValues(pool, "no_params"),
+		Retries:          PDPrefillRetries.WithLabelValues(pool),
+		PrefillSeconds:   PDLegSeconds.WithLabelValues(pool, "prefill"),
+		DecodeSeconds:    PDLegSeconds.WithLabelValues(pool, "decode"),
+	}
+}
+
 // All returns every collector this package declares. The dead-metric check in
 // hack/ walks this list, so a new collector must be added here to be registered
 // — and must be referenced somewhere to pass.
@@ -567,6 +612,7 @@ func All() []prometheus.Collector {
 		RequestsShed, SaturationRejects, BackendCapExceeded, observedShadow,
 		PrefillRejections, PrefillJobs, PrefillConversions, PrefillReleases,
 		PrefillBypassFallbacks, PrefillJobRetries, PrefillQueuedJobs, PrefillNodes, PrefillNodeMode, PrefillPendingTokens,
+		PDPrefillLegs, PDFallbacks, PDPrefillRetries, PDLegSeconds,
 	}
 }
 

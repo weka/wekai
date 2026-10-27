@@ -272,7 +272,12 @@ func (s *Server) inferenceHandler(route dialect.Route, affine bool) http.Handler
 		if target.Split != nil && !prefill.HasBypass(body) {
 			r = r.WithContext(proxy.WithRejectCapture(r.Context()))
 		}
-		res := s.serveWithCapacityRetry(w, r, target, rr, body, accepted, outcome, auth)
+		var res proxy.Result
+		if target.PD != nil && pdRoute(route.Class) {
+			res = s.pdServe(w, r, target, rr, body, accepted, outcome, auth)
+		} else {
+			res = s.serveWithCapacityRetry(w, r, target, rr, body, accepted, outcome, auth)
+		}
 		if res.PrefillRejected {
 			res = s.splitAndServe(w, r, target, rr, body, res, accepted, outcome, auth)
 		}
@@ -376,6 +381,10 @@ func (s *Server) candidates(t Target) []*registry.Backend {
 		// Ordinary routing never lands on a node that is draining for, or
 		// running, prefill jobs.
 		cands = t.Split.DecodeNodes(cands)
+	}
+	if t.PD != nil {
+		// A P node serves only the prefill leg.
+		cands = t.PD.DecodeNodes(cands)
 	}
 	return cands
 }

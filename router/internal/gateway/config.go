@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/weka/wekai/router/internal/clock"
+	"github.com/weka/wekai/router/internal/pd"
 	"github.com/weka/wekai/router/internal/prefill"
 	"github.com/weka/wekai/router/internal/proxy"
 	"github.com/weka/wekai/router/internal/registry"
@@ -177,6 +178,11 @@ type Target struct {
 	// Split moves heavy prefills a backend refuses onto prefill-only nodes. Nil
 	// leaves the backend's refusal to reach the caller unchanged.
 	Split *prefill.Manager
+	// PD, when set, runs every chat and completions request as a prefill leg on
+	// a P node and then a decode leg on a D node. Nil is ordinary routing.
+	PD *pd.Set
+	// PrefillSelector is the flow that chooses among the P nodes.
+	PrefillSelector proxy.Selector
 }
 
 // Router maps a request's model to the pool that serves it.

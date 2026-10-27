@@ -65,6 +65,7 @@ type RouterServeCommand struct {
 	TailTTL           time.Duration `long:"cache-tail-ttl" default:"5m" description:"How long a leaf of the shared prefix tree may go untouched before eviction. Memory pressure only: eviction never removes a run that still has children."`
 	TransientFallback float64       `long:"transient-fallback-threshold" description:"Serve a request the split guard refused on a backend WITHOUT recording it as a holder, while that backend is below ref*(1-this) — the same reference the guard measures against. Must be BELOW --cache-split-guard to do anything, since it is the looser bar: at 0.05 against a guard of 0.20, a backend under 80% of the holders' load takes the prefix and keeps it, one between 80% and 95% serves the request and is forgotten. 0 = off, and the guard's rejection is final."`
 	PrefillSplit      bool          `long:"prefill-split" description:"Move heavy prefills off decode nodes. When a backend refuses a request with HTTP 503 with an X-Weka-Prefill-Reject header (its WEKA_PREFILL_REJECT_TOKENS), the router runs that prefill on a node it has set aside — draining it of decode work first — then sends the request for decode as usual; the client never sees the refusal. Needs a KV tier the nodes share, or the decode node recomputes what the prefill node computed. With this off, the 503 reaches the client unchanged. Off by default."`
+	PDPrefill         []string      `long:"pd-prefill-backends" description:"Vanilla vLLM NIXL prefill/decode disaggregation. Comma-separated backend URLs that are PREFILL nodes (a subset of --backends); the rest are decode nodes. Every chat/completions request then goes to a prefill node first (a copy with max_tokens=1 and kv_transfer_params.do_remote_decode), and its returned kv_transfer_params go with the original request to a decode node. Both nodes are chosen by the same prefix-affinity and load flow as ordinary routing, over their own set. A failed prefill leg sends the request to a decode node alone, which recomputes. Exclusive with --prefill-split. /v1/messages is served over decode nodes only. Off when empty."`
 	PrefillBudget     int64         `long:"prefill-node-budget-tokens" default:"4000000" description:"Most prefill tokens queued plus in flight on one prefill node. A job larger than this still runs on an otherwise empty node."`
 	PrefillFraction   float64       `long:"prefill-max-fleet-fraction" default:"0.5" description:"Largest share of a pool that may be draining or prefill nodes: floor(nodes * this), and at least one node always stays in decode."`
 	RetryTimeLimit    time.Duration `long:"retry-time-limit" description:"Keep re-deciding a request that no backend can currently take for up to this long before answering 429, backing off 10ms/20ms/50ms/... to 3s with jitter. Applies to CAPACITY refusals only — every backend saturated, or the split guard declining a duplicate — both of which stop being true the moment any in-flight request completes. A client would retry anyway; this does the waiting where the fleet's state is already known. 0 = off, answer immediately. NOTE this is a per-attempt hold, not a per-request budget: a client that retries a shed request pays it again on every attempt, so the added latency is this value TIMES the attempt count. Measured against a client retrying ~18 times, a 10s setting produced ~190s of added latency before the request finally failed. Also the wait budget for --max-node-concurrency's per-backend queue (see there): this is reused rather than adding a second timeout flag, since both describe the same thing — how long to wait out a capacity refusal before answering 429."`
@@ -240,6 +241,7 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		SoftNodeConcurrency:     c.SoftNodeConc,
 		RebalanceRatio:          c.RebalanceRatio,
 		PrefillSplit:            c.PrefillSplit,
+		PDPrefillBackends:       splitList(joinBackends(c.PDPrefill)),
 		PrefillNodeBudgetTokens: c.PrefillBudget,
 		PrefillMaxFleetFraction: c.PrefillFraction,
 		AutoModel:               c.AutoModel,
@@ -302,6 +304,14 @@ func trackInFlight(wg *sync.WaitGroup, next http.Handler) http.Handler {
 // Rewriting every comma to a pipe — which is what this did — split that
 // selector into two endpoints, one of them the nonsense "tier=prod". The
 // shorthand has to survive the syntax it is shorthand for.
+// splitList undoes joinBackends: a pipe-joined list back into its elements.
+func splitList(joined string) []string {
+	if joined == "" {
+		return nil
+	}
+	return strings.Split(joined, "|")
+}
+
 func joinBackends(backends []string) string {
 	var out []string
 	for _, b := range backends {

@@ -65,6 +65,7 @@ type chatCompletionRequest struct {
 	MaxTokens     int             `json:"max_tokens"`
 	Tools         json.RawMessage `json:"tools"`
 	VLLMXArgs     xargs           `json:"vllm_xargs"`
+	KVTransfer    json.RawMessage `json:"kv_transfer_params"`
 }
 
 func (r *chatCompletionRequest) bypassesPrefillReject() bool {
@@ -109,6 +110,7 @@ type completionRequest struct {
 	StreamOptions *streamOptions  `json:"stream_options"`
 	MaxTokens     int             `json:"max_tokens"`
 	VLLMXArgs     xargs           `json:"vllm_xargs"`
+	KVTransfer    json.RawMessage `json:"kv_transfer_params"`
 }
 
 func (r *completionRequest) bypassesPrefillReject() bool {
@@ -191,6 +193,9 @@ type chatCompletionResponse struct {
 	Model   string       `json:"model"`
 	Choices []chatChoice `json:"choices"`
 	Usage   *usage       `json:"usage,omitempty"`
+	// KVTransfer is answered to a request that asked to be a remote-decode
+	// source (NIXL prefill leg).
+	KVTransfer json.RawMessage `json:"kv_transfer_params,omitempty"`
 }
 
 type completionChoice struct {
@@ -206,6 +211,8 @@ type completionResponse struct {
 	Model   string             `json:"model"`
 	Choices []completionChoice `json:"choices"`
 	Usage   *usage             `json:"usage,omitempty"`
+
+	KVTransfer json.RawMessage `json:"kv_transfer_params,omitempty"`
 }
 
 type modelsResponse struct {

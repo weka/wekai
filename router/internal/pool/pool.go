@@ -27,6 +27,7 @@ import (
 	"github.com/weka/wekai/router/internal/clock"
 	"github.com/weka/wekai/router/internal/health"
 	"github.com/weka/wekai/router/internal/metrics"
+	"github.com/weka/wekai/router/internal/pd"
 	"github.com/weka/wekai/router/internal/policy"
 	"github.com/weka/wekai/router/internal/policy/affinity"
 	"github.com/weka/wekai/router/internal/prefill"
@@ -76,6 +77,11 @@ type Config struct {
 	// onto prefill-only nodes. Its PoolName and Clock are filled in here.
 	PrefillSplit *prefill.Config
 
+	// PDPrefill lists the backend URLs that are prefill nodes under
+	// prefill/decode disaggregation; every other backend is a decode node.
+	// Empty leaves the pool undisaggregated.
+	PDPrefill []string
+
 	// OnCircuitTransition, when set, is attached to every backend as it joins,
 	// so an operator can tell an overload from an outage.
 	OnCircuitTransition func(url string) func(from, to any, ok, fail int)
@@ -88,6 +94,11 @@ type Pool struct {
 	Flow     *affinity.Policy
 	// Split is nil unless Config.PrefillSplit is set.
 	Split *prefill.Manager
+	// PD is nil unless Config.PDPrefill is set.
+	PD *pd.Set
+	// PDFlow routes the prefill leg over the P nodes, with prefix state of its
+	// own. Flow routes the decode leg.
+	PDFlow *affinity.Policy
 
 	checker *health.Checker
 	log     *slog.Logger
@@ -104,6 +115,22 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Pool, error) {
 		return nil, fmt.Errorf("pool %q: %w", cfg.Name, err)
 	}
 
+	// Under prefill/decode disaggregation the P nodes get a flow of their own:
+	// one prefix tree shared by both roles would anchor a request at the deeper
+	// run the other role holds, and neither would see its own session as a hit.
+	var pflow *affinity.Policy
+	if len(cfg.PDPrefill) > 0 {
+		pc := cfg.Flow
+		if pc.PoolName == "" {
+			pc.PoolName = affinity.DefaultPoolName
+		}
+		pc.PoolName += ":prefill"
+		pflow, err = affinity.New(pc, policy.LeastOutstanding{})
+		if err != nil {
+			return nil, fmt.Errorf("pool %q: %w", cfg.Name, err)
+		}
+	}
+
 	opts := registry.Options{
 		Clock:         clk,
 		DrainDeadline: cfg.DrainDeadline,
@@ -111,8 +138,18 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Pool, error) {
 		// is discovered and later removed does not leak its marks, and its
 		// prefixes are never reassigned to whoever takes its place
 		// (CACHE-10, CU-4, CU-12).
-		OnAdd:  flow.AddBackend,
-		OnDrop: flow.DropBackend,
+		OnAdd: func(b *registry.Backend) {
+			flow.AddBackend(b)
+			if pflow != nil {
+				pflow.AddBackend(b)
+			}
+		},
+		OnDrop: func(b *registry.Backend) {
+			flow.DropBackend(b)
+			if pflow != nil {
+				pflow.DropBackend(b)
+			}
+		},
 	}
 	reg := registry.New(opts)
 
@@ -127,6 +164,14 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Pool, error) {
 		sc := *cfg.PrefillSplit
 		sc.PoolName, sc.Clock = cfg.Name, clk
 		p.Split = prefill.New(sc)
+	}
+
+	if len(cfg.PDPrefill) > 0 {
+		if cfg.PrefillSplit != nil {
+			return nil, fmt.Errorf("pool %q: prefill/decode disaggregation and the prefill split are mutually exclusive", cfg.Name)
+		}
+		p.PD = pd.New(cfg.Name, cfg.PDPrefill)
+		p.PDFlow = pflow
 	}
 
 	for _, b := range cfg.Backends {
@@ -180,6 +225,10 @@ func (p *Pool) Run(ctx context.Context) {
 
 	go p.tick(ctx, sweepInterval(p.Flow.TailTTL()), func() { p.Flow.Sweep() })
 	go p.tick(ctx, gaugeInterval, p.Flow.PublishGauges)
+	if p.PDFlow != nil {
+		go p.tick(ctx, sweepInterval(p.PDFlow.TailTTL()), func() { p.PDFlow.Sweep() })
+		go p.tick(ctx, gaugeInterval, p.PDFlow.PublishGauges)
+	}
 	if p.Split != nil {
 		go p.Split.Run(ctx, func() []*registry.Backend { return p.Registry.Snapshot().Backends })
 	}

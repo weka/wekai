@@ -1,7 +1,9 @@
 package mockvllm
 
 import (
+	"encoding/json"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -40,6 +42,52 @@ type Server struct {
 	coll   *collectors
 	reg    *prometheus.Registry
 	nextID atomic.Int64
+
+	// EngineID names this engine in the kv_transfer_params it hands out.
+	// Empty is "mock-engine".
+	EngineID string
+
+	kvMu       sync.Mutex
+	kvReceived []json.RawMessage
+}
+
+// KVTransfersReceived is the kv_transfer_params of every request this server
+// has received, in arrival order, null for a request that carried none.
+func (s *Server) KVTransfersReceived() []json.RawMessage {
+	s.kvMu.Lock()
+	defer s.kvMu.Unlock()
+	return append([]json.RawMessage(nil), s.kvReceived...)
+}
+
+func (s *Server) recordKVTransfer(raw json.RawMessage) {
+	if len(raw) == 0 {
+		raw = json.RawMessage("null")
+	}
+	s.kvMu.Lock()
+	s.kvReceived = append(s.kvReceived, raw)
+	s.kvMu.Unlock()
+}
+
+// kvTransferAnswer is what a NIXL prefill leg (do_remote_decode) gets back:
+// params a decode node would use to pull the blocks. Any other request gets
+// none.
+func (s *Server) kvTransferAnswer(req json.RawMessage) json.RawMessage {
+	var in struct {
+		RemoteDecode bool `json:"do_remote_decode"`
+	}
+	if json.Unmarshal(req, &in) != nil || !in.RemoteDecode {
+		return nil
+	}
+	id := s.EngineID
+	if id == "" {
+		id = "mock-engine"
+	}
+	out, _ := json.Marshal(map[string]any{
+		"do_remote_prefill": true, "do_remote_decode": false,
+		"remote_engine_id": id, "remote_block_ids": []int{1, 2, 3},
+		"remote_host": "127.0.0.1", "remote_port": 5600,
+	})
+	return out
 }
 
 func NewServer(engine *Engine) *Server {

@@ -36,6 +36,7 @@ import (
 	"github.com/weka/wekai/router/internal/gateway"
 	"github.com/weka/wekai/router/internal/health"
 	"github.com/weka/wekai/router/internal/metrics"
+	"github.com/weka/wekai/router/internal/pd"
 	"github.com/weka/wekai/router/internal/policy/affinity"
 	"github.com/weka/wekai/router/internal/pool"
 	"github.com/weka/wekai/router/internal/prefill"
@@ -147,6 +148,10 @@ type Options struct {
 	// large_prefill_rejected) onto prefill-only nodes the router sets aside
 	// from the fleet. Off by default.
 	PrefillSplit bool
+	// PDPrefillBackends are the backends that are prefill nodes under vanilla
+	// NIXL prefill/decode disaggregation; every other backend is a decode node.
+	// Each must be an endpoint of some route. Exclusive with PrefillSplit.
+	PDPrefillBackends []string
 	// PrefillNodeBudgetTokens bounds the prefill tokens queued plus in flight
 	// on one prefill node.
 	PrefillNodeBudgetTokens int64
@@ -265,6 +270,49 @@ func (o Options) prefillConfig() *prefill.Config {
 	}
 }
 
+// pdPrefillFor is the part of the P set that belongs to one route.
+func (o Options) pdPrefillFor(rt Route) []string {
+	var out []string
+	for _, ep := range rt.Endpoints {
+		for _, p := range o.PDPrefillBackends {
+			if pd.Normalize(p) == pd.Normalize(ep) {
+				out = append(out, ep)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// validatePD rejects a P set that cannot work: combined with the prefill
+// split, naming a backend no route has, or leaving a pool without a decode
+// node.
+func (o Options) validatePD() error {
+	if len(o.PDPrefillBackends) == 0 {
+		return nil
+	}
+	if o.PrefillSplit {
+		return errors.New("router: --pd-prefill-backends and --prefill-split are mutually exclusive")
+	}
+	for _, p := range o.PDPrefillBackends {
+		found := false
+		for _, rt := range o.Routes {
+			for _, ep := range rt.Endpoints {
+				found = found || pd.Normalize(ep) == pd.Normalize(p)
+			}
+		}
+		if !found {
+			return fmt.Errorf("router: --pd-prefill-backends %q is not one of the routes' backends", p)
+		}
+	}
+	for _, rt := range o.Routes {
+		if n := len(o.pdPrefillFor(rt)); n > 0 && n >= len(rt.Endpoints) && rt.DiscoverySelector == "" {
+			return fmt.Errorf("router: route %q has no decode backend left after --pd-prefill-backends", rt.Patterns)
+		}
+	}
+	return nil
+}
+
 func (o Options) healthConfig() health.Config {
 	return health.Config{
 		Interval: o.HealthInterval, UnhealthyInterval: o.HealthUnhealthy,
@@ -339,6 +387,10 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 		if opts.APIKey == "" {
 			return nil, fmt.Errorf("api key file %s is empty", opts.APIKeyFile)
 		}
+	}
+
+	if err := opts.validatePD(); err != nil {
+		return nil, err
 	}
 
 	// One dialect, registered at the wiring layer rather than as a package side
@@ -430,6 +482,7 @@ func Handler(ctx context.Context, opts Options) (http.Handler, error) {
 			DefaultDialect:  d.ID(),
 			DrainDeadline:   opts.DrainDeadline,
 			PrefillSplit:    opts.prefillConfig(),
+			PDPrefill:       opts.pdPrefillFor(rt),
 		}, clk, log)
 		if err != nil {
 			return nil, err
@@ -747,8 +800,26 @@ func vizData(pools []*pool.Pool) http.HandlerFunc {
 		if p.Split != nil {
 			src = splitSource{inner: p.Flow, m: p.Split}
 		}
+		if p.PD != nil {
+			src = pdSource{inner: p.Flow, set: p.PD}
+		}
 		viz.DataHandler(src)(w, r)
 	}
+}
+
+// pdSource labels each backend with its P/D role. Mode reuses the prefill
+// split's field: "prefill" for a P node, "decode" for a D node.
+type pdSource struct {
+	inner viz.DataSource
+	set   *pd.Set
+}
+
+func (s pdSource) Snapshot(opts viz.SnapshotOptions) viz.Snapshot {
+	snap := s.inner.Snapshot(opts)
+	for i := range snap.Backends {
+		snap.Backends[i].Mode = s.set.Role(&registry.Backend{URL: snap.Backends[i].URL})
+	}
+	return snap
 }
 
 // splitSource adds the prefill split's node modes and counters to the KV map.

@@ -50,6 +50,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.recordKVTransfer(req.KVTransfer)
 	units := s.engine.Tokenize(string(req.promptBytes()))
 	release, res, ok := s.admitOrReject(w, units, req.bypassesPrefillReject())
 	if !ok {
@@ -90,7 +91,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			Message:      &chatMsgOut{Role: "assistant", Content: content},
 			FinishReason: &finish,
 		}},
-		Usage: &u,
+		Usage:      &u,
+		KVTransfer: s.kvTransferAnswer(req.KVTransfer),
 	})
 
 	s.coll.observe("success", res, maxTok)
@@ -103,6 +105,7 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.recordKVTransfer(req.KVTransfer)
 	units := s.engine.Tokenize(req.promptText())
 	release, res, ok := s.admitOrReject(w, units, req.bypassesPrefillReject())
 	if !ok {
@@ -140,6 +143,8 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 		Model:   modelID,
 		Choices: []completionChoice{{Index: 0, Text: text, FinishReason: &finish}},
 		Usage:   &u,
+
+		KVTransfer: s.kvTransferAnswer(req.KVTransfer),
 	})
 
 	s.coll.observe("success", res, maxTok)
