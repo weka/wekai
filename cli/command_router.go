@@ -68,7 +68,6 @@ type RouterServeCommand struct {
 	PrefillSplit      bool          `long:"prefill-split" description:"Move heavy prefills off decode nodes. When a backend refuses a request with HTTP 503 with an X-Weka-Prefill-Reject header (its WEKA_PREFILL_REJECT_TOKENS), the router runs that prefill on a node it has set aside — draining it of decode work first — then sends the request for decode as usual; the client never sees the refusal. Needs a KV tier the nodes share, or the decode node recomputes what the prefill node computed. With this off, the 503 reaches the client unchanged. Off by default."`
 	PrefillBudget     int64         `long:"prefill-node-budget-tokens" default:"4000000" description:"Most prefill tokens queued plus in flight on one prefill node. A job larger than this still runs on an otherwise empty node."`
 	PrefillFraction   float64       `long:"prefill-max-fleet-fraction" default:"0.5" description:"Largest share of a pool that may be draining or prefill nodes: floor(nodes * this), and at least one node always stays in decode."`
-	PrefillIdle       time.Duration `long:"prefill-release-idle" default:"60s" description:"A prefill node with no prefill work for this long returns to decode."`
 	RefusalTTL        time.Duration `long:"cache-refusal-ttl" default:"2s" description:"How long a backend's own 429 keeps it out of its prefixes. Cleared early by any success from it, and by its in-flight dropping below the level it refused at."`
 
 	// --- Listener behaviour.
@@ -242,7 +241,6 @@ func (c *RouterServeCommand) Execute(args []string) error {
 		PrefillSplit:            c.PrefillSplit,
 		PrefillNodeBudgetTokens: c.PrefillBudget,
 		PrefillMaxFleetFraction: c.PrefillFraction,
-		PrefillReleaseIdle:      c.PrefillIdle,
 		AutoModel:               c.AutoModel,
 		SplitGuard:              c.SplitGuard,
 		TransientFallback:       c.TransientFallback,

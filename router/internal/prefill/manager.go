@@ -9,8 +9,8 @@
 //
 // A node is in one of three modes. It starts in decode, becomes draining when a
 // rejected request needs a prefill node and none has room, becomes prefill once
-// its running decode requests have finished, and returns to decode after going
-// idle. Which nodes are prefill nodes is therefore the router's decision, made
+// its running decode requests have finished, and returns to decode as soon as
+// it has no job running or queued. Which nodes are prefill nodes is therefore the router's decision, made
 // from traffic, with nothing configured per node.
 package prefill
 
@@ -46,7 +46,6 @@ func (m Mode) String() string { return metrics.PrefillModes[m] }
 const (
 	DefaultNodeBudgetTokens = 4_000_000
 	DefaultMaxFleetFraction = 0.5
-	DefaultReleaseIdle      = 60 * time.Second
 
 	// drainPoll is how often a queued job re-checks whether its node's decode
 	// work has finished. Drain is bounded by the longest running decode, so
@@ -72,9 +71,6 @@ type Config struct {
 	// at once, and counts the node's other in-flight requests against it; jobs
 	// beyond it wait their turn. 0 is no limit.
 	NodeConcurrency int64
-	// ReleaseIdle is how long a node goes without prefill work before it
-	// returns to decode.
-	ReleaseIdle time.Duration
 
 	Clock    clock.Clock
 	PoolName string
@@ -86,9 +82,6 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MaxFleetFraction <= 0 || c.MaxFleetFraction > 1 {
 		c.MaxFleetFraction = DefaultMaxFleetFraction
-	}
-	if c.ReleaseIdle <= 0 {
-		c.ReleaseIdle = DefaultReleaseIdle
 	}
 	if c.Clock == nil {
 		c.Clock = clock.Real{}
@@ -105,11 +98,10 @@ type node struct {
 	b *registry.Backend
 	// running is the jobs holding a slot; queue the jobs waiting for one, in
 	// arrival order.
-	running  int
-	queue    []*Job
-	mode     Mode
-	pending  int64
-	lastWork time.Time
+	running int
+	queue   []*Job
+	mode    Mode
+	pending int64
 }
 
 // Manager owns the node modes for one pool.
@@ -157,7 +149,7 @@ func (j *Job) Done() {
 			j.mgr.grantLocked(j.n)
 		}
 		j.n.pending -= j.tokens
-		j.n.lastWork = j.mgr.cfg.Clock.Now()
+		j.mgr.releaseIfIdleLocked(j.n)
 		j.mgr.publishLocked(j.n)
 	})
 }
@@ -247,7 +239,6 @@ func (m *Manager) Reserve(cands []*registry.Backend, tokens int64, pick Picker) 
 
 	n := m.nodes[chosen.URL]
 	n.pending += tokens
-	n.lastWork = m.cfg.Clock.Now()
 	m.publishLocked(n)
 	j := &Job{mgr: m, n: n, tokens: tokens, Backend: chosen, granted: make(chan struct{}), queued: true}
 	n.queue = append(n.queue, j)
@@ -405,45 +396,50 @@ func (m *Manager) CountJobRetry() {
 	m.m.JobRetries.Inc()
 }
 
-// Sweep returns idle nodes to decode and forgets nodes that have left the
-// pool. A node is idle when it has no pending prefill and none was finished
-// within ReleaseIdle.
-func (m *Manager) Sweep(known []*registry.Backend) {
+// releaseIfIdleLocked returns a node to decode the moment it has no job in
+// flight and none queued. It runs under the same lock as every queue change,
+// so a job reserved concurrently either finds the node still in prefill and
+// keeps it, or finds it back in decode and converts it afresh.
+func (m *Manager) releaseIfIdleLocked(n *node) {
+	if n.mode == Decode || n.pending != 0 || n.running != 0 || len(n.queue) != 0 {
+		return
+	}
+	n.mode = Decode
+	m.releases.Add(1)
+	m.m.Releases.Inc()
+}
+
+// Prune forgets nodes that have left the pool and drops their series.
+func (m *Manager) Prune(known []*registry.Backend) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	live := make(map[string]bool, len(known))
 	for _, b := range known {
 		live[b.URL] = true
 	}
-	now := m.cfg.Clock.Now()
-	for url, n := range m.nodes {
+	for url := range m.nodes {
 		if !live[url] {
 			delete(m.nodes, url)
 			m.m.DropNode(url)
-			continue
-		}
-		if n.mode != Decode && n.pending == 0 && now.Sub(n.lastWork) >= m.cfg.ReleaseIdle {
-			n.mode = Decode
-			m.releases.Add(1)
-			m.m.Releases.Inc()
-			m.publishLocked(n)
 		}
 	}
 	m.publishCountsLocked()
 }
 
-// Run sweeps on a ticker until ctx is done. known supplies the pool's current
-// backends.
+// pruneEvery is how often Run forgets departed nodes.
+const pruneEvery = 30 * time.Second
+
+// Run prunes departed nodes until ctx is done. known supplies the pool's
+// current backends.
 func (m *Manager) Run(ctx context.Context, known func() []*registry.Backend) {
-	every := min(max(m.cfg.ReleaseIdle/4, 100*time.Millisecond), 5*time.Second)
-	t := m.cfg.Clock.NewTicker(every)
+	t := m.cfg.Clock.NewTicker(pruneEvery)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C():
-			m.Sweep(known())
+			m.Prune(known())
 		}
 	}
 }

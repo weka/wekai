@@ -240,13 +240,12 @@ func TestJobLargerThanTheBudgetStillRunsOnAnEmptyNode(t *testing.T) {
 
 func TestPickerChoosesAmongEligibleNodesOnly(t *testing.T) {
 	f := newFleet(t, 6, Config{NodeBudgetTokens: 100, MaxFleetFraction: 0.5})
-	a, _ := f.m.Reserve(f.bs, 90, nil) // node a is nearly full
+	a, _ := f.m.Reserve(f.bs, 40, nil) // node a has room for 60 more
 	b, _ := f.m.Reserve(f.bs, 90, nil) // forces a second prefill node
 	c, _ := f.m.Reserve(f.bs, 90, nil) // and a third
 	if a.Backend == b.Backend || b.Backend == c.Backend || a.Backend == c.Backend {
 		t.Fatal("setup: expected three distinct prefill nodes")
 	}
-	a.Done() // a has room again; b and c stay full
 
 	var offered []*registry.Backend
 	pick := func(eligible []*registry.Backend) (*registry.Backend, error) {
@@ -263,10 +262,8 @@ func TestPickerChoosesAmongEligibleNodesOnly(t *testing.T) {
 	}
 
 	// With several eligible, the policy's choice wins over load order.
-	b.Done()
-	c.Done()
 	want := c.Backend
-	j2, _ := f.m.Reserve(f.bs, 10, func(el []*registry.Backend) (*registry.Backend, error) {
+	j2, _ := f.m.Reserve(f.bs, 5, func(el []*registry.Backend) (*registry.Backend, error) {
 		for _, e := range el {
 			if e == want {
 				return e, nil
@@ -322,35 +319,92 @@ func TestDecodeNodesNeverEmptiesTheCandidateSet(t *testing.T) {
 	}
 }
 
-func TestIdleNodeReturnsToDecode(t *testing.T) {
-	f := newFleet(t, 4, Config{ReleaseIdle: time.Minute})
-	j, _ := f.m.Reserve(f.bs, 10, nil)
-	n := j.Backend
-
-	f.clk.Advance(2 * time.Minute)
-	f.m.Sweep(f.bs)
-	if got := f.m.ModeOf(n); got == Decode {
-		t.Fatal("a node with a job outstanding was released")
+func TestNodeReturnsToDecodeTheMomentItsLastJobCompletes(t *testing.T) {
+	f := newFleet(t, 4, Config{})
+	a, _ := f.m.Reserve(f.bs, 10, nil)
+	b, _ := f.m.Reserve(f.bs, 10, nil)
+	if a.Backend != b.Backend {
+		t.Fatal("setup: both jobs should share the one prefill node")
 	}
-
-	j.Done()
-	f.clk.Advance(59 * time.Second)
-	f.m.Sweep(f.bs)
-	if got := f.m.ModeOf(n); got == Decode {
-		t.Fatal("released before the idle period elapsed")
+	if err := f.m.WaitReady(context.Background(), a); err != nil {
+		t.Fatal(err)
 	}
-
-	f.clk.Advance(2 * time.Second)
-	f.m.Sweep(f.bs)
-	if got := f.m.ModeOf(n); got != Decode {
-		t.Errorf("mode = %v after %s idle, want decode", got, time.Minute)
+	if err := f.m.WaitReady(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	a.Done()
+	if got := f.m.ModeOf(a.Backend); got != Prefill {
+		t.Fatalf("mode = %v with a job still running, want prefill", got)
+	}
+	b.Done()
+	if got := f.m.ModeOf(a.Backend); got != Decode {
+		t.Errorf("mode = %v after the last job, want decode with no waiting", got)
 	}
 	if got := f.m.State().Releases; got != 1 {
 		t.Errorf("releases = %d, want 1", got)
 	}
+	if n := f.m.DecodeNodes(f.bs); len(n) != 4 {
+		t.Errorf("%d nodes take decode traffic, want all 4", len(n))
+	}
 }
 
-func TestSweepForgetsDepartedNodes(t *testing.T) {
+func TestJobQueuedAsTheLastOneFinishesKeepsTheNode(t *testing.T) {
+	f := newFleet(t, 4, Config{NodeConcurrency: 1})
+	a, _ := f.m.Reserve(f.bs, 10, nil)
+	if err := f.m.WaitReady(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := f.m.Reserve(f.bs, 10, nil) // queued behind a
+	if b.Backend != a.Backend {
+		t.Fatal("setup: the queued job should join the prefill node")
+	}
+	a.Done()
+	if got := f.m.ModeOf(a.Backend); got != Prefill {
+		t.Fatalf("mode = %v with a job queued, want prefill", got)
+	}
+	if err := f.m.WaitReady(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	b.Done()
+	if got := f.m.ModeOf(a.Backend); got != Decode {
+		t.Errorf("mode = %v after the queue emptied, want decode", got)
+	}
+
+	// A job arriving after the release converts the node afresh.
+	c, err := f.m.Reserve(f.bs, 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.m.ModeOf(c.Backend); got == Decode {
+		t.Error("a job reserved after the release left its node in decode")
+	}
+	c.Done()
+}
+
+func TestDrainingNodeWhoseQueuedJobsAllCancelReturnsToDecode(t *testing.T) {
+	f := newFleet(t, 2, Config{})
+	defer lease.Acquire(f.bs[0]).Release()
+	defer lease.Acquire(f.bs[1]).Release()
+	defer lease.Acquire(f.bs[1]).Release()
+	a, _ := f.m.Reserve(f.bs, 10, nil)
+	b, _ := f.m.Reserve(f.bs, 10, nil)
+	if got := f.m.ModeOf(a.Backend); got != Draining {
+		t.Fatalf("setup: mode = %v, want draining", got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, j := range []*Job{a, b} {
+		if err := f.m.WaitReady(ctx, j); !errors.Is(err, context.Canceled) {
+			t.Fatalf("WaitReady = %v", err)
+		}
+		j.Done()
+	}
+	if got := f.m.ModeOf(a.Backend); got != Decode {
+		t.Errorf("mode = %v after every queued job cancelled before running, want decode", got)
+	}
+}
+
+func TestPruneForgetsDepartedNodes(t *testing.T) {
 	f := newFleet(t, 3, Config{})
 	j, _ := f.m.Reserve(f.bs, 10, nil)
 	j.Done()
@@ -360,7 +414,7 @@ func TestSweepForgetsDepartedNodes(t *testing.T) {
 			rest = append(rest, b)
 		}
 	}
-	f.m.Sweep(rest)
+	f.m.Prune(rest)
 	for _, n := range f.m.State().Nodes {
 		if n.URL == j.Backend.URL {
 			t.Errorf("%s left the pool but is still tracked", n.URL)

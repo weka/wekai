@@ -139,7 +139,7 @@ reaches the client unchanged.
 
 A node is `decode` (normal), `draining` (no new decode routing; its running
 requests finish, and prefill jobs queue behind them), `prefill` (jobs only), and
-back to `decode` once it has had no prefill work for `--prefill-release-idle`.
+back to `decode` the moment it has no prefill job running or queued.
 The prefill node is chosen like any other routing decision — the same flow, over
 the prefill nodes with room — where room is `--prefill-node-budget-tokens` of
 queued plus in-flight prefill. When none has room a decode node is drained, up
@@ -742,7 +742,7 @@ So alert on all three:
 | `router_retry_wait_seconds` | latency `--retry-time-limit` added, **per request** — `_count{outcome="satisfied"}` is how many requests the waiting rescued, `{outcome="expired"}` how many spent the budget and got a 429 anyway, and the quantiles what it cost. Spans the first refusal to the *start* of the attempt that ended the wait, so it excludes that attempt's service time and stays bounded by the budget in every outcome — quantiles are comparable across them. End-to-end cost is `router_request_duration_seconds`. `retries_total` counts *attempts*, so it answers neither |
 | `router_prefill_rejections_total` | `large_prefill_rejected` 503s the router absorbed (`--prefill-split` only, like the rest of this family) |
 | `router_prefill_jobs_total{outcome}` | prefill jobs, `ok` or `failed`; a failed job still sends the request on with the bypass |
-| `router_prefill_conversions_total` / `router_prefill_releases_total` | decode nodes taken out for prefill, and returned after `--prefill-release-idle` |
+| `router_prefill_conversions_total` / `router_prefill_releases_total` | decode nodes taken out for prefill, and returned to decode as soon as their last job finishes |
 | `router_prefill_bypass_fallbacks_total{reason}` | requests served with the bypass and no prefill: `no_node` (none could be added) or `job_failed` |
 | `router_prefill_nodes{mode}` / `router_prefill_node_mode{backend}` | backends per mode, and each backend's mode (0 decode, 1 draining, 2 prefill) |
 | `router_prefill_queued_jobs` / `router_prefill_job_retries_total` | prefill jobs waiting for a slot under `--max-node-concurrency` (a prefill node never runs more jobs than that, counting its other in-flight requests), and jobs retried on the same node after it answered 429 |

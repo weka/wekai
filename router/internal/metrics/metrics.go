@@ -463,7 +463,7 @@ var (
 
 	PrefillReleases = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "router_prefill_releases_total",
-		Help: "Prefill nodes returned to decode after going idle.",
+		Help: "Prefill nodes returned to decode when their last prefill job finished.",
 	}, []string{"pool"})
 
 	PrefillBypassFallbacks = prometheus.NewCounterVec(prometheus.CounterOpts{
