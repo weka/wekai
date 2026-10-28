@@ -89,9 +89,9 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-// Picker chooses among the eligible prefill nodes. The gateway passes the
-// pool's routing flow, so the choice uses the same prefix knowledge and load
-// rules as ordinary routing, over the eligible set.
+// Picker breaks a tie between equally loaded prefill nodes with room. The
+// gateway passes the pool's routing flow, so the choice uses the same prefix
+// knowledge and load rules as ordinary routing, over the tied set.
 type Picker func(eligible []*registry.Backend) (*registry.Backend, error)
 
 type node struct {
@@ -195,8 +195,10 @@ func (m *Manager) DecodeNodes(cands []*registry.Backend) []*registry.Backend {
 
 // Reserve picks the node a prefill job of tokens runs on and charges it.
 //
-//  1. Among draining and prefill nodes with budget room, pick by the routing
-//     policy.
+//  1. Among draining and prefill nodes with budget room, take the one with the
+//     most pending tokens; the routing policy only breaks ties. Packing jobs
+//     onto the fullest node leaves the others to run dry and return to decode,
+//     where spreading them would keep every prefill node busy with a little.
 //  2. Failing that, and while the prefill share is under the cap, take the
 //     least-loaded decode node and start draining it.
 //  3. Failing that, queue on the prefill node with the least pending tokens.
@@ -247,15 +249,24 @@ func (m *Manager) Reserve(cands []*registry.Backend, tokens int64, pick Picker) 
 }
 
 func (m *Manager) pickLocked(eligible []*registry.Backend, pick Picker) *registry.Backend {
-	if pick != nil {
-		if b, err := pick(eligible); err == nil && b != nil {
+	var fullest []*registry.Backend
+	for _, b := range eligible {
+		switch p := m.nodes[b.URL].pending; {
+		case len(fullest) == 0 || p > m.nodes[fullest[0].URL].pending:
+			fullest = append(fullest[:0], b)
+		case p == m.nodes[fullest[0].URL].pending:
+			fullest = append(fullest, b)
+		}
+	}
+	if len(fullest) > 1 && pick != nil {
+		// The policy declining — a saturation signal on a node already
+		// running prefill jobs is expected — must not refuse work the budget
+		// says fits, so any tied node will do.
+		if b, err := pick(fullest); err == nil && b != nil {
 			return b
 		}
 	}
-	// The policy declined — a saturation signal on a node already running
-	// prefill jobs is expected — so fall back to the emptiest queue rather
-	// than refuse work the budget says fits.
-	return m.leastPendingLocked(eligible)
+	return fullest[0]
 }
 
 func (m *Manager) leastPendingLocked(bs []*registry.Backend) *registry.Backend {

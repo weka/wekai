@@ -247,23 +247,24 @@ func TestPickerChoosesAmongEligibleNodesOnly(t *testing.T) {
 		t.Fatal("setup: expected three distinct prefill nodes")
 	}
 
-	var offered []*registry.Backend
-	pick := func(eligible []*registry.Backend) (*registry.Backend, error) {
-		offered = eligible
-		return eligible[0], nil
-	}
-	j, err := f.m.Reserve(f.bs, 50, pick)
+	// Only a has room for 45, though b and c hold more.
+	j, err := f.m.Reserve(f.bs, 45, func(el []*registry.Backend) (*registry.Backend, error) {
+		t.Errorf("picker consulted with no tie: %d nodes", len(el))
+		return el[0], nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(offered) != 1 || offered[0] != a.Backend || j.Backend != a.Backend {
-		t.Errorf("picker offered %d nodes, job on %s; want only the node with room (%s)",
-			len(offered), j.Backend.URL, a.Backend.URL)
+	if j.Backend != a.Backend {
+		t.Errorf("job on %s, want the only node with room %s", j.Backend.URL, a.Backend.URL)
 	}
 
-	// With several eligible, the policy's choice wins over load order.
+	// b and c tie as the fullest with room for 5: the policy breaks the tie,
+	// over those two only.
 	want := c.Backend
+	var offered []*registry.Backend
 	j2, _ := f.m.Reserve(f.bs, 5, func(el []*registry.Backend) (*registry.Backend, error) {
+		offered = el
 		for _, e := range el {
 			if e == want {
 				return e, nil
@@ -271,23 +272,48 @@ func TestPickerChoosesAmongEligibleNodesOnly(t *testing.T) {
 		}
 		return nil, errors.New("holder not offered")
 	})
-	if j2.Backend != want {
-		t.Errorf("job on %s, want the policy's pick %s", j2.Backend.URL, want.URL)
+	if len(offered) != 2 || j2.Backend != want {
+		t.Errorf("picker offered %d nodes, job on %s; want the tie (b, c) and the policy's pick %s",
+			len(offered), j2.Backend.URL, want.URL)
 	}
 }
 
-func TestPickerErrorFallsBackToLeastPending(t *testing.T) {
-	f := newFleet(t, 4, Config{NodeBudgetTokens: 1000})
-	a, _ := f.m.Reserve(f.bs, 400, nil)
-	b, _ := f.m.Reserve(f.bs, 900, nil) // over a's room, so a second node
+func TestPickerErrorStillPlacesTheJobOnATiedNode(t *testing.T) {
+	f := newFleet(t, 4, Config{NodeBudgetTokens: 100})
+	a, _ := f.m.Reserve(f.bs, 60, nil)
+	b, _ := f.m.Reserve(f.bs, 60, nil) // over a's room, so a second node
 	if a.Backend == b.Backend {
 		t.Fatal("setup")
 	}
-	j, err := f.m.Reserve(f.bs, 50, func([]*registry.Backend) (*registry.Backend, error) {
+	j, err := f.m.Reserve(f.bs, 10, func([]*registry.Backend) (*registry.Backend, error) {
 		return nil, errors.New("saturated")
 	})
-	if err != nil || j.Backend != a.Backend {
-		t.Errorf("Reserve = %v, %v; want the emptier node %s", j, err, a.Backend.URL)
+	if err != nil || (j.Backend != a.Backend && j.Backend != b.Backend) {
+		t.Errorf("Reserve = %v, %v; want one of the tied prefill nodes", j, err)
+	}
+}
+
+func TestJobsPackOntoTheFullestNodeSoTheLighterReturnsToDecode(t *testing.T) {
+	f := newFleet(t, 4, Config{NodeBudgetTokens: 100})
+	heavy, _ := f.m.Reserve(f.bs, 60, nil)
+	light, _ := f.m.Reserve(f.bs, 50, nil) // over heavy's room, so a second node
+	if heavy.Backend == light.Backend {
+		t.Fatal("setup")
+	}
+	for _, j := range []*Job{heavy, light} {
+		if err := f.m.WaitReady(context.Background(), j); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Both have room for 30; it goes to the fuller one, not the emptier.
+	next, _ := f.m.Reserve(f.bs, 30, nil)
+	if next.Backend != heavy.Backend {
+		t.Fatalf("job on %s, want the fullest node with room %s", next.Backend.URL, heavy.Backend.URL)
+	}
+	light.Done()
+	if got := f.m.ModeOf(light.Backend); got != Decode {
+		t.Errorf("lighter node mode = %v, want decode once its only job is done", got)
 	}
 }
 

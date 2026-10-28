@@ -175,9 +175,11 @@ reaches the client unchanged.
 A node is `decode` (normal), `draining` (no new decode routing; its running
 requests finish, and prefill jobs queue behind them), `prefill` (jobs only), and
 back to `decode` the moment it has no prefill job running or queued.
-The prefill node is chosen like any other routing decision — the same flow, over
-the prefill nodes with room — where room is `--prefill-node-budget-tokens` of
-queued plus in-flight prefill. When none has room a decode node is drained, up
+A job goes to the prefill node with the most queued plus in-flight prefill that
+still has room under `--prefill-node-budget-tokens`; the ordinary routing flow
+only breaks a tie. Packing onto the fullest node lets the others run dry and
+return to decode, where spreading jobs would keep every prefill node a little
+busy and none would ever go back. When none has room a decode node is drained, up
 to `floor(nodes * --prefill-max-fleet-fraction)` and always leaving one decode
 node; past that, jobs queue on the least-loaded prefill node, and with no
 prefill node at all the request is resent to the backend that refused it, with
