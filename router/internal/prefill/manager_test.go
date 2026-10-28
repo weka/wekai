@@ -625,3 +625,78 @@ func prefillNode(f *fleet) NodeState {
 	}
 	return NodeState{}
 }
+
+func TestConvertAfterQueuesUntilTheOverflowHasLastedThatLong(t *testing.T) {
+	f := newFleet(t, 4, Config{NodeBudgetTokens: 100, ConvertAfter: 10 * time.Second})
+	first, _ := f.m.Reserve(f.bs, 80, nil) // no prefill node yet: converts at once
+	// 80+50 overflows the budget, but the node is not over it yet: queue.
+	j, _ := f.m.Reserve(f.bs, 50, nil)
+	if j.Backend != first.Backend {
+		t.Fatalf("job on %s, want it queued on the one prefill node %s", j.Backend.URL, first.Backend.URL)
+	}
+	f.clk.Advance(9 * time.Second)
+	if j, _ := f.m.Reserve(f.bs, 10, nil); j.Backend != first.Backend {
+		t.Fatalf("converted after 9s over budget, want to wait 10s")
+	}
+	f.clk.Advance(time.Second)
+	j2, _ := f.m.Reserve(f.bs, 10, nil)
+	if j2.Backend == first.Backend {
+		t.Fatal("still queued after 10s over budget, want a second node drained")
+	}
+	if got := f.m.State().Conversions; got != 2 {
+		t.Errorf("conversions = %d, want 2", got)
+	}
+}
+
+func TestReleaseIdleKeepsAPrefillNodeThroughItsGrace(t *testing.T) {
+	f := newFleet(t, 4, Config{ReleaseIdle: 30 * time.Second})
+	j, _ := f.m.Reserve(f.bs, 10, nil)
+	if err := f.m.WaitReady(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	j.Done()
+	if got := f.m.ModeOf(j.Backend); got != Prefill {
+		t.Fatalf("mode = %v right after its last job, want prefill through the grace", got)
+	}
+
+	// A job inside the grace keeps the node, and restarts the clock.
+	f.clk.Advance(20 * time.Second)
+	j2, _ := f.m.Reserve(f.bs, 10, nil)
+	if j2.Backend != j.Backend || f.m.ModeOf(j2.Backend) != Prefill {
+		t.Fatalf("job on %s (%v), want the idle prefill node %s ready", j2.Backend.URL, f.m.ModeOf(j2.Backend), j.Backend.URL)
+	}
+	if err := f.m.WaitReady(context.Background(), j2); err != nil {
+		t.Fatal(err)
+	}
+	j2.Done()
+	f.clk.Advance(20 * time.Second)
+	f.m.releaseExpired()
+	if got := f.m.ModeOf(j.Backend); got != Prefill {
+		t.Fatalf("mode = %v after 20s idle, want prefill until 30s", got)
+	}
+	f.clk.Advance(10 * time.Second)
+	f.m.releaseExpired()
+	if got := f.m.ModeOf(j.Backend); got != Decode {
+		t.Errorf("mode = %v after 30s idle, want decode", got)
+	}
+	if got := f.m.State().Releases; got != 1 {
+		t.Errorf("releases = %d, want 1", got)
+	}
+}
+
+func TestReleaseIdleStillReturnsAJoblessDrainingNodeAtOnce(t *testing.T) {
+	f := newFleet(t, 4, Config{ReleaseIdle: 30 * time.Second})
+	defer lease.Acquire(f.bs[0]).Release()
+	for _, b := range f.bs[1:] {
+		defer lease.Acquire(b).Release()
+		defer lease.Acquire(b).Release()
+	}
+	j, _ := f.m.Reserve(f.bs, 10, nil)
+	if f.m.ModeOf(j.Backend) != Draining {
+		t.Fatal("setup: want the node draining behind its decode")
+	}
+	j.Done()
+	if got := f.m.ModeOf(j.Backend); got != Decode {
+		t.Errorf("mode = %v, want decode: a draining node serves nothing while it waits", got)
+	}
+}

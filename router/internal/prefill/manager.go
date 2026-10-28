@@ -9,9 +9,10 @@
 //
 // A node is in one of three modes. It starts in decode, becomes draining when a
 // rejected request needs a prefill node and none has room, becomes prefill once
-// its running decode requests have finished, and returns to decode as soon as
-// it has no job running or queued. Which nodes are prefill nodes is therefore the router's decision, made
-// from traffic, with nothing configured per node.
+// its running decode requests have finished, and returns to decode once it has
+// no job running or queued (after Config.ReleaseIdle, when set). Which nodes are
+// prefill nodes is therefore the router's decision, made from traffic, with
+// nothing configured per node.
 package prefill
 
 import (
@@ -71,6 +72,16 @@ type Config struct {
 	// at once, and counts the node's other in-flight requests against it; jobs
 	// beyond it wait their turn. 0 is no limit.
 	NodeConcurrency int64
+	// ConvertAfter holds back draining another decode node until the
+	// least-loaded prefill node has been over its budget for this long; jobs
+	// queue on it meanwhile. A drained node takes no new decode work and no
+	// prefill until its decodes finish, so converting on every brief overflow
+	// costs more decode capacity than the queue it relieves. 0 converts at once.
+	ConvertAfter time.Duration
+	// ReleaseIdle keeps a prefill node out of decode until it has had no job
+	// for this long, so a burst that arrives just after its last job finds it
+	// ready instead of draining a node afresh. 0 releases at once.
+	ReleaseIdle time.Duration
 
 	Clock    clock.Clock
 	PoolName string
@@ -102,6 +113,10 @@ type node struct {
 	queue   []*Job
 	mode    Mode
 	pending int64
+	// overSince is when pending last rose above the budget (zero while
+	// within it); idleSince when a prefill node last ran out of jobs (zero
+	// while it has any).
+	overSince, idleSince time.Time
 }
 
 // Manager owns the node modes for one pool.
@@ -149,6 +164,7 @@ func (j *Job) Done() {
 			j.mgr.grantLocked(j.n)
 		}
 		j.n.pending -= j.tokens
+		j.mgr.trackBudgetLocked(j.n)
 		j.mgr.releaseIfIdleLocked(j.n)
 		j.mgr.publishLocked(j.n)
 	})
@@ -200,7 +216,8 @@ func (m *Manager) DecodeNodes(cands []*registry.Backend) []*registry.Backend {
 //     onto the fullest node leaves the others to run dry and return to decode,
 //     where spreading them would keep every prefill node busy with a little.
 //  2. Failing that, and while the prefill share is under the cap, take the
-//     least-loaded decode node and start draining it.
+//     least-loaded decode node and start draining it — with ConvertAfter set,
+//     only once the least-loaded prefill node has been over budget that long.
 //  3. Failing that, queue on the prefill node with the least pending tokens.
 //  4. With no prefill node at all, ErrNoPrefillNode.
 //
@@ -227,7 +244,7 @@ func (m *Manager) Reserve(cands []*registry.Backend, tokens int64, pick Picker) 
 	switch {
 	case len(eligible) > 0:
 		chosen = m.pickLocked(eligible, pick)
-	case m.canConvertLocked(len(cands), len(nonDecode), len(decode)):
+	case m.canConvertLocked(len(cands), len(nonDecode), len(decode)) && m.overflowedLongEnoughLocked(nonDecode):
 		chosen = leastLoaded(decode)
 		n := m.nodes[chosen.URL]
 		n.mode = Draining
@@ -241,6 +258,8 @@ func (m *Manager) Reserve(cands []*registry.Backend, tokens int64, pick Picker) 
 
 	n := m.nodes[chosen.URL]
 	n.pending += tokens
+	n.idleSince = time.Time{}
+	m.trackBudgetLocked(n)
 	m.publishLocked(n)
 	j := &Job{mgr: m, n: n, tokens: tokens, Backend: chosen, granted: make(chan struct{}), queued: true}
 	n.queue = append(n.queue, j)
@@ -306,6 +325,26 @@ func leastLoaded(bs []*registry.Backend) *registry.Backend {
 func (m *Manager) canConvertLocked(fleet, nonDecode, decode int) bool {
 	limit := min(int(float64(fleet)*m.cfg.MaxFleetFraction), fleet-1)
 	return decode > 1 && nonDecode < limit
+}
+
+// overflowedLongEnoughLocked applies ConvertAfter: with no prefill node yet,
+// or the least-loaded one over budget for at least that long, a decode node
+// may be drained.
+func (m *Manager) overflowedLongEnoughLocked(nonDecode []*registry.Backend) bool {
+	if m.cfg.ConvertAfter <= 0 || len(nonDecode) == 0 {
+		return true
+	}
+	n := m.nodes[m.leastPendingLocked(nonDecode).URL]
+	return !n.overSince.IsZero() && m.cfg.Clock.Now().Sub(n.overSince) >= m.cfg.ConvertAfter
+}
+
+func (m *Manager) trackBudgetLocked(n *node) {
+	switch {
+	case n.pending <= m.cfg.NodeBudgetTokens:
+		n.overSince = time.Time{}
+	case n.overSince.IsZero():
+		n.overSince = m.cfg.Clock.Now()
+	}
 }
 
 // WaitReady blocks until the job may run on its node; a job is queued from
@@ -407,17 +446,44 @@ func (m *Manager) CountJobRetry() {
 	m.m.JobRetries.Inc()
 }
 
-// releaseIfIdleLocked returns a node to decode the moment it has no job in
-// flight and none queued. It runs under the same lock as every queue change,
-// so a job reserved concurrently either finds the node still in prefill and
-// keeps it, or finds it back in decode and converts it afresh.
+// releaseIfIdleLocked returns a node to decode once it has no job in flight
+// and none queued: at once, or for a prefill node with ReleaseIdle set, after
+// that long idle (see releaseExpired). A draining node always goes at once:
+// it serves neither decode nor prefill while it waits. It runs under the same
+// lock as every queue change, so a job reserved concurrently either finds the
+// node still in prefill and keeps it, or finds it back in decode and converts
+// it afresh.
 func (m *Manager) releaseIfIdleLocked(n *node) {
 	if n.mode == Decode || n.pending != 0 || n.running != 0 || len(n.queue) != 0 {
 		return
 	}
+	if n.mode == Prefill && m.cfg.ReleaseIdle > 0 {
+		if n.idleSince.IsZero() {
+			n.idleSince = m.cfg.Clock.Now()
+		}
+		return
+	}
+	m.releaseLocked(n)
+}
+
+func (m *Manager) releaseLocked(n *node) {
 	n.mode = Decode
+	n.idleSince = time.Time{}
 	m.releases.Add(1)
 	m.m.Releases.Inc()
+	m.publishLocked(n)
+}
+
+// releaseExpired returns to decode every prefill node idle for ReleaseIdle.
+func (m *Manager) releaseExpired() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.cfg.Clock.Now()
+	for _, n := range m.nodes {
+		if n.mode == Prefill && !n.idleSince.IsZero() && now.Sub(n.idleSince) >= m.cfg.ReleaseIdle {
+			m.releaseLocked(n)
+		}
+	}
 }
 
 // Prune forgets nodes that have left the pool and drops their series.
@@ -440,17 +506,26 @@ func (m *Manager) Prune(known []*registry.Backend) {
 // pruneEvery is how often Run forgets departed nodes.
 const pruneEvery = 30 * time.Second
 
-// Run prunes departed nodes until ctx is done. known supplies the pool's
-// current backends.
+// Run prunes departed nodes and, with ReleaseIdle set, returns idle prefill
+// nodes to decode, until ctx is done. known supplies the pool's current
+// backends.
 func (m *Manager) Run(ctx context.Context, known func() []*registry.Backend) {
 	t := m.cfg.Clock.NewTicker(pruneEvery)
 	defer t.Stop()
+	var release <-chan time.Time
+	if m.cfg.ReleaseIdle > 0 {
+		r := m.cfg.Clock.NewTicker(min(max(m.cfg.ReleaseIdle/4, 100*time.Millisecond), time.Second))
+		defer r.Stop()
+		release = r.C()
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C():
 			m.Prune(known())
+		case <-release:
+			m.releaseExpired()
 		}
 	}
 }

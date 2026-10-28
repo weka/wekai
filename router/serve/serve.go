@@ -165,6 +165,10 @@ type Options struct {
 	// PrefillMaxFleetFraction caps the share of a pool that may be prefill
 	// nodes; at least one node always stays in decode.
 	PrefillMaxFleetFraction float64
+	// PrefillConvertAfter and PrefillReleaseIdle are prefill.Config's
+	// ConvertAfter and ReleaseIdle; 0 converts and releases at once.
+	PrefillConvertAfter time.Duration
+	PrefillReleaseIdle  time.Duration
 	// AutoModel controls asking a pool what it serves when a route carries no
 	// explicit `as <model>`: "auto" (rewrite only when the pool serves exactly
 	// one model), "force", or "off". Empty means "auto".
@@ -294,6 +298,8 @@ func (o Options) prefillConfig() *prefill.Config {
 		NodeConcurrency:  o.NodeConcurrency,
 		NodeBudgetTokens: o.PrefillNodeBudgetTokens,
 		MaxFleetFraction: o.PrefillMaxFleetFraction,
+		ConvertAfter:     o.PrefillConvertAfter,
+		ReleaseIdle:      o.PrefillReleaseIdle,
 	}
 }
 

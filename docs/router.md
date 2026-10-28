@@ -174,14 +174,21 @@ reaches the client unchanged.
 
 A node is `decode` (normal), `draining` (no new decode routing; its running
 requests finish, and prefill jobs queue behind them), `prefill` (jobs only), and
-back to `decode` the moment it has no prefill job running or queued.
+back to `decode` once it has no prefill job running or queued — at once, or
+after `--prefill-release-idle` without one, so a burst that follows soon after
+finds it ready instead of draining a node afresh. A draining node whose jobs
+all went away returns at once regardless: it serves nothing while it waits.
 A job goes to the prefill node with the most queued plus in-flight prefill that
 still has room under `--prefill-node-budget-tokens`; the ordinary routing flow
 only breaks a tie. Packing onto the fullest node lets the others run dry and
 return to decode, where spreading jobs would keep every prefill node a little
 busy and none would ever go back. When none has room a decode node is drained, up
 to `floor(nodes * --prefill-max-fleet-fraction)` and always leaving one decode
-node; past that, jobs queue on the least-loaded prefill node, and with no
+node. With `--prefill-convert-after` set, that drain waits until the
+least-loaded prefill node has been over budget for that long, jobs queueing on it
+meanwhile: draining costs decode capacity before it adds any prefill, so a
+brief overflow is cheaper to queue through. Past the cap, or while the overflow
+is younger than that, jobs queue on the least-loaded prefill node, and with no
 prefill node at all the request is resent to the backend that refused it, with
 the bypass. It needs a KV tier the nodes share; without one the prefill is
 wasted work.
