@@ -8,8 +8,8 @@ import (
 )
 
 // recordTypeRunParams tags the run-parameter header row in a request-data
-// JSONL file. Like recordTypeVLLMMetricsSample it rides in the same stream and
-// is told apart by record_type; request rows carry no record_type at all.
+// JSONL file. Like recordTypeCacheMetricsSample it rides in the same stream
+// and is told apart by record_type; request rows carry no record_type at all.
 const recordTypeRunParams = "run_params"
 
 // runParamsSchemaVersion is bumped when the MEANING of an existing field

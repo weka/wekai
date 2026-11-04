@@ -73,6 +73,20 @@ func TestParsePromptTokensBySourceGarbage(t *testing.T) {
 	}
 }
 
+func TestVLLMEngineDerive(t *testing.T) {
+	got := vllmEngine.Derive(map[string]float64{
+		"local_compute":        500,
+		"local_cache_hit":      300,
+		"external_kv_transfer": 42,
+	})
+	want := map[string]float64{"compute": 500, "host": 300, "external": 42}
+	for k, w := range want {
+		if got[k] != w {
+			t.Errorf("band %q = %v, want %v (got %+v)", k, got[k], w, got)
+		}
+	}
+}
+
 func TestVLLMMetricsEndpoints(t *testing.T) {
 	cases := []struct {
 		spec         string
@@ -94,7 +108,7 @@ func TestVLLMMetricsEndpoints(t *testing.T) {
 		{"anthropic/claude-3", nil, false},
 	}
 	for _, c := range cases {
-		got := vllmMetricsEndpoints(c.spec)
+		got := engineEndpoints(vllmEngine, c.spec)
 		if len(got.urls) != len(c.want) {
 			t.Errorf("%s: got %v, want %v", c.spec, got.urls, c.want)
 			continue
@@ -107,127 +121,6 @@ func TestVLLMMetricsEndpoints(t *testing.T) {
 		if got.explicit != c.wantExplicit {
 			t.Errorf("%s: explicit = %v, want %v", c.spec, got.explicit, c.wantExplicit)
 		}
-	}
-}
-
-func TestActiveDatasetTracker(t *testing.T) {
-	tr := newActiveDatasetTracker()
-	if tok, n := tr.Sum(); tok != 0 || n != 0 {
-		t.Fatalf("empty tracker: got %d/%d", tok, n)
-	}
-	tr.Update(1, 1000)
-	tr.Update(2, 500)
-	tr.Update(1, 1200) // latest snapshot replaces, not accumulates
-	if tok, n := tr.Sum(); tok != 1700 || n != 2 {
-		t.Fatalf("got %d tokens / %d series, want 1700/2", tok, n)
-	}
-	// Recycle: slot 1 resets, contributes nothing until its new session's
-	// first response lands.
-	tr.Reset(1)
-	if tok, n := tr.Sum(); tok != 500 || n != 1 {
-		t.Fatalf("after reset: got %d/%d, want 500/1", tok, n)
-	}
-	tr.Update(1, 64)
-	if tok, n := tr.Sum(); tok != 564 || n != 2 {
-		t.Fatalf("after re-populate: got %d/%d, want 564/2", tok, n)
-	}
-}
-
-// bandTokens looks up one named band's delta within a segment, failing the
-// test if the band is absent — every segment buildSampleVizVLLM/
-// buildSampleVizSGLang emit is expected to carry its full fixed band set.
-func bandTokens(t *testing.T, seg vizSampleSegment, name string) float64 {
-	t.Helper()
-	for _, b := range seg.Bands {
-		if b.Name == name {
-			return b.Tokens
-		}
-	}
-	t.Fatalf("segment %+v has no band %q", seg, name)
-	return 0
-}
-
-func TestBuildSampleVizDeltasAndClamp(t *testing.T) {
-	t0 := time.Unix(1000, 0)
-	mk := func(offsetSec int, c, lc, ec, adt int64, as int) vllmMetricsSample {
-		return vllmMetricsSample{
-			RecordType:          recordTypeVLLMMetricsSample,
-			TS:                  t0.Add(time.Duration(offsetSec) * time.Second),
-			Sources:             vllmSourceCounters{Compute: c, LocalCache: lc, ExternalCache: ec},
-			ActiveDatasetTokens: adt,
-			ActiveSeries:        as,
-		}
-	}
-	// Out of order on purpose; sample 3 has a counter reset (values drop).
-	samples := []vllmMetricsSample{
-		mk(60, 1500, 300, 42, 2000, 2),
-		mk(0, 1000, 200, 40, 1000, 1),
-		mk(120, 100, 50, 5, 3000, 3), // reset: deltas must clamp to 0
-		mk(180, 200, 80, 6, 2500, 2),
-	}
-	mix, adt := buildSampleVizVLLM(samples)
-	if len(mix) != 3 {
-		t.Fatalf("got %d segments, want 3", len(mix))
-	}
-	// Segment 1: 0s -> 60s.
-	if bandTokens(t, mix[0], "local_compute") != 500 || bandTokens(t, mix[0], "local_cache_hit") != 100 || bandTokens(t, mix[0], "external_kv_transfer") != 2 {
-		t.Errorf("seg0 deltas = %+v, want c=500 lc=100 ec=2", mix[0])
-	}
-	// Segment 2 spans the counter reset: all deltas clamp at 0.
-	if bandTokens(t, mix[1], "local_compute") != 0 || bandTokens(t, mix[1], "local_cache_hit") != 0 || bandTokens(t, mix[1], "external_kv_transfer") != 0 {
-		t.Errorf("seg1 (reset) deltas = %+v, want all 0", mix[1])
-	}
-	// Segment 3 resumes from the post-reset baseline.
-	if bandTokens(t, mix[2], "local_compute") != 100 || bandTokens(t, mix[2], "local_cache_hit") != 30 || bandTokens(t, mix[2], "external_kv_transfer") != 1 {
-		t.Errorf("seg2 deltas = %+v, want c=100 lc=30 ec=1", mix[2])
-	}
-	if mix[0].T0 != float64(t0.UnixMilli()) || mix[0].T1 != float64(t0.Add(60*time.Second).UnixMilli()) {
-		t.Errorf("seg0 span = %v..%v", mix[0].T0, mix[0].T1)
-	}
-	if len(adt) != 4 || adt[0].Tokens != 1000 || adt[3].Tokens != 2500 || adt[3].Series != 2 {
-		t.Errorf("adt points wrong: %+v", adt)
-	}
-}
-
-func TestBuildSampleVizEmpty(t *testing.T) {
-	mix, adt := buildSampleVizVLLM(nil)
-	if mix != nil || adt != nil {
-		t.Fatalf("expected nil/nil, got %v %v", mix, adt)
-	}
-}
-
-func TestReadJSONLFileMixedRecordTypes(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "mixed.jsonl")
-	lines := []string{
-		`{"start_time":"2026-07-21T10:00:00Z","end_time":"2026-07-21T10:00:01Z","ttft_ms":100,"response_time_ms":1000,"model":"dynamic/http://h:8000/v1,type=openai_vllm,alias=A","series_num":1,"request_num":1,"input_tokens":50,"cached_tokens":0,"cache_hit":false,"server_cache_confirmed":false,"is_cold_start":true,"output_tokens":10,"is_error":false,"is_empty":false,"local_cache_ratio":0}`,
-		`{"record_type":"vllm_metrics_sample","ts":"2026-07-21T10:00:30Z","model":"dynamic/http://h:8000/v1,type=openai_vllm,alias=A","sources":{"compute":1000,"local_cache":200,"external_cache":40},"active_dataset_tokens":5000,"active_series":3}`,
-		`not json at all`,
-		`{"record_type":"future_unknown_type","whatever":1}`,
-		`{"start_time":"2026-07-21T10:01:00Z","end_time":"2026-07-21T10:01:01Z","ttft_ms":50,"response_time_ms":500,"model":"dynamic/http://h:8000/v1,type=openai_vllm,alias=A","series_num":1,"request_num":2,"input_tokens":60,"cached_tokens":40,"cache_hit":true,"server_cache_confirmed":true,"is_cold_start":false,"output_tokens":10,"is_error":false,"is_empty":false,"local_cache_ratio":0.5}`,
-	}
-	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	records, samples, err := readJSONLFile(path)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if len(records) != 2 {
-		t.Fatalf("got %d request records, want 2 (samples/unknown must not leak in as phantom requests): %+v", len(records), records)
-	}
-	if records[0].RequestNum != 1 || records[1].RequestNum != 2 {
-		t.Errorf("request rows corrupted: %+v", records)
-	}
-	if len(samples) != 1 {
-		t.Fatalf("got %d samples, want 1", len(samples))
-	}
-	s := samples[0]
-	if s.Sources.Compute != 1000 || s.Sources.LocalCache != 200 || s.Sources.ExternalCache != 40 {
-		t.Errorf("sample sources = %+v", s.Sources)
-	}
-	if s.ActiveDatasetTokens != 5000 || s.ActiveSeries != 3 {
-		t.Errorf("sample active dataset = %d/%d", s.ActiveDatasetTokens, s.ActiveSeries)
 	}
 }
 
@@ -284,7 +177,8 @@ func TestSamplerSampleOnceWritesRecord(t *testing.T) {
 	tracker.Update(1, 4000)
 	tracker.Update(2, 1000)
 
-	s := &vllmMetricsSampler{
+	s := &metricsSampler{
+		engine:  vllmEngine,
 		model:   "dynamic/" + srv.URL + "/v1,type=openai_vllm",
 		urls:    []string{srv.URL + "/metrics"},
 		tracker: tracker,
@@ -305,81 +199,23 @@ func TestSamplerSampleOnceWritesRecord(t *testing.T) {
 		t.Fatalf("got %d samples, want 1", len(samples))
 	}
 	got := samples[0]
-	if got.RecordType != recordTypeVLLMMetricsSample {
+	if got.RecordType != recordTypeCacheMetricsSample {
 		t.Errorf("record_type = %q", got.RecordType)
 	}
+	if got.Engine != "vllm" {
+		t.Errorf("engine = %q, want vllm", got.Engine)
+	}
 	// The first sighting of an endpoint sets a BASELINE and contributes nothing.
-	// Totals are a running sum of deltas, and these pods carry counters from
-	// whatever ran before the benchmark started; importing that history would
-	// attribute another run's work to this one.
-	if got.Sources != (vllmSourceCounters{}) {
-		t.Errorf("first sample = %+v, want all zero: it is the baseline, not a measurement", got.Sources)
+	for band, v := range got.Bands {
+		if v != 0 {
+			t.Errorf("first sample band %q = %d, want 0: it is the baseline, not a measurement", band, v)
+		}
 	}
 	if got.EndpointsOK != 1 || got.EndpointsTotal != 1 {
 		t.Errorf("coverage = %d/%d, want 1/1", got.EndpointsOK, got.EndpointsTotal)
 	}
 	if got.ActiveDatasetTokens != 5000 || got.ActiveSeries != 2 {
 		t.Errorf("active dataset = %d/%d, want 5000/2", got.ActiveDatasetTokens, got.ActiveSeries)
-	}
-}
-
-// TestSamplerGracefulDegradation: an endpoint that cannot be read contributes
-// no delta and no panic — but the interval is still RECORDED, at zero coverage.
-//
-// Omitting it was the old behaviour and it was wrong: a missing row and an idle
-// fleet are different claims, and the report drew both as nothing. On a loaded
-// fleet /metrics competes with inference for the same event loop, so the
-// intervals lost this way were disproportionately the interesting ones.
-func TestSamplerGracefulDegradation(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
-	}))
-	defer srv.Close()
-
-	dir := t.TempDir()
-	rdw, err := newRequestDataWriter(dir, "degraded_model", time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := &vllmMetricsSampler{
-		model:   "m",
-		urls:    []string{srv.URL + "/metrics"},
-		tracker: newActiveDatasetTracker(),
-		rdw:     rdw,
-		client:  srv.Client(),
-		now:     time.Now,
-	}
-	s.sampleOnce(context.Background())
-
-	// Connection refused: close the server and sample again.
-	srv.Close()
-	s.client = &http.Client{}
-	s.sampleOnce(context.Background())
-
-	if err := rdw.close(); err != nil {
-		t.Fatal(err)
-	}
-	_, samples, err := readJSONLFile(filepath.Join(dir, "degraded_model.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(samples) != 2 {
-		t.Fatalf("got %d samples, want 2: an interval nobody could observe is still an interval, "+
-			"and dropping it leaves a gap in the report with no explanation", len(samples))
-	}
-	for i, smp := range samples {
-		if smp.EndpointsOK != 0 {
-			t.Errorf("sample %d: EndpointsOK = %d, want 0", i, smp.EndpointsOK)
-		}
-		if smp.EndpointsTotal != 1 {
-			t.Errorf("sample %d: EndpointsTotal = %d, want 1", i, smp.EndpointsTotal)
-		}
-		if smp.Sources != (vllmSourceCounters{}) {
-			t.Errorf("sample %d: an unreadable endpoint contributed %+v", i, smp.Sources)
-		}
-	}
-	if s.skipped.Load() != 2 {
-		t.Errorf("skipped = %d, want 2", s.skipped.Load())
 	}
 }
 
@@ -414,7 +250,7 @@ func TestStartVLLMMetricsSamplerLifecycle(t *testing.T) {
 	path := filepath.Join(dir, "lifecycle_model.jsonl")
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), recordTypeVLLMMetricsSample) {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), recordTypeCacheMetricsSample) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -459,7 +295,7 @@ func TestStartVLLMMetricsSamplerSpeculativeCollects(t *testing.T) {
 	path := filepath.Join(dir, "speculative_model.jsonl")
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), recordTypeVLLMMetricsSample) {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), recordTypeCacheMetricsSample) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -478,7 +314,7 @@ func TestStartVLLMMetricsSamplerSpeculativeCollects(t *testing.T) {
 }
 
 // The give-up rule, exercised through sampleOnce directly so the test doesn't
-// have to wait out vllmMetricsSampleInterval between attempts.
+// have to wait out metricsSampleInterval between attempts.
 func TestVLLMMetricsSamplerGiveUp(t *testing.T) {
 	// A server that has no /metrics at all — a public API, a gateway, or any
 	// non-vLLM OpenAI-compatible endpoint.
@@ -487,9 +323,10 @@ func TestVLLMMetricsSamplerGiveUp(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	newSampler := func(explicit bool) (*vllmMetricsSampler, *[]string) {
+	newSampler := func(explicit bool) (*metricsSampler, *[]string) {
 		var logs []string
-		return &vllmMetricsSampler{
+		return &metricsSampler{
+			engine:   vllmEngine,
 			model:    "m",
 			urls:     []string{srv.URL + "/metrics"},
 			explicit: explicit,
@@ -503,13 +340,13 @@ func TestVLLMMetricsSamplerGiveUp(t *testing.T) {
 
 	t.Run("speculative gives up after the budget", func(t *testing.T) {
 		s, logs := newSampler(false)
-		for i := 1; i < vllmMetricsSpeculativeBudget; i++ {
+		for i := 1; i < metricsSpeculativeBudget; i++ {
 			if !s.sampleOnce(context.Background()) {
-				t.Fatalf("gave up after %d attempts, budget is %d", i, vllmMetricsSpeculativeBudget)
+				t.Fatalf("gave up after %d attempts, budget is %d", i, metricsSpeculativeBudget)
 			}
 		}
 		if s.sampleOnce(context.Background()) {
-			t.Fatalf("still polling after %d attempts, budget is %d", vllmMetricsSpeculativeBudget, vllmMetricsSpeculativeBudget)
+			t.Fatalf("still polling after %d attempts, budget is %d", metricsSpeculativeBudget, metricsSpeculativeBudget)
 		}
 		if len(*logs) != 1 {
 			t.Errorf("want exactly one log line on give-up, got %v", *logs)
@@ -518,7 +355,7 @@ func TestVLLMMetricsSamplerGiveUp(t *testing.T) {
 
 	t.Run("explicit keeps polling", func(t *testing.T) {
 		s, logs := newSampler(true)
-		for i := 0; i < vllmMetricsSpeculativeBudget+3; i++ {
+		for i := 0; i < metricsSpeculativeBudget+3; i++ {
 			if !s.sampleOnce(context.Background()) {
 				t.Fatalf("explicit sampler gave up on attempt %d", i+1)
 			}
@@ -564,7 +401,8 @@ func TestVLLMMetricsSamplerSuccessRetiresBudget(t *testing.T) {
 	}
 	defer func() { _ = rdw.close() }()
 
-	s := &vllmMetricsSampler{
+	s := &metricsSampler{
+		engine:   vllmEngine,
 		model:    "m",
 		urls:     []string{srv.URL + "/metrics"},
 		tracker:  newActiveDatasetTracker(),
@@ -578,9 +416,54 @@ func TestVLLMMetricsSamplerSuccessRetiresBudget(t *testing.T) {
 		t.Fatal("first sample should have succeeded")
 	}
 	serve.Store(false)
-	for i := 0; i < vllmMetricsSpeculativeBudget+3; i++ {
+	for i := 0; i < metricsSpeculativeBudget+3; i++ {
 		if !s.sampleOnce(context.Background()) {
 			t.Fatalf("gave up on attempt %d after a proven-good endpoint went down", i+1)
 		}
+	}
+}
+
+// TestMetricsURLOverrideReachesTheSampler.
+//
+// The default derives /metrics from the serving spec, which is right only when
+// the thing serving inference is also the thing exposing the counters. Behind a
+// router it never is: the router refuses /metrics on its serving port on
+// purpose, because proxying it answers with ONE backend's counters — a number
+// that looks like a fleet total and is not. Without a way to name the real
+// address, an entire campaign records zero samples and the report shows nothing
+// where the interesting half of the comparison should be.
+func TestMetricsURLOverrideReachesTheSampler(t *testing.T) {
+	a := newFakeEngineServer(t, renderVLLMFixture)
+	b := newFakeEngineServer(t, renderVLLMFixture)
+	dir := t.TempDir()
+	rdw, err := newRequestDataWriter(dir, "override_model", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A serving spec pointing somewhere with no /metrics at all — the router.
+	s := startVLLMMetricsSampler(context.Background(),
+		"dynamic/http://router.invalid:9000/v1,type=openai_vllm",
+		[]string{strings.TrimSuffix(a.url(), "/metrics"), b.url()}, // bare endpoint AND explicit /metrics
+		newActiveDatasetTracker(), rdw)
+	if s == nil {
+		t.Fatal("no sampler started despite explicit metrics URLs")
+	}
+	defer s.stop()
+
+	want := map[string]bool{a.url(): true, b.url(): true}
+	for _, u := range s.urls {
+		if !want[u] {
+			t.Errorf("sampler is scraping %q; want exactly %v — a bare endpoint must be normalised "+
+				"to /metrics rather than fetched as-is", u, want)
+		}
+		delete(want, u)
+	}
+	if len(want) != 0 {
+		t.Errorf("sampler never resolved %v", want)
+	}
+	if !s.explicit {
+		t.Error("explicitly named endpoints must poll forever rather than spending a speculative " +
+			"budget; the operator said where they are and a backend loading weights must not cost " +
+			"the rest of the run")
 	}
 }

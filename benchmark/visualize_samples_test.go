@@ -60,7 +60,7 @@ console.log("ALL_OK");
 	runNodeProbe(t, nodeBin, dir, "output_worker", script, probe)
 }
 
-func writeMixedJSONL(t *testing.T, dir, name string, records []requestDataRecord, samples []vllmMetricsSample) string {
+func writeMixedJSONL(t *testing.T, dir, name string, records []requestDataRecord, samples []cacheMetricsSample) string {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func writeMixedJSONL(t *testing.T, dir, name string, records []requestDataRecord
 	return path
 }
 
-func benchFixtureData(alias string, base time.Time) ([]requestDataRecord, []vllmMetricsSample) {
+func benchFixtureData(alias string, base time.Time) ([]requestDataRecord, []cacheMetricsSample) {
 	model := "dynamic/http://localhost:8000/v1,type=openai_vllm,alias=" + alias
 	var records []requestDataRecord
 	for i := 0; i < 5; i++ {
@@ -103,13 +103,18 @@ func benchFixtureData(alias string, base time.Time) ([]requestDataRecord, []vllm
 			OutputTokens: 50,
 		})
 	}
-	var samples []vllmMetricsSample
+	var samples []cacheMetricsSample
 	for i := 0; i < 3; i++ {
-		samples = append(samples, vllmMetricsSample{
-			RecordType:          recordTypeVLLMMetricsSample,
-			TS:                  base.Add(time.Duration(i) * 60 * time.Second),
-			Model:               model,
-			Sources:             vllmSourceCounters{Compute: int64(1000 * (i + 1)), LocalCache: int64(300 * i), ExternalCache: int64(100 * i)},
+		samples = append(samples, cacheMetricsSample{
+			RecordType: recordTypeCacheMetricsSample,
+			TS:         base.Add(time.Duration(i) * 60 * time.Second),
+			Model:      model,
+			Engine:     "vllm",
+			Bands: map[string]int64{
+				"compute":  int64(1000 * (i + 1)),
+				"host":     int64(300 * i),
+				"external": int64(100 * i),
+			},
 			ActiveDatasetTokens: int64(4000 * (i + 1)),
 			ActiveSeries:        i + 1,
 		})
@@ -154,9 +159,9 @@ func TestGenerateVisualizationWithCacheMixSamples(t *testing.T) {
 }
 
 // sglangBenchFixtureData mirrors benchFixtureData for an openai_sglang arm:
-// same record shape, but samples are sglangMetricsSample with the 4-way
-// compute/device/host/storage breakdown instead of vLLM's 3-way sources.
-func sglangBenchFixtureData(alias string, base time.Time) ([]requestDataRecord, []sglangMetricsSample) {
+// same record shape, but samples carry the 4-way compute/gpu/host/storage
+// breakdown instead of vLLM's 3-way bands.
+func sglangBenchFixtureData(alias string, base time.Time) ([]requestDataRecord, []cacheMetricsSample) {
 	model := "dynamic/http://localhost:8000/v1,type=openai_sglang,alias=" + alias
 	var records []requestDataRecord
 	for i := 0; i < 5; i++ {
@@ -174,17 +179,18 @@ func sglangBenchFixtureData(alias string, base time.Time) ([]requestDataRecord, 
 			OutputTokens: 50,
 		})
 	}
-	var samples []sglangMetricsSample
+	var samples []cacheMetricsSample
 	for i := 0; i < 3; i++ {
-		samples = append(samples, sglangMetricsSample{
-			RecordType: recordTypeSGLangMetricsSample,
+		samples = append(samples, cacheMetricsSample{
+			RecordType: recordTypeCacheMetricsSample,
 			TS:         base.Add(time.Duration(i) * 60 * time.Second),
 			Model:      model,
-			Sources: sglangSourceCounters{
-				Compute: int64(1000 * (i + 1)),
-				Device:  int64(300 * i),
-				Host:    int64(150 * i),
-				Storage: int64(100 * i),
+			Engine:     "sglang",
+			Bands: map[string]int64{
+				"compute": int64(1000 * (i + 1)),
+				"gpu":     int64(300 * i),
+				"host":    int64(150 * i),
+				"storage": int64(100 * i),
 			},
 			ActiveDatasetTokens: int64(4000 * (i + 1)),
 			ActiveSeries:        i + 1,
@@ -194,15 +200,15 @@ func sglangBenchFixtureData(alias string, base time.Time) ([]requestDataRecord, 
 }
 
 // TestGenerateVisualizationWithSGLangCacheMixSamples confirms an
-// openai_sglang-typed series with sglang_metrics_sample data produces a
-// seriesData carrying non-nil mix/adt AND the sglang band order (compute/
-// device/host/storage) rather than vLLM's — the report JS needs bandOrder to
-// pick the right legend/colors without guessing from Mix's shape.
+// openai_sglang-typed series with cache-metrics samples produces a seriesData
+// carrying non-nil mix/adt AND the sglang band order (compute/gpu/host/
+// storage) rather than vLLM's — the report JS needs bandOrder to pick the
+// right legend/colors without guessing from Mix's shape.
 func TestGenerateVisualizationWithSGLangCacheMixSamples(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
 	rec, smp := sglangBenchFixtureData("sglangA", base)
-	writeSGLangMixedJSONL(t, dir, "a", rec, smp)
+	writeMixedJSONL(t, dir, "a", rec, smp)
 
 	htmlPath, err := GenerateVisualization(dir, 4)
 	if err != nil {
@@ -215,7 +221,7 @@ func TestGenerateVisualizationWithSGLangCacheMixSamples(t *testing.T) {
 	html := string(b)
 	for _, want := range []string{
 		`"mix":`, `"adt":`,
-		`"bandOrder":["compute","device","host","storage"]`,
+		`"bandOrder":["compute","gpu","host","storage"]`,
 		"MIX_HOST_COLOR", "MIX_BAND_STYLE", // generalized band styling present
 	} {
 		if !strings.Contains(html, want) {
@@ -234,7 +240,7 @@ func TestGenerateVisualizationMixedVLLMAndSGLang(t *testing.T) {
 	vRec, vSmp := benchFixtureData("vllmArm", base)
 	sRec, sSmp := sglangBenchFixtureData("sglangArm", base)
 	writeMixedJSONL(t, dir, "a_vllm", vRec, vSmp)
-	writeSGLangMixedJSONL(t, dir, "b_sglang", sRec, sSmp)
+	writeMixedJSONL(t, dir, "b_sglang", sRec, sSmp)
 
 	htmlPath, err := GenerateVisualization(dir, 4)
 	if err != nil {
@@ -245,38 +251,12 @@ func TestGenerateVisualizationMixedVLLMAndSGLang(t *testing.T) {
 		t.Fatal(err)
 	}
 	html := string(b)
-	if !strings.Contains(html, `"bandOrder":["local_compute","local_cache_hit","external_kv_transfer"]`) {
+	if !strings.Contains(html, `"bandOrder":["compute","host","external"]`) {
 		t.Errorf("missing vLLM arm's band order")
 	}
-	if !strings.Contains(html, `"bandOrder":["compute","device","host","storage"]`) {
+	if !strings.Contains(html, `"bandOrder":["compute","gpu","host","storage"]`) {
 		t.Errorf("missing sglang arm's band order")
 	}
-}
-
-// writeSGLangMixedJSONL mirrors writeMixedJSONL for sglangMetricsSample rows.
-func writeSGLangMixedJSONL(t *testing.T, dir, name string, records []requestDataRecord, samples []sglangMetricsSample) string {
-	t.Helper()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, name+".jsonl")
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	for _, r := range records {
-		if err := enc.Encode(r); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, s := range samples {
-		if err := enc.Encode(s); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return path
 }
 
 func TestGenerateVisualizationWithoutSamplesUnchanged(t *testing.T) {
@@ -803,11 +783,11 @@ func TestMaxElapsedTruncation(t *testing.T) {
 		mkRec := func(offset time.Duration) requestDataRecord {
 			return requestDataRecord{StartTime: t0.Add(offset), Model: "m", RequestNum: 1, InputTokens: 10}
 		}
-		mkSmp := func(offset time.Duration) vllmMetricsSample {
-			return vllmMetricsSample{RecordType: recordTypeVLLMMetricsSample, TS: t0.Add(offset), Model: "m"}
+		mkSmp := func(offset time.Duration) cacheMetricsSample {
+			return cacheMetricsSample{RecordType: recordTypeCacheMetricsSample, TS: t0.Add(offset), Model: "m"}
 		}
 		records := []requestDataRecord{mkRec(0), mkRec(7*time.Hour + 45*time.Minute), mkRec(7*time.Hour + 45*time.Minute + time.Second), mkRec(7*time.Hour + 51*time.Minute)}
-		samples := []vllmMetricsSample{mkSmp(time.Minute), mkSmp(7*time.Hour + 45*time.Minute), mkSmp(7*time.Hour + 46*time.Minute)}
+		samples := []cacheMetricsSample{mkSmp(time.Minute), mkSmp(7*time.Hour + 45*time.Minute), mkSmp(7*time.Hour + 46*time.Minute)}
 		gotR, gotS := truncateToElapsed(records, samples, 7*time.Hour+45*time.Minute)
 		if len(gotR) != 2 {
 			t.Fatalf("records kept = %d, want 2 (t0 + exactly-at-cutoff; past-cutoff dropped)", len(gotR))
@@ -843,9 +823,9 @@ func TestMaxElapsedTruncation(t *testing.T) {
 			for _, off := range []time.Duration{0, 20 * time.Minute, 30 * time.Minute, 40 * time.Minute} {
 				recs = append(recs, requestDataRecord{StartTime: start.Add(off), Model: model, RequestNum: 1, InputTokens: 5})
 			}
-			smps := []vllmMetricsSample{
-				{RecordType: recordTypeVLLMMetricsSample, TS: start.Add(10 * time.Minute), Model: model},
-				{RecordType: recordTypeVLLMMetricsSample, TS: start.Add(35 * time.Minute), Model: model},
+			smps := []cacheMetricsSample{
+				{RecordType: recordTypeCacheMetricsSample, TS: start.Add(10 * time.Minute), Model: model},
+				{RecordType: recordTypeCacheMetricsSample, TS: start.Add(35 * time.Minute), Model: model},
 			}
 			writeMixedJSONL(t, dir, "reqs", recs, smps)
 		}
